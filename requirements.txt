@@ -1,0 +1,28 @@
+# TabHERA requirements
+# Python 3.12.10 + CUDA 12.8 (RTX 5060 Blackwell) 환경 기준
+#
+# 설치 방법:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+
+# ── HPO ────────────────────────────────────────────────
+optuna>=3.5.0
+
+# ── 딥러닝 (별도 설치 필요) ────────────────────────────
+# pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+
+# ── 데이터 처리 ─────────────────────────────────────────
+# scikit-learn 1.2.2는 Python 3.12에서 C++ 빌드 필요 → 1.3.0 이상 사용
+scikit-learn>=1.3.0
+scipy>=1.11.0
+numpy>=1.26.0
+pandas>=2.1.0
+
+# ── Parquet 지원 (데이터 캐시용) ────────────────────────
+pyarrow>=12.0.0
+
+# ── 기타 ────────────────────────────────────────────────
+openml>=0.14.1
+joblib>=1.2.0
+tqdm>=4.66.0

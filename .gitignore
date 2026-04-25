@@ -1,0 +1,21 @@
+﻿# 실험 로그 (용량 큼)
+optim_logs/
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 데이터 캐시
+*.parquet
+*.csv
+tabzilla_datasets.json
+
+# VS Code
+.vscode/
+
+# Optuna DB
+*.db
