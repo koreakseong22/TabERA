@@ -51,7 +51,7 @@ else:
 if not os.path.exists(savepath):
     os.makedirs(savepath)
 
-fname = os.path.join(savepath, f"data={args.openml_id}..model=tabhera.pkl")
+fname = os.path.join(savepath, f"data={args.openml_id}..model=tabera.pkl")
 
 # ─────────────────────────────────────────────────────────────
 # 중복 실행 방지  (MultiTab 원본과 동일)
@@ -163,7 +163,7 @@ if train:
 
         # MultiTab 원본과 동일한 출력
         print(device, env_info, args.openml_id,
-              data_info.get(str(args.openml_id))["name"], "tabhera", savepath)
+              data_info.get(str(args.openml_id))["name"], "tabera", savepath)
         print(val_metrics)
         print(test_metrics)
         now      = datetime.datetime.now()
@@ -203,7 +203,7 @@ if train:
     print(env_info)
     print(study.best_trial.user_attrs)
     df = study.trials_dataframe()
-    df.to_csv(os.path.join(savepath, f"data={args.openml_id}..model=tabhera.csv"), index=False)
+    df.to_csv(os.path.join(savepath, f"data={args.openml_id}..model=tabera.csv"), index=False)
     joblib.dump(study, fname)
     print(fname)
     print("#############################################")
