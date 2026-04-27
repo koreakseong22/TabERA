@@ -64,7 +64,7 @@ Gumbel-Softmax 대신 STE를 사용하는 이유:
 ```
 TabERA/
 ├── libs/
-│   ├── tabr.py          # TabERA 통합 모델 (TabERA, MemoryBank, FeatureStore)
+│   ├── tabera.py        # TabERA 모델 (TabERA, MemoryBank, FeatureStore)
 │   ├── prototypes.py    # CentroidLayer (STE, KMeans++, EMA, Dual-Space)
 │   ├── evidence.py      # AttentionAggregator, FeatureCrossAttention
 │   ├── supervised.py    # TabERAWrapper (학습 루프, EMA 호출)
