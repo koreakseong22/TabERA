@@ -29,8 +29,8 @@ TabERA는 Rosch(1975)의 **Prototype Theory**에서 영감을 받았습니다.
 | **STE Routing** | `libs/prototypes.py` | Bengio et al. (2013) + VQ-VAE (van den Oord, 2017) |
 | **EMA (centroid_x 전용)** | `libs/prototypes.py` | 설명의 사실성(faithfulness) 보장 |
 | **AttentionAggregator** | `libs/evidence.py` | Scaled dot-product attention |
-| **MemoryBank** | `libs/tabr.py` | 캐시 기반 그룹 내 벡터화 검색 |
-| **FeatureStore** | `libs/tabr.py` | 이웃 원본 feature 값 조회 |
+| **MemoryBank** | `libs/tabera.py` | 캐시 기반 그룹 내 벡터화 검색 |
+| **FeatureStore** | `libs/tabera.py` | 이웃 원본 feature 값 조회 |
 
 ### Dual-Space Centroid
 
