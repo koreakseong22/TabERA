@@ -14,7 +14,7 @@ parser.add_argument("--savepath",  type=str, default=".",    help="path to save 
 parser.add_argument("--n_trials",  type=int, default=100,    help="Number of optimization trials")
 parser.add_argument("--metric",    type=str, default="l2",
                     choices=["l2", "l1", "cosine", "mahalanobis", "wasserstein", "kl"],
-                    help="Distance metric for TabERA Retriever")
+                    help="Distance metric for TabR Retriever")
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
@@ -104,7 +104,7 @@ if train:
     output_dim = dataset.n_classes if tasktype == "multiclass" else 1
 
     # n_prototypes: 가설 기반 sqrt(N) 자동 설정
-    n_proto_default = max(4, min(int(math.sqrt(len(y_train))), 64))
+    n_proto_default = max(4, int(math.sqrt(len(y_train))))
     print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
 
     # ── 자동 가설 생성 (컬럼 평균 기준) ──────────────────
@@ -127,13 +127,6 @@ if train:
             column_names=dataset.col_names,
             memory_size=min(int(len(y_train) * 2), 10_000),
         )
-
-        # 시간 폭발 조합 사전 차단 (batch_size=128 + embed_dim=256 + k=32 → 평균 117s)
-        _bs = params.get('batch_size', 256)
-        _ed = params.get('embed_dim', 128)
-        _k  = params.get('k', 16)
-        if _bs == 128 and _ed == 256 and _k == 32:
-            raise optuna.exceptions.TrialPruned()  # 예상 시간 >100s → skip
 
         wrapper = TabERAWrapper(model, params, tasktype,
                                   device=str(device), epochs=100, patience=20)

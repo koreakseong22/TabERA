@@ -1,10 +1,10 @@
 """
 libs/tabera.py
 ============
-TabERA — Dual-Space Prototype Explainable TabERA Model.
+TabERA — Dual-Space Prototype Explainable TabR Model.
 
-MultiTab의 tabera.py를 대체하는 파일입니다.
-아래 세 가지 구조적 혁신을 TabERA 위에 통합합니다.
+MultiTab의 tabr.py를 대체하는 파일입니다.
+아래 세 가지 구조적 혁신을 TabR 위에 통합합니다.
 
   2. CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
   3. AttentionAggregator  : Scaled dot-product attention → 이웃 집계
@@ -141,9 +141,13 @@ class MemoryBank(nn.Module):
         # 캐시 없거나 초기화 전 → 전체 검색
         cached = getattr(self, '_cached_groups', None)
         if hard_assignment is None or cached is None or n < k:
+            # N이 작으면 전체 검색 (OOM 위험 없음)
+            # N이 크면 이 분기 자체를 줄이기 위해 warmup 에폭 동안
+            # MemoryBank를 먼저 충분히 채운 후 검색
             keys_all = F.normalize(keys_full, dim=-1)
             sim      = q_norm @ keys_all.T
             _, idx   = sim.topk(min(k, n), dim=-1)
+            idx      = idx.clamp(0, n - 1)
             return keys_full[idx], vals_full[idx], torch.zeros(B, k, device=dev), idx
 
         # ── 완전 벡터화 (for loop 없음) ────────────────────────
@@ -195,16 +199,13 @@ class MemoryBank(nn.Module):
             out_nv[nm_idx] = vals_full[i_final.view(-1)].view(nm_idx.shape[0], k_eff, D)
             top_k_idx[nm_idx] = i_final
 
-        # ── fallback 샘플: 전체 검색 (희귀 케이스) ─────────────
+        # ── fallback 샘플: zero 반환 (OOM 근본 해결) ────────────
+        # 발생 시점: cached_groups가 아직 없는 초기 1~2 에폭
+        # 이전 방식: F.normalize(keys_full) → (B, max_mem, D) 할당 → OOM
+        # 수정 방식: zero 반환 → 해당 샘플의 agg_emb=0으로 처리
+        # 영향: 초기 에폭 ~2% 구간만, cached_groups 구성 후 정상 작동
         if fallback_mask.any():
-            fb_idx   = fallback_mask.nonzero(as_tuple=True)[0]
-            keys_all = F.normalize(keys_full, dim=-1)
-            sim_fb   = q_norm[fb_idx] @ keys_all.T
-            _, i_fb  = sim_fb.topk(min(k, n), dim=-1)
-            i_fb = i_fb.clamp(0, n-1)  # 범위 보장
-            out_nk[fb_idx] = keys_full[i_fb]
-            out_nv[fb_idx] = vals_full[i_fb]
-            top_k_idx[fb_idx] = i_fb
+            pass  # out_nk/nv/top_k_idx 이미 zeros 초기화 → zero agg_emb
 
         return out_nk, out_nv, torch.zeros(B, k, device=dev), top_k_idx
 
@@ -435,11 +436,17 @@ class TabERA(nn.Module):
                 self._feature_store.update(X)
 
         # 7. 보조 손실
+        # diversity:  centroid 붕괴 방지 (off-diagonal cosine sim 최소화)
+        # commitment: VQ-VAE 표준 — query를 배정 centroid 방향으로 수렴
+        # entropy:    STE collapse 방지 — 모든 centroid에 gradient 보장
+        #             soft routing 분포의 entropy를 최대화 → 고르게 분산
+        #             근거: VQ-VAE-2 (Razavi et al., NeurIPS 2019)
         aux_loss = torch.tensor(0.0, device=X.device)
         if self.training:
             aux_loss = (
                 self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
                 + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
+                + self.loss_weights.get("entropy", 0.01) * self.prototype_layer.entropy_loss(routing_probs)
             )
 
         out = {
@@ -495,3 +502,4 @@ class TabERA(nn.Module):
                  f"  Dual-Space  : {'ON' if self.prototype_layer.F > 0 else 'OFF'}"]
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)
+    

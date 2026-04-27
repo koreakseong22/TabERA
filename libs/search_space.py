@@ -1,12 +1,12 @@
 """
 libs/search_space.py
 ====================
-TabERA용 Optuna 하이퍼파라미터 탐색 공간.
+TabHERA용 Optuna 하이퍼파라미터 탐색 공간.
 MultiTab의 search_space.py 형식을 따릅니다.
 
 get_search_space      : trial → params dict
 suggest_initial_trial : 첫 번째 trial의 기본값 (빠른 warmup)
-params_to_model_kwargs: params → TabERA 생성자 인자
+params_to_model_kwargs: params → TabHERA 생성자 인자
 """
 
 from __future__ import annotations
@@ -46,17 +46,17 @@ def get_search_space(
     trial: optuna.Trial,
     num_features: int = 0,   # MultiTab 호환 인자 (현재 미사용)
     data_id: int = 0,        # MultiTab 호환 인자 (현재 미사용)
-    metric: str = "l2",      # TabERA Retriever 거리 지표
+    metric: str = "l2",      # TabR Retriever 거리 지표
 ) -> dict:
     """
-    Optuna Trial로부터 TabERA 하이퍼파라미터를 샘플링합니다.
+    Optuna Trial로부터 TabHERA 하이퍼파라미터를 샘플링합니다.
 
     Parameters
     ----------
     trial        : optuna.Trial
     num_features : 입력 특성 수 (조건부 탐색에 활용 가능)
     data_id      : 데이터셋 ID (조건부 탐색에 활용 가능)
-    metric       : TabERA Retriever 거리 지표
+    metric       : TabR Retriever 거리 지표
 
     Returns
     -------
@@ -77,6 +77,8 @@ def get_search_space(
         # loss_diversity 상한 확장: centroid 분산 강화 → 소수 클래스 centroid 생존율 향상
         "loss_diversity":  trial.suggest_float("loss_diversity",  1e-4, 5e-1, log=True),
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-4, 1e-1, log=True),
+        # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
+        "loss_entropy":    trial.suggest_float("loss_entropy",    1e-3, 1e-1, log=True),
 
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
@@ -85,13 +87,13 @@ def get_search_space(
         "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
         "n_heads":         trial.suggest_categorical("n_heads", [2, 4, 8]),
 
-        # ── TabERA Retriever 거리 지표 (확장용) ──────────
+        # ── TabR Retriever 거리 지표 (확장용) ──────────
         "metric":          metric,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-# params → TabERA 생성자 인자 변환
+# params → TabHERA 생성자 인자 변환
 # ─────────────────────────────────────────────────────────────
 
 def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict:
@@ -106,5 +108,6 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "loss_weights": {
             "diversity":        params["loss_diversity"],
             "commitment":       params["loss_commitment"],
+            "entropy":          params["loss_entropy"],
         },
     }

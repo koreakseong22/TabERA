@@ -1,4 +1,4 @@
-# TabHERA × TabZilla Benchmark
+# TabERA × TabZilla Benchmark
 # 28개 데이터셋 (N≤50,000)
 # 사용법: .\run_tabzilla.ps1
 
@@ -29,10 +29,10 @@ $datasets = @(
     1043,  # ada_agnostic                   N=  4,562 F= 49 binclass
     1489,  # phoneme                        N=  5,404 F=  6 binclass
     40536,  # SpeedDating                    N=  8,378 F=121 binclass
+    # ---------------------------------------------------------------- # 아래부터는 재실험 필요.
     4538,  # GesturePhaseSegmentationProcessed N=  9,873 F= 33 multiclass
     1459,  # artificial-characters          N= 10,218 F=  8 multiclass
     846,  # elevators                      N= 16,599 F= 19 binclass
-    # ---------------------------------------------------------------- # 로컬 가능했던 범위
     1486,  # nomao                          N= 34,465 F=119 binclass
     41027,  # jungle_chess_2pcs_raw_endgame_complete N= 44,819 F=  7 multiclass
     151  # electricity                    N= 45,312 F=  9 binclass

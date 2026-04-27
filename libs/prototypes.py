@@ -27,13 +27,13 @@ CentroidLayer — Dual-Space Prototype Representation
 이론적 근거
 ───────────
 - Dual-Space Prototype Representation (본 가설)
-- GumbelRetriever (업로드된 tabera.py의 GumbelRetriever 구조 통합)
+- GumbelRetriever (업로드된 tabr.py의 GumbelRetriever 구조 통합)
 - ODC EMA centroid update (Zhan et al. 2020)
 - Gumbel-Softmax (Jang et al. 2017)
 
 하위 호환성
 ───────────
-PrototypeLayer = CentroidLayer  (alias 유지, 기존 tabera.py 수정 불필요)
+PrototypeLayer = CentroidLayer  (alias 유지, 기존 tabr.py 수정 불필요)
 """
 
 from __future__ import annotations
@@ -362,16 +362,15 @@ class CentroidLayer(nn.Module):
 
         # 가설 바이어스 주입
 
-        # (2) Straight-Through Estimator (STE) routing
-        # VQ-VAE (van den Oord, 2017) 표준 설계
-        # Forward: hard argmax (이산, 결정론적)
-        # Backward: softmax gradient 그대로 통과
-        hard_assignment = logits.argmax(dim=-1)            # (B,)
+        # (2) STE routing (Bengio et al., 2013 + VQ-VAE, van den Oord et al., 2017)
+        # forward: hard argmax (이산, 결정론적)
+        # backward: softmax gradient 통과
+        # collapse 방지: entropy loss (VQ-VAE-2, Razavi et al., NeurIPS 2019)
+        hard_assignment = logits.argmax(dim=-1)              # (B,)
         hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
+        soft = F.softmax(logits, dim=-1)                     # (B, P)
 
         if self.training:
-            # STE: forward=hard, backward=softmax gradient
-            soft = F.softmax(logits, dim=-1)               # (B, P) — gradient 운반
             routing_probs = soft + (hard_one_hot - soft).detach()
         else:
             routing_probs = hard_one_hot
@@ -382,15 +381,34 @@ class CentroidLayer(nn.Module):
         return context_emb, hard_assignment, routing_probs
 
     # ─────────────────────────────────────────────────────────
-    # Auxiliary Losses (기존 tabera.py 호환)
+    # Auxiliary Losses (기존 tabr.py 호환)
     # ─────────────────────────────────────────────────────────
 
     def diversity_loss(self) -> torch.Tensor:
-        """Centroid 붕괴 방지: off-diagonal cosine similarity 최소화."""
+        """Centroid 붕괴 방지: off-diagonal cosine similarity 최소화.
+        clamp(max=1e4): STE collapse 시 nan 전파 방지
+        """
         c = F.normalize(self.centroid_emb, dim=-1)
         sim = c @ c.T
         mask = 1.0 - torch.eye(self.P, device=sim.device)
-        return (sim.pow(2) * mask).sum() / (self.P * (self.P - 1))
+        loss = (sim.pow(2) * mask).sum() / (self.P * (self.P - 1))
+        return loss.clamp(max=1e4)  # nan 방지
+
+    def entropy_loss(self, routing_probs: torch.Tensor) -> torch.Tensor:
+        """
+        Codebook utilization 향상 — 배정 분포의 entropy 최대화.
+
+        근거: VQ-VAE-2 (Razavi et al., NeurIPS 2019)
+        배치 내 평균 routing 분포의 entropy를 최대화하여
+        모든 centroid가 고르게 사용되도록 유도.
+
+        routing_probs: (B, P) — STE output (soft 값 보유, gradient 연결됨)
+        soft collapse 시 avg_probs 편중 → entropy 낮음 → loss 높음
+        → gradient가 centroid_emb를 분산 방향으로 당김
+        """
+        avg_probs = routing_probs.mean(dim=0)              # (P,) 배치 평균
+        entropy   = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
+        return -entropy  # entropy 최대화 → loss 최소화
 
     def rank_consistency_loss(
         self,
@@ -459,7 +477,7 @@ class CentroidLayer(nn.Module):
         return F.mse_loss(query_emb, assigned.detach())
 
     # ─────────────────────────────────────────────────────────
-    # 설명 헬퍼 (기존 tabera.py 호환 + 원본 feature 값 추가)
+    # 설명 헬퍼 (기존 tabr.py 호환 + 원본 feature 값 추가)
     # ─────────────────────────────────────────────────────────
 
     def explain_routing(

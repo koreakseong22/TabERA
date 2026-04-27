@@ -8,10 +8,11 @@ TabERA 전용으로 재작성한 버전입니다.
 
   - TqdmLoggingHandler  : tqdm과 logging 충돌 방지 (MultiTab 원본 동일)
   - EarlyStopping       : val_loss 기준 조기 종료 (MultiTab 원본 동일)
-  - TabERAWrapper     : TabERA용 fit/predict/predict_proba
+  - TabERAWrapper      : TabERA용 fit/predict/predict_proba
                           (MultiTab supmodel 인터페이스와 동일)
 """
 
+import math
 import torch
 import torch.nn as nn
 import logging
@@ -267,3 +268,4 @@ class TabERAWrapper:
         for start in range(0, len(X), batch_size):
             parts.append(self.model(X[start:start + batch_size])["logits"])
         return torch.cat(parts, dim=0)
+    
