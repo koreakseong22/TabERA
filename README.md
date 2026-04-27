@@ -78,7 +78,6 @@ TabERA/
 ├── ensemble.py          # 예측 앙상블
 ├── fetch_tabzilla.py    # TabZilla 데이터셋 목록 조회
 ├── run_tabzilla.ps1     # TabZilla 벤치마크 실행 (TabERA)
-├── run_tabzilla_modernnca.ps1  # TabZilla 벤치마크 실행 (ModernNCA 비교용)
 └── requirements.txt
 ```
 
