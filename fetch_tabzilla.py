@@ -1,4 +1,4 @@
-# TabHERA — TabZilla Benchmark Runner
+# TabERA — TabZilla Benchmark Runner
 # 사용법:
 #   1. python fetch_tabzilla.py        # TabZilla 36개 데이터셋 ID 조회 및 저장
 #   2. .\run_tabzilla.ps1              # 자동 생성된 스크립트로 벤치마크 실행
@@ -75,7 +75,7 @@ def filter_local(datasets, max_n=50000, max_f=500):
 def generate_ps1(datasets, n_trials=100, gpu_id=0, seed=1):
     """PowerShell 실행 스크립트 생성"""
     lines = [
-        "# TabHERA × TabZilla Benchmark",
+        "# TabERA × TabZilla Benchmark",
         f"# {len(datasets)}개 데이터셋 (N≤50,000)",
         "# 사용법: .\\run_tabzilla.ps1",
         "",
@@ -94,12 +94,12 @@ def generate_ps1(datasets, n_trials=100, gpu_id=0, seed=1):
         "$total = $datasets.Count",
         "$done = 0; $failed = @(); $skipped = @()",
         "",
-        'Write-Host "===== TabHERA x TabZilla =====" -ForegroundColor Yellow',
+        'Write-Host "===== TabERA x TabZilla =====" -ForegroundColor Yellow',
         'Write-Host "총 $total개 데이터셋"',
         "",
         "foreach ($id in $datasets) {",
         "    $done++",
-        '    $fname = ".\\optim_logs\\seed=$seed\\data=$id..model=tabhera.pkl"',
+        '    $fname = ".\\optim_logs\\seed=$seed\\data=$id..model=tabera.pkl"',
         "    if (Test-Path $fname) {",
         '        Write-Host "[$done/$total] SKIP  id=$id" -ForegroundColor Gray',
         "        $skipped += $id; continue",
@@ -139,21 +139,18 @@ if __name__ == "__main__":
     else:
         datasets = fetch_tabzilla_datasets()
 
-    local_datasets = filter_local(datasets, max_n=50000)
+    all_datasets = datasets
 
-    print(f"\n===== 로컬 실행 가능 데이터셋 ({len(local_datasets)}개) =====")
+    print(f"\n===== 전체 TabZilla 데이터셋 ({len(all_datasets)}개) =====")
     print(f"{'dataset_id':>12} {'이름':30s} {'N':>8} {'F':>4} {'task':10s}")
     print("─" * 68)
-    for d in local_datasets:
+
+    for d in all_datasets:
         print(f"  {d['dataset_id']:>10d} {d['name']:30s} "
               f"{d['n']:>8,d} {d['f']:>4d} {d['tasktype']}")
 
-    print(f"\n제외된 대규모 데이터셋 (N>50,000):")
-    for d in sorted(datasets, key=lambda x: x['n'], reverse=True):
-        if d['n'] > 50000:
-            print(f"  {d['dataset_id']:>10d} {d['name']:30s} N={d['n']:>10,d}")
+    generate_ps1(all_datasets)
 
-    generate_ps1(local_datasets)
     print("\n실행 방법:")
-    print("  1. python fetch_tabzilla.py  (이미 실행됨)")
-    print("  2. .\\run_tabzilla.ps1")
+    print("  1. python fetch_tabzilla.py")
+    print("  2. ./run_tabzilla.ps1")
