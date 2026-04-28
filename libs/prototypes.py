@@ -7,11 +7,11 @@ CentroidLayer — Dual-Space Prototype Representation
 가설 핵심 구현
 ──────────────
 (1) 이중 공간 저장
-    - centroid_emb  (P, D) : 임베딩 공간 — Gumbel routing + FAISS 마스킹용
+    - centroid_emb  (P, D) : 임베딩 공간 — STE routing + FAISS 마스킹용
     - centroid_x    (P, F) : 원본 feature 공간 — 역정규화 없이 직접 해석 가능
     → "Centroid #3: alcohol=10.2, pH=3.3" 형태의 즉각적 설명
 
-(2) Gumbel-Softmax Hard Routing + FAISS 범위 제한
+(2) Straight-Through Estimator (STE) Hard Routing + FAISS 범위 제한
     - O(N) → O(P + k·log k) 복잡도 개선
     - 배정된 centroid 그룹 내 샘플 인덱스만 FAISS 검색 후보로 제한
     - train: Straight-Through Estimator (STE) / eval: argmax hard
@@ -27,9 +27,9 @@ CentroidLayer — Dual-Space Prototype Representation
 이론적 근거
 ───────────
 - Dual-Space Prototype Representation (본 가설)
-- GumbelRetriever (업로드된 tabr.py의 GumbelRetriever 구조 통합)
+- Straight-Through Estimator (Bengio et al. 2013)
+- VQ-VAE hard assignment trick (van den Oord et al. 2017)
 - ODC EMA centroid update (Zhan et al. 2020)
-- Gumbel-Softmax (Jang et al. 2017)
 
 하위 호환성
 ───────────
@@ -305,7 +305,7 @@ class CentroidLayer(nn.Module):
 
     def anneal(self, factor: Optional[float] = None) -> None:
         """
-        Gumbel 온도 어닐링.
+        (하위 호환) 온도 어닐링 인터페이스.
         factor가 None이면 tau_anneal_rate 기반 지수 감소.
         """
         pass  # STE 전환으로 annealing 불필요
@@ -353,7 +353,7 @@ class CentroidLayer(nn.Module):
         ───────
         context_emb    : (B, D)  — centroid 혼합 컨텍스트 (미분 가능)
         hard_assignment: (B,)    — Top-1 centroid 인덱스 (FAISS 마스킹 + 설명용)
-        routing_probs  : (B, P)  — Gumbel-Softmax 확률
+        routing_probs  : (B, P)  — STE용 soft routing 확률
         """
         # 코사인 유사도 로짓
         q = F.normalize(query_emb, dim=-1)               # (B, D)

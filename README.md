@@ -167,7 +167,7 @@ python reproduce.py --gpu_id 0 --openml_id 43986 --explain
 |---|---|---|
 | `embed_dim` | {64, 128, 256} | 임베딩 차원 |
 | `k` | {8, 16, 32, 64} | 검색 이웃 수 |
-| `n_prototypes` | HPO 탐색 (실제: sqrt(N)) | centroid 수 P |
+| `n_prototypes` | {4, 8, 12, 16} | centroid 수 P |
 | `loss_diversity` | 1e-4 ~ 5e-1 | centroid 분산 강제 |
 | `loss_commitment` | 1e-4 ~ 1e-1 | VQ-VAE commitment loss |
 | `lr` | 1e-4 ~ 1e-2 | 학습률 |

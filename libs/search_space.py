@@ -24,7 +24,7 @@ def suggest_initial_trial() -> dict:
     """
     return {
         "embed_dim":        128,
-        "n_prototypes":     8,   # optimize.py에서 sqrt(N)으로 override됨
+        "n_prototypes":     8,
         "k":                16,
         "embedder_layers":  2,
         "dropout":          0.1,

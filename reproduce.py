@@ -26,17 +26,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# ─────────────────────────────────────────────────────────────
-# 자동 가설 생성 (optimize.py와 동일 — median 사용)
-# ─────────────────────────────────────────────────────────────
-
-def make_hypotheses(col_names, X_tensor):
-    hyps   = []
-    median = np.median(X_tensor.cpu().numpy(), axis=0)
-    for i, col in enumerate(col_names[:6]):
-        med = float(median[i])
-    return hyps[:8]
-
 
 # ─────────────────────────────────────────────────────────────
 # 설명 출력 (§3.3 feature_match 포함)
@@ -161,11 +150,8 @@ def main():
 
     # ── 모델 구성 ──────────────────────────────────────────
     model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
-    hypotheses   = make_hypotheses(dataset.col_names, X_train)
-
     model = TabERA(
         **model_kwargs,
-        hypotheses=hypotheses,
         column_names=dataset.col_names,
         memory_size=min(int(len(y_train) * 2), 10_000),
     )

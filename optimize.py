@@ -19,7 +19,7 @@ args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
 
-import optuna, torch, json, joblib, datetime, math
+import optuna, torch, json, joblib, datetime
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error
 from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs
@@ -103,10 +103,6 @@ if train:
     # output_dim: n_classes 사용 (y가 1D이므로 shape[1] 불가)
     output_dim = dataset.n_classes if tasktype == "multiclass" else 1
 
-    # n_prototypes: 가설 기반 sqrt(N) 자동 설정
-    n_proto_default = max(4, int(math.sqrt(len(y_train))))
-    print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
-
     # ── 자동 가설 생성 (컬럼 평균 기준) ──────────────────
 
     global best_so_far
@@ -117,9 +113,6 @@ if train:
         global best_so_far
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id, metric=args.metric)
-        # sqrt(N) 기반 n_prototypes override (가설 ② 복잡도 개선)
-        params["n_prototypes"] = n_proto_default
-        trial.set_user_attr("n_prototypes_actual", n_proto_default)
         model_kwargs = params_to_model_kwargs(params, dataset.n_features, output_dim)
 
         model = TabERA(
