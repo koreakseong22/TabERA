@@ -1,6 +1,7 @@
 ﻿# 실험 로그 (용량 큼)
 optim_logs/
 results/
+data_cache/
 
 # Python
 __pycache__/
