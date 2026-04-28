@@ -141,6 +141,8 @@ class TabERAWrapper:
 
         best_state = None
         best_val   = None
+        self.ema_history = []
+        self.final_ema_stats = None
 
         # MultiTab 스타일 에폭 tqdm
         pbar = tqdm(
@@ -216,7 +218,6 @@ class TabERAWrapper:
                         pbar.write(
                             f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
                             f"alive={ema_stats.get('active_centroids', 0)}  "
-                            f"pruned={ema_stats.get('pruned_this_epoch', 0)}  "
                             f"min={ema_stats['min_cluster_size']}  "
                             f"max={ema_stats['max_cluster_size']}  "
                         )

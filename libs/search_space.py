@@ -30,6 +30,7 @@ def suggest_initial_trial() -> dict:
         "dropout":          0.1,
         "loss_diversity":   0.01,
         "loss_commitment":  0.01,
+        "loss_entropy":     0.01,
         "lr":               3e-4,
         "weight_decay":     1e-5,
         "batch_size":       256,

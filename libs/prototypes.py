@@ -53,7 +53,7 @@ class CentroidLayer(nn.Module):
 
     Parameters
     ──────────
-    n_prototypes      : 초기 centroid 수 P\n                        (학습 중 비활성 centroid pruning이 적용되므로,\n                         예상 군집 수보다 다소 크게 시작하는 것을 권장)
+    n_prototypes      : centroid 수 P
     embed_dim         : 임베딩 차원 D
     n_features        : 원본 feature 수 F (이중 공간 저장용)
     prototype_labels  : centroid 의미론적 이름 (없으면 "Centroid_i" 자동 생성)
@@ -71,9 +71,6 @@ class CentroidLayer(nn.Module):
         prototype_labels: Optional[List[str]] = None,
         ema_momentum: float = 0.95,
         ema_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
-        prune_threshold: float = 0.005,
-        prune_patience: int = 5,
-        min_active_centroids: int = 2,
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
     ) -> None:
@@ -83,9 +80,6 @@ class CentroidLayer(nn.Module):
         self.F                 = n_features
         self.ema_momentum      = ema_momentum
         self.ema_warmup_epochs = ema_warmup_epochs
-        self.prune_threshold   = prune_threshold
-        self.prune_patience    = prune_patience
-        self.min_active_centroids = max(1, min_active_centroids)
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
 
         # ── 온도 (register_buffer: 저장되지만 gradient 없음) ──
@@ -113,9 +107,6 @@ class CentroidLayer(nn.Module):
             'centroid_labels',
             torch.full((n_prototypes,), float('nan'))
         )
-        self.register_buffer("usage_ema", torch.zeros(n_prototypes))
-        self.register_buffer("inactive_streak", torch.zeros(n_prototypes, dtype=torch.long))
-        self.register_buffer("active_mask", torch.ones(n_prototypes, dtype=torch.bool))
 
         # ── 레이블 ────────────────────────────────────────────
         self.labels = prototype_labels or [f"Centroid_{i}" for i in range(n_prototypes)]
@@ -203,10 +194,6 @@ class CentroidLayer(nn.Module):
         if X_raw is not None and self.centroid_x is not None:
             self.centroid_x.data = X_raw[idx_t].float()
             self.centroid_x_initialized.fill_(True)
-        self.usage_ema.zero_()
-        self.inactive_streak.zero_()
-        self.active_mask.fill_(True)
-
         self.sample_groups = [[] for _ in range(self.P)]
 
         # 초기화 품질 로그: centroid 간 평균 코사인 거리
@@ -280,31 +267,6 @@ class CentroidLayer(nn.Module):
                 mean_x = X_raw[mask].float().mean(dim=0)
                 self.centroid_x.data[p] = m * self.centroid_x.data[p] + (1 - m) * mean_x
 
-        # ── Usage EMA 기반 dead centroid pruning ───────────────
-        n_samples = max(int(assignments.numel()), 1)
-        batch_usage = torch.tensor(sizes, device=self.usage_ema.device, dtype=self.usage_ema.dtype) / n_samples
-        self.usage_ema.mul_(m).add_((1 - m) * batch_usage)
-
-        low_usage = self.usage_ema < self.prune_threshold
-        self.inactive_streak[low_usage] += 1
-        self.inactive_streak[~low_usage] = 0
-
-        prune_cand = (self.inactive_streak >= self.prune_patience) & self.active_mask
-        active_count = int(self.active_mask.sum().item())
-        max_prunable = max(0, active_count - self.min_active_centroids)
-        pruned_this_epoch = 0
-        if prune_cand.any() and max_prunable > 0:
-            cand_idx = prune_cand.nonzero(as_tuple=True)[0]
-            order = torch.argsort(self.usage_ema[cand_idx])  # 사용률 낮은 순
-            to_prune = cand_idx[order[:max_prunable]]
-            self.active_mask[to_prune] = False
-            self.inactive_streak[to_prune] = 0
-            pruned_this_epoch = int(to_prune.numel())
-
-        for p in range(self.P):
-            if not self.active_mask[p]:
-                new_groups[p] = []
-
         self.sample_groups = new_groups
         self.current_epoch += 1
 
@@ -313,8 +275,8 @@ class CentroidLayer(nn.Module):
 
         return {
             "active_ratio":     n_assigned / self.P,
-            "active_centroids": int(self.active_mask.sum().item()),
-            "pruned_this_epoch": pruned_this_epoch,
+            "active_centroids": int(n_assigned),
+            "pruned_this_epoch": 0,
             "min_cluster_size": int(min(sizes)) if sizes else 0,
             "max_cluster_size": int(max(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
         }
@@ -429,60 +391,6 @@ class CentroidLayer(nn.Module):
         avg_probs = routing_probs.mean(dim=0)              # (P,) 배치 평균
         entropy   = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
         return -entropy  # entropy 최대화 → loss 최소화
-
-    def rank_consistency_loss(
-        self,
-        centroid_labels: Optional[torch.Tensor],  # (P,) 각 centroid의 평균 레이블
-        margin: float = 0.1,
-    ) -> torch.Tensor:
-        """
-        Rank-Consistency Loss.
-
-        제언: 임베딩 공간에서 centroid가 레이블 순서대로
-        일직선(manifold) 위에 놓이도록 제약합니다.
-
-        핵심 아이디어
-        ─────────────
-        레이블 순서: label_i < label_j 이면
-        임베딩 거리 d(c_i, c_k) < d(c_i, c_j) (k가 i에 더 가까운 레이블)
-
-        구현: Triplet-style
-          anchor   = centroid_a
-          positive = 레이블상 anchor에 더 가까운 centroid_p
-          negative = 레이블상 anchor에서 더 먼 centroid_n
-          loss = max(0, d(a,p) - d(a,n) + margin)
-
-        centroid_labels가 None이면 0 반환 (초기 에폭 안전 처리)
-        """
-        if centroid_labels is None or self.P < 3:
-            return torch.tensor(0.0, device=self.centroid_emb.device)
-
-        c    = F.normalize(self.centroid_emb, dim=-1)  # (P, D)
-        dist = 1.0 - c @ c.T                           # (P, P) cosine distance
-        lbl  = centroid_labels.float()                 # (P,)
-
-        # 레이블 차이 행렬
-        lbl_diff = (lbl.unsqueeze(0) - lbl.unsqueeze(1)).abs()  # (P, P)
-
-        loss = torch.tensor(0.0, device=self.centroid_emb.device)
-        n_triplets = 0
-
-        # triplet 샘플링: 각 anchor a에 대해
-        # positive p = a와 레이블이 가장 가까운 centroid
-        # negative n = a와 레이블이 가장 먼 centroid
-        for a in range(self.P):
-            sorted_by_lbl = lbl_diff[a].argsort()  # 레이블 거리 오름차순
-            # positive: 레이블 거리 2번째 (0번째는 자기 자신)
-            p = sorted_by_lbl[1].item()
-            # negative: 레이블 거리 가장 큰 것
-            n = sorted_by_lbl[-1].item()
-            if p == n:
-                continue
-            triplet = dist[a, p] - dist[a, n] + margin
-            loss = loss + torch.clamp(triplet, min=0.0)
-            n_triplets += 1
-
-        return loss / max(n_triplets, 1)
 
     def cosine_similarity_matrix(self) -> torch.Tensor:
         """진단용: centroid 간 cosine similarity 행렬 반환 (P, P)."""
