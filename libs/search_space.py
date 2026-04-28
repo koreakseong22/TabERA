@@ -85,7 +85,7 @@ def get_search_space(
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
         "batch_size":      trial.suggest_categorical("batch_size", [128, 256, 512]),
         "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
-        "n_heads":         trial.suggest_categorical("n_heads", [2, 4, 8]),
+        "n_heads":         trial.suggest_categorical("n_heads", [1, 2, 4, 8]),
 
         # ── TabR Retriever 거리 지표 (확장용) ──────────
         "metric":          metric,
@@ -103,6 +103,7 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "n_prototypes":    params["n_prototypes"],
         "k":               params["k"],
         "embedder_layers": params["embedder_layers"],
+        "n_heads":         params["n_heads"],
         "dropout":         params["dropout"],
         "n_output":        n_output,
         "loss_weights": {

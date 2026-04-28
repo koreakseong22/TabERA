@@ -334,6 +334,7 @@ class TabERA(nn.Module):
         n_output: int = 1,
         memory_size: int = 10_000,
         embedder_layers: int = 2,
+        n_heads: int = 1,
         dropout: float = 0.1,
         loss_weights: Optional[Dict[str, float]] = None,
         column_names: Optional[List[str]] = None,
@@ -367,6 +368,7 @@ class TabERA(nn.Module):
             embed_dim=embed_dim,
             k=k,
             n_features=n_features,
+            n_heads=n_heads,
             dropout=dropout,
         )
 

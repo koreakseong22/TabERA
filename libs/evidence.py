@@ -95,7 +95,10 @@ class AttentionAggregator(nn.Module):
         self.embed_dim  = embed_dim
         self.k          = k
         self.n_features = n_features
-        self.scale      = math.sqrt(embed_dim)
+        self.n_heads    = n_heads
+        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
+        self.head_dim   = embed_dim // n_heads
+        self.scale      = math.sqrt(self.head_dim)
 
         # query/key/value 투영 (optional — TabR 원본은 투영 없이 raw 사용)
         # 여기서는 학습 가능한 투영 추가로 표현력 향상
@@ -128,19 +131,24 @@ class AttentionAggregator(nn.Module):
         k = self.k_proj(nk)          # (B, k, D)
         v = self.v_proj(nv)          # (B, k, D)
 
-        # Scaled dot-product attention
-        # (B, D) → (B, 1, D) @ (B, D, k) → (B, 1, k) → (B, k)
-        attn_logits = torch.bmm(
-            q.unsqueeze(1), k.transpose(1, 2)
-        ).squeeze(1) / self.scale                     # (B, k)
+        # Multi-head scaled dot-product attention
+        # q: (B, H, Dh), k/v: (B, H, k, Dh)
+        q_h = q.view(B, self.n_heads, self.head_dim)
+        k_h = k.view(B, self.k, self.n_heads, self.head_dim).transpose(1, 2)
+        v_h = v.view(B, self.k, self.n_heads, self.head_dim).transpose(1, 2)
 
-        evidence_w = F.softmax(attn_logits, dim=-1)   # (B, k) — 합=1
-        evidence_w = self.dropout(evidence_w)
+        # (B, H, 1, Dh) @ (B, H, Dh, k) -> (B, H, k)
+        attn_logits = torch.matmul(
+            q_h.unsqueeze(2), k_h.transpose(-1, -2)
+        ).squeeze(2) / self.scale                      # (B, H, k)
 
-        # 가중 집계
-        agg_emb = torch.bmm(
-            evidence_w.unsqueeze(1), v
-        ).squeeze(1)                                   # (B, D)
+        attn_per_head = F.softmax(attn_logits, dim=-1)   # (B, H, k)
+        attn_per_head = self.dropout(attn_per_head)
+        evidence_w    = attn_per_head.mean(dim=1)        # (B, k), 인터페이스 유지
+
+        # (B, H, 1, k) @ (B, H, k, Dh) -> (B, H, Dh) -> (B, D)
+        agg_h = torch.matmul(attn_per_head.unsqueeze(2), v_h).squeeze(2)
+        agg_emb = agg_h.reshape(B, self.embed_dim)
 
         # feature 수준 기여도 (설명 계층 3)
         feature_imp, attn_w = self.feat_cross(query_emb, nk, evidence_w)
