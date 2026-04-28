@@ -18,7 +18,7 @@ import torch.nn as nn
 import logging
 import numpy as np
 from tqdm import tqdm
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from libs.eval import compute_metric, get_criterion, get_preds_and_probs, is_better
 from libs.tabera import TabERA
@@ -106,6 +106,8 @@ class TabERAWrapper:
         self.patience = patience
         self._best_state = None
         self._data_id    = "?"      # tqdm 표시용 (optimize.py에서 주입)
+        self.ema_history: List[Dict[str, float]] = []
+        self.final_ema_stats: Optional[Dict[str, float]] = None
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -190,6 +192,15 @@ class TabERAWrapper:
                     emb_ema  = torch.cat(all_emb, dim=0)
                     x_ema    = X_train
                     ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
+                    self.final_ema_stats = dict(ema_stats)
+                    self.ema_history.append({
+                        "epoch": float(epoch),
+                        "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
+                        "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
+                        "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
+                        "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
+                        "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
+                    })
 
                     # 에폭당 1회: sample_groups를 GPU 텐서로 캐시 (76,800번 변환 제거)
                     self.model.memory.cache_sample_groups(

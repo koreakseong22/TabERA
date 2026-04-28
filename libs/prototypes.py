@@ -53,7 +53,7 @@ class CentroidLayer(nn.Module):
 
     Parameters
     ──────────
-    n_prototypes      : centroid 수 P (권장: int(sqrt(N_train)))
+    n_prototypes      : 초기 centroid 수 P\n                        (학습 중 비활성 centroid pruning이 적용되므로,\n                         예상 군집 수보다 다소 크게 시작하는 것을 권장)
     embed_dim         : 임베딩 차원 D
     n_features        : 원본 feature 수 F (이중 공간 저장용)
     prototype_labels  : centroid 의미론적 이름 (없으면 "Centroid_i" 자동 생성)

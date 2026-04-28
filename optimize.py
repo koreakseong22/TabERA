@@ -125,6 +125,17 @@ if train:
                                   device=str(device), epochs=100, patience=20)
         wrapper._data_id = args.openml_id   # 에폭 tqdm에 data_id 표시
         wrapper.fit(X_train, y_train, X_val, y_val)
+        if getattr(wrapper, "final_ema_stats", None) is not None:
+            trial.set_user_attr(
+                "final_active_centroids",
+                int(wrapper.final_ema_stats.get("active_centroids", 0))
+            )
+            trial.set_user_attr(
+                "final_active_ratio",
+                float(wrapper.final_ema_stats.get("active_ratio", 0.0))
+            )
+            total_pruned = int(sum(h.get("pruned_this_epoch", 0.0) for h in getattr(wrapper, "ema_history", [])))
+            trial.set_user_attr("total_pruned_centroids", total_pruned)
 
         preds_val  = wrapper.predict(X_val)
         preds_test = wrapper.predict(X_test)
