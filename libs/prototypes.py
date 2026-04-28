@@ -71,6 +71,9 @@ class CentroidLayer(nn.Module):
         prototype_labels: Optional[List[str]] = None,
         ema_momentum: float = 0.95,
         ema_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
+        prune_threshold: float = 0.005,
+        prune_patience: int = 5,
+        min_active_centroids: int = 2,
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
     ) -> None:
@@ -80,6 +83,9 @@ class CentroidLayer(nn.Module):
         self.F                 = n_features
         self.ema_momentum      = ema_momentum
         self.ema_warmup_epochs = ema_warmup_epochs
+        self.prune_threshold   = prune_threshold
+        self.prune_patience    = prune_patience
+        self.min_active_centroids = max(1, min_active_centroids)
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
 
         # ── 온도 (register_buffer: 저장되지만 gradient 없음) ──
@@ -107,6 +113,9 @@ class CentroidLayer(nn.Module):
             'centroid_labels',
             torch.full((n_prototypes,), float('nan'))
         )
+        self.register_buffer("usage_ema", torch.zeros(n_prototypes))
+        self.register_buffer("inactive_streak", torch.zeros(n_prototypes, dtype=torch.long))
+        self.register_buffer("active_mask", torch.ones(n_prototypes, dtype=torch.bool))
 
         # ── 레이블 ────────────────────────────────────────────
         self.labels = prototype_labels or [f"Centroid_{i}" for i in range(n_prototypes)]
@@ -194,6 +203,9 @@ class CentroidLayer(nn.Module):
         if X_raw is not None and self.centroid_x is not None:
             self.centroid_x.data = X_raw[idx_t].float()
             self.centroid_x_initialized.fill_(True)
+        self.usage_ema.zero_()
+        self.inactive_streak.zero_()
+        self.active_mask.fill_(True)
 
         self.sample_groups = [[] for _ in range(self.P)]
 
@@ -268,24 +280,30 @@ class CentroidLayer(nn.Module):
                 mean_x = X_raw[mask].float().mean(dim=0)
                 self.centroid_x.data[p] = m * self.centroid_x.data[p] + (1 - m) * mean_x
 
-        # ── Dead centroid 재초기화 ───────────────────────
-        # 비어있는 centroid는 가장 큰 클러스터에서 샘플을 가져와 재설정
-        alive = [p for p, s in enumerate(sizes) if s > 0]
-        for p, s in enumerate(sizes):
-            if s == 0 and len(alive) > 0:
-                # 가장 큰 클러스터 선택
-                donor = max(alive, key=lambda a: sizes[a])
-                donor_mask = (assignments == donor)
-                donor_idx  = donor_mask.nonzero(as_tuple=True)[0]
-                if len(donor_idx) > 1:
-                    # donor 클러스터에서 무작위 샘플로 dead centroid 재초기화
-                    pick = donor_idx[torch.randint(len(donor_idx), (1,)).item()]
-                    noise = torch.randn_like(X_emb[pick]) * 0.01
-                    self.centroid_emb.data[p] = F.normalize(
-                        X_emb[pick].float() + noise, dim=-1
-                    )
-                    if X_raw is not None and self.centroid_x is not None:
-                        self.centroid_x.data[p] = X_raw[pick].float()
+        # ── Usage EMA 기반 dead centroid pruning ───────────────
+        n_samples = max(int(assignments.numel()), 1)
+        batch_usage = torch.tensor(sizes, device=self.usage_ema.device, dtype=self.usage_ema.dtype) / n_samples
+        self.usage_ema.mul_(m).add_((1 - m) * batch_usage)
+
+        low_usage = self.usage_ema < self.prune_threshold
+        self.inactive_streak[low_usage] += 1
+        self.inactive_streak[~low_usage] = 0
+
+        prune_cand = (self.inactive_streak >= self.prune_patience) & self.active_mask
+        active_count = int(self.active_mask.sum().item())
+        max_prunable = max(0, active_count - self.min_active_centroids)
+        pruned_this_epoch = 0
+        if prune_cand.any() and max_prunable > 0:
+            cand_idx = prune_cand.nonzero(as_tuple=True)[0]
+            order = torch.argsort(self.usage_ema[cand_idx])  # 사용률 낮은 순
+            to_prune = cand_idx[order[:max_prunable]]
+            self.active_mask[to_prune] = False
+            self.inactive_streak[to_prune] = 0
+            pruned_this_epoch = int(to_prune.numel())
+
+        for p in range(self.P):
+            if not self.active_mask[p]:
+                new_groups[p] = []
 
         self.sample_groups = new_groups
         self.current_epoch += 1
@@ -295,6 +313,8 @@ class CentroidLayer(nn.Module):
 
         return {
             "active_ratio":     n_assigned / self.P,
+            "active_centroids": int(self.active_mask.sum().item()),
+            "pruned_this_epoch": pruned_this_epoch,
             "min_cluster_size": int(min(sizes)) if sizes else 0,
             "max_cluster_size": int(max(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
         }

@@ -204,6 +204,8 @@ class TabERAWrapper:
                         reduction = (1 - avg_cand / n_total) * 100
                         pbar.write(
                             f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
+                            f"alive={ema_stats.get('active_centroids', 0)}  "
+                            f"pruned={ema_stats.get('pruned_this_epoch', 0)}  "
                             f"min={ema_stats['min_cluster_size']}  "
                             f"max={ema_stats['max_cluster_size']}  "
                         )
@@ -268,4 +270,3 @@ class TabERAWrapper:
         for start in range(0, len(X), batch_size):
             parts.append(self.model(X[start:start + batch_size])["logits"])
         return torch.cat(parts, dim=0)
-    

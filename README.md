@@ -7,11 +7,12 @@ Dual-Space Prototype 기반 설명가능 검색 아키텍처
 
 ## 핵심 아이디어
 
-TabERA는 Rosch(1975)의 **Prototype Theory**에서 영감을 받았습니다.
+TabERA는 Rosch(1975)의 **Prototype Theory**에서 영감을 받았지만, 순수 구현은 아닙니다.
 
 > 인간은 개체를 인지할 때 전형적 prototype과의 유사도를 **먼저** 확인한 후, 구체적 사례와 비교한다.
 
-이 인지 구조를 모델 설계에 직접 반영합니다.
+현재 구현의 정체성은 **cluster-conditioned exemplar retrieval**입니다.
+데이터 구조에서 centroid를 발견하고, centroid를 검색 제한·설명의 앵커로 사용합니다.
 
 ```
 ① 전역 맥락 먼저   →  centroid_x: "이 샘플은 alcohol=10.24 그룹에 속한다"
@@ -25,7 +26,7 @@ TabERA는 Rosch(1975)의 **Prototype Theory**에서 영감을 받았습니다.
 
 | 구성요소 | 파일 | 이론 근거 |
 |---|---|---|
-| **CentroidLayer** (Dual-Space) | `libs/prototypes.py` | Prototype Theory (Rosch, 1975) |
+| **CentroidLayer** (Dual-Space) | `libs/prototypes.py` | Data-discovered centroid dictionary |
 | **STE Routing** | `libs/prototypes.py` | Bengio et al. (2013) + VQ-VAE (van den Oord, 2017) |
 | **EMA (centroid_x 전용)** | `libs/prototypes.py` | 설명의 사실성(faithfulness) 보장 |
 | **AttentionAggregator** | `libs/evidence.py` | Scaled dot-product attention |
@@ -117,7 +118,7 @@ python optimize.py --gpu_id 0 --openml_id 43986 --n_trials 100
 | `--n_trials` | Optuna trial 수 | 100 |
 | `--seed` | 랜덤 시드 | 1 |
 
-결과: `optim_logs/seed=1/data={id}..model=tabhera.pkl`
+결과: `optim_logs/seed=1/data={id}..model=tabera.pkl`
 
 ### 2. Best Config 재현 + 설명 출력
 
