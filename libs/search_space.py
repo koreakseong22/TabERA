@@ -104,7 +104,6 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "n_prototypes":    params["n_prototypes"],
         "k":               params["k"],
         "embedder_layers": params["embedder_layers"],
-        "n_heads":         params["n_heads"],
         "dropout":         params["dropout"],
         "n_output":        n_output,
         "loss_weights": {

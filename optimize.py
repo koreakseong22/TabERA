@@ -19,7 +19,7 @@ args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
 
-import optuna, torch, json, joblib, datetime
+import optuna, torch, json, joblib, datetime, math
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error
 from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs
@@ -103,6 +103,10 @@ if train:
     # output_dim: n_classes 사용 (y가 1D이므로 shape[1] 불가)
     output_dim = dataset.n_classes if tasktype == "multiclass" else 1
 
+    # n_prototypes: 가설 기반 sqrt(N) 자동 설정
+    n_proto_default = max(4, int(math.sqrt(len(y_train))))
+    print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
+
     # ── 자동 가설 생성 (컬럼 평균 기준) ──────────────────
 
     global best_so_far
@@ -113,6 +117,9 @@ if train:
         global best_so_far
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id, metric=args.metric)
+        # sqrt(N) 기반 n_prototypes override (가설 ② 복잡도 개선)
+        params["n_prototypes"] = n_proto_default
+        trial.set_user_attr("n_prototypes_actual", n_proto_default)
         model_kwargs = params_to_model_kwargs(params, dataset.n_features, output_dim)
 
         model = TabERA(
@@ -125,17 +132,6 @@ if train:
                                   device=str(device), epochs=100, patience=20)
         wrapper._data_id = args.openml_id   # 에폭 tqdm에 data_id 표시
         wrapper.fit(X_train, y_train, X_val, y_val)
-        if getattr(wrapper, "final_ema_stats", None) is not None:
-            trial.set_user_attr(
-                "final_active_centroids",
-                int(wrapper.final_ema_stats.get("active_centroids", 0))
-            )
-            trial.set_user_attr(
-                "final_active_ratio",
-                float(wrapper.final_ema_stats.get("active_ratio", 0.0))
-            )
-            total_pruned = int(sum(h.get("pruned_this_epoch", 0.0) for h in getattr(wrapper, "ema_history", [])))
-            trial.set_user_attr("total_pruned_centroids", total_pruned)
 
         preds_val  = wrapper.predict(X_val)
         preds_test = wrapper.predict(X_test)
@@ -204,4 +200,3 @@ if train:
     joblib.dump(study, fname)
     print(fname)
     print("#############################################")
-    

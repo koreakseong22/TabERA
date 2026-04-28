@@ -63,94 +63,56 @@ class FeatureCrossAttention(nn.Module):
 
 
 class AttentionAggregator(nn.Module):
-    """
-    Scaled Dot-Product Attention 기반 이웃 집계.
-
-    OTEvidenceSelector를 대체합니다.
-
-    작동 방식
-    ─────────
-    1. query와 k개 이웃 key 간 scaled dot-product attention
-       → attention weight = evidence_w (B, k)
-       → 이웃별 기여도를 자연스럽게 제공 (TabR 원본 방식)
-
-    2. attention weight로 이웃 value를 가중 집계
-       → agg_emb (B, D)
-
-    3. FeatureCrossAttention으로 feature 수준 기여도 계산
-       → feature_imp (B, k, F)
-
-    기존 OTEvidenceSelector와 완전히 동일한 인터페이스 유지.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        k: int,
-        n_features: int,
-        n_heads: int = 1,
-        dropout: float = 0.0,
-    ) -> None:
+    def __init__(self, embed_dim, k, n_features, n_output, dropout=0.0):
         super().__init__()
-        self.embed_dim  = embed_dim
-        self.k          = k
+        self.embed_dim = embed_dim
+        self.k = k
         self.n_features = n_features
-        self.n_heads    = n_heads
-        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
-        self.head_dim   = embed_dim // n_heads
-        self.scale      = math.sqrt(self.head_dim)
 
-        # query/key/value 투영 (optional — TabR 원본은 투영 없이 raw 사용)
-        # 여기서는 학습 가능한 투영 추가로 표현력 향상
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        # TabR 원본: label 임베딩
+        # n_output=1 (binary/regression) → Linear, >1 (multiclass) → Embedding
+        self.label_encoder = nn.Linear(1, embed_dim)  # binary/regression용
+        # multiclass는 tabera.py에서 n_output 넘겨받아 분기
+
+        # TabR 원본: T() — query-neighbour 차이 변환 MLP
+        d_block = embed_dim * 2
+        self.T = nn.Sequential(
+            nn.Linear(embed_dim, d_block),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_block, embed_dim, bias=False),
+        )
+
         self.dropout = nn.Dropout(dropout)
-
-        # feature 수준 기여도 (설명 계층 3)
         self.feat_cross = FeatureCrossAttention(embed_dim, n_features)
 
-    def forward(
-        self,
-        query_emb: torch.Tensor,     # (B, D)
-        nk:        torch.Tensor,     # (B, k, D) — 이웃 key 임베딩
-        nv:        torch.Tensor,     # (B, k, D) — 이웃 value 임베딩
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        반환 (OTEvidenceSelector와 동일 인터페이스)
-        ────
-        agg_emb      : (B, D)    — 집계된 이웃 표현
-        evidence_w   : (B, k)   — 이웃별 기여도 (attention weight)
-        feature_imp  : (B, k, F) — feature 수준 기여도
-        attn_w       : (B, k, D) — 차원별 attention (진단용)
-        """
-        B = query_emb.shape[0]
+    def forward(self, query_emb, nk, nv, neighbour_labels):
+        # query_emb: (B, D)
+        # nk:        (B, k, D) — 이웃 key 임베딩
+        # neighbour_labels: (B, k) — 이웃 레이블
 
-        # 투영
-        q = self.q_proj(query_emb)   # (B, D)
-        k = self.k_proj(nk)          # (B, k, D)
-        v = self.v_proj(nv)          # (B, k, D)
+        # 1. TabR 방식 similarity (투영 없음, raw 내적 기반 L2)
+        # -||q||² + 2(q·k) - ||k||²
+        similarities = (
+            -query_emb.square().sum(-1, keepdim=True)          # (B, 1)
+            + 2 * (query_emb.unsqueeze(1) @ nk.transpose(-1,-2)).squeeze(1)  # (B, k)
+            - nk.square().sum(-1)                              # (B, k)
+        )
+        evidence_w = F.softmax(similarities, dim=-1)           # (B, k)
+        evidence_w = self.dropout(evidence_w)
 
-        # Multi-head scaled dot-product attention
-        # q: (B, H, Dh), k/v: (B, H, k, Dh)
-        q_h = q.view(B, self.n_heads, self.head_dim)
-        k_h = k.view(B, self.k, self.n_heads, self.head_dim).transpose(1, 2)
-        v_h = v.view(B, self.k, self.n_heads, self.head_dim).transpose(1, 2)
+        # 2. TabR 방식 value = label_emb + T(query - neighbour)
+        label_emb = self.label_encoder(
+            neighbour_labels.unsqueeze(-1).float()             # (B, k, 1)
+        )                                                       # (B, k, D)
+        values = label_emb + self.T(
+            query_emb.unsqueeze(1) - nk                        # (B, k, D)
+        )
 
-        # (B, H, 1, Dh) @ (B, H, Dh, k) -> (B, H, k)
-        attn_logits = torch.matmul(
-            q_h.unsqueeze(2), k_h.transpose(-1, -2)
-        ).squeeze(2) / self.scale                      # (B, H, k)
+        # 3. 가중합
+        agg_emb = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
 
-        attn_per_head = F.softmax(attn_logits, dim=-1)   # (B, H, k)
-        attn_per_head = self.dropout(attn_per_head)
-        evidence_w    = attn_per_head.mean(dim=1)        # (B, k), 인터페이스 유지
-
-        # (B, H, 1, k) @ (B, H, k, Dh) -> (B, H, Dh) -> (B, D)
-        agg_h = torch.matmul(attn_per_head.unsqueeze(2), v_h).squeeze(2)
-        agg_emb = agg_h.reshape(B, self.embed_dim)
-
-        # feature 수준 기여도 (설명 계층 3)
+        # 4. feature 수준 기여도 (설명용)
         feature_imp, attn_w = self.feat_cross(query_emb, nk, evidence_w)
 
         return agg_emb, evidence_w, feature_imp, attn_w
