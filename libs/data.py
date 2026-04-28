@@ -6,6 +6,8 @@ dataset_id.json 기반으로 OpenML 데이터셋을 로드하고
 train(80%) / val(10%) / test(10%) 고정 분할을 제공합니다.
 
 CA(999999)는 sklearn에서 로드하며, 나머지는 openml 라이브러리를 사용합니다.
+
+[변경] NaN imputation: median → mean  (TabZilla 원논문 전처리와 통일)
 """
 
 from __future__ import annotations
@@ -72,6 +74,8 @@ def _preprocess_X(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     수치형 + 범주형을 모두 float32로 변환 (Label-encode cat).
     컬럼명은 sanitize 처리.
     반환: X (N, F) float32,  col_names list[str]
+
+    NaN imputation: mean (TabZilla 원논문 전처리와 통일)
     """
     out_cols = []
     out_parts = []
@@ -80,7 +84,8 @@ def _preprocess_X(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
 
     if num_cols:
-        X_num = df[num_cols].astype(np.float32).fillna(df[num_cols].median())
+        # TabZilla 원논문: NaN → mean imputation
+        X_num = df[num_cols].astype(np.float32).fillna(df[num_cols].mean())
         for c in num_cols:
             out_cols.append(_sanitize_col(c))
         out_parts.append(X_num.values)
@@ -300,3 +305,4 @@ class TabularDataset:
             (self._X_val,   self._y_val),
             (self._X_test,  self._y_test),
         )
+    
