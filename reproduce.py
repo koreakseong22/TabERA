@@ -3,6 +3,7 @@
 ## Based on: MultiTab (Kyungeun Lee, kyungeun.lee@lgresearch.ai)
 
 import sys, os, argparse
+from xml.parsers.expat import model
 
 # ── CUDA_VISIBLE_DEVICES: torch import 전 설정 ──────────────
 _parser_pre = argparse.ArgumentParser(add_help=False)
@@ -204,6 +205,19 @@ def main():
 
     print(f"\n  저장: {pred_path}")
 
+    state_path = save_dir / f"data={openml_id}..seed{args.seed}_model_state.pt"
+    torch.save({
+        "state_dict":   model.state_dict(),
+        "model_kwargs": model_kwargs,
+        "col_names":    dataset.col_names,
+        "n_train":      len(X_train),
+        "tasktype":     tasktype,
+        "val_metrics":  val_metrics,
+        "test_metrics": test_metrics,
+        "seed":         args.seed,
+    }, str(state_path))
+    print(f"  저장: {state_path}")
+    
     # ── §3.3 Feature 기여도 설명 출력 ─────────────────────
     if args.explain:
         print(f"\n{'='*52}")

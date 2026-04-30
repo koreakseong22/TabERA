@@ -1,4 +1,4 @@
-# TabHERA requirements
+# TabERA requirements
 # Python 3.12.10 + CUDA 12.8 (RTX 5060 Blackwell) 환경 기준
 #
 # 설치 방법:
@@ -21,6 +21,9 @@ pandas>=2.1.0
 
 # ── Parquet 지원 (데이터 캐시용) ────────────────────────
 pyarrow>=12.0.0
+
+# ── 시각화 (visualize_embeddings.py) ───────────────────
+matplotlib>=3.8.0
 
 # ── 기타 ────────────────────────────────────────────────
 openml>=0.14.1
