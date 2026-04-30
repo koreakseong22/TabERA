@@ -147,6 +147,10 @@ def main():
     study       = joblib.load(fname)
     best_params = study.best_params
     print(f"  Best trial #{study.best_trial.number}  val={study.best_value:.4f}")
+
+    # optimize.py가 실제 사용한 n_prototypes 그대로 복원
+    best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
+    print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
     print(f"  Params: {best_params}")
 
     # ── 모델 구성 ──────────────────────────────────────────
@@ -205,6 +209,7 @@ def main():
 
     print(f"\n  저장: {pred_path}")
 
+    # ── model state 저장 (visualize_embeddings.py --from_state 용) ──
     state_path = save_dir / f"data={openml_id}..seed{args.seed}_model_state.pt"
     torch.save({
         "state_dict":   model.state_dict(),
@@ -217,7 +222,7 @@ def main():
         "seed":         args.seed,
     }, str(state_path))
     print(f"  저장: {state_path}")
-    
+
     # ── §3.3 Feature 기여도 설명 출력 ─────────────────────
     if args.explain:
         print(f"\n{'='*52}")

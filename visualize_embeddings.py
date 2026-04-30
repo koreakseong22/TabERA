@@ -905,6 +905,10 @@ def main():
         best_params = study.best_params
         print(f"  Best trial #{study.best_trial.number}  val={study.best_value:.4f}")
 
+        # optimize.py가 실제 사용한 n_prototypes 그대로 복원
+        best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
+        print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
+
         best_params.setdefault("loss_entropy",    0.01)
         best_params.setdefault("loss_diversity",  0.01)
         best_params.setdefault("loss_commitment", 0.01)
