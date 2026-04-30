@@ -210,17 +210,6 @@ figures/seed=1/B_centroid_{id}_seed1_tsne.png # Figure B: Centroid 발견
 figures/seed=1/C_retrieval_{id}_seed1_tsne.png # Figure C: Retrieval
 ```
 
-**seed=1~5 전체 파이프라인 실행:**
-
-```powershell
-foreach ($seed in 1..5) {
-    Write-Host "=== seed=$seed ===" -ForegroundColor Cyan
-    python optimize.py             --openml_id 43986 --seed $seed
-    python reproduce.py            --openml_id 43986 --seed $seed
-    python visualize_embeddings.py --openml_id 43986 --seed $seed --proj tsne --from_state
-}
-```
-
 ### 4. TabZilla 벤치마크
 
 ```powershell
