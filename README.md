@@ -93,20 +93,32 @@ Gumbel-Softmax 대신 STE를 사용하는 이유:
 ```
 TabERA/
 ├── libs/
-│   ├── tabera.py        # TabERA 모델 (TabERA, MemoryBank, FeatureStore)
-│   ├── prototypes.py    # CentroidLayer (STE, KMeans++, EMA, Dual-Space)
-│   ├── evidence.py      # AttentionAggregator, FeatureCrossAttention
-│   ├── supervised.py    # TabERAWrapper (학습 루프, EMA 호출)
-│   ├── eval.py          # 평가 지표 (CE/BCE/MSE)
-│   ├── search_space.py  # Optuna HPO 탐색 공간 (12개 파라미터)
-│   └── data.py          # OpenML 데이터 로더
-├── optim_logs/          # HPO 결과 (.pkl, .csv)
-├── results/             # 재현 결과
-├── optimize.py          # HPO 실행
-├── reproduce.py         # Best config 재현 + 설명 출력
-├── ensemble.py          # 예측 앙상블
-├── fetch_tabzilla.py    # TabZilla 데이터셋 목록 조회
-├── run_tabzilla.ps1     # TabZilla 벤치마크 실행 (TabERA)
+│   ├── tabera.py            # TabERA 모델 (TabERA, MemoryBank, FeatureStore)
+│   ├── prototypes.py        # CentroidLayer (STE, KMeans++, EMA, Dual-Space)
+│   ├── evidence.py          # AttentionAggregator, FeatureCrossAttention
+│   ├── supervised.py        # TabERAWrapper (학습 루프, EMA 호출)
+│   ├── eval.py              # 평가 지표 (CE/BCE/MSE)
+│   ├── search_space.py      # Optuna HPO 탐색 공간 (12개 파라미터)
+│   └── data.py              # OpenML 데이터 로더
+├── optim_logs/
+│   └── seed={seed}/
+│       ├── data={id}..model=tabera.pkl               # HPO study (Optuna)
+│       ├── data={id}..seed={seed}..model=tabera.csv  # trial별 결과
+│       ├── data={id}..seed{seed}_model_state.pt      # 최적 model state
+│       ├── data={id}..seed{seed}_preds.npy           # test 예측값
+│       └── data={id}..seed{seed}_meta.pkl            # 평가 지표
+├── figures/
+│   └── seed={seed}/
+│       ├── A_embed_{id}_seed{seed}_{proj}.png        # 임베딩 공간 구조
+│       ├── B_centroid_{id}_seed{seed}_{proj}.png     # Centroid 발견
+│       ├── C_retrieval_{id}_seed{seed}_{proj}.png    # Retrieval
+│       └── data_{id}_seed{seed}_{proj}.pkl           # 투영 데이터 캐시
+├── optimize.py              # HPO 실행
+├── reproduce.py             # Best config 재현 + model state 저장
+├── visualize_embeddings.py  # 3-Figure 임베딩 시각화
+├── ensemble.py              # 예측 앙상블
+├── fetch_tabzilla.py        # TabZilla 데이터셋 목록 조회
+├── run_tabzilla.ps1         # TabZilla 벤치마크 실행 (TabERA)
 └── requirements.txt
 ```
 
@@ -146,17 +158,70 @@ python optimize.py --gpu_id 0 --openml_id 43986 --n_trials 100
 | `--n_trials` | Optuna trial 수 | 100 |
 | `--seed` | 랜덤 시드 | 1 |
 
-결과: `optim_logs/seed=1/data={id}..model=tabera.pkl`
-
-### 2. Best Config 재현 + 설명 출력
-
-```powershell
-python reproduce.py --gpu_id 0 --openml_id 43986 --explain
+결과:
+```
+optim_logs/seed=1/data={id}..model=tabera.pkl
+optim_logs/seed=1/data={id}..seed=1..model=tabera.csv
 ```
 
-`--explain` 플래그를 사용하면 테스트 샘플별 설명 경로가 출력됩니다.
+### 2. Best Config 재현 + Model State 저장
 
-### 3. TabZilla 벤치마크
+```powershell
+python reproduce.py --gpu_id 0 --openml_id 43986 --seed 1
+```
+
+`--explain` 플래그를 추가하면 테스트 샘플별 feature 기여도 설명이 출력됩니다.
+
+```powershell
+python reproduce.py --gpu_id 0 --openml_id 43986 --seed 1 --explain
+```
+
+결과:
+```
+optim_logs/seed=1/data={id}..seed1_preds.npy
+optim_logs/seed=1/data={id}..seed1_meta.pkl
+optim_logs/seed=1/data={id}..seed1_model_state.pt
+```
+
+> `reproduce.py`는 `optimize.py`가 실제 사용한 `n_prototypes`(`n_prototypes_actual`)를
+> `user_attrs`에서 복원하므로 HPO와 동일한 설정으로 재현됩니다.
+
+### 3. 임베딩 시각화 (3-Figure)
+
+```powershell
+# 첫 실행: reproduce.py 완료 후 model state 로드 (권장)
+python visualize_embeddings.py --openml_id 43986 --seed 1 --proj tsne --from_state
+
+# pkl 재사용: Figure 스타일만 수정할 때
+python visualize_embeddings.py --openml_id 43986 --seed 1 --proj tsne --from_pkl
+```
+
+| 옵션 | 설명 |
+|---|---|
+| `--proj` | 투영 방법: `pca` 또는 `tsne` |
+| `--from_state` | reproduce.py가 저장한 최적 model state 로드 |
+| `--from_pkl` | 기존 투영 pkl 재사용 (Figure 스타일 수정 시) |
+| `--k_show` | Figure C에서 표시할 이웃 수 (기본값: 5) |
+
+결과:
+```
+figures/seed=1/A_embed_{id}_seed1_tsne.png    # Figure A: 임베딩 공간 구조
+figures/seed=1/B_centroid_{id}_seed1_tsne.png # Figure B: Centroid 발견
+figures/seed=1/C_retrieval_{id}_seed1_tsne.png # Figure C: Retrieval
+```
+
+**seed=1~5 전체 파이프라인 실행:**
+
+```powershell
+foreach ($seed in 1..5) {
+    Write-Host "=== seed=$seed ===" -ForegroundColor Cyan
+    python optimize.py             --openml_id 43986 --seed $seed
+    python reproduce.py            --openml_id 43986 --seed $seed
+    python visualize_embeddings.py --openml_id 43986 --seed $seed --proj tsne --from_state
+}
+```
+
+### 4. TabZilla 벤치마크
 
 ```powershell
 # TabERA 30개 데이터셋 실행 (완료된 것은 자동 스킵)
