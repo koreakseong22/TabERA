@@ -196,7 +196,7 @@ if train:
     print(env_info)
     print(study.best_trial.user_attrs)
     df = study.trials_dataframe()
-    df.to_csv(os.path.join(savepath, f"data={args.openml_id}..model=tabera.csv"), index=False)
+    df.to_csv(os.path.join(savepath, f"data={args.openml_id}..seed={args.seed}..model=tabera.csv"), index=False)
     joblib.dump(study, fname)
     print(fname)
     print("#############################################")
