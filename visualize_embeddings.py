@@ -268,8 +268,11 @@ def ax_setup(ax, title, xlabel, ylabel):
 
 def save_fig(fig, path):
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    fig.savefig(path, bbox_inches="tight", dpi=150)
+    # bbox_inches="tight"는 annotation 극단값이 있을 때 figsize를 폭발시킬 수 있음
+    # 고정 크기로 저장 후 plt 전체 정리
+    fig.savefig(path, dpi=150)
     plt.close(fig)
+    plt.close("all")
     print(f"  [저장] {path}")
 
 
@@ -401,11 +404,11 @@ def draw_figure_B(X2d, y, C2d, hard_assign,
             alpha=0.5, zorder=2))
 
     # 파이 차트 (inset axes)
-    # ax 범위 먼저 확정
+    # ax 범위 먼저 확정 (canvas.draw() 대신 autoscale만 사용)
     ax.autoscale()
-    fig.canvas.draw()
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
+    ax.figure.tight_layout()
+    xlim    = ax.get_xlim()
+    ylim    = ax.get_ylim()
     ax_bbox = ax.get_position()
     pw = 0.052   # figure fraction 단위 파이 너비
     ph = pw * (fig.get_size_inches()[0] / fig.get_size_inches()[1])
@@ -492,11 +495,28 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
 
     # 클로즈업 범위: 그룹 샘플 + centroid + query 기준
     # t-SNE 왜곡으로 타원 밖에 찍히는 이웃은 별도 표시
+    # fallback 이웃은 극단 좌표일 수 있으므로 범위 계산에서 제외
     idx_grp = np.where(hard_assign == ci)[0]
-    grp_pts = np.vstack([X2d[idx_grp], C2d[ci:ci+1], X2d[si:si+1]])
-    margin  = np.clip((grp_pts.max(axis=0) - grp_pts.min(axis=0)) * 0.38, 0.5, None)
-    xlim    = (grp_pts[:,0].min()-margin[0], grp_pts[:,0].max()+margin[0])
-    ylim    = (grp_pts[:,1].min()-margin[1], grp_pts[:,1].max()+margin[1])
+    ref_pts = np.vstack([X2d[idx_grp], C2d[ci:ci+1], X2d[si:si+1]])
+    for ni, ig in zip(nbr_idx, nbr_in_grp):
+        ni = int(ni)
+        if ig and ni < len(X2d):
+            ref_pts = np.vstack([ref_pts, X2d[ni:ni+1]])
+    margin  = np.clip((ref_pts.max(axis=0) - ref_pts.min(axis=0)) * 0.38, 0.5, None)
+    xlim    = (ref_pts[:,0].min()-margin[0], ref_pts[:,0].max()+margin[0])
+    ylim    = (ref_pts[:,1].min()-margin[1], ref_pts[:,1].max()+margin[1])
+
+    # 범위 상한 cap: 전체 데이터 범위의 70% 이내로 제한 (극단 좌표 방지)
+    x_span = xlim[1] - xlim[0]
+    y_span = ylim[1] - ylim[0]
+    max_x  = (X2d[:,0].max() - X2d[:,0].min()) * 0.70
+    max_y  = (X2d[:,1].max() - X2d[:,1].min()) * 0.70
+    if x_span > max_x:
+        mid = (xlim[0] + xlim[1]) / 2
+        xlim = (mid - max_x/2, mid + max_x/2)
+    if y_span > max_y:
+        mid = (ylim[0] + ylim[1]) / 2
+        ylim = (mid - max_y/2, mid + max_y/2)
 
     # 레이아웃: 메인 + 우측 바 차트
     fig = plt.figure(figsize=(11, 6.5), dpi=150)
@@ -727,7 +747,7 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
 
     fig.suptitle(
         f"Dataset: {dataset_name}  (id={openml_id}, seed={seed})",
-        fontsize=9, y=1.01)
+        fontsize=9, y=0.99)
     fig.tight_layout()
     save_fig(fig, out_path)
 
@@ -1012,3 +1032,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
