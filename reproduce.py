@@ -233,7 +233,11 @@ def save_per_sample_diagnostics(
 # Temperature Scaling
 # ─────────────────────────────────────────────────────────────
 
-def find_temperature(logits_val: np.ndarray, y_val_np: np.ndarray) -> float:
+def find_temperature(
+    logits_val: np.ndarray,
+    y_val_np: np.ndarray,
+    tasktype: str = "multiclass",
+) -> float:
     """
     Validation set NLL을 최소화하는 Temperature T를 찾습니다.
 
@@ -242,10 +246,20 @@ def find_temperature(logits_val: np.ndarray, y_val_np: np.ndarray) -> float:
         calibrated_probs = softmax(logits / T)
     T는 단 하나의 스칼라 파라미터이며 모델 구조와 예측 순서,
     centroid 배정, retrieval, 설명 구조에 영향을 주지 않습니다.
+
+    binclass: logits shape (N, 1) → sigmoid 기반으로 처리
+    multiclass: logits shape (N, C) → softmax 기반으로 처리
     """
     def nll(T: float) -> float:
-        scaled     = torch.tensor(logits_val, dtype=torch.float32) / T
-        probs      = F.softmax(scaled, dim=-1).numpy()
+        scaled = torch.tensor(logits_val, dtype=torch.float32) / T
+
+        if tasktype == "binclass":
+            # (N, 1) → sigmoid → (N,) pos prob → (N, 2)
+            probs_pos  = torch.sigmoid(scaled.squeeze(-1)).numpy()
+            probs      = np.stack([1 - probs_pos, probs_pos], axis=-1)
+        else:
+            probs = F.softmax(scaled, dim=-1).numpy()
+
         true_probs = probs[np.arange(len(y_val_np)), y_val_np.astype(int)]
         return float(-np.log(true_probs + 1e-8).mean())
 
@@ -298,13 +312,22 @@ def apply_temperature_scaling(
     y_test_np   = y_test.cpu().numpy().astype(int)
 
     # ── T 최적화 ─────────────────────────────────────────
-    T = find_temperature(logits_val, y_val_np)
+    T = find_temperature(logits_val, y_val_np, tasktype=tasktype)
 
     # ── 보정 전후 확률 계산 ───────────────────────────────
-    labels = list(range(output_dim))
+    def _to_probs(logits_np: np.ndarray, T: float = 1.0) -> np.ndarray:
+        t = torch.tensor(logits_np, dtype=torch.float32) / T
+        if tasktype == "binclass":
+            # logits shape (N, 1) → sigmoid → (N, 2)
+            p = torch.sigmoid(t.squeeze(-1)).numpy()
+            return np.stack([1 - p, p], axis=-1)
+        return F.softmax(t, dim=-1).numpy()
 
-    probs_before = F.softmax(torch.tensor(logits_test, dtype=torch.float32),      dim=-1).numpy()
-    probs_after  = F.softmax(torch.tensor(logits_test, dtype=torch.float32) / T,  dim=-1).numpy()
+    probs_before = _to_probs(logits_test, T=1.0)
+    probs_after  = _to_probs(logits_test, T=T)
+
+    # labels는 probs 열 수 기준 (binclass: 2, multiclass: C)
+    labels = list(range(probs_before.shape[1]))
 
     logloss_before = float(log_loss(y_test_np, probs_before, labels=labels))
     logloss_after  = float(log_loss(y_test_np, probs_after,  labels=labels))
