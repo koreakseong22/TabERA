@@ -93,18 +93,22 @@ def save_per_sample_diagnostics(
     save_dir: Path,
     openml_id: str,
     seed: int,
-) -> pd.DataFrame:
+) -> dict:
     """
-    per-sample 진단 정보를 추출하여 CSV로 저장하고 요약을 출력합니다.
+    per-sample 진단 정보를 추출하여 CSV로 저장하고 요약 dict를 반환합니다.
 
-    저장 항목
+    저장 파일
     ─────────
-    y_true            : 정답 레이블
-    y_pred            : 예측 레이블
-    max_prob          : 예측 클래스의 확률 (모델의 확신도)
-    correct           : 정답 여부 (True/False)
-    sample_loss       : 샘플별 cross-entropy loss (-log p(y_true))
-    assigned_centroid : 배정된 centroid 인덱스 (hard_group)
+    _per_sample.csv : 샘플별 y_true, y_pred, max_prob, correct,
+                      sample_loss, assigned_centroid
+
+    반환값 (diagnostics dict — _diagnostics.json에 병합됨)
+    ────────────────────────────────────────────────────────
+    n_test, acc_test
+    mean_max_prob, correct_mean_max_prob, wrong_mean_max_prob
+    wrong_over_09, wrong_over_09_pct
+    wrong_over_07, wrong_over_07_pct
+    overconfidence_verdict
     """
     model.eval()
 
@@ -151,36 +155,46 @@ def save_per_sample_diagnostics(
     print(f"\n  저장: {diag_path}")
 
     n_total   = len(df)
-    n_correct = correct_np.sum()
+    n_correct = int(correct_np.sum())
     n_wrong   = n_total - n_correct
 
+    # ── 요약 수치 계산 ─────────────────────────────────────
+    mean_max_prob         = float(max_prob_np.mean())
+    correct_mean_max_prob = float(df[df.correct]["max_prob"].mean()) if n_correct > 0 else float("nan")
+    wrong_mean_max_prob   = float(df[~df.correct]["max_prob"].mean()) if n_wrong > 0 else float("nan")
+
+    wrong_over_09     = int(((~df.correct) & (df.max_prob > 0.9)).sum()) if n_wrong > 0 else 0
+    wrong_over_09_pct = round(wrong_over_09 / n_wrong * 100, 1)          if n_wrong > 0 else 0.0
+    wrong_over_07     = int(((~df.correct) & (df.max_prob > 0.7)).sum()) if n_wrong > 0 else 0
+    wrong_over_07_pct = round(wrong_over_07 / n_wrong * 100, 1)          if n_wrong > 0 else 0.0
+
+    overconf_ratio = wrong_over_09 / n_wrong if n_wrong > 0 else 0
+    if overconf_ratio > 0.3:
+        verdict = "overconfidence_strong"
+    elif overconf_ratio > 0.1:
+        verdict = "overconfidence_partial"
+    else:
+        verdict = "overconfidence_none"
+
+    verdict_label = {
+        "overconfidence_strong":  "⚠ overconfidence 현상 강함",
+        "overconfidence_partial": "△ overconfidence 현상 일부 존재",
+        "overconfidence_none":    "○ overconfidence 현상 미미",
+    }[verdict]
+
+    # ── 터미널 출력 ────────────────────────────────────────
     print(f"\n  {'─'*52}")
     print(f"  [Per-sample 진단 요약]  seed={seed}  N={n_total}")
     print(f"  {'─'*52}")
     print(f"  전체 accuracy          : {n_correct/n_total*100:.1f}%  ({n_correct}/{n_total})")
-    print(f"  전체 평균 max_prob     : {max_prob_np.mean():.4f}")
-
+    print(f"  전체 평균 max_prob     : {mean_max_prob:.4f}")
     if n_correct > 0:
-        print(f"  correct 평균 max_prob  : {df[df.correct]['max_prob'].mean():.4f}")
+        print(f"  correct 평균 max_prob  : {correct_mean_max_prob:.4f}")
     if n_wrong > 0:
-        mean_conf_wrong = df[~df.correct]["max_prob"].mean()
-        print(f"  wrong   평균 max_prob  : {mean_conf_wrong:.4f}")
-
-        wrong_high_90 = ((~df.correct) & (df.max_prob > 0.9)).sum()
-        wrong_high_70 = ((~df.correct) & (df.max_prob > 0.7)).sum()
-        print(f"\n  wrong인데 max_prob > 0.9 : {wrong_high_90}개  "
-              f"({wrong_high_90/n_wrong*100:.1f}% of wrong)")
-        print(f"  wrong인데 max_prob > 0.7 : {wrong_high_70}개  "
-              f"({wrong_high_70/n_wrong*100:.1f}% of wrong)")
-
-        overconf_ratio = wrong_high_90 / n_wrong if n_wrong > 0 else 0
-        if overconf_ratio > 0.3:
-            verdict = "⚠ overconfidence 현상 강함"
-        elif overconf_ratio > 0.1:
-            verdict = "△ overconfidence 현상 일부 존재"
-        else:
-            verdict = "○ overconfidence 현상 미미"
-        print(f"\n  판정: {verdict}")
+        print(f"  wrong   평균 max_prob  : {wrong_mean_max_prob:.4f}")
+        print(f"\n  wrong인데 max_prob > 0.9 : {wrong_over_09}개  ({wrong_over_09_pct:.1f}% of wrong)")
+        print(f"  wrong인데 max_prob > 0.7 : {wrong_over_07}개  ({wrong_over_07_pct:.1f}% of wrong)")
+        print(f"\n  판정: {verdict_label}")
 
     print(f"\n  [Centroid별 오류 분포]")
     centroid_stats = df.groupby("assigned_centroid").agg(
@@ -188,22 +202,31 @@ def save_per_sample_diagnostics(
         n_wrong=("correct", lambda x: (~x).sum()),
         mean_max_prob=("max_prob", "mean"),
     ).reset_index()
-    centroid_stats["error_rate"] = (
-        centroid_stats["n_wrong"] / centroid_stats["n"] * 100
-    ).round(1)
+    centroid_stats["error_rate"]    = (centroid_stats["n_wrong"] / centroid_stats["n"] * 100).round(1)
     centroid_stats["mean_max_prob"] = centroid_stats["mean_max_prob"].round(4)
     centroid_stats = centroid_stats.sort_values("error_rate", ascending=False)
 
-    print(f"  {'centroid':>9} {'n':>5} {'n_wrong':>7} "
-          f"{'error%':>7} {'mean_conf':>10}")
+    print(f"  {'centroid':>9} {'n':>5} {'n_wrong':>7} {'error%':>7} {'mean_conf':>10}")
     for _, row in centroid_stats.iterrows():
         flag = " ← collapse?" if row["error_rate"] > 60 else ""
         print(f"  C{int(row['assigned_centroid']):>8} {int(row['n']):>5} "
               f"{int(row['n_wrong']):>7} {row['error_rate']:>6.1f}% "
               f"{row['mean_max_prob']:>10.4f}{flag}")
-
     print(f"  {'─'*52}")
-    return df
+
+    # ── 반환: _diagnostics.json에 병합될 dict ─────────────
+    return {
+        "n_test":                 n_total,
+        "acc_test":               round(n_correct / n_total, 4),
+        "mean_max_prob":          round(mean_max_prob, 4),
+        "correct_mean_max_prob":  round(correct_mean_max_prob, 4) if n_correct > 0 else None,
+        "wrong_mean_max_prob":    round(wrong_mean_max_prob, 4)   if n_wrong > 0  else None,
+        "wrong_over_09":          wrong_over_09,
+        "wrong_over_09_pct":      wrong_over_09_pct,
+        "wrong_over_07":          wrong_over_07,
+        "wrong_over_07_pct":      wrong_over_07_pct,
+        "overconfidence_verdict": verdict,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -215,10 +238,8 @@ def find_temperature(logits_val: np.ndarray, y_val_np: np.ndarray) -> float:
     Validation set NLL을 최소화하는 Temperature T를 찾습니다.
 
     근거: Guo et al. (ICML 2017) "On Calibration of Modern Neural Networks"
-    ────────────────────────────────────────────────────────────────────────
     T > 1로 나누면 softmax 입력이 작아져 확률 분포가 완화됩니다.
         calibrated_probs = softmax(logits / T)
-
     T는 단 하나의 스칼라 파라미터이며 모델 구조와 예측 순서,
     centroid 배정, retrieval, 설명 구조에 영향을 주지 않습니다.
     """
@@ -247,6 +268,14 @@ def apply_temperature_scaling(
     """
     Temperature Scaling을 적용하고 보정 전후 지표를 비교 출력합니다.
     regression에는 적용하지 않습니다.
+
+    반환값 (diagnostics dict — _diagnostics.json에 병합됨)
+    ────────────────────────────────────────────────────────
+    temperature_T
+    logloss_before_ts, logloss_after_ts
+    mean_max_prob_before, mean_max_prob_after
+    wrong_mean_max_prob_before, wrong_mean_max_prob_after
+    cal_test_metrics  (보정 후 전체 지표 dict)
     """
     if tasktype == "regression":
         return {}
@@ -270,46 +299,43 @@ def apply_temperature_scaling(
 
     # ── T 최적화 ─────────────────────────────────────────
     T = find_temperature(logits_val, y_val_np)
+
+    # ── 보정 전후 확률 계산 ───────────────────────────────
+    labels = list(range(output_dim))
+
+    probs_before = F.softmax(torch.tensor(logits_test, dtype=torch.float32),      dim=-1).numpy()
+    probs_after  = F.softmax(torch.tensor(logits_test, dtype=torch.float32) / T,  dim=-1).numpy()
+
+    logloss_before = float(log_loss(y_test_np, probs_before, labels=labels))
+    logloss_after  = float(log_loss(y_test_np, probs_after,  labels=labels))
+
+    preds_after          = probs_after.argmax(axis=1)
+    mean_max_before      = float(probs_before.max(axis=1).mean())
+    mean_max_after       = float(probs_after.max(axis=1).mean())
+
+    wrong_mask_before    = y_test_np != probs_before.argmax(axis=1)
+    wrong_mask_after     = y_test_np != preds_after
+    wmp_before = float(probs_before.max(axis=1)[wrong_mask_before].mean()) if wrong_mask_before.sum() > 0 else float("nan")
+    wmp_after  = float(probs_after.max(axis=1)[wrong_mask_after].mean())   if wrong_mask_after.sum()  > 0 else float("nan")
+
+    cal_test_metrics = calculate_metric(
+        y_test,
+        torch.tensor(preds_after),
+        torch.tensor(probs_after),
+        tasktype, "test",
+    )
+
+    # ── 터미널 출력 ────────────────────────────────────────
     print(f"\n  {'─'*52}")
     print(f"  [Temperature Scaling]  T = {T:.4f}")
     print(f"  {'─'*52}")
-
-    # ── 보정 전후 logloss 비교 ───────────────────────────
-    labels = list(range(output_dim))
-
-    probs_before = F.softmax(torch.tensor(logits_test, dtype=torch.float32), dim=-1).numpy()
-    probs_after  = F.softmax(
-        torch.tensor(logits_test, dtype=torch.float32) / T, dim=-1
-    ).numpy()
-
-    logloss_before = log_loss(y_test_np, probs_before, labels=labels)
-    logloss_after  = log_loss(y_test_np, probs_after,  labels=labels)
-
-    preds_after  = probs_after.argmax(axis=1)
-    max_prob_before = probs_before.max(axis=1).mean()
-    max_prob_after  = probs_after.max(axis=1).mean()
-
-    wrong_before = y_test_np != probs_before.argmax(axis=1)
-    wrong_after  = y_test_np != preds_after
-
+    direction = "↓" if logloss_after < logloss_before else "↑"
     print(f"  logloss before TS  : {logloss_before:.4f}")
-    print(f"  logloss after  TS  : {logloss_after:.4f}  "
-          f"({'↓' if logloss_after < logloss_before else '↑'}"
-          f"{abs(logloss_before - logloss_after):.4f})")
-
-    print(f"\n  평균 max_prob before : {max_prob_before:.4f}")
-    print(f"  평균 max_prob after  : {max_prob_after:.4f}")
-
-    if wrong_before.sum() > 0:
-        wmp_before = probs_before.max(axis=1)[wrong_before].mean()
-        wmp_after  = probs_after.max(axis=1)[wrong_after].mean() if wrong_after.sum() > 0 else float("nan")
-        print(f"\n  wrong 평균 max_prob before : {wmp_before:.4f}")
-        print(f"  wrong 평균 max_prob after  : {wmp_after:.4f}")
-
-    # 보정 후 전체 지표
-    cal_preds  = torch.tensor(preds_after)
-    cal_probs  = torch.tensor(probs_after)
-    cal_test_metrics = calculate_metric(y_test, cal_preds, cal_probs, tasktype, "test")
+    print(f"  logloss after  TS  : {logloss_after:.4f}  ({direction}{abs(logloss_before - logloss_after):.4f})")
+    print(f"\n  평균 max_prob before : {mean_max_before:.4f}")
+    print(f"  평균 max_prob after  : {mean_max_after:.4f}")
+    print(f"\n  wrong 평균 max_prob before : {wmp_before:.4f}")
+    print(f"  wrong 평균 max_prob after  : {wmp_after:.4f}")
     print(f"\n  test (calibrated)  : {cal_test_metrics}")
 
     # ── 저장 ─────────────────────────────────────────────
@@ -326,11 +352,17 @@ def apply_temperature_scaling(
     print(f"\n  저장: {ts_path}")
     print(f"  {'─'*52}")
 
+    # ── 반환: _diagnostics.json에 병합될 dict ─────────────
     return {
-        "T":               T,
-        "cal_probs_test":  probs_after,
-        "cal_preds_test":  preds_after,
-        "cal_test_metrics": cal_test_metrics,
+        "temperature_T":              round(T, 4),
+        "logloss_before_ts":          round(logloss_before, 4),
+        "logloss_after_ts":           round(logloss_after, 4),
+        "logloss_improvement":        round(logloss_before - logloss_after, 4),
+        "mean_max_prob_before":       round(mean_max_before, 4),
+        "mean_max_prob_after":        round(mean_max_after, 4),
+        "wrong_mean_max_prob_before": round(wmp_before, 4) if not np.isnan(wmp_before) else None,
+        "wrong_mean_max_prob_after":  round(wmp_after,  4) if not np.isnan(wmp_after)  else None,
+        "cal_test_metrics":           {k: round(v, 4) for k, v in cal_test_metrics.items()},
     }
 
 
@@ -473,9 +505,13 @@ def main():
     }, str(state_path))
     print(f"  저장: {state_path}")
 
+    # ── diagnostics 기본값 (regression 또는 플래그 미사용 시) ──
+    diag_summary = {}
+    ts_summary   = {}
+
     # ── Per-sample 진단 (--diagnose) ──────────────────────
     if args.diagnose and tasktype != "regression":
-        save_per_sample_diagnostics(
+        diag_summary = save_per_sample_diagnostics(
             model     = model,
             X_test    = X_test,
             y_test    = y_test,
@@ -487,7 +523,7 @@ def main():
 
     # ── Temperature Scaling (--calibrate) ─────────────────
     if args.calibrate and tasktype != "regression":
-        apply_temperature_scaling(
+        ts_summary = apply_temperature_scaling(
             model      = model,
             X_val      = X_val,
             X_test     = X_test,
@@ -499,6 +535,30 @@ def main():
             openml_id  = openml_id,
             seed       = args.seed,
         )
+
+    # ── _diagnostics.json 저장 ─────────────────────────────
+    # --diagnose 또는 --calibrate 중 하나라도 사용한 경우 저장
+    if (args.diagnose or args.calibrate) and tasktype != "regression":
+        diagnostics = {
+            # 기본 식별 정보
+            "openml_id":         openml_id,
+            "dataset_name":      dataset_info.get("name", openml_id),
+            "tasktype":          tasktype,
+            "seed":              args.seed,
+            "label_smoothing":   best_params.get("label_smoothing", None),
+            # 기본 지표
+            "val_metrics":       {k: round(v, 4) for k, v in val_metrics.items()},
+            "test_metrics":      {k: round(v, 4) for k, v in test_metrics.items()},
+            # per-sample 진단 요약 (--diagnose 시 채워짐)
+            **diag_summary,
+            # Temperature Scaling 요약 (--calibrate 시 채워짐)
+            **ts_summary,
+        }
+
+        diag_json_path = save_dir / f"data={openml_id}..seed{args.seed}_diagnostics.json"
+        with open(diag_json_path, "w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+        print(f"\n  저장: {diag_json_path}")
 
     # ── §3.3 Feature 기여도 설명 출력 (기존과 동일) ───────
     if args.explain:
