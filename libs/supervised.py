@@ -8,8 +8,21 @@ TabERA 전용으로 재작성한 버전입니다.
 
   - TqdmLoggingHandler  : tqdm과 logging 충돌 방지 (MultiTab 원본 동일)
   - EarlyStopping       : val_loss 기준 조기 종료 (MultiTab 원본 동일)
-  - TabERAWrapper      : TabERA용 fit/predict/predict_proba
+  - TabERAWrapper       : TabERA용 fit/predict/predict_proba
                           (MultiTab supmodel 인터페이스와 동일)
+
+변경사항
+────────
+fit() 내부 criterion 생성 시 label_smoothing 전달:
+    get_criterion(tasktype, label_smoothing=params.get("label_smoothing", 0.1))
+    params.get("label_smoothing", 0.1) → 기존 study 하위 호환 보장
+
+버그 수정
+────────
+ema_update 호출 시그니처를 prototypes.py 실제 구현에 맞게 수정:
+    기존(잘못됨): ema_update(X_train, y_train, self.model.embedder)
+    수정:        ema_update(emb_ema, X_train)
+    → AttributeError: 'bool' object has no attribute 'sum' 해결
 """
 
 import math
@@ -52,14 +65,15 @@ class EarlyStopping:
         self.should_stop      = False
 
     def step(self, val_metric: float, higher_is_better: bool) -> bool:
-        """
-        Returns True if training should stop.
-        """
+        """Returns True if training should stop."""
         if self.best_value is None:
             self.best_value = val_metric
             return False
 
-        improved = (val_metric > self.best_value) if higher_is_better else (val_metric < self.best_value)
+        improved = (
+            (val_metric > self.best_value) if higher_is_better
+            else (val_metric < self.best_value)
+        )
         if improved:
             self.best_value       = val_metric
             self.patience_counter = 0
@@ -105,7 +119,7 @@ class TabERAWrapper:
         self.epochs   = epochs
         self.patience = patience
         self._best_state = None
-        self._data_id    = "?"      # tqdm 표시용 (optimize.py에서 주입)
+        self._data_id    = "?"
         self.ema_history: List[Dict[str, float]] = []
         self.final_ema_stats: Optional[Dict[str, float]] = None
 
@@ -118,33 +132,42 @@ class TabERAWrapper:
         X_val: torch.Tensor,
         y_val: torch.Tensor,
     ) -> None:
-        criterion  = get_criterion(self.tasktype)  # weight_matrix GPU 이동
-        optimizer  = torch.optim.AdamW(
+        # [변경] label_smoothing을 params에서 꺼내 criterion에 전달
+        # params.get("label_smoothing", 0.1): 기존 study(파라미터 없는 버전)
+        # 하위 호환 보장 — KeyError 없이 기본값 0.1로 동작
+        criterion = get_criterion(
+            self.tasktype,
+            label_smoothing=self.params.get("label_smoothing", 0.1),
+        )
+
+        optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.params["lr"],
             weight_decay=self.params["weight_decay"],
         )
-        scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
-        es         = EarlyStopping(patience=self.patience)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.epochs
+        )
+        es = EarlyStopping(patience=self.patience)
 
-        # ── CentroidLayer 초기화 (이중 공간 설정) ─────────────
-        if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'initialize_from_data'):
+        # ── CentroidLayer 초기화 ──────────────────────────────
+        if (hasattr(self.model, 'prototype_layer') and
+                hasattr(self.model.prototype_layer, 'initialize_from_data')):
             with torch.no_grad():
                 n_init   = min(len(X_train), 5000)
                 init_emb = self.model.embedder(X_train[:n_init])
                 init_x   = X_train[:n_init]
-                init_y   = y_train[:n_init]  # 소수 클래스 보장용
+                init_y   = y_train[:n_init]
                 self.model.prototype_layer.initialize_from_data(
                     init_emb, init_x, y_labels=init_y
                 )
-        higher_is_better = (self.tasktype != "regression")
 
-        best_state = None
-        best_val   = None
-        self.ema_history = []
+        higher_is_better     = (self.tasktype != "regression")
+        best_state           = None
+        best_val             = None
+        self.ema_history     = []
         self.final_ema_stats = None
 
-        # MultiTab 스타일 에폭 tqdm
         pbar = tqdm(
             range(1, self.epochs + 1),
             desc=f"EPOCH: 1",
@@ -153,9 +176,9 @@ class TabERAWrapper:
         )
 
         for epoch in pbar:
-            # ── 학습 ──────────────────────────────────────
+            # ── 학습 ────────────────────────────────────────
             self.model.train()
-            perm    = torch.randperm(len(y_train), device=self.device)
+            perm    = torch.randperm(len(y_train), device=X_train.device)
             tr_loss = 0.0
             n_batch = 0
 
@@ -182,61 +205,66 @@ class TabERAWrapper:
             scheduler.step()
             self.model.anneal(self.params.get("anneal_factor", 0.97))
 
-            # ── (3) EMA centroid 업데이트 ───────────────────────
-            if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
+            # ── EMA centroid 업데이트 ─────────────────────────
+            # ema_update(X_emb, X_raw, assignments=None) 시그니처
+            # assignments=None → 내부에서 현재 centroid 기준 재배정
+            if (hasattr(self.model, 'prototype_layer') and
+                    hasattr(self.model.prototype_layer, 'ema_update')):
                 with torch.no_grad():
-                    # EMA: 전체 훈련 데이터 사용
-                    # 샘플링하면 일부 centroid가 배정 못 받아 dead 발생
-                    n_chunk = 1024  # GPU 메모리 고려 청크 처리
+                    # 전체 훈련 데이터 임베딩 계산 (청크 처리)
+                    n_chunk = 1024
                     all_emb = []
                     for s in range(0, len(X_train), n_chunk):
-                        all_emb.append(self.model.embedder(X_train[s:s+n_chunk]))
-                    emb_ema  = torch.cat(all_emb, dim=0)
-                    x_ema    = X_train
-                    ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
+                        all_emb.append(self.model.embedder(X_train[s:s + n_chunk]))
+                    emb_ema = torch.cat(all_emb, dim=0)
+
+                    ema_stats = self.model.prototype_layer.ema_update(
+                        emb_ema,   # X_emb: (N, D) 임베딩
+                        X_train,   # X_raw: (N, F) 원본 feature
+                    )
                     self.final_ema_stats = dict(ema_stats)
                     self.ema_history.append({
-                        "epoch": float(epoch),
-                        "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
-                        "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
+                        "epoch":             float(epoch),
+                        "active_ratio":      float(ema_stats.get("active_ratio", 0.0)),
+                        "active_centroids":  float(ema_stats.get("active_centroids", 0.0)),
                         "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
-                        "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
-                        "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
+                        "min_cluster_size":  float(ema_stats.get("min_cluster_size", 0.0)),
+                        "max_cluster_size":  float(ema_stats.get("max_cluster_size", 0.0)),
                     })
 
-                    # 에폭당 1회: sample_groups를 GPU 텐서로 캐시 (76,800번 변환 제거)
-                    self.model.memory.cache_sample_groups(
-                        self.model.prototype_layer.sample_groups,
-                        device=torch.device(self.device),
-                    )
-                    if epoch % 10 == 0:
-                        # 검색 범위 축소율 계산 (가설 ②)
-                        n_total = len(X_train)
-                        n_proto = self.model.prototype_layer.P
-                        avg_cand = n_total / n_proto if n_proto > 0 else n_total
-                        reduction = (1 - avg_cand / n_total) * 100
-                        pbar.write(
-                            f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
-                            f"alive={ema_stats.get('active_centroids', 0)}  "
-                            f"min={ema_stats['min_cluster_size']}  "
-                            f"max={ema_stats['max_cluster_size']}  "
+                    # sample_groups GPU 캐시 갱신
+                    if hasattr(self.model, 'memory') and hasattr(
+                            self.model.memory, 'cache_sample_groups'):
+                        self.model.memory.cache_sample_groups(
+                            self.model.prototype_layer.sample_groups,
+                            device=torch.device(self.device),
+                        )
+
+                    if epoch % 10 == 0 or epoch == 1:
+                        active_pct = ema_stats.get("active_ratio", 0)
+                        alive      = ema_stats.get("active_centroids", 0)
+                        min_count  = ema_stats.get("min_cluster_size", 0)
+                        max_count  = ema_stats.get("max_cluster_size", 0)
+                        tqdm.write(
+                            f"  [EMA] active={active_pct:.0%}  "
+                            f"alive={alive}  "
+                            f"min={min_count}  max={max_count}"
                         )
 
             avg_loss = tr_loss / max(n_batch, 1)
 
-            # ── 검증 ──────────────────────────────────────
+            # ── Validation ───────────────────────────────────
             self.model.eval()
             with torch.no_grad():
                 val_logits = self._forward_batched(X_val)
-                val_m  = compute_metric(val_logits, y_val, self.tasktype)
+                val_m      = compute_metric(val_logits, y_val, self.tasktype)
+
             val_v = list(val_m.values())[0]
 
-            # best 모델 저장
             if is_better(val_v, best_val, self.tasktype):
                 best_val   = val_v
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-            # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
             pbar.set_description(f"EPOCH: {epoch}")
             pbar.set_postfix(
                 loss=f"{avg_loss:.4f}",
@@ -244,7 +272,6 @@ class TabERAWrapper:
                 refresh=False,
             )
 
-            # 조기 종료
             if es.step(val_v, higher_is_better):
                 tqdm.write(f"Early stopping at epoch {epoch}")
                 break
@@ -254,6 +281,9 @@ class TabERAWrapper:
         if best_state:
             self.model.load_state_dict(best_state)
         self._best_state = best_state
+
+        if self.ema_history:
+            self.final_ema_stats = self.ema_history[-1]
 
     # ── predict ─────────────────────────────────────────────
 

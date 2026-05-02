@@ -1,12 +1,18 @@
 """
 libs/search_space.py
 ====================
-TabHERA용 Optuna 하이퍼파라미터 탐색 공간.
+TabERA용 Optuna 하이퍼파라미터 탐색 공간.
 MultiTab의 search_space.py 형식을 따릅니다.
 
 get_search_space      : trial → params dict
 suggest_initial_trial : 첫 번째 trial의 기본값 (빠른 warmup)
-params_to_model_kwargs: params → TabHERA 생성자 인자
+params_to_model_kwargs: params → TabERA 생성자 인자
+
+변경사항
+────────
+label_smoothing 파라미터 추가 (0.0 ~ 0.3)
+    - ε=0이면 기존 CE와 동일 → HPO가 끄는 것도 허용
+    - overconfidence 억제 목적
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ def suggest_initial_trial() -> dict:
         "batch_size":       256,
         "anneal_factor":    0.97,
         "n_heads":          4,
+        "label_smoothing":  0.1,   # 추가: overconfidence 억제 기본값
     }
 
 
@@ -45,12 +52,12 @@ def suggest_initial_trial() -> dict:
 
 def get_search_space(
     trial: optuna.Trial,
-    num_features: int = 0,   # MultiTab 호환 인자 (현재 미사용)
-    data_id: int = 0,        # MultiTab 호환 인자 (현재 미사용)
-    metric: str = "l2",      # TabR Retriever 거리 지표
+    num_features: int = 0,
+    data_id: int = 0,
+    metric: str = "l2",
 ) -> dict:
     """
-    Optuna Trial로부터 TabHERA 하이퍼파라미터를 샘플링합니다.
+    Optuna Trial로부터 TabERA 하이퍼파라미터를 샘플링합니다.
 
     Parameters
     ----------
@@ -67,18 +74,13 @@ def get_search_space(
         # ── 모델 구조 ───────────────────────────────────
         "embed_dim":       trial.suggest_categorical("embed_dim",   [64, 128, 256]),
         "n_prototypes":    trial.suggest_int("n_prototypes", 4, 16, step=4),
-        # k 확장: 소수 클래스 이웃 포함 확률 향상 → recall↑ → f1 gap 완화
         "k":               trial.suggest_categorical("k",           [8, 16, 32, 64]),
         "embedder_layers": trial.suggest_int("embedder_layers", 1, 4),
         "dropout":         trial.suggest_float("dropout", 0.0, 0.5, step=0.05),
 
-        # ── Gumbel 온도 ────────────────────────────────
-
         # ── 보조 손실 가중치 ────────────────────────────
-        # loss_diversity 상한 확장: centroid 분산 강화 → 소수 클래스 centroid 생존율 향상
         "loss_diversity":  trial.suggest_float("loss_diversity",  1e-4, 5e-1, log=True),
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-4, 1e-1, log=True),
-        # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
         "loss_entropy":    trial.suggest_float("loss_entropy",    1e-3, 1e-1, log=True),
 
         # ── 학습 파라미터 ───────────────────────────────
@@ -88,13 +90,22 @@ def get_search_space(
         "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
         "n_heads":         trial.suggest_categorical("n_heads", [1, 2, 4, 8]),
 
+        # ── Label Smoothing ─────────────────────────────
+        # 근거: Müller et al. (NeurIPS 2019) "When Does Label Smoothing Help?"
+        # hard routing으로 인한 overconfidence 억제:
+        #   p(y_true)  → 1 - ε + ε/C  (완화된 목표)
+        #   p(y_other) →         ε/C  (인접 클래스에 소량 분산)
+        # ε=0 → 기존 CrossEntropyLoss와 동일 (HPO가 끄는 것도 허용)
+        # ε=0.3 → 상한: 이 이상이면 학습 신호가 지나치게 약해질 수 있음
+        "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.3, step=0.05),
+
         # ── TabR Retriever 거리 지표 (확장용) ──────────
         "metric":          metric,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-# params → TabHERA 생성자 인자 변환
+# params → TabERA 생성자 인자 변환
 # ─────────────────────────────────────────────────────────────
 
 def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict:
@@ -107,8 +118,8 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "dropout":         params["dropout"],
         "n_output":        n_output,
         "loss_weights": {
-            "diversity":        params["loss_diversity"],
-            "commitment":       params["loss_commitment"],
-            "entropy":          params["loss_entropy"],
+            "diversity":   params["loss_diversity"],
+            "commitment":  params["loss_commitment"],
+            "entropy":     params["loss_entropy"],
         },
     }

@@ -6,6 +6,13 @@ MultiTab 스타일 평가 지표.
 calculate_metric : val/test split 별 dict 반환 (ModernNCA 동일 지표 포함)
 compute_metric   : 내부 학습 루프용 단순 버전
 is_study_todo    : 최적화 재개 여부 판단
+
+변경사항
+────────
+get_criterion(): label_smoothing 파라미터 추가
+    - multiclass: CrossEntropyLoss(label_smoothing=ε)
+    - ε=0이면 기존과 동일 → 하위 호환 보장
+    - 근거: Müller et al. (NeurIPS 2019) "When Does Label Smoothing Help?"
 """
 
 from __future__ import annotations
@@ -89,8 +96,6 @@ def calculate_metric(
                 prob_pos = pr_np[:, 1] if pr_np.ndim == 2 else pr_np
                 metrics[f"auroc_{split}"] = float(roc_auc_score(y_np, prob_pos))
             else:
-                # y에 실제 등장한 클래스만 선택 + 재정규화
-                # (일부 클래스가 split에 없을 때 probs 열 수와 불일치 방지)
                 present = sorted(np.unique(y_np).tolist())
                 pr_sub  = pr_np[:, present]
                 pr_sub  = pr_sub / pr_sub.sum(axis=1, keepdims=True).clip(1e-8)
@@ -103,7 +108,7 @@ def calculate_metric(
                 )
         else:
             metrics[f"auroc_{split}"] = float("nan")
-    except Exception as e:
+    except Exception:
         metrics[f"auroc_{split}"] = float("nan")
 
     # F1 (macro)
@@ -124,7 +129,7 @@ def calculate_metric(
             )
         else:
             metrics[f"logloss_{split}"] = float("nan")
-    except Exception as e:
+    except Exception:
         metrics[f"logloss_{split}"] = float("nan")
 
     return metrics
@@ -196,29 +201,13 @@ def check_if_fname_exists_in_error(fname: str) -> bool:
 
 # ─────────────────────────────────────────────────────────────
 # Ordinal Cross-Entropy Loss
+# (리팩토링 시 제거 예정 — 현재 미사용)
 # ─────────────────────────────────────────────────────────────
 
 class OrdinalCrossEntropyLoss(nn.Module):
     """
     순서형 분류를 위한 Ordinal Cross-Entropy Loss.
-
-    가설 맥락에서의 역할
-    ─────────────────
-    - Centroid가 데이터의 실제 순서 구조를 반영하도록 유도
-    - OT Evidence의 인접 이웃 집중 현상과 정합적으로 작동
-    - 인접 등급 오류(5→6)를 비인접 오류(5→9)보다 작게 처벌
-      → Confidence 과잉 억제 → logloss 안정화
-
-    수식
-    ────
-    weight_c = 1 / (|c - y| + 1)  for each class c
-    soft_target[y]   = (1 - ε) + ε * weight_y / Σ weight_c
-    soft_target[c≠y] =             ε * weight_c / Σ weight_c
-    loss = -Σ soft_target * log(softmax(logits))
-
-    ε=0 이면 일반 CE, ε=1 이면 완전 순서형 smoothing.
-    기본값 ε=0.1: CE의 안정적 gradient를 유지하면서
-    인접 클래스에 소량의 확률 질량을 나눠줌.
+    현재 미사용 (리팩토링 시 제거 예정).
     """
 
     def __init__(self, n_classes: int, epsilon: float = 0.1) -> None:
@@ -226,8 +215,6 @@ class OrdinalCrossEntropyLoss(nn.Module):
         self.n_classes = n_classes
         self.epsilon   = epsilon
 
-        # 클래스 간 거리 기반 가중치 행렬 (C, C) — 미리 계산
-        # weight[y, c] = 1 / (|y - c| + 1)
         idx = torch.arange(n_classes).float()
         dist = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))  # (C, C)
         self.register_buffer('weight_matrix', 1.0 / (dist + 1.0))
@@ -240,19 +227,14 @@ class OrdinalCrossEntropyLoss(nn.Module):
         B, C = logits.shape
         device = logits.device
 
-        # 각 샘플의 정답 클래스에 대한 거리 가중치 (B, C)
         w = self.weight_matrix[targets.long()]  # (B, C)
         w_sum = w.sum(dim=-1, keepdim=True)     # (B, 1)
-        w_norm = w / w_sum                       # (B, C) 정규화
+        w_norm = w / w_sum                       # (B, C)
 
-        # Soft target:
-        # 정답 위치: (1 - ε) + ε * w_norm[y]
-        # 나머지:           ε * w_norm[c]
         one_hot = torch.zeros(B, C, device=device)
         one_hot.scatter_(1, targets.long().unsqueeze(1), 1.0)
         soft_target = (1.0 - self.epsilon) * one_hot + self.epsilon * w_norm
 
-        # log-softmax와 내적
         log_prob = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, C)
         loss = -(soft_target * log_prob).sum(dim=-1).mean()
         return loss
@@ -262,24 +244,37 @@ class OrdinalCrossEntropyLoss(nn.Module):
 # 손실 함수 / 비교 유틸
 # ─────────────────────────────────────────────────────────────
 
-# tasktype별 n_classes 캐시 (OrdinalCrossEntropyLoss 생성용)
 _criterion_cache: dict = {}
 
-def get_criterion(tasktype: str) -> nn.Module:
+def get_criterion(tasktype: str, label_smoothing: float = 0.1) -> nn.Module:
     """
     tabular deep learning 표준 손실 함수.
-    TabR, ModernNCA와 동일한 설정.
 
-    multiclass → CrossEntropyLoss
-    binclass   → BCEWithLogitsLoss
-    regression → MSELoss
+    변경사항: multiclass에 label_smoothing 추가
+    ─────────────────────────────────────────────────────────
+    근거: Müller et al. (NeurIPS 2019) "When Does Label Smoothing Help?"
+
+    hard routing 구조에서 CrossEntropyLoss는 정답 클래스 확률을 1.0으로
+    만드는 것을 목표로 학습합니다. 이것이 inference에서 구조적
+    overconfidence를 만드는 원인입니다.
+
+    label_smoothing=ε는 목표를 완화합니다:
+        p(y_true)  → 1 - ε + ε/C
+        p(y_other) →         ε/C
+
+    ε=0이면 기존 CrossEntropyLoss와 완전히 동일 → 하위 호환 보장.
+    순서형 가정 없이 어떤 분류 데이터에도 적용 가능 → 범용성 유지.
+
+    multiclass → CrossEntropyLoss(label_smoothing=ε)
+    binclass   → BCEWithLogitsLoss  (변경 없음)
+    regression → MSELoss            (변경 없음)
     """
     if tasktype == "regression":
         return nn.MSELoss()
     elif tasktype == "binclass":
         return nn.BCEWithLogitsLoss()
     else:
-        return nn.CrossEntropyLoss()
+        return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
 
 def is_better(new_val: float, old_val: Optional[float], tasktype: str) -> bool:

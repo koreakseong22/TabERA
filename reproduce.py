@@ -12,20 +12,22 @@ _pre, _ = _parser_pre.parse_known_args()
 if _pre.gpu_id >= 0:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre.gpu_id)
 
-import joblib, json, pickle, datetime
+import joblib, json, pickle
 import numpy as np
 import torch
+import torch.nn.functional as F
+import pandas as pd
 from pathlib import Path
+from scipy.optimize import minimize_scalar
 
 from libs.data         import TabularDataset
 from libs.search_space import params_to_model_kwargs
 from libs.supervised   import TabERAWrapper
-from libs.tabera         import TabERA
+from libs.tabera       import TabERA
 from libs.eval         import calculate_metric
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -39,7 +41,6 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
     print(f"  TabERA Explanation — Sample #{sample_idx}")
     print(f"{'━'*52}")
 
-    # ② 프로토타입 그룹 (가설 ①: centroid_features — 역정규화 없이 원본값 표시)
     proto = e["prototype"]
     print(f"\n  ① 프로토타입 그룹")
     print(f"     → \"{proto['assigned_group']}\"  (confidence={proto['group_confidence']:.1%})")
@@ -47,7 +48,6 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
         ru = ", ".join(f"\"{l}\"({s:.1%})" for l, s in proto["runners_up"])
         print(f"     Runner-up: {ru}")
 
-    # centroid 원본 feature 값 출력 (이중 공간의 핵심)
     cf = proto.get("centroid_features", {})
     if cf:
         feat_str = ",  ".join(
@@ -55,25 +55,21 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
         )
         print(f"     특성: {feat_str}")
 
-    # ③ OT 증거 선택
     ev = e["evidence"]
     print(f"\n  ② OT 증거 선택")
     print(f"     {ev['summary']}")
     for t in ev["top_evidence"]:
         print(f"     #{t['rank']} Neighbour {t['neighbour_idx']}: {t['weight_pct']}")
 
-    # ④ §3.3 Feature Cross-Attention (핵심 신규)
     fm = e.get("feature_match")
     if fm and "per_neighbour" in fm:
         print(f"\n  ③ Feature 기여도 (§3.3 Cross-Attention)")
 
-        # 전체 결정의 feature 기여도
         print(f"     [전체 결정 기여 feature]")
         for fname, score in fm["overall_features"]:
             bar = "█" * int(score * 30)
             print(f"       {fname:25s} {score*100:5.1f}%  {bar}")
 
-        # 상위 이웃 2개의 feature 기여도
         print(f"\n     [이웃별 유사 이유]")
         for nb in fm["per_neighbour"][:3]:
             print(f"       Neighbour #{nb['neighbour_idx']} "
@@ -83,6 +79,259 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
                 print(f"         {fname:23s} {score*100:5.1f}%  {bar}")
 
     print(f"{'━'*52}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Per-sample 진단
+# ─────────────────────────────────────────────────────────────
+
+def save_per_sample_diagnostics(
+    model: TabERA,
+    X_test: torch.Tensor,
+    y_test: torch.Tensor,
+    tasktype: str,
+    save_dir: Path,
+    openml_id: str,
+    seed: int,
+) -> pd.DataFrame:
+    """
+    per-sample 진단 정보를 추출하여 CSV로 저장하고 요약을 출력합니다.
+
+    저장 항목
+    ─────────
+    y_true            : 정답 레이블
+    y_pred            : 예측 레이블
+    max_prob          : 예측 클래스의 확률 (모델의 확신도)
+    correct           : 정답 여부 (True/False)
+    sample_loss       : 샘플별 cross-entropy loss (-log p(y_true))
+    assigned_centroid : 배정된 centroid 인덱스 (hard_group)
+    """
+    model.eval()
+
+    batch_size    = 512
+    all_logits    = []
+    all_centroids = []
+
+    with torch.no_grad():
+        for start in range(0, len(X_test), batch_size):
+            xb  = X_test[start:start + batch_size]
+            out = model(xb)
+            all_logits.append(out["logits"].cpu())
+            all_centroids.append(out["hard_group"].cpu())
+
+    logits_all    = torch.cat(all_logits,    dim=0)
+    centroids_all = torch.cat(all_centroids, dim=0)
+
+    if tasktype == "binclass":
+        probs_pos  = torch.sigmoid(logits_all.squeeze(-1))
+        probs_all  = torch.stack([1 - probs_pos, probs_pos], dim=-1)
+    else:
+        probs_all  = F.softmax(logits_all, dim=-1)
+
+    y_true_np   = y_test.cpu().numpy().astype(int)
+    y_pred_np   = probs_all.argmax(dim=-1).numpy().astype(int)
+    max_prob_np = probs_all.max(dim=-1).values.numpy()
+    correct_np  = (y_pred_np == y_true_np)
+    centroid_np = centroids_all.numpy().astype(int)
+
+    true_probs  = probs_all[torch.arange(len(y_true_np)), y_true_np].numpy()
+    sample_loss = -np.log(true_probs + 1e-8)
+
+    df = pd.DataFrame({
+        "y_true":            y_true_np,
+        "y_pred":            y_pred_np,
+        "max_prob":          max_prob_np.round(4),
+        "correct":           correct_np,
+        "sample_loss":       sample_loss.round(4),
+        "assigned_centroid": centroid_np,
+    })
+
+    diag_path = save_dir / f"data={openml_id}..seed{seed}_per_sample.csv"
+    df.to_csv(diag_path, index=False)
+    print(f"\n  저장: {diag_path}")
+
+    n_total   = len(df)
+    n_correct = correct_np.sum()
+    n_wrong   = n_total - n_correct
+
+    print(f"\n  {'─'*52}")
+    print(f"  [Per-sample 진단 요약]  seed={seed}  N={n_total}")
+    print(f"  {'─'*52}")
+    print(f"  전체 accuracy          : {n_correct/n_total*100:.1f}%  ({n_correct}/{n_total})")
+    print(f"  전체 평균 max_prob     : {max_prob_np.mean():.4f}")
+
+    if n_correct > 0:
+        print(f"  correct 평균 max_prob  : {df[df.correct]['max_prob'].mean():.4f}")
+    if n_wrong > 0:
+        mean_conf_wrong = df[~df.correct]["max_prob"].mean()
+        print(f"  wrong   평균 max_prob  : {mean_conf_wrong:.4f}")
+
+        wrong_high_90 = ((~df.correct) & (df.max_prob > 0.9)).sum()
+        wrong_high_70 = ((~df.correct) & (df.max_prob > 0.7)).sum()
+        print(f"\n  wrong인데 max_prob > 0.9 : {wrong_high_90}개  "
+              f"({wrong_high_90/n_wrong*100:.1f}% of wrong)")
+        print(f"  wrong인데 max_prob > 0.7 : {wrong_high_70}개  "
+              f"({wrong_high_70/n_wrong*100:.1f}% of wrong)")
+
+        overconf_ratio = wrong_high_90 / n_wrong if n_wrong > 0 else 0
+        if overconf_ratio > 0.3:
+            verdict = "⚠ overconfidence 현상 강함"
+        elif overconf_ratio > 0.1:
+            verdict = "△ overconfidence 현상 일부 존재"
+        else:
+            verdict = "○ overconfidence 현상 미미"
+        print(f"\n  판정: {verdict}")
+
+    print(f"\n  [Centroid별 오류 분포]")
+    centroid_stats = df.groupby("assigned_centroid").agg(
+        n=("correct", "count"),
+        n_wrong=("correct", lambda x: (~x).sum()),
+        mean_max_prob=("max_prob", "mean"),
+    ).reset_index()
+    centroid_stats["error_rate"] = (
+        centroid_stats["n_wrong"] / centroid_stats["n"] * 100
+    ).round(1)
+    centroid_stats["mean_max_prob"] = centroid_stats["mean_max_prob"].round(4)
+    centroid_stats = centroid_stats.sort_values("error_rate", ascending=False)
+
+    print(f"  {'centroid':>9} {'n':>5} {'n_wrong':>7} "
+          f"{'error%':>7} {'mean_conf':>10}")
+    for _, row in centroid_stats.iterrows():
+        flag = " ← collapse?" if row["error_rate"] > 60 else ""
+        print(f"  C{int(row['assigned_centroid']):>8} {int(row['n']):>5} "
+              f"{int(row['n_wrong']):>7} {row['error_rate']:>6.1f}% "
+              f"{row['mean_max_prob']:>10.4f}{flag}")
+
+    print(f"  {'─'*52}")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
+# Temperature Scaling
+# ─────────────────────────────────────────────────────────────
+
+def find_temperature(logits_val: np.ndarray, y_val_np: np.ndarray) -> float:
+    """
+    Validation set NLL을 최소화하는 Temperature T를 찾습니다.
+
+    근거: Guo et al. (ICML 2017) "On Calibration of Modern Neural Networks"
+    ────────────────────────────────────────────────────────────────────────
+    T > 1로 나누면 softmax 입력이 작아져 확률 분포가 완화됩니다.
+        calibrated_probs = softmax(logits / T)
+
+    T는 단 하나의 스칼라 파라미터이며 모델 구조와 예측 순서,
+    centroid 배정, retrieval, 설명 구조에 영향을 주지 않습니다.
+    """
+    def nll(T: float) -> float:
+        scaled     = torch.tensor(logits_val, dtype=torch.float32) / T
+        probs      = F.softmax(scaled, dim=-1).numpy()
+        true_probs = probs[np.arange(len(y_val_np)), y_val_np.astype(int)]
+        return float(-np.log(true_probs + 1e-8).mean())
+
+    result = minimize_scalar(nll, bounds=(0.1, 10.0), method="bounded")
+    return float(result.x)
+
+
+def apply_temperature_scaling(
+    model: TabERA,
+    X_val: torch.Tensor,
+    X_test: torch.Tensor,
+    y_val: torch.Tensor,
+    y_test: torch.Tensor,
+    tasktype: str,
+    output_dim: int,
+    save_dir: Path,
+    openml_id: str,
+    seed: int,
+) -> dict:
+    """
+    Temperature Scaling을 적용하고 보정 전후 지표를 비교 출력합니다.
+    regression에는 적용하지 않습니다.
+    """
+    if tasktype == "regression":
+        return {}
+
+    from sklearn.metrics import log_loss
+
+    model.eval()
+    batch_size = 512
+
+    def get_logits(X):
+        parts = []
+        with torch.no_grad():
+            for start in range(0, len(X), batch_size):
+                parts.append(model(X[start:start + batch_size])["logits"].cpu())
+        return torch.cat(parts, dim=0).numpy()
+
+    logits_val  = get_logits(X_val)
+    logits_test = get_logits(X_test)
+    y_val_np    = y_val.cpu().numpy()
+    y_test_np   = y_test.cpu().numpy().astype(int)
+
+    # ── T 최적화 ─────────────────────────────────────────
+    T = find_temperature(logits_val, y_val_np)
+    print(f"\n  {'─'*52}")
+    print(f"  [Temperature Scaling]  T = {T:.4f}")
+    print(f"  {'─'*52}")
+
+    # ── 보정 전후 logloss 비교 ───────────────────────────
+    labels = list(range(output_dim))
+
+    probs_before = F.softmax(torch.tensor(logits_test, dtype=torch.float32), dim=-1).numpy()
+    probs_after  = F.softmax(
+        torch.tensor(logits_test, dtype=torch.float32) / T, dim=-1
+    ).numpy()
+
+    logloss_before = log_loss(y_test_np, probs_before, labels=labels)
+    logloss_after  = log_loss(y_test_np, probs_after,  labels=labels)
+
+    preds_after  = probs_after.argmax(axis=1)
+    max_prob_before = probs_before.max(axis=1).mean()
+    max_prob_after  = probs_after.max(axis=1).mean()
+
+    wrong_before = y_test_np != probs_before.argmax(axis=1)
+    wrong_after  = y_test_np != preds_after
+
+    print(f"  logloss before TS  : {logloss_before:.4f}")
+    print(f"  logloss after  TS  : {logloss_after:.4f}  "
+          f"({'↓' if logloss_after < logloss_before else '↑'}"
+          f"{abs(logloss_before - logloss_after):.4f})")
+
+    print(f"\n  평균 max_prob before : {max_prob_before:.4f}")
+    print(f"  평균 max_prob after  : {max_prob_after:.4f}")
+
+    if wrong_before.sum() > 0:
+        wmp_before = probs_before.max(axis=1)[wrong_before].mean()
+        wmp_after  = probs_after.max(axis=1)[wrong_after].mean() if wrong_after.sum() > 0 else float("nan")
+        print(f"\n  wrong 평균 max_prob before : {wmp_before:.4f}")
+        print(f"  wrong 평균 max_prob after  : {wmp_after:.4f}")
+
+    # 보정 후 전체 지표
+    cal_preds  = torch.tensor(preds_after)
+    cal_probs  = torch.tensor(probs_after)
+    cal_test_metrics = calculate_metric(y_test, cal_preds, cal_probs, tasktype, "test")
+    print(f"\n  test (calibrated)  : {cal_test_metrics}")
+
+    # ── 저장 ─────────────────────────────────────────────
+    ts_path = save_dir / f"data={openml_id}..seed{seed}_temperature.pkl"
+    with open(ts_path, "wb") as f:
+        pickle.dump({
+            "T":                 T,
+            "logloss_before":    logloss_before,
+            "logloss_after":     logloss_after,
+            "cal_probs_test":    probs_after,
+            "cal_preds_test":    preds_after,
+            "cal_test_metrics":  cal_test_metrics,
+        }, f)
+    print(f"\n  저장: {ts_path}")
+    print(f"  {'─'*52}")
+
+    return {
+        "T":               T,
+        "cal_probs_test":  probs_after,
+        "cal_preds_test":  preds_after,
+        "cal_test_metrics": cal_test_metrics,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -104,6 +353,10 @@ def main():
                         help="설명 출력할 테스트 샘플 수")
     parser.add_argument("--explain",   action="store_true",
                         help="학습 후 feature 기여도 설명 출력")
+    parser.add_argument("--diagnose",  action="store_true",
+                        help="per-sample 진단 저장 (overconfidence 검증용)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Temperature Scaling으로 확률 보정")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -131,7 +384,6 @@ def main():
           f"  |  Features: {dataset.n_features}")
 
     # ── best params 로드 ───────────────────────────────────
-    # optimize.py 저장 경로와 동일하게 맞춤
     if not args.savepath.endswith("optim_logs"):
         log_dir = os.path.join(args.savepath, "optim_logs", f"seed={args.seed}")
     else:
@@ -148,7 +400,6 @@ def main():
     best_params = study.best_params
     print(f"  Best trial #{study.best_trial.number}  val={study.best_value:.4f}")
 
-    # optimize.py가 실제 사용한 n_prototypes 그대로 복원
     best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
     print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
     print(f"  Params: {best_params}")
@@ -186,7 +437,7 @@ def main():
     print(f"  val  : {val_metrics}")
     print(f"  test : {test_metrics}")
 
-    # ── 결과 저장 ──────────────────────────────────────────
+    # ── 결과 저장 (기존과 동일) ────────────────────────────
     save_dir  = Path(log_dir)
     pred_path = save_dir / f"data={openml_id}..seed{args.seed}_preds.npy"
     meta_path = save_dir / f"data={openml_id}..seed{args.seed}_meta.pkl"
@@ -197,19 +448,18 @@ def main():
     np.save(str(pred_path), logits)
 
     meta = {
-        "openml_id":   openml_id,
-        "tasktype":    tasktype,
-        "best_params": best_params,
-        "val_metrics": val_metrics,
-        "test_metrics":test_metrics,
-        "seed":        args.seed,
+        "openml_id":    openml_id,
+        "tasktype":     tasktype,
+        "best_params":  best_params,
+        "val_metrics":  val_metrics,
+        "test_metrics": test_metrics,
+        "seed":         args.seed,
     }
     with open(meta_path, "wb") as f:
         pickle.dump(meta, f)
-
     print(f"\n  저장: {pred_path}")
 
-    # ── model state 저장 (visualize_embeddings.py --from_state 용) ──
+    # ── model state 저장 (기존과 동일) ────────────────────
     state_path = save_dir / f"data={openml_id}..seed{args.seed}_model_state.pt"
     torch.save({
         "state_dict":   model.state_dict(),
@@ -223,20 +473,45 @@ def main():
     }, str(state_path))
     print(f"  저장: {state_path}")
 
-    # ── §3.3 Feature 기여도 설명 출력 ─────────────────────
+    # ── Per-sample 진단 (--diagnose) ──────────────────────
+    if args.diagnose and tasktype != "regression":
+        save_per_sample_diagnostics(
+            model     = model,
+            X_test    = X_test,
+            y_test    = y_test,
+            tasktype  = tasktype,
+            save_dir  = save_dir,
+            openml_id = openml_id,
+            seed      = args.seed,
+        )
+
+    # ── Temperature Scaling (--calibrate) ─────────────────
+    if args.calibrate and tasktype != "regression":
+        apply_temperature_scaling(
+            model      = model,
+            X_val      = X_val,
+            X_test     = X_test,
+            y_val      = y_val,
+            y_test     = y_test,
+            tasktype   = tasktype,
+            output_dim = output_dim,
+            save_dir   = save_dir,
+            openml_id  = openml_id,
+            seed       = args.seed,
+        )
+
+    # ── §3.3 Feature 기여도 설명 출력 (기존과 동일) ───────
     if args.explain:
         print(f"\n{'='*52}")
         print(f"  Feature 기여도 설명 (--explain)")
         print(f"{'='*52}")
 
-        # Centroid cosine similarity matrix 출력
         print(f"\n  [Centroid Similarity Matrix]")
         sim_mat = model.prototype_layer.cosine_similarity_matrix().numpy()
         cl = model.prototype_layer.centroid_labels
         P  = model.prototype_layer.P
         if cl is not None and not cl.isnan().any():
-            # 레이블 순서대로 centroid 정렬
-            order = cl.cpu().argsort().numpy()
+            order      = cl.cpu().argsort().numpy()
             sim_sorted = sim_mat[order][:, order]
             cl_sorted  = cl.cpu().numpy()[order]
             print(f"  centroid를 평균 레이블 순으로 정렬 ({P}개):")
@@ -244,7 +519,6 @@ def main():
             for i in range(min(P,10)):
                 row = "".join(f"{sim_sorted[i,j]:5.2f}" for j in range(min(P,10)))
                 print(f"  {cl_sorted[i]:5.1f} {row}")
-            # 순서 정합성 지표: 인접 centroid 유사도 평균
             adj_sim = np.mean([sim_sorted[i,i+1] for i in range(min(P,10)-1)])
             far_sim = np.mean([sim_sorted[i,min(i+3,min(P,10)-1)]
                                for i in range(min(P,10)-3)])
@@ -266,17 +540,16 @@ def main():
 
         explanations = out.get("explanations", [])
 
-        # FeatureStore에서 이웃 feature 값 조회하여 설명에 추가
-        if model.feature_store is not None and topk_idx is not None:
-            # topk_idx: (B, k) → B개 샘플별 k개 이웃 인덱스
-            neighbour_feats = model.feature_store.retrieve(topk_idx)  # list[list[dict]]
+        if model.feature_store is not None and out.get("topk_idx") is not None:
+            topk_idx        = out["topk_idx"]
+            neighbour_feats = model.feature_store.retrieve(topk_idx)
             for b, exp in enumerate(explanations):
                 if b < len(neighbour_feats):
-                    # 상위 5개 feature만 선택
                     exp["neighbour_features"] = [
                         model.feature_store.top_features(nd, n=5)
                         for nd in neighbour_feats[b]
                     ]
+
         if not explanations:
             print("  (설명 없음 — memory bank가 채워지지 않았습니다)")
             print("  → epochs를 늘리거나 n_trials를 더 실행하세요.")
