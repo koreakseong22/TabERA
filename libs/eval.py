@@ -246,33 +246,66 @@ class OrdinalCrossEntropyLoss(nn.Module):
 
 _criterion_cache: dict = {}
 
+class LabelSmoothingBCELoss(nn.Module):
+    """
+    binclass용 Label Smoothing BCE Loss.
+
+    BCEWithLogitsLoss는 label_smoothing 파라미터를 공식 지원하지 않으므로
+    정답 레이블을 직접 완화하는 방식으로 구현합니다.
+
+    근거: Müller et al. (NeurIPS 2019) "When Does Label Smoothing Help?"
+
+    학습 목표 완화:
+        y=1 → 1 - ε      (기존 1.0에서 완화)
+        y=0 → ε           (기존 0.0에서 완화)
+
+    ε=0이면 기존 BCEWithLogitsLoss와 완전히 동일 → 하위 호환 보장.
+    """
+    def __init__(self, epsilon: float = 0.1) -> None:
+        super().__init__()
+        self.epsilon = epsilon
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # targets: (B,) float  0.0 or 1.0
+        # y=1 → 1-ε,  y=0 → ε
+        y_smooth = targets * (1.0 - self.epsilon) + (1.0 - targets) * self.epsilon
+        return self.bce(logits, y_smooth)
+
+
 def get_criterion(tasktype: str, label_smoothing: float = 0.1) -> nn.Module:
     """
     tabular deep learning 표준 손실 함수.
 
-    변경사항: multiclass에 label_smoothing 추가
+    변경사항: binclass에도 label_smoothing 적용
     ─────────────────────────────────────────────────────────
     근거: Müller et al. (NeurIPS 2019) "When Does Label Smoothing Help?"
 
-    hard routing 구조에서 CrossEntropyLoss는 정답 클래스 확률을 1.0으로
+    hard routing 구조에서 모든 손실 함수는 정답 레이블을 1.0으로
     만드는 것을 목표로 학습합니다. 이것이 inference에서 구조적
     overconfidence를 만드는 원인입니다.
 
     label_smoothing=ε는 목표를 완화합니다:
+
+    multiclass:
         p(y_true)  → 1 - ε + ε/C
         p(y_other) →         ε/C
 
-    ε=0이면 기존 CrossEntropyLoss와 완전히 동일 → 하위 호환 보장.
+    binclass:
+        y=1 → 1 - ε
+        y=0 → ε
+
+    ε=0이면 기존 손실 함수와 완전히 동일 → 하위 호환 보장.
     순서형 가정 없이 어떤 분류 데이터에도 적용 가능 → 범용성 유지.
 
     multiclass → CrossEntropyLoss(label_smoothing=ε)
-    binclass   → BCEWithLogitsLoss  (변경 없음)
-    regression → MSELoss            (변경 없음)
+    binclass   → LabelSmoothingBCELoss(epsilon=ε)
+    regression → MSELoss  (변경 없음)
     """
     if tasktype == "regression":
         return nn.MSELoss()
     elif tasktype == "binclass":
-        return nn.BCEWithLogitsLoss()
+        return LabelSmoothingBCELoss(epsilon=label_smoothing)
     else:
         return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
