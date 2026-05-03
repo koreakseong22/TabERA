@@ -9,6 +9,7 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+aggregate_results.py
 
 # 데이터 캐시
 *.parquet
