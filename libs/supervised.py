@@ -222,6 +222,14 @@ class TabERAWrapper:
                             f"max={ema_stats['max_cluster_size']}  "
                         )
 
+                    # ── Centroid collapse 감지 → 조기 종료 ──────────
+                    if ema_stats.get("active_ratio", 1.0) < 0.1:
+                        tqdm.write(
+                            f"  [STOP] Centroid collapse at epoch {epoch} "
+                            f"(active={ema_stats['active_ratio']:.0%}). Early exit."
+                        )
+                        break
+
             avg_loss = tr_loss / max(n_batch, 1)
 
             # ── 검증 ──────────────────────────────────────
