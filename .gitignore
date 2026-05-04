@@ -10,6 +10,7 @@ __pycache__/
 .venv/
 venv/
 aggregate_results.py
+rename_by_seed.py
 
 # 데이터 캐시
 *.parquet
