@@ -163,36 +163,59 @@ class MemoryBank(nn.Module):
         out_labels = torch.zeros(B, k,            device=dev)
         top_k_idx = torch.zeros(B, k, dtype=torch.long, device=dev)
 
-        # ── 정상 샘플: 벡터화 처리 ──────────────────────────────
+        # ── 정상 샘플: 청크 단위 처리 (OOM 방지) ───────────────────
         if normal_mask.any():
             nm_idx   = normal_mask.nonzero(as_tuple=True)[0]  # (Bn,)
             ha_nm    = ha[nm_idx]                              # (Bn,)
             q_nm     = q_norm[nm_idx]                          # (Bn, D)
 
-            # cached_groups[ha_nm] → (Bn, max_g) 후보 인덱스
             cand_idx   = self._cached_groups[ha_nm]            # (Bn, max_g)
             max_g      = cand_idx.shape[1]
             valid_mask = (cand_idx >= 0)                       # (Bn, max_g)
             safe_idx   = cand_idx.clamp(min=0, max=n - 1)
+            k_eff      = min(k, max_g)
 
-            keys_c = F.normalize(
-                keys_full[safe_idx.view(-1)].view(nm_idx.shape[0], max_g, D),
-                dim=-1,
-            )                                                  # (Bn, max_g, D)
+            Bn = nm_idx.shape[0]
 
-            sim_nm = torch.bmm(
-                q_nm.unsqueeze(1), keys_c.transpose(1, 2)
-            ).squeeze(1)                                       # (Bn, max_g)
-            sim_nm = sim_nm.masked_fill(~valid_mask, -1e9)
+            # 청크 크기: max_g × D × 4bytes 기준 256MB 이하로 제한
+            # 예) max_g=5000, D=256 → 5000×256×4 = 5MB/샘플 → chunk=50이면 250MB
+            chunk = max(1, min(Bn, (256 * 1024 * 1024) // max(max_g * D * 4, 1)))
 
-            k_eff     = min(k, max_g)
-            _, top    = sim_nm.topk(k_eff, dim=-1)            # (Bn, k)
-            i_final   = safe_idx.gather(1, top)               # (Bn, k)
+            i_final_all    = torch.zeros(Bn, k_eff, dtype=torch.long, device=dev)
+            out_nk_chunk   = torch.zeros(Bn, k_eff, D, device=dev)
+            out_nv_chunk   = torch.zeros(Bn, k_eff, D, device=dev)
+            out_labels_chunk = torch.zeros(Bn, k_eff, device=dev)
 
-            out_nk[nm_idx]     = keys_full[i_final.view(-1)].view(nm_idx.shape[0], k_eff, D)
-            out_nv[nm_idx]     = vals_full[i_final.view(-1)].view(nm_idx.shape[0], k_eff, D)
-            out_labels[nm_idx] = labels_full[i_final.clamp(0, n - 1)]  # (Bn, k)
-            top_k_idx[nm_idx]  = i_final
+            for start in range(0, Bn, chunk):
+                end = min(start + chunk, Bn)
+                sl  = slice(start, end)
+
+                si_c  = safe_idx[sl]      # (c, max_g)
+                vm_c  = valid_mask[sl]    # (c, max_g)
+                q_c   = q_nm[sl]          # (c, D)
+
+                keys_c = F.normalize(
+                    keys_full[si_c.reshape(-1)].view(end - start, max_g, D),
+                    dim=-1,
+                )                                              # (c, max_g, D)
+
+                sim_c = torch.bmm(
+                    q_c.unsqueeze(1), keys_c.transpose(1, 2)
+                ).squeeze(1)                                   # (c, max_g)
+                sim_c = sim_c.masked_fill(~vm_c, -1e9)
+
+                _, top_c   = sim_c.topk(k_eff, dim=-1)        # (c, k)
+                i_final_c  = si_c.gather(1, top_c)            # (c, k)
+
+                i_final_all[sl]      = i_final_c
+                out_nk_chunk[sl]     = keys_full[i_final_c.reshape(-1)].view(end - start, k_eff, D)
+                out_nv_chunk[sl]     = vals_full[i_final_c.reshape(-1)].view(end - start, k_eff, D)
+                out_labels_chunk[sl] = labels_full[i_final_c.clamp(0, n - 1)]
+
+            out_nk[nm_idx]     = out_nk_chunk
+            out_nv[nm_idx]     = out_nv_chunk
+            out_labels[nm_idx] = out_labels_chunk
+            top_k_idx[nm_idx]  = i_final_all
 
         # fallback 샘플: zeros 유지 (초기 1~2 에폭만 해당)
 
@@ -454,4 +477,3 @@ class TabERA(nn.Module):
                  f"  Dual-Space  : {'ON' if self.prototype_layer.F > 0 else 'OFF'}"]
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)
-    
