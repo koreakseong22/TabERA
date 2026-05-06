@@ -22,6 +22,7 @@ from libs.search_space import params_to_model_kwargs
 from libs.supervised   import TabERAWrapper
 from libs.tabera         import TabERA
 from libs.eval         import calculate_metric
+from libs.diagnostics  import run_phase1_diagnostics
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -137,7 +138,11 @@ def main():
     else:
         log_dir = args.savepath
 
-    fname = os.path.join(log_dir, f"data={openml_id}..model=tabera.pkl")
+    fname = os.path.join(log_dir, f"data={openml_id}..seed{args.seed}..model=tabera.pkl")
+    # 구파일명 패턴 fallback (data_10__seed1__model_tabera.pkl)
+    fname_alt = os.path.join(log_dir, f"data_{openml_id}__seed{args.seed}__model_tabera.pkl")
+    if not os.path.exists(fname) and os.path.exists(fname_alt):
+        fname = fname_alt
     if not os.path.exists(fname):
         raise FileNotFoundError(
             f"최적화 로그 없음: {fname}\n"
@@ -223,6 +228,31 @@ def main():
     }, str(state_path))
     print(f"  저장: {state_path}")
 
+    # ── Phase 1 진단 ───────────────────────────────────────
+    print(f"\n{'='*52}")
+    print(f"  Phase 1 Diagnostics")
+    print(f"{'='*52}")
+
+    model._wrapper = wrapper  # ema_history 접근용
+
+    diag = run_phase1_diagnostics(
+        model          = model,
+        X_test         = X_test,
+        y_test         = y_test,
+        X_train        = X_train,
+        tasktype       = tasktype,
+        top_m          = 3,
+        n_faithfulness = min(200, len(y_test)),
+        n_entropy      = min(500, len(y_test)),
+        device         = str(device),
+    )
+
+    # 진단 결과를 meta에 함께 저장
+    meta["phase1_diagnostics"] = diag
+    with open(meta_path, "wb") as f:
+        pickle.dump(meta, f)
+    print(f"  진단 결과 저장 완료: {meta_path}")
+
     # ── §3.3 Feature 기여도 설명 출력 ─────────────────────
     if args.explain:
         print(f"\n{'='*52}")
@@ -265,6 +295,7 @@ def main():
             out = model(X_show, return_explanations=True)
 
         explanations = out.get("explanations", [])
+        topk_idx     = out.get("topk_idx", None)
 
         # FeatureStore에서 이웃 feature 값 조회하여 설명에 추가
         if model.feature_store is not None and topk_idx is not None:

@@ -232,11 +232,20 @@ class CentroidLayer(nn.Module):
 
         Returns
         ───────
-        stats: {"active_ratio": float, "min_cluster_size": int, "max_cluster_size": int}
+        stats: dict with keys —
+            active_ratio, active_centroids, min/max_cluster_size  (기존)
+            mean_cluster_size, std_cluster_size, max_mean_ratio,  (Phase 1 신규)
+            empty_ratio, usage_entropy_hard_norm                  (Phase 1 신규)
         """
         epoch = self.current_epoch.item()
         if epoch < self.ema_warmup_epochs:
-            return {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
+            return {
+                "active_ratio": 0.0, "active_centroids": 0, "pruned_this_epoch": 0,
+                "min_cluster_size": 0, "max_cluster_size": 0,
+                "mean_cluster_size": 0.0, "std_cluster_size": 0.0,
+                "max_mean_ratio": 0.0, "empty_ratio": 1.0,
+                "usage_entropy_hard_norm": 0.0,
+            }
 
         if assignments is None:
             # 현재 centroid 기준으로 재배정
@@ -270,15 +279,50 @@ class CentroidLayer(nn.Module):
         self.sample_groups = new_groups
         self.current_epoch += 1
 
-        # 통계
-        n_assigned = sum(1 for s in sizes if s > 0)
+        # ── 기본 통계 ────────────────────────────────────────────
+        n_assigned   = sum(1 for s in sizes if s > 0)
+        active_sizes = [s for s in sizes if s > 0]
+
+        # ── Phase 1: bucket size 분포 ────────────────────────────
+        if active_sizes:
+            mean_s = sum(active_sizes) / len(active_sizes)
+            var_s  = sum((s - mean_s) ** 2 for s in active_sizes) / len(active_sizes)
+            std_s  = math.sqrt(var_s)
+            max_s  = max(active_sizes)
+            max_mean_ratio = round(max_s / mean_s, 3) if mean_s > 0 else 0.0
+        else:
+            mean_s = std_s = max_mean_ratio = 0.0
+
+        empty_ratio = round(1.0 - len(active_sizes) / self.P, 3)
+
+        # ── Phase 1: hard assignment usage entropy ───────────────
+        # entropy_loss(routing_probs)의 forward 값이 hard_one_hot이므로
+        # 이 지표가 entropy_loss가 실제로 최대화하는 값과 동일함
+        total = sum(sizes)
+        if total > 0 and self.P > 1:
+            ent = 0.0
+            for s in sizes:
+                if s > 0:
+                    p_k = s / total
+                    ent -= p_k * math.log(p_k + 1e-8)
+            usage_entropy_hard_norm = round(ent / math.log(self.P), 4)
+        else:
+            usage_entropy_hard_norm = 0.0
 
         return {
-            "active_ratio":     n_assigned / self.P,
-            "active_centroids": int(n_assigned),
+            # 기존 (하위 호환 유지)
+            "active_ratio":      n_assigned / self.P,
+            "active_centroids":  int(n_assigned),
             "pruned_this_epoch": 0,
-            "min_cluster_size": int(min(sizes)) if sizes else 0,
-            "max_cluster_size": int(max(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
+            "min_cluster_size":  int(min(sizes)) if sizes else 0,
+            "max_cluster_size":  int(max(active_sizes)) if active_sizes else 0,
+            # Phase 1 신규: bucket size 분포
+            "mean_cluster_size": round(mean_s, 2),
+            "std_cluster_size":  round(std_s, 2),
+            "max_mean_ratio":    max_mean_ratio,
+            "empty_ratio":       empty_ratio,
+            # Phase 1 신규: hard usage entropy
+            "usage_entropy_hard_norm": usage_entropy_hard_norm,
         }
 
     # ─────────────────────────────────────────────────────────

@@ -25,6 +25,49 @@ from libs.tabera import TabERA
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 1 헬퍼: bucket label purity
+# ─────────────────────────────────────────────────────────────
+
+def _compute_label_purity(
+    sample_groups: list,
+    y_train_np: np.ndarray,
+) -> tuple:
+    """
+    Bucket label purity 계산.
+
+    각 centroid bucket 내 샘플의 label 분포에서 majority label 비율을
+    bucket 크기로 가중 평균한다.
+
+    주의: class imbalance가 심한 데이터에서는 purity가 과대평가될 수 있으므로
+    단독 지표가 아닌 진단 보조 지표로 사용한다.
+
+    Returns:
+        (weighted_purity, unweighted_purity) — 둘 다 [0, 1]
+    """
+    purity_list = []
+    weight_list = []
+
+    for grp in sample_groups:
+        if len(grp) == 0:
+            continue
+        labels_in_bucket = y_train_np[grp]
+        unique, counts = np.unique(labels_in_bucket, return_counts=True)
+        majority_count  = int(counts.max())
+        purity_p        = majority_count / len(grp)
+        purity_list.append(purity_p)
+        weight_list.append(len(grp))
+
+    if not purity_list:
+        return 0.0, 0.0
+
+    total_weight     = sum(weight_list)
+    weighted_purity  = sum(p * w for p, w in zip(purity_list, weight_list)) / total_weight
+    simple_purity    = sum(purity_list) / len(purity_list)
+
+    return round(weighted_purity, 4), round(simple_purity, 4)
+
+
+# ─────────────────────────────────────────────────────────────
 # TqdmLoggingHandler  (MultiTab 원본과 동일)
 # ─────────────────────────────────────────────────────────────
 
@@ -195,13 +238,32 @@ class TabERAWrapper:
                     x_ema    = X_train
                     ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
                     self.final_ema_stats = dict(ema_stats)
+
+                    # ── Phase 1: label purity 계산 ───────────────────────
+                    y_np = y_train.cpu().numpy() if hasattr(y_train, 'cpu') else np.array(y_train)
+                    purity_weighted, purity_simple = _compute_label_purity(
+                        sample_groups=self.model.prototype_layer.sample_groups,
+                        y_train_np=y_np,
+                    )
+
                     self.ema_history.append({
-                        "epoch": float(epoch),
-                        "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
-                        "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
+                        "epoch":             float(epoch),
+                        # 기존 (하위 호환)
+                        "active_ratio":      float(ema_stats.get("active_ratio", 0.0)),
+                        "active_centroids":  float(ema_stats.get("active_centroids", 0.0)),
                         "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
-                        "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
-                        "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
+                        "min_cluster_size":  float(ema_stats.get("min_cluster_size", 0.0)),
+                        "max_cluster_size":  float(ema_stats.get("max_cluster_size", 0.0)),
+                        # Phase 1 신규: bucket size 분포
+                        "mean_cluster_size": float(ema_stats.get("mean_cluster_size", 0.0)),
+                        "std_cluster_size":  float(ema_stats.get("std_cluster_size", 0.0)),
+                        "max_mean_ratio":    float(ema_stats.get("max_mean_ratio", 0.0)),
+                        "empty_ratio":       float(ema_stats.get("empty_ratio", 0.0)),
+                        # Phase 1 신규: entropy
+                        "usage_entropy_hard_norm": float(ema_stats.get("usage_entropy_hard_norm", 0.0)),
+                        # Phase 1 신규: label purity
+                        "bucket_label_purity":            float(purity_weighted),
+                        "bucket_label_purity_unweighted": float(purity_simple),
                     })
 
                     # 에폭당 1회: sample_groups를 GPU 텐서로 캐시 (76,800번 변환 제거)
@@ -210,16 +272,13 @@ class TabERAWrapper:
                         device=torch.device(self.device),
                     )
                     if epoch % 10 == 0:
-                        # 검색 범위 축소율 계산 (가설 ②)
-                        n_total = len(X_train)
-                        n_proto = self.model.prototype_layer.P
-                        avg_cand = n_total / n_proto if n_proto > 0 else n_total
-                        reduction = (1 - avg_cand / n_total) * 100
                         pbar.write(
-                            f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
-                            f"alive={ema_stats.get('active_centroids', 0)}  "
-                            f"min={ema_stats['min_cluster_size']}  "
-                            f"max={ema_stats['max_cluster_size']}  "
+                            f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%"
+                            f"  mean={ema_stats.get('mean_cluster_size', 0):.0f}"
+                            f"  max/mean={ema_stats.get('max_mean_ratio', 0):.2f}"
+                            f"  empty={ema_stats.get('empty_ratio', 0)*100:.0f}%"
+                            f"  H_hard={ema_stats.get('usage_entropy_hard_norm', 0):.3f}"
+                            f"  purity={purity_weighted:.3f}"
                         )
 
                     # ── Centroid collapse 감지 → 조기 종료 ──────────
