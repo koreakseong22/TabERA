@@ -373,13 +373,15 @@ class CentroidLayer(nn.Module):
     def forward(
         self,
         query_emb: torch.Tensor,                          # (B, D)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
         ───────
         context_emb    : (B, D)  — centroid 혼합 컨텍스트 (미분 가능)
         hard_assignment: (B,)    — Top-1 centroid 인덱스 (FAISS 마스킹 + 설명용)
-        routing_probs  : (B, P)  — STE용 soft routing 확률
+        routing_probs  : (B, P)  — STE routing (forward=hard, backward=soft gradient)
+        soft_probs     : (B, P)  — 순수 softmax 확률 (Phase 2 soft cohesion loss용)
+                                   routing_probs와 달리 forward도 soft 값 유지
         """
         # 코사인 유사도 로짓
         q = F.normalize(query_emb, dim=-1)               # (B, D)
@@ -394,17 +396,17 @@ class CentroidLayer(nn.Module):
         # collapse 방지: entropy loss (VQ-VAE-2, Razavi et al., NeurIPS 2019)
         hard_assignment = logits.argmax(dim=-1)              # (B,)
         hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
-        soft = F.softmax(logits, dim=-1)                     # (B, P)
+        soft_probs = F.softmax(logits, dim=-1)               # (B, P) — 순수 soft
 
         if self.training:
-            routing_probs = soft + (hard_one_hot - soft).detach()
+            routing_probs = soft_probs + (hard_one_hot - soft_probs).detach()
         else:
             routing_probs = hard_one_hot
 
         # 컨텍스트: routing_probs로 centroid 혼합
         context_emb = self.dropout(routing_probs @ self.centroid_emb)  # (B, D)
 
-        return context_emb, hard_assignment, routing_probs
+        return context_emb, hard_assignment, routing_probs, soft_probs
 
     # ─────────────────────────────────────────────────────────
     # Auxiliary Losses (기존 tabr.py 호환)

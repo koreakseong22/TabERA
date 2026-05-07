@@ -105,6 +105,8 @@ def main():
                         help="설명 출력할 테스트 샘플 수")
     parser.add_argument("--explain",   action="store_true",
                         help="학습 후 feature 기여도 설명 출력")
+    parser.add_argument("--loss_cohesion", type=float, default=1e-3,
+                        help="Phase 2 soft feature cohesion loss 가중치 (0.0=비활성화)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -155,7 +157,13 @@ def main():
 
     # optimize.py가 실제 사용한 n_prototypes 그대로 복원
     best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
+
+    # ── Phase 2: loss_cohesion 주입 ──────────────────────────
+    # HPO params에 없는 경우(Phase 1 시절 결과) --loss_cohesion 인자로 주입
+    best_params["loss_cohesion"] = args.loss_cohesion
+    cohesion_status = f"{args.loss_cohesion:.0e}" if args.loss_cohesion > 0 else "OFF"
     print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
+    print(f"  loss_cohesion: {cohesion_status}")
     print(f"  Params: {best_params}")
 
     # ── 모델 구성 ──────────────────────────────────────────
@@ -318,3 +326,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

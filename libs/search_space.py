@@ -31,6 +31,7 @@ def suggest_initial_trial() -> dict:
         "loss_diversity":   0.01,
         "loss_commitment":  0.01,
         "loss_entropy":     0.01,
+        "loss_cohesion":    1e-3,   # Phase 2: soft feature cohesion (작게 시작)
         "lr":               3e-4,
         "weight_decay":     1e-5,
         "batch_size":       256,
@@ -80,6 +81,9 @@ def get_search_space(
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-4, 1e-1, log=True),
         # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
         "loss_entropy":    trial.suggest_float("loss_entropy",    1e-3, 1e-1, log=True),
+        # Phase 2: soft feature cohesion — embedding routing을 feature-space prototype과 정렬
+        # 0.0이면 비활성화 (Phase 1과 동일), 작게 시작할 것
+        "loss_cohesion":   trial.suggest_float("loss_cohesion",   1e-4, 1e-2, log=True),
 
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
@@ -110,5 +114,6 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
             "diversity":        params["loss_diversity"],
             "commitment":       params["loss_commitment"],
             "entropy":          params["loss_entropy"],
+            "cohesion":         params.get("loss_cohesion", 0.0),  # Phase 2, 없으면 0
         },
     }

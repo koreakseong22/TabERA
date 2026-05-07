@@ -303,7 +303,8 @@ class TabERA(nn.Module):
     memory_size       : 메모리 뱅크 최대 크기
     embedder_layers   : TabularEmbedder ResidualMLP 수
     dropout           : 전역 드롭아웃
-    loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': .., 'entropy': ..}
+    loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': .., 'entropy': .., 'cohesion': ..}
+                        cohesion=0.0 이면 Phase 1과 동일 (기본값, 하위 호환)
     column_names      : 특성 컬럼명 (설명 출력용)
     """
 
@@ -386,7 +387,9 @@ class TabERA(nn.Module):
         query_emb = self.embedder(X)               # (B, D)
 
         # 2. 프로토타입 라우팅 (CentroidLayer)
-        context_emb, hard_assignment, routing_probs = self.prototype_layer(query_emb)
+        # soft_probs: 순수 softmax 확률 — Phase 2 soft cohesion loss에 사용
+        # routing_probs: STE (forward=hard, backward=soft gradient)
+        context_emb, hard_assignment, routing_probs, soft_probs = self.prototype_layer(query_emb)
 
         # 3. 그룹별 부분 검색을 위한 sample_groups
         sample_groups = self.prototype_layer.sample_groups
@@ -426,6 +429,27 @@ class TabERA(nn.Module):
                 + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
                 + self.loss_weights.get("entropy", 0.01) * self.prototype_layer.entropy_loss(routing_probs)
             )
+
+            # ── Phase 2: Soft Feature Cohesion Loss ─────────────────
+            # 목적: soft routing probability가 feature-space prototype proximity와
+            #        정렬되도록 유도 (embedding routing → feature space 해석 가능성 강화)
+            #
+            # 설계 원칙:
+            #   - C_x는 EMA buffer (gradient 없음) → C_x.detach() 필수
+            #   - soft_probs (진짜 softmax) 사용 → routing_probs(STE)와 구분
+            #   - X는 이미 전처리된 normalized feature → scale 통일
+            #   - / X.size(1) 로 feature 차원 정규화 → λ_cohesion 튜닝 안정화
+            #
+            # gradient 흐름:
+            #   L_cohesion → soft_probs → logits → query_emb → ResidualMLP
+            #                                     → centroid_emb
+            #   (C_x는 EMA로만 갱신, gradient 없음)
+            lw_cohesion = self.loss_weights.get("cohesion", 0.0)
+            if lw_cohesion > 0 and self.prototype_layer.centroid_x is not None:
+                C_x    = self.prototype_layer.centroid_x.detach()  # (P, F)
+                dist_x = torch.cdist(X.float(), C_x.float(), p=2).pow(2) / X.size(1)  # (B, P)
+                L_cohesion = (soft_probs * dist_x).sum(dim=1).mean()
+                aux_loss = aux_loss + lw_cohesion * L_cohesion
 
         out = {
             "logits":      logits,
