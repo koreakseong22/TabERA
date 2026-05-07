@@ -28,8 +28,8 @@ def suggest_initial_trial() -> dict:
         "k":                16,
         "embedder_layers":  2,
         "dropout":          0.1,
-        "loss_diversity":   0.01,
-        "loss_commitment":  0.01,
+        "loss_diversity":   0.05,
+        "loss_commitment":  0.05,
         "loss_entropy":     0.01,
         "lr":               3e-4,
         "weight_decay":     1e-5,
@@ -77,9 +77,14 @@ def get_search_space(
         # 근거: credit-approval(id=29) seed=1에서 loss_diversity=0.000357이
         #       선택됐을 때 centroid collapse 발생이 실험적으로 확인됨.
         #       diversity=0.1로 override 시 collapse 해소 확인.
-        #       하한을 1e-2로 올려 HPO가 collapse 유발 범위를 탐색하지 않도록 제한.
         "loss_diversity":  trial.suggest_float("loss_diversity",  1e-2, 5e-1, log=True),
-        "loss_commitment": trial.suggest_float("loss_commitment", 1e-4, 1e-1, log=True),
+
+        # [수정] loss_commitment 하한: 1e-4 → 1e-2
+        # 근거: colic(id=25) seed=1에서 loss_diversity=0.466, loss_commitment=0.0019으로
+        #       diversity:commitment 비율이 244:1이 되어 centroid가 데이터에서 멀어지는
+        #       현상 확인. 두 loss가 같은 order of magnitude에서 탐색되도록 하한 통일.
+        "loss_commitment": trial.suggest_float("loss_commitment", 1e-2, 1e-1, log=True),
+
         # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
         "loss_entropy":    trial.suggest_float("loss_entropy",    1e-3, 1e-1, log=True),
 
