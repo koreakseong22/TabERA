@@ -72,11 +72,13 @@ def get_search_space(
         "embedder_layers": trial.suggest_int("embedder_layers", 1, 4),
         "dropout":         trial.suggest_float("dropout", 0.0, 0.5, step=0.05),
 
-        # ── Gumbel 온도 ────────────────────────────────
-
         # ── 보조 손실 가중치 ────────────────────────────
-        # loss_diversity 상한 확장: centroid 분산 강화 → 소수 클래스 centroid 생존율 향상
-        "loss_diversity":  trial.suggest_float("loss_diversity",  1e-4, 5e-1, log=True),
+        # [수정] loss_diversity 하한: 1e-4 → 1e-2
+        # 근거: credit-approval(id=29) seed=1에서 loss_diversity=0.000357이
+        #       선택됐을 때 centroid collapse 발생이 실험적으로 확인됨.
+        #       diversity=0.1로 override 시 collapse 해소 확인.
+        #       하한을 1e-2로 올려 HPO가 collapse 유발 범위를 탐색하지 않도록 제한.
+        "loss_diversity":  trial.suggest_float("loss_diversity",  1e-2, 5e-1, log=True),
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-4, 1e-1, log=True),
         # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
         "loss_entropy":    trial.suggest_float("loss_entropy",    1e-3, 1e-1, log=True),
@@ -107,8 +109,8 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "dropout":         params["dropout"],
         "n_output":        n_output,
         "loss_weights": {
-            "diversity":        params["loss_diversity"],
-            "commitment":       params["loss_commitment"],
-            "entropy":          params["loss_entropy"],
+            "diversity":   params["loss_diversity"],
+            "commitment":  params["loss_commitment"],
+            "entropy":     params["loss_entropy"],
         },
     }
