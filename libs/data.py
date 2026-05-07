@@ -8,6 +8,10 @@ train(80%) / val(10%) / test(10%) 고정 분할을 제공합니다.
 CA(999999)는 sklearn에서 로드하며, 나머지는 openml 라이브러리를 사용합니다.
 
 [변경] NaN imputation: median → mean  (TabZilla 원논문 전처리와 통일)
+[변경] X 정규화: z-score → QuantileTransformer(output_distribution='uniform')
+       (Gorishniy et al. 2023, TabR 논문 표준 전처리와 통일)
+       categorical features(label-encoded)는 정규화 제외,
+       numerical features에만 적용.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ import torch
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, QuantileTransformer
 
 warnings.filterwarnings("ignore")
 
@@ -70,16 +74,23 @@ def _split_data(arrays, seed=RANDOM_SEED, stratify_by=None):
     return splits
 
 
-def _preprocess_X(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+def _preprocess_X(df: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[int], List[int]]:
     """
     수치형 + 범주형을 모두 float32로 변환 (Label-encode cat).
     컬럼명은 sanitize 처리.
-    반환: X (N, F) float32,  col_names list[str]
 
     NaN imputation: mean (TabZilla 원논문 전처리와 통일)
+
+    반환:
+        X          : (N, F) float32
+        col_names  : list[str]
+        num_indices: numerical feature의 열 인덱스 (QuantileTransformer 적용 대상)
+        cat_indices: categorical feature의 열 인덱스 (정규화 제외)
     """
-    out_cols = []
-    out_parts = []
+    out_cols    = []
+    out_parts   = []
+    num_indices = []
+    cat_indices = []
 
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
@@ -87,18 +98,21 @@ def _preprocess_X(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     if num_cols:
         # TabZilla 원논문: NaN → mean imputation
         X_num = df[num_cols].astype(np.float32).fillna(df[num_cols].mean())
-        for c in num_cols:
+        start = len(out_cols)
+        for i, c in enumerate(num_cols):
             out_cols.append(_sanitize_col(c))
+            num_indices.append(start + i)
         out_parts.append(X_num.values)
 
     for c in cat_cols:
         le = LabelEncoder()
         enc = le.fit_transform(df[c].astype(str)).astype(np.float32)
+        cat_indices.append(len(out_cols))
         out_cols.append(_sanitize_col(c))
         out_parts.append(enc.reshape(-1, 1))
 
     X = np.concatenate(out_parts, axis=1) if out_parts else np.zeros((len(df), 0), dtype=np.float32)
-    return X, out_cols
+    return X, out_cols, num_indices, cat_indices
 
 
 # ─────────────────────────────────────────────────────────────
@@ -132,6 +146,9 @@ def load_dataset(
         tasktype               : str
         name / fullname        : str
         label_encoder          : LabelEncoder or None
+        qt                     : QuantileTransformer (numerical features용)
+        num_indices            : list[int] — QuantileTransformer 적용된 열 인덱스
+        cat_indices            : list[int] — categorical 열 인덱스 (정규화 미적용)
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -181,7 +198,7 @@ def load_dataset(
             y_s = pd.Series(y_s.values)
 
     # ── 전처리 ────────────────────────────────────────
-    X, col_names = _preprocess_X(df)
+    X, col_names, num_indices, cat_indices = _preprocess_X(df)
     y, label_encoder = _encode_target(y_s, tasktype)
     n_classes = len(np.unique(y)) if tasktype != "regression" else None
 
@@ -190,12 +207,16 @@ def load_dataset(
     strat = y if tasktype != 'regression' else None
     (X_tr, X_va, X_te), (y_tr, y_va, y_te) = _split_data([X, y], seed=seed, stratify_by=strat)
 
-    # ── 정규화 (train 기준) ───────────────────────────
-    mean = X_tr.mean(axis=0)
-    std  = X_tr.std(axis=0) + 1e-8
-    X_tr = (X_tr - mean) / std
-    X_va = (X_va - mean) / std
-    X_te = (X_te - mean) / std
+    # ── X 정규화: QuantileTransformer (numerical features만) ──
+    # Gorishniy et al. 2023 (TabR) 표준 전처리.
+    # categorical features(label-encoded 정수)는 정규화하지 않음.
+    # train에서만 fit → val/test에 transform (leakage 방지).
+    qt = None
+    if num_indices:
+        qt = QuantileTransformer(output_distribution='uniform', random_state=42)
+        X_tr[:, num_indices] = qt.fit_transform(X_tr[:, num_indices]).astype(np.float32)
+        X_va[:, num_indices] = qt.transform(X_va[:, num_indices]).astype(np.float32)
+        X_te[:, num_indices] = qt.transform(X_te[:, num_indices]).astype(np.float32)
 
     # ── regression y 정규화 (MultiTab: y_std 저장) ──────
     y_std = np.array(1.0, dtype=np.float32)
@@ -218,9 +239,10 @@ def load_dataset(
         fullname=fullname,
         openml_id=oid,
         label_encoder=label_encoder,
-        norm_mean=mean,
-        norm_std=std,
-        y_std=y_std,          # regression 역정규화용 (MultiTab 호환)
+        qt=qt,                    # QuantileTransformer (inference 시 역변환용)
+        num_indices=num_indices,  # numerical feature 열 인덱스
+        cat_indices=cat_indices,  # categorical feature 열 인덱스
+        y_std=y_std,              # regression 역정규화용 (MultiTab 호환)
     )
 
 
@@ -281,11 +303,11 @@ class TabularDataset:
             return torch.tensor(arr, dtype=torch.float32).to(device)
 
         self._X_train = _t(data["X_train"])
-        self._y_train = _t(data["y_train"], is_label=True)   # (N,) 1D
+        self._y_train = _t(data["y_train"], is_label=True)
         self._X_val   = _t(data["X_val"])
-        self._y_val   = _t(data["y_val"],   is_label=True)   # (N,) 1D
+        self._y_val   = _t(data["y_val"],   is_label=True)
         self._X_test  = _t(data["X_test"])
-        self._y_test  = _t(data["y_test"],  is_label=True)   # (N,) 1D
+        self._y_test  = _t(data["y_test"],  is_label=True)
 
         self.y_std       = data["y_std"]
         self.col_names   = data["col_names"]
@@ -295,6 +317,9 @@ class TabularDataset:
         self.name        = data["name"]
         self.fullname    = data["fullname"]
         self.openml_id   = str(openml_id)
+        self.qt          = data["qt"]           # QuantileTransformer
+        self.num_indices = data["num_indices"]  # numerical 열 인덱스
+        self.cat_indices = data["cat_indices"]  # categorical 열 인덱스
 
     def _indv_dataset(self):
         """
@@ -306,4 +331,3 @@ class TabularDataset:
             (self._X_val,   self._y_val),
             (self._X_test,  self._y_test),
         )
-    
