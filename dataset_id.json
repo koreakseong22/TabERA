@@ -1308,5 +1308,17 @@
         "name": "AZ",
         "fullname": "Amazon_employee_access",
         "tasktype": "binclass"
+    },
+
+    "1468": {
+        "name": "CN",
+        "fullname": "cnae-9",
+        "tasktype": "multiclass"
+    },
+
+    "4134": {
+        "name": "BR",
+        "fullname": "Bioresponse",
+        "tasktype": "binclass"
     }
 }
