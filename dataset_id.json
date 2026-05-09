@@ -1320,5 +1320,11 @@
         "name": "BR",
         "fullname": "Bioresponse",
         "tasktype": "binclass"
+    },
+
+    "41159": {
+        "name": "GU",
+        "fullname": "guillermo",
+        "tasktype": "binclass"
     }
 }
