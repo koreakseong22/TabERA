@@ -11,6 +11,7 @@ __pycache__/
 venv/
 aggregate_results.py
 rename_by_seed.py
+fetch_tabzilla.py
 
 # 데이터 캐시
 *.parquet

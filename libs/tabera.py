@@ -8,6 +8,8 @@ MultiTab의 tabr.py를 대체하는 파일입니다.
 
   2. CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
   3. AttentionAggregator  : TabR 방식 similarity 기반 이웃 집계
+                            + [개선 1] FiLM Centroid Conditioning
+                            + [개선 2] Gated Feature Fusion
 
 Forward 흐름
 ------------
@@ -16,10 +18,22 @@ Forward 흐름
   query_emb (B, D)
     ├─ CentroidLayer(query_emb) → context_emb (B, D) + routing + FAISS mask
     └─ MemoryBank.retrieve → k neighbours + neighbour_labels
-         ↓ AttentionAggregator
-       agg_emb (B, D) + evidence_weights (B, k)
+         ↓ AttentionAggregator(query_emb, nk, nv, labels, context_emb)
+         │  ├─ [개선 1] FiLM: q_cond = γ(ctx)·q + β(ctx) for similarity only
+         │  └─ [개선 2] Gated fusion: fused = g·feat_emb + (1-g)·agg
+       fused_agg (B, D) + evidence_w (B, k) + feature_imp (B, k, F)
     ↓
-  [query_emb ‖ context_emb ‖ agg_emb] → PredictionHead → ŷ
+  [query_emb ‖ context_emb ‖ fused_agg] → PredictionHead → ŷ
+
+[개선 1 효과]
+  - Attention pattern이 centroid 그룹별로 변조됨
+  - "centroid-conditioned retrieval" motivation을 attention 메커니즘에 새김
+  - Zero-init으로 학습 초기에 정확히 baseline 동작
+
+[개선 2 효과]
+  - 설명에 쓰이는 feature_imp가 prediction 경로에도 참여
+  - faithfulness(설명-예측 일관성) architectural 보장
+  - gate 값으로 sample-wise feature/neighbor path 사용 비율 진단 가능
 """
 
 from __future__ import annotations
@@ -178,7 +192,6 @@ class MemoryBank(nn.Module):
             Bn = nm_idx.shape[0]
 
             # 청크 크기: max_g × D × 4bytes 기준 256MB 이하로 제한
-            # 예) max_g=5000, D=256 → 5000×256×4 = 5MB/샘플 → chunk=50이면 250MB
             chunk = max(1, min(Bn, (256 * 1024 * 1024) // max(max_g * D * 4, 1)))
 
             i_final_all    = torch.zeros(Bn, k_eff, dtype=torch.long, device=dev)
@@ -346,7 +359,7 @@ class TabERA(nn.Module):
             col_names=column_names,
         )
 
-        # ── TabR 방식 이웃 집계 ───────────────────────
+        # ── TabR 방식 이웃 집계 + FiLM(개선 1) + Gated Fusion(개선 2) ──
         self.ot_selector = AttentionAggregator(
             embed_dim=embed_dim,
             k=k,
@@ -367,7 +380,8 @@ class TabERA(nn.Module):
                 col_names=column_names,
             )
 
-        # ── 예측 헤드: [query ‖ context ‖ agg] → ŷ ──
+        # ── 예측 헤드: [query ‖ context ‖ fused_agg] → ŷ ──
+        # head 입력 차원은 그대로 3D (gated fusion 덕분에 차원 유지)
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim * 3),
             nn.Linear(embed_dim * 3, embed_dim), nn.GELU(), nn.Dropout(dropout),
@@ -391,25 +405,30 @@ class TabERA(nn.Module):
         # 3. 그룹별 부분 검색을 위한 sample_groups
         sample_groups = self.prototype_layer.sample_groups
 
-        # 4. KNN 검색 + TabR 방식 집계
+        # 4. KNN 검색 + TabR 방식 집계 + FiLM(개선 1) + Gated Fusion(개선 2)
         if self.memory.filled.item() >= self.k:
             nk, nv, neighbour_labels, topk_idx = self.memory.retrieve(
                 query_emb, self.k,
                 hard_assignment=hard_assignment,
                 sample_groups=sample_groups,
             )
-            agg_emb, evidence_w, feature_imp, attn_w = self.ot_selector(
-                query_emb, nk, nv, neighbour_labels
-            )
+            # 개선 1: context_emb 전달 (FiLM conditioning)
+            # 개선 2: 반환값에 gate, agg_emb_pure, (gamma, beta) 추가
+            fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure, film_params = \
+                self.ot_selector(query_emb, nk, nv, neighbour_labels, context_emb=context_emb)
         else:
-            agg_emb        = torch.zeros_like(query_emb)
+            # Memory 미충족 시 fallback: feature path 없이 zeros
+            fused_agg      = torch.zeros_like(query_emb)
             evidence_w     = torch.full((X.shape[0], self.k), 1.0 / self.k, device=X.device)
             feature_imp    = None
             attn_w         = None
             topk_idx       = torch.zeros(X.shape[0], self.k, dtype=torch.long, device=X.device)
+            gate           = torch.full_like(query_emb, 0.5)
+            agg_emb_pure   = torch.zeros_like(query_emb)
+            film_params    = (torch.ones_like(query_emb), torch.zeros_like(query_emb))
 
-        # 5. 예측
-        combined = torch.cat([query_emb, context_emb, agg_emb], dim=-1)
+        # 5. 예측 (개선 2: agg_emb 대신 fused_agg 사용)
+        combined = torch.cat([query_emb, context_emb, fused_agg], dim=-1)
         logits   = self.head(combined)
 
         # 6. 메모리 업데이트 (학습 시)
@@ -427,6 +446,8 @@ class TabERA(nn.Module):
                 + self.loss_weights.get("entropy", 0.01) * self.prototype_layer.entropy_loss(routing_probs)
             )
 
+        gamma, beta = film_params
+
         out = {
             "logits":      logits,
             "aux_loss":    aux_loss,
@@ -436,6 +457,13 @@ class TabERA(nn.Module):
             "feature_imp": feature_imp,
             "attn_w":      attn_w,
             "topk_idx":    topk_idx,
+            # 개선 2: 진단/ablation용 노출
+            "gate":          gate,            # (B, D) — feature path mixing 비율
+            "agg_emb_pure":  agg_emb_pure,    # (B, D) — gated fusion 전 raw aggregation
+            "fused_agg":     fused_agg,       # (B, D) — 최종 aggregation (head 입력)
+            # 개선 1: 진단/ablation용 노출
+            "film_gamma":    gamma,           # (B, D) — FiLM scale
+            "film_beta":     beta,            # (B, D) — FiLM shift
         }
 
         if return_explanations:
@@ -454,6 +482,11 @@ class TabERA(nn.Module):
                     "prototype":     proto_exp[b],
                     "evidence":      ev_exp[b],
                     "feature_match": feat_exp[b],
+                    # 개선 2: 샘플별 gate 통계 — feature-driven vs neighbor-driven
+                    "gate_mean":     float(gate[b].mean().item()),
+                    # 개선 1: FiLM 변조 강도 — centroid가 query를 얼마나 변조했는지
+                    "film_shift_norm": float(beta[b].norm().item()),
+                    "film_scale_dev":  float((gamma[b] - 1.0).abs().mean().item()),
                 }
                 for b in range(X.shape[0])
             ]
@@ -470,10 +503,12 @@ class TabERA(nn.Module):
     def summary(self) -> str:
         total = sum(p.numel() for p in self.parameters())
         lines = ["=" * 48, "TabERA", "=" * 48,
-                 f"  Parameters  : {total:,}",
-                 f"  Embed dim   : {self.embed_dim}",
-                 f"  Centroids   : {self.prototype_layer.P}",
-                 f"  KNN k       : {self.k}",
-                 f"  Dual-Space  : {'ON' if self.prototype_layer.F > 0 else 'OFF'}"]
+                 f"  Parameters     : {total:,}",
+                 f"  Embed dim      : {self.embed_dim}",
+                 f"  Centroids      : {self.prototype_layer.P}",
+                 f"  KNN k          : {self.k}",
+                 f"  Dual-Space     : {'ON' if self.prototype_layer.F > 0 else 'OFF'}",
+                 f"  FiLM Cond.     : ON (improvement 1, scope=similarity-only)",
+                 f"  Gated Fusion   : ON (improvement 2)"]
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)
