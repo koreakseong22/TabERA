@@ -44,8 +44,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from libs.prototypes import CentroidLayer, PrototypeLayer  # PrototypeLayer = CentroidLayer alias
-from libs.evidence   import AttentionAggregator
+from libs.prototypes   import CentroidLayer, PrototypeLayer  # PrototypeLayer = CentroidLayer alias
+from libs.evidence     import AttentionAggregator
 
 
 # ─────────────────────────────────────────────────────────────
@@ -340,9 +340,9 @@ class TabERA(nn.Module):
         self.n_output     = n_output
         self.n_features   = n_features
         self.loss_weights = loss_weights or {
-            "diversity":  0.01,
-            "commitment": 0.01,
-            "entropy":    0.01,
+            "diversity":    0.01,
+            "commitment":   0.01,
+            "entropy":      0.01,
         }
         self.column_names = column_names
 
