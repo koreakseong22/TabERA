@@ -34,7 +34,7 @@ def suggest_initial_trial() -> dict:
         "lr":               3e-4,
         "weight_decay":     1e-5,
         "batch_size":       256,
-        "anneal_factor":    0.97,
+        # "anneal_factor":    0.97,
         # "n_heads":          4,  
     }
 
@@ -92,7 +92,7 @@ def get_search_space(
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
         "batch_size":      trial.suggest_categorical("batch_size", [128, 256, 512]),
-        "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
+        # "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
         # "n_heads":         trial.suggest_categorical("n_heads", [1, 2, 4, 8]),
 
         # ── TabR Retriever 거리 지표 (확장용) ──────────
