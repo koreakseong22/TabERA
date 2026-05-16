@@ -323,44 +323,89 @@ class CentroidLayer(nn.Module):
         return result
 
     # ─────────────────────────────────────────────────────────
-    # Forward
+    # Forward (Hierarchical-extended)
     # ─────────────────────────────────────────────────────────
 
     def forward(
         self,
         query_emb: torch.Tensor,                          # (B, D)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        top_m: int = 1,                                    # 신규: 사용할 centroid 수
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor]:
         """
+        Hierarchical-extended forward.
+
+        Parameters
+        ──────────
+        query_emb : (B, D) 임베더 출력
+        top_m     : 사용할 top-M centroid 수 (default 1 = 기존 hard routing)
+                    M=1이면 기존 STE 동작과 완전 동일 (backward-compat)
+                    M=2~3이면 hierarchical soft routing
+
         Returns
         ───────
-        context_emb    : (B, D)  — centroid 혼합 컨텍스트 (미분 가능)
-        hard_assignment: (B,)    — Top-1 centroid 인덱스 (FAISS 마스킹 + 설명용)
-        routing_probs  : (B, P)  — STE용 soft routing 확률
+        context_emb     : (B, D)   — top-M centroid 가중 혼합 (gradient 흐름)
+        hard_assignment : (B,)     — Top-1 centroid (FAISS 마스킹 + 설명용)
+        routing_probs   : (B, P)   — 전체 분포 (entropy loss용, STE-style for M=1)
+        topM_idx        : (B, M)   — top-M centroid 인덱스 (retrieve용)
+        topM_weights    : (B, M)   — top-M softmax 가중치 (differentiable)
+
+        Backward-compatibility
+        ──────────────────────
+        top_m=1일 때:
+          - hard_assignment, routing_probs 동작은 기존과 동일 (STE 유지)
+          - context_emb = centroid_emb[hard_assignment] (기존과 동일)
+          - topM_idx = hard_assignment.unsqueeze(1) — (B, 1)
+          - topM_weights = ones(B, 1) — 단일 centroid이므로 1.0
         """
         # 코사인 유사도 로짓
         q = F.normalize(query_emb, dim=-1)               # (B, D)
         c = F.normalize(self.centroid_emb, dim=-1)        # (P, D)
         logits = q @ c.T                                  # (B, P)
 
-        # 가설 바이어스 주입
+        # ── 전체 softmax (기존 entropy_loss 호환용, M=1에서 STE 적용) ─
+        soft = F.softmax(logits, dim=-1)                  # (B, P)
 
-        # (2) STE routing (Bengio et al., 2013 + VQ-VAE, van den Oord et al., 2017)
-        # forward: hard argmax (이산, 결정론적)
-        # backward: softmax gradient 통과
-        # collapse 방지: entropy loss (VQ-VAE-2, Razavi et al., NeurIPS 2019)
-        hard_assignment = logits.argmax(dim=-1)              # (B,)
-        hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
-        soft = F.softmax(logits, dim=-1)                     # (B, P)
+        # ── Top-M soft routing (핵심 변경) ──────────────
+        top_m_eff = min(top_m, self.P)  # P 초과 방지
+        topM_logits, topM_idx = logits.topk(top_m_eff, dim=-1)  # (B, M)
 
-        if self.training:
-            routing_probs = soft + (hard_one_hot - soft).detach()
+        # ── hard_assignment: Top-1 (FAISS 마스킹 + 설명용) ──
+        hard_assignment = topM_idx[:, 0]                  # (B,)
+
+        # ── routing_probs 분기 ──────────────────────────
+        # M=1: 기존 STE 동작 유지 (entropy_loss 호환)
+        # M>1: 일반 softmax (hierarchical 경로에서는 STE 의미 없음)
+        if top_m_eff == 1:
+            # 기존 STE: forward는 hard, backward는 soft gradient
+            hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
+            if self.training:
+                routing_probs = soft + (hard_one_hot - soft).detach()
+            else:
+                routing_probs = hard_one_hot
+
+            # topM_weights = 1.0 (단일 centroid)
+            topM_weights = torch.ones_like(topM_logits)   # (B, 1)
+
+            # context_emb: 기존과 동일 (routing_probs @ centroid_emb)
+            context_emb = self.dropout(routing_probs @ self.centroid_emb)
         else:
-            routing_probs = hard_one_hot
+            # Hierarchical 경로
+            # routing_probs는 entropy_loss용 (soft 그대로, gradient 흐름)
+            routing_probs = soft
 
-        # 컨텍스트: routing_probs로 centroid 혼합
-        context_emb = self.dropout(routing_probs @ self.centroid_emb)  # (B, D)
+            # topM_weights: top-M에 대한 softmax (differentiable!)
+            topM_weights = F.softmax(topM_logits, dim=-1) # (B, M)
 
-        return context_emb, hard_assignment, routing_probs
+            # context_emb: top-M centroid 가중 혼합
+            # ★ topM_weights가 differentiable → centroid 선택에 gradient 흐름
+            topM_centroids = self.centroid_emb[topM_idx]  # (B, M, D)
+            context_emb = (
+                topM_weights.unsqueeze(-1) * topM_centroids
+            ).sum(dim=1)                                   # (B, D)
+            context_emb = self.dropout(context_emb)
+
+        return context_emb, hard_assignment, routing_probs, topM_idx, topM_weights
 
     # ─────────────────────────────────────────────────────────
     # Auxiliary Losses (기존 tabr.py 호환)

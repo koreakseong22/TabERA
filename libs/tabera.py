@@ -4,36 +4,33 @@ libs/tabera.py
 TabERA — Dual-Space Prototype Explainable TabR Model.
 
 MultiTab의 tabr.py를 대체하는 파일입니다.
-아래 세 가지 구조적 혁신을 TabR 위에 통합합니다.
 
-  2. CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
-  3. AttentionAggregator  : TabR 방식 similarity 기반 이웃 집계
-                            + [개선 1] FiLM Centroid Conditioning
-                            + [개선 2] Gated Feature Fusion
+  CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
+  AttentionAggregator  : TabR 방식 similarity 기반 이웃 집계
+                          + Gated Feature Fusion (faithfulness 보장)
+  MemoryBank           : Cross-group fallback (인접 centroid 확장 검색)
 
 Forward 흐름
-------------
+────────────
   X_query
     ↓  TabularEmbedder
   query_emb (B, D)
     ├─ CentroidLayer(query_emb) → context_emb (B, D) + routing + FAISS mask
-    └─ MemoryBank.retrieve → k neighbours + neighbour_labels
-         ↓ AttentionAggregator(query_emb, nk, nv, labels, context_emb)
-         │  ├─ [개선 1] FiLM: q_cond = γ(ctx)·q + β(ctx) for similarity only
-         │  └─ [개선 2] Gated fusion: fused = g·feat_emb + (1-g)·agg
+    └─ MemoryBank.retrieve → k neighbours (cross-group fallback 포함)
+         ↓ AttentionAggregator(query_emb, nk, nv, labels)
+         │  └─ Gated fusion: fused = g·feat_emb + (1-g)·agg
        fused_agg (B, D) + evidence_w (B, k) + feature_imp (B, k, F)
     ↓
   [query_emb ‖ context_emb ‖ fused_agg] → PredictionHead → ŷ
 
-[개선 1 효과]
-  - Attention pattern이 centroid 그룹별로 변조됨
-  - "centroid-conditioned retrieval" motivation을 attention 메커니즘에 새김
-  - Zero-init으로 학습 초기에 정확히 baseline 동작
-
-[개선 2 효과]
+[Gated Fusion 효과]
   - 설명에 쓰이는 feature_imp가 prediction 경로에도 참여
   - faithfulness(설명-예측 일관성) architectural 보장
   - gate 값으로 sample-wise feature/neighbor path 사용 비율 진단 가능
+
+[Cross-group fallback 효과]
+  - 그룹 크기 < K인 소규모 그룹에서 인접 centroid 그룹까지 확장 검색
+  - 전체 검색 fallback 대비 centroid 분할 의미 유지
 """
 
 from __future__ import annotations
@@ -102,17 +99,24 @@ class MemoryBank(nn.Module):
         self,
         sample_groups: "List[List[int]]",
         device: "torch.device",
+        centroid_emb: "Optional[torch.Tensor]" = None,  # (P, D) — cross-group용
     ) -> None:
         """
         sample_groups를 GPU 텐서로 미리 변환·캐시.
         EMA 업데이트 후 에폭당 1번만 호출 → retrieve 내부 변환 비용 제거.
         패딩: 가장 큰 그룹 크기에 맞춰 -1로 채움.
+
+        [Cross-group fallback]
+        centroid_emb가 주어지면, 각 centroid에 대해 가장 가까운 centroid를
+        미리 계산하여 캐시합니다. 그룹 크기 < k인 경우 인접 centroid 그룹까지
+        확장하여 검색합니다 (전체 검색 대신).
         """
         P   = len(sample_groups)
         max_g = max((len(g) for g in sample_groups), default=0)
         if max_g == 0:
             self._cached_groups      = None
             self._cached_group_sizes = None
+            self._cached_extended    = None
             return
 
         # (P, max_g) 패딩 텐서 (-1 = 패딩)
@@ -125,6 +129,39 @@ class MemoryBank(nn.Module):
         self._cached_group_sizes = torch.tensor(
             [len(g) for g in sample_groups], dtype=torch.long, device=device
         )                                                     # (P,)
+
+        # ── Cross-group: 인접 centroid 그룹까지 합친 확장 그룹 캐시 ──
+        # 각 centroid p에 대해, 자기 그룹 + 가장 가까운 centroid 그룹을 합침
+        if centroid_emb is not None and P > 1:
+            c = F.normalize(centroid_emb.detach(), dim=-1)    # (P, D)
+            sim = c @ c.T                                     # (P, P)
+            sim.fill_diagonal_(-1.0)  # 자기 자신 제외
+            nearest = sim.argmax(dim=-1)                      # (P,) 각 centroid의 최인접
+
+            extended_groups = []
+            for p in range(P):
+                # 자기 그룹 + 최인접 그룹 합침
+                own    = sample_groups[p]
+                near_p = nearest[p].item()
+                neighbor = sample_groups[near_p]
+                merged = own + neighbor
+                extended_groups.append(merged)
+
+            # 확장 그룹도 패딩 텐서로 캐시
+            max_eg = max((len(g) for g in extended_groups), default=0)
+            if max_eg > 0:
+                padded_ext = torch.full((P, max_eg), -1, dtype=torch.long)
+                for p, g in enumerate(extended_groups):
+                    if g:
+                        padded_ext[p, :len(g)] = torch.tensor(g, dtype=torch.long)
+                self._cached_extended      = padded_ext.to(device)    # (P, max_eg)
+                self._cached_extended_sizes = torch.tensor(
+                    [len(g) for g in extended_groups], dtype=torch.long, device=device
+                )
+            else:
+                self._cached_extended = None
+        else:
+            self._cached_extended = None
 
     @torch.no_grad()
     def retrieve(
@@ -230,9 +267,130 @@ class MemoryBank(nn.Module):
             out_labels[nm_idx] = out_labels_chunk
             top_k_idx[nm_idx]  = i_final_all
 
-        # fallback 샘플: zeros 유지 (초기 1~2 에폭만 해당)
+        # fallback 샘플: 인접 centroid 그룹까지 확장하여 검색 (cross-group)
+        # 기존: zeros 유지 (사실상 전체 검색 포기)
+        # 개선: 자기 그룹 + 최인접 centroid 그룹에서 검색
+        if fallback_mask.any():
+            fb_idx = fallback_mask.nonzero(as_tuple=True)[0]   # (Bf,)
+            ha_fb  = ha[fb_idx]                                 # (Bf,)
+            q_fb   = q_norm[fb_idx]                             # (Bf, D)
+            Bf     = fb_idx.shape[0]
+
+            # cross-group 확장 캐시가 있으면 사용, 없으면 전체 검색
+            ext = getattr(self, '_cached_extended', None)
+            if ext is not None:
+                cand_ext   = ext[ha_fb]                         # (Bf, max_eg)
+                ext_sizes  = self._cached_extended_sizes[ha_fb] # (Bf,)
+                valid_ext  = (cand_ext >= 0)
+                safe_ext   = cand_ext.clamp(min=0, max=n - 1)
+
+                # 확장 그룹도 K보다 작으면 → 진짜 전체 검색 fallback
+                still_small = ext_sizes < k
+                use_ext     = ~still_small
+
+                if use_ext.any():
+                    ext_idx   = use_ext.nonzero(as_tuple=True)[0]
+                    max_eg    = safe_ext.shape[1]
+                    k_eff_ext = min(k, max_eg)
+
+                    for i in ext_idx:
+                        i = i.item()
+                        b_pos = fb_idx[i]
+                        si_e  = safe_ext[i]                     # (max_eg,)
+                        vm_e  = valid_ext[i]                    # (max_eg,)
+                        q_e   = q_fb[i:i+1]                     # (1, D)
+
+                        keys_e = F.normalize(keys_full[si_e[vm_e]], dim=-1)  # (valid, D)
+                        if keys_e.shape[0] < k:
+                            # 그래도 부족하면 전체 검색
+                            keys_all = F.normalize(keys_full, dim=-1)
+                            sim_all  = q_e @ keys_all.T
+                            _, idx_all = sim_all.topk(min(k, n), dim=-1)
+                            idx_all = idx_all.squeeze(0).clamp(0, n - 1)
+                            out_nk[b_pos]     = keys_full[idx_all]
+                            out_nv[b_pos]     = vals_full[idx_all]
+                            out_labels[b_pos] = labels_full[idx_all]
+                            top_k_idx[b_pos]  = idx_all
+                        else:
+                            sim_e = q_e @ keys_e.T                           # (1, valid)
+                            _, top_e = sim_e.topk(min(k, keys_e.shape[0]), dim=-1)
+                            real_idx = si_e[vm_e][top_e.squeeze(0)]          # (k,)
+                            real_idx = real_idx.clamp(0, n - 1)
+                            kk = real_idx.shape[0]
+                            out_nk[b_pos, :kk]     = keys_full[real_idx]
+                            out_nv[b_pos, :kk]     = vals_full[real_idx]
+                            out_labels[b_pos, :kk] = labels_full[real_idx]
+                            top_k_idx[b_pos, :kk]  = real_idx
+
+                # 확장도 부족한 샘플 → 전체 검색
+                if still_small.any():
+                    ss_idx = still_small.nonzero(as_tuple=True)[0]
+                    for i in ss_idx:
+                        i = i.item()
+                        b_pos = fb_idx[i]
+                        q_s   = q_fb[i:i+1]
+                        keys_all = F.normalize(keys_full, dim=-1)
+                        sim_all  = q_s @ keys_all.T
+                        _, idx_all = sim_all.topk(min(k, n), dim=-1)
+                        idx_all = idx_all.squeeze(0).clamp(0, n - 1)
+                        out_nk[b_pos]     = keys_full[idx_all]
+                        out_nv[b_pos]     = vals_full[idx_all]
+                        out_labels[b_pos] = labels_full[idx_all]
+                        top_k_idx[b_pos]  = idx_all
+            else:
+                # 확장 캐시 없으면 전체 검색 (기존 동작)
+                keys_all = F.normalize(keys_full, dim=-1)
+                for i in range(Bf):
+                    b_pos = fb_idx[i]
+                    q_s   = q_fb[i:i+1]
+                    sim_all = q_s @ keys_all.T
+                    _, idx_all = sim_all.topk(min(k, n), dim=-1)
+                    idx_all = idx_all.squeeze(0).clamp(0, n - 1)
+                    out_nk[b_pos]     = keys_full[idx_all]
+                    out_nv[b_pos]     = vals_full[idx_all]
+                    out_labels[b_pos] = labels_full[idx_all]
+                    top_k_idx[b_pos]  = idx_all
 
         return out_nk, out_nv, out_labels, top_k_idx
+
+    @torch.no_grad()
+    def retrieve_hierarchical(
+        self,
+        query: torch.Tensor,             # (B, D)
+        k: int,                           # 그룹당 이웃 수
+        topM_idx: torch.Tensor,          # (B, M) — top-M centroid 인덱스
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Top-M centroid 각각의 그룹에서 k개 이웃을 검색.
+
+        기존 retrieve를 M번 호출 (M=2~3이므로 부담 없음).
+
+        Returns
+        ───────
+        nk_hier     : (B, M, k, D)  — M개 그룹 × k개 이웃 key
+        nv_hier     : (B, M, k, D)  — M개 그룹 × k개 이웃 value
+        labels_hier : (B, M, k)
+        idx_hier    : (B, M, k)     — MemoryBank 인덱스 (FeatureStore용)
+        """
+        B, M = topM_idx.shape
+
+        nk_list, nv_list, lbl_list, idx_list = [], [], [], []
+        for m in range(M):
+            ha_m = topM_idx[:, m]  # (B,)
+            nk_m, nv_m, lbl_m, idx_m = self.retrieve(
+                query, k, hard_assignment=ha_m,
+            )
+            nk_list.append(nk_m)
+            nv_list.append(nv_m)
+            lbl_list.append(lbl_m)
+            idx_list.append(idx_m)
+
+        nk_hier  = torch.stack(nk_list,  dim=1)   # (B, M, k, D)
+        nv_hier  = torch.stack(nv_list,  dim=1)
+        lbl_hier = torch.stack(lbl_list, dim=1)
+        idx_hier = torch.stack(idx_list, dim=1)
+
+        return nk_hier, nv_hier, lbl_hier, idx_hier
 
 
 class FeatureStore:
@@ -359,7 +517,7 @@ class TabERA(nn.Module):
             col_names=column_names,
         )
 
-        # ── TabR 방식 이웃 집계 + FiLM(개선 1) + Gated Fusion(개선 2) ──
+        # ── TabR 방식 이웃 집계 + Gated Fusion (faithfulness) ──
         self.ot_selector = AttentionAggregator(
             embed_dim=embed_dim,
             k=k,
@@ -400,44 +558,39 @@ class TabERA(nn.Module):
         query_emb = self.embedder(X)               # (B, D)
 
         # 2. 프로토타입 라우팅 (CentroidLayer)
-        context_emb, hard_assignment, routing_probs = self.prototype_layer(query_emb)
+        # prototypes.py가 5개 반환 (hierarchical 호환) → 필요한 3개만 사용
+        context_emb, hard_assignment, routing_probs, _, _ = \
+            self.prototype_layer(query_emb)
 
-        # 3. 그룹별 부분 검색을 위한 sample_groups
-        sample_groups = self.prototype_layer.sample_groups
-
-        # 4. KNN 검색 + TabR 방식 집계 + FiLM(개선 1) + Gated Fusion(개선 2)
+        # 3. KNN 검색 + Gated Fusion
         if self.memory.filled.item() >= self.k:
             nk, nv, neighbour_labels, topk_idx = self.memory.retrieve(
                 query_emb, self.k,
                 hard_assignment=hard_assignment,
-                sample_groups=sample_groups,
             )
-            # 개선 1: context_emb 전달 (FiLM conditioning)
-            # 개선 2: 반환값에 gate, agg_emb_pure, (gamma, beta) 추가
-            fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure, film_params = \
-                self.ot_selector(query_emb, nk, nv, neighbour_labels, context_emb=context_emb)
+            fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure = \
+                self.ot_selector(query_emb, nk, nv, neighbour_labels)
         else:
-            # Memory 미충족 시 fallback: feature path 없이 zeros
+            # Memory 미충족 fallback
             fused_agg      = torch.zeros_like(query_emb)
+            agg_emb_pure   = torch.zeros_like(query_emb)
             evidence_w     = torch.full((X.shape[0], self.k), 1.0 / self.k, device=X.device)
             feature_imp    = None
             attn_w         = None
             topk_idx       = torch.zeros(X.shape[0], self.k, dtype=torch.long, device=X.device)
             gate           = torch.full_like(query_emb, 0.5)
-            agg_emb_pure   = torch.zeros_like(query_emb)
-            film_params    = (torch.ones_like(query_emb), torch.zeros_like(query_emb))
 
-        # 5. 예측 (개선 2: agg_emb 대신 fused_agg 사용)
+        # 4. 예측
         combined = torch.cat([query_emb, context_emb, fused_agg], dim=-1)
         logits   = self.head(combined)
 
-        # 6. 메모리 업데이트 (학습 시)
+        # 5. 메모리 업데이트 (학습 시)
         if self.training and labels is not None:
             self.memory.update(query_emb.detach(), context_emb.detach(), labels.float())
             if self._feature_store is not None:
                 self._feature_store.update(X)
 
-        # 7. 보조 손실
+        # 6. 보조 손실
         aux_loss = torch.tensor(0.0, device=X.device)
         if self.training:
             aux_loss = (
@@ -445,8 +598,6 @@ class TabERA(nn.Module):
                 + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
                 + self.loss_weights.get("entropy", 0.01) * self.prototype_layer.entropy_loss(routing_probs)
             )
-
-        gamma, beta = film_params
 
         out = {
             "logits":      logits,
@@ -457,13 +608,10 @@ class TabERA(nn.Module):
             "feature_imp": feature_imp,
             "attn_w":      attn_w,
             "topk_idx":    topk_idx,
-            # 개선 2: 진단/ablation용 노출
-            "gate":          gate,            # (B, D) — feature path mixing 비율
-            "agg_emb_pure":  agg_emb_pure,    # (B, D) — gated fusion 전 raw aggregation
-            "fused_agg":     fused_agg,       # (B, D) — 최종 aggregation (head 입력)
-            # 개선 1: 진단/ablation용 노출
-            "film_gamma":    gamma,           # (B, D) — FiLM scale
-            "film_beta":     beta,            # (B, D) — FiLM shift
+            # Gated Fusion 진단용
+            "gate":          gate,
+            "agg_emb_pure":  agg_emb_pure,
+            "fused_agg":     fused_agg,
         }
 
         if return_explanations:
@@ -479,14 +627,10 @@ class TabERA(nn.Module):
             )
             out["explanations"] = [
                 {
-                    "prototype":     proto_exp[b],
-                    "evidence":      ev_exp[b],
-                    "feature_match": feat_exp[b],
-                    # 개선 2: 샘플별 gate 통계 — feature-driven vs neighbor-driven
-                    "gate_mean":     float(gate[b].mean().item()),
-                    # 개선 1: FiLM 변조 강도 — centroid가 query를 얼마나 변조했는지
-                    "film_shift_norm": float(beta[b].norm().item()),
-                    "film_scale_dev":  float((gamma[b] - 1.0).abs().mean().item()),
+                    "prototype":      proto_exp[b],
+                    "evidence":       ev_exp[b],
+                    "feature_match":  feat_exp[b],
+                    "gate_mean":      float(gate[b].mean().item()),
                 }
                 for b in range(X.shape[0])
             ]
@@ -508,7 +652,7 @@ class TabERA(nn.Module):
                  f"  Centroids      : {self.prototype_layer.P}",
                  f"  KNN k          : {self.k}",
                  f"  Dual-Space     : {'ON' if self.prototype_layer.F > 0 else 'OFF'}",
-                 f"  FiLM Cond.     : ON (improvement 1, scope=similarity-only)",
-                 f"  Gated Fusion   : ON (improvement 2)"]
+                 f"  Gated Fusion   : ON (faithfulness)",
+                 f"  Cross-group    : ON (adjacent centroid fallback)"]
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)

@@ -208,6 +208,7 @@ class TabERAWrapper:
                     self.model.memory.cache_sample_groups(
                         self.model.prototype_layer.sample_groups,
                         device=torch.device(self.device),
+                        centroid_emb=self.model.prototype_layer.centroid_emb,
                     )
                     if epoch % 10 == 0:
                         # 검색 범위 축소율 계산 (가설 ②)
