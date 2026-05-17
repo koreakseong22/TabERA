@@ -267,6 +267,7 @@ def main():
         explanations = out.get("explanations", [])
 
         # FeatureStore에서 이웃 feature 값 조회하여 설명에 추가
+        topk_idx = out.get("topk_idx")
         if model.feature_store is not None and topk_idx is not None:
             # topk_idx: (B, k) → B개 샘플별 k개 이웃 인덱스
             neighbour_feats = model.feature_store.retrieve(topk_idx)  # list[list[dict]]
