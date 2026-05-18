@@ -1326,5 +1326,80 @@
         "name": "GU",
         "fullname": "guillermo",
         "tasktype": "binclass"
+    },
+    "45577": {
+        "name": "GMSC",
+        "fullname": "Give-Me-Some-Credit",
+        "tasktype": "binclass"
+    },
+    "42477": {
+        "name": "DCC",
+        "fullname": "default-of-credit-card-clients",
+        "tasktype": "binclass"
+    },
+    "43539": {
+        "name": "SBA",
+        "fullname": "SBA-Loans-Case-Data-Set",
+        "tasktype": "binclass"
+    },
+    "15": {
+        "name": "BRW",
+        "fullname": "breast-w",
+        "tasktype": "binclass"
+    },
+    "55": {
+        "name": "HPT",
+        "fullname": "hepatitis",
+        "tasktype": "binclass"
+    },
+    "43797": {
+        "name": "HCV",
+        "fullname": "Hepatitis-C-Prediction-Dataset",
+        "tasktype": "binclass"
+    },
+    "1480": {
+        "name": "ILPD",
+        "fullname": "ilpd",
+        "tasktype": "binclass"
+    },
+    "43": {
+        "name": "HBM",
+        "fullname": "haberman",
+        "tasktype": "binclass"
+    },
+    "310": {
+        "name": "MAM",
+        "fullname": "mammography",
+        "tasktype": "binclass"
+    },
+    "41214": {
+        "name": "FMT",
+        "fullname": "freMTPL2freq",
+        "tasktype": "regression"
+    },
+    "43593": {
+        "name": "FMF",
+        "fullname": "French-Motor-Claims-Datasets-freMTPL2freq",
+        "tasktype": "regression"
+    },
+    "1461": {
+        "name": "BKM",
+        "fullname": "bank-marketing",
+        "tasktype": "binclass"
+    },
+    "1590": {
+        "name": "ADT",
+        "fullname": "adult",
+        "tasktype": "binclass"
+    },
+    "44067": {
+        "name": "LDP",
+        "fullname": "LoanDefaultPrediction",
+        "tasktype": "binclass"
+    },
+    "43743": {
+        "name": "TLD",
+        "fullname": "TVS_Loan_Default",
+        "tasktype": "binclass"
     }
 }

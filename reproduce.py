@@ -39,7 +39,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
     print(f"  TabERA Explanation — Sample #{sample_idx}")
     print(f"{'━'*52}")
 
-    # ② 프로토타입 그룹 (가설 ①: centroid_features — 역정규화 없이 원본값 표시)
+    # ① 프로토타입 그룹 (centroid_features — 역정규화 없이 원본값 표시)
     proto = e["prototype"]
     print(f"\n  ① 프로토타입 그룹")
     print(f"     → \"{proto['assigned_group']}\"  (confidence={proto['group_confidence']:.1%})")
@@ -47,7 +47,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
         ru = ", ".join(f"\"{l}\"({s:.1%})" for l, s in proto["runners_up"])
         print(f"     Runner-up: {ru}")
 
-    # centroid 원본 feature 값 출력 (이중 공간의 핵심)
+    # centroid 원본 feature 값 출력 (Dual-Space의 핵심)
     cf = proto.get("centroid_features", {})
     if cf:
         feat_str = ",  ".join(
@@ -55,32 +55,34 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
         )
         print(f"     특성: {feat_str}")
 
-    # ③ OT 증거 선택
+    # ② 이웃 증거 (Attention weight)
     ev = e["evidence"]
-    print(f"\n  ② OT 증거 선택")
-    print(f"     {ev['summary']}")
-    for t in ev["top_evidence"]:
-        print(f"     #{t['rank']} Neighbour {t['neighbour_idx']}: {t['weight_pct']}")
+    print(f"\n  ② 이웃 증거 (Attention)")
+    print(f"     dominant={ev['dominant_weight']:.1%},  entropy={ev['entropy']:.3f}")
+    for rank, (idx, w) in enumerate(ev["top_neighbours"]):
+        print(f"     #{rank+1} Neighbour {idx}: {w:.1%}")
 
-    # ④ §3.3 Feature Cross-Attention (핵심 신규)
+    # 이웃의 원본 feature 값 (FeatureStore에서 조회된 경우)
+    nf = e.get("neighbour_features")
+    if nf:
+        for rank, (idx, w) in enumerate(ev["top_neighbours"][:3]):
+            if rank < len(nf):
+                feat_str = ", ".join(f"{k}={v:.3f}" for k, v in list(nf[idx].items())[:4])
+                print(f"        → {feat_str}")
+
+    # ③ Feature 기여도 (Cross-Attention)
     fm = e.get("feature_match")
-    if fm and "per_neighbour" in fm:
-        print(f"\n  ③ Feature 기여도 (§3.3 Cross-Attention)")
+    if fm and "top_features" in fm:
+        print(f"\n  ③ Feature 기여도 (Cross-Attention)")
+        for feat in fm["top_features"]:
+            bar = "█" * int(feat["importance"] * 30)
+            print(f"     {feat['feature']:25s} {feat['importance']*100:5.1f}%  {bar}")
 
-        # 전체 결정의 feature 기여도
-        print(f"     [전체 결정 기여 feature]")
-        for fname, score in fm["overall_features"]:
-            bar = "█" * int(score * 30)
-            print(f"       {fname:25s} {score*100:5.1f}%  {bar}")
-
-        # 상위 이웃 2개의 feature 기여도
-        print(f"\n     [이웃별 유사 이유]")
-        for nb in fm["per_neighbour"][:3]:
-            print(f"       Neighbour #{nb['neighbour_idx']} "
-                  f"(weight={nb['evidence_weight']*100:.1f}%)")
-            for fname, score in nb["top_features"]:
-                bar = "█" * int(score * 20)
-                print(f"         {fname:23s} {score*100:5.1f}%  {bar}")
+    # Gated Fusion 진단
+    gate_mean = e.get("gate_mean")
+    if gate_mean is not None:
+        label = "feature path 우세" if gate_mean > 0.5 else "neighbor path 우세"
+        print(f"\n  gate_mean: {gate_mean:.2f}  ({label})")
 
     print(f"{'━'*52}")
 
@@ -223,39 +225,11 @@ def main():
     }, str(state_path))
     print(f"  저장: {state_path}")
 
-    # ── §3.3 Feature 기여도 설명 출력 ─────────────────────
+    # ── Feature 기여도 설명 출력 ─────────────────────────
     if args.explain:
         print(f"\n{'='*52}")
-        print(f"  Feature 기여도 설명 (--explain)")
+        print(f"  TabERA 설명 출력 (--explain)")
         print(f"{'='*52}")
-
-        # Centroid cosine similarity matrix 출력
-        print(f"\n  [Centroid Similarity Matrix]")
-        sim_mat = model.prototype_layer.cosine_similarity_matrix().numpy()
-        cl = model.prototype_layer.centroid_labels
-        P  = model.prototype_layer.P
-        if cl is not None and not cl.isnan().any():
-            # 레이블 순서대로 centroid 정렬
-            order = cl.cpu().argsort().numpy()
-            sim_sorted = sim_mat[order][:, order]
-            cl_sorted  = cl.cpu().numpy()[order]
-            print(f"  centroid를 평균 레이블 순으로 정렬 ({P}개):")
-            print(f"  {'lbl':>5}" + "".join(f"{cl_sorted[j]:5.1f}" for j in range(min(P,10))))
-            for i in range(min(P,10)):
-                row = "".join(f"{sim_sorted[i,j]:5.2f}" for j in range(min(P,10)))
-                print(f"  {cl_sorted[i]:5.1f} {row}")
-            # 순서 정합성 지표: 인접 centroid 유사도 평균
-            adj_sim = np.mean([sim_sorted[i,i+1] for i in range(min(P,10)-1)])
-            far_sim = np.mean([sim_sorted[i,min(i+3,min(P,10)-1)]
-                               for i in range(min(P,10)-3)])
-            print(f"\n  인접 centroid 유사도 평균:  {adj_sim:.3f}")
-            print(f"  원거리 centroid 유사도 평균: {far_sim:.3f}")
-            if adj_sim > far_sim:
-                print(f"  → 순서 정합: 인접>원거리 (Rank-Consistency 반영됨)")
-            else:
-                print(f"  → 순서 미반영: Rank-Consistency Loss 효과 확인 필요")
-        else:
-            print(f"  (centroid_labels 미초기화 — epochs를 늘려주세요)")
 
         model.eval()
         n_show = min(args.n_explain, len(y_test))
