@@ -1,31 +1,22 @@
 """
 evidence.py — Attention 기반 이웃 집계 및 설명 모듈
 
-OTEvidenceSelector(Sinkhorn OT)를 AttentionAggregator로 교체.
-
 설계 원칙
 ─────────
 - 미분 가능성: Scaled dot-product attention → 역전파 가능
 - 설명가능성: attention weight = evidence_w (이웃별 기여도)
-              인터페이스는 기존 OT와 완전 동일 유지
 - 속도:       Sinkhorn 20 iter 제거 → 단순 softmax (~15배 빠름)
-- 근거:       TabERA 원본 방식과 동일한 attention 집계
 
-[Gated Fusion of Feature Attribution]
-─────────────────────────────────────
-feature_imp가 explanation에만 쓰이고 prediction 경로에 참여하지 않는
-구조적 약점을 해결합니다. AttentionAggregator 내부에서 feature_imp를
-D차원으로 투영(feat_to_emb)한 뒤 agg_emb와 sample-wise gated fusion으로
-결합합니다.
+[Gated Fusion 제거]
+───────────────────
+feat_to_emb, gate_net 제거.
+feature_imp는 순수 설명 경로로만 사용 (prediction path 비참여).
+head 입력은 [query_emb ‖ context_emb ‖ agg_emb] 유지.
 
-- gate ∈ (0,1)^D: query_emb와 feat_emb로부터 학습
-- fused_agg = gate * feat_emb + (1 - gate) * agg_emb
-- TabERA.forward에서 head 입력에 fused_agg 사용 (차원 그대로 3D 유지)
-
-이렇게 함으로써 설명에 사용되는 feature attribution이 곧 예측 경로에도
-영향을 미치게 되어 faithfulness(설명-예측 일관성)를 architectural하게
-보장합니다. (cf. Highway Networks, Srivastava et al. 2015;
-              GRU update gate, Cho et al. 2014)
+Faithfulness 주장 범위:
+- evidence_w 가중합 agg_emb가 prediction에 직접 참여
+  → "이웃 #i가 evidence_w[i] 비율로 예측에 기여"는 구조적으로 성립
+- feature_imp는 설명 참고용, faithfulness 주장 대상 아님
 """
 
 from __future__ import annotations
@@ -80,16 +71,14 @@ class FeatureCrossAttention(nn.Module):
 
 class AttentionAggregator(nn.Module):
     """
-    TabR 방식 이웃 집계 + Gated Feature Fusion (faithfulness 보장).
+    TabR 방식 이웃 집계.
 
     Forward 출력
     ────────────
-    fused_agg     : (B, D)   — gated fusion된 최종 aggregation (head 입력용)
-    evidence_w    : (B, k)   — 이웃별 attention weight (설명용)
-    feature_imp   : (B, k, F)— feature attribution (설명용)
-    attn_w        : (B, k, D)— 차원별 attention (진단용)
-    gate          : (B, D)   — 학습된 gate 값 (진단/ablation용)
-    agg_emb_pure  : (B, D)   — gated fusion 전 raw aggregation (ablation/진단용)
+    agg_emb    : (B, D)    — evidence_w 가중합 aggregation (head 입력용)
+    evidence_w : (B, k)    — 이웃별 attention weight (설명 + faithfulness)
+    feature_imp: (B, k, F) — feature attribution (설명용, prediction 경로 비참여)
+    attn_w     : (B, k, D) — 차원별 attention (진단용)
     """
 
     def __init__(self, embed_dim, k, n_features, n_output, dropout=0.0):
@@ -112,19 +101,6 @@ class AttentionAggregator(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.feat_cross = FeatureCrossAttention(embed_dim, n_features)
-
-        # ── Gated Fusion 구성 요소 ──────────────────────────
-        # (a) feature attribution (B, k, F) → evidence-weighted summary (B, F) → (B, D)
-        self.feat_to_emb = nn.Linear(n_features, embed_dim)
-
-        # (b) gate network: [query_emb, feat_emb] → gate ∈ (0,1)^D
-        self.gate_net = nn.Sequential(
-            nn.LayerNorm(embed_dim * 2),
-            nn.Linear(embed_dim * 2, embed_dim),
-        )
-
-        # Gate 초기화: 초기 gate ≈ 0.5
-        nn.init.zeros_(self.gate_net[-1].bias)
 
     def forward(self, query_emb, nk, nv, neighbour_labels):
         """
@@ -153,28 +129,13 @@ class AttentionAggregator(nn.Module):
             query_emb.unsqueeze(1) - nk                            # (B, k, D)
         )
 
-        # 3. 가중합 (raw aggregation, gated fusion 전)
-        agg_emb_pure = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
+        # 3. 가중합 → agg_emb (prediction path)
+        agg_emb = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
 
-        # 4. feature 수준 기여도 (설명용 + gated fusion 입력)
+        # 4. feature attribution (설명 전용)
         feature_imp, attn_w = self.feat_cross(query_emb, nk, evidence_w)
-        # feature_imp: (B, k, F), attn_w: (B, k, D)
 
-        # ── Gated Fusion ────────────────────────────────────
-        # (a) feature attribution을 evidence-weighted summary로 압축
-        feat_summary = feature_imp.sum(dim=1)                      # (B, F)
-
-        # (b) F → D 투영
-        feat_emb = self.feat_to_emb(feat_summary)                  # (B, D)
-
-        # (c) Gate 계산: query와 feat_emb를 보고 mixing 결정
-        gate_input = torch.cat([query_emb, feat_emb], dim=-1)      # (B, 2D)
-        gate = torch.sigmoid(self.gate_net(gate_input))            # (B, D)
-
-        # (d) Sample-wise gated fusion
-        fused_agg = gate * feat_emb + (1.0 - gate) * agg_emb_pure  # (B, D)
-
-        return fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure
+        return agg_emb, evidence_w, feature_imp, attn_w
 
     # ── 설명 인터페이스 (OTEvidenceSelector와 완전 동일) ────────
 
