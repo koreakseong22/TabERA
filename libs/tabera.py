@@ -615,7 +615,25 @@ class TabERA(nn.Module):
         }
 
         if return_explanations:
-            proto_exp = self.prototype_layer.explain_routing(hard_assignment, routing_probs)
+            # 설명용 softmax — temperature scaling 적용
+            # ─────────────────────────────────────────────────────
+            # 문제: cosine similarity는 정규화된 벡터끼리의 내적이라
+            #       값 범위가 좁음 → softmax가 flat → confidence ≈ 1/P
+            # 원인 1: entropy_loss 과다 시 centroid 분리 실패 (australian)
+            # 원인 2: cosine similarity 범위 자체가 좁아서 발생 (vehicle 등)
+            # 해결: temperature scaling으로 logit 차이를 증폭
+            #       예측 경로(routing_probs)는 그대로 유지 — 학습에 영향 없음
+            # temperature=0.1: SimCLR, CLIP 등 contrastive learning 표준값
+            # ─────────────────────────────────────────────────────
+            _temperature = 0.1
+            with torch.no_grad():
+                q_norm     = F.normalize(query_emb.detach(), dim=-1)       # (B, D)
+                c_norm     = F.normalize(
+                    self.prototype_layer.centroid_emb.detach(), dim=-1)    # (P, D)
+                soft_probs = F.softmax(
+                    (q_norm @ c_norm.T) / _temperature, dim=-1)            # (B, P)
+
+            proto_exp = self.prototype_layer.explain_routing(hard_assignment, soft_probs)
             ev_exp    = self.ot_selector.explain_evidence(evidence_w)
             feat_exp  = (
                 self.ot_selector.explain_feature_match(

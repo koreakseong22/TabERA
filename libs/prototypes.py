@@ -18,18 +18,21 @@ CentroidLayer — Dual-Space Prototype Representation
     - STE: forward=argmax(hard), backward=softmax gradient 통과
     - 근거: VQ-VAE(van den Oord, 2017) 표준 설계 + commitment loss
 
-(3) EMA 기반 centroid 업데이트
-    - 매 에폭 후 배정된 샘플 임베딩·원본 X의 평균으로 갱신
-    - centroid_emb_new = τ * centroid_emb + (1-τ) * batch_mean_emb
-    - centroid_x_new   = τ * centroid_x   + (1-τ) * batch_mean_x
-    - 학습 초기 고정(freeze) → epoch > warmup 후 활성화
+(3) Medoid 기반 centroid_x 갱신
+    - 매 에폭 후 각 centroid 그룹에서 medoid를 선택하여 centroid_x 갱신
+    - medoid: latent space 기준 centroid_emb[p]에 가장 가까운 실제 훈련 샘플
+    - centroid_x[p] = X_raw[argmax cosine_sim(X_emb_group, centroid_emb[p])]
+    - EMA 평균 대비 장점:
+        · gradient로 최적화된 centroid_emb 방향이 centroid_x에 반영됨
+        · 항상 실제 존재하는 훈련 샘플 → 설명의 신뢰성 보장
+        · "이 그룹의 대표 실제 사례" 로 사용자에게 직접 제시 가능
 
 이론적 근거
 ───────────
 - Dual-Space Prototype Representation (본 가설)
 - Straight-Through Estimator (Bengio et al. 2013)
 - VQ-VAE hard assignment trick (van den Oord et al. 2017)
-- ODC EMA centroid update (Zhan et al. 2020)
+- Medoid-based prototype representation (본 구현)
 
 하위 호환성
 ───────────
@@ -211,24 +214,32 @@ class CentroidLayer(nn.Module):
     def ema_update(
         self,
         X_emb: torch.Tensor,        # (N, D) 전체 훈련 임베딩 — assignment 계산용
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — centroid_x EMA용
+        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — centroid_x medoid용
         assignments: Optional[torch.Tensor] = None,  # (N,) hard assignment
     ) -> Dict[str, float]:
         """
-        centroid_x만 EMA로 갱신합니다 (설명용 원본 feature 공간).
-        centroid_emb는 gradient + commitment loss로 학습되므로 EMA 불필요.
+        에폭 종료 후 호출: sample_groups 갱신 + centroid_x medoid 갱신.
 
-        변경 이유
-        ─────────
-        centroid_emb EMA와 commitment loss가 같은 방향으로 중복 작동.
-        EMA 제거 → gradient 신호 단일화 → 학습 속도 향상 + 신호 명확화.
-        centroid_x는 gradient가 없으므로 EMA가 유일한 갱신 수단 → 유지.
+        centroid_x 갱신 방식: EMA 평균 → Medoid 교체
+        ──────────────────────────────────────────────
+        기존 EMA 평균은 그룹 샘플들의 원본 feature 평균을 추적하지만,
+        centroid_emb가 gradient로 이동한 방향과 무관하게 갱신된다는 문제가 있음.
+
+        Medoid 방식:
+          centroid_x[p] = 그룹 내에서 centroid_emb[p]에
+                          latent space 기준 가장 가까운 실제 훈련 샘플의 원본 feature
+
+        효과
+        ────
+        - centroid_emb의 gradient 최적화 결과가 centroid_x에 반영됨
+        - centroid_x가 항상 실제 존재하는 훈련 샘플 → 설명의 신뢰성 향상
+        - "이 그룹의 대표 사례" 로 사용자에게 직접 제시 가능
+        - EMA smoothing 불필요 → 에폭마다 현재 상태를 정확히 반영
 
         유지되는 기능
         ─────────────
-        - centroid_x EMA: 설명 품질 보장
-        - dead centroid 재초기화: 학습 안정성
-        - sample_groups 갱신: 캐시 기반 검색
+        - sample_groups 갱신: KNN 검색 범위 제한 (필수)
+        - dead centroid 감지: collapse 조기 종료 (필수)
 
         Returns
         ───────
@@ -244,28 +255,32 @@ class CentroidLayer(nn.Module):
             c = F.normalize(self.centroid_emb, dim=-1)
             assignments = (q @ c.T).argmax(dim=-1)
 
-        m = self.ema_momentum
         sizes = []
-        active = 0
         new_groups: List[List[int]] = [[] for _ in range(self.P)]
+
+        # centroid_emb 정규화 (medoid 계산용, 루프 밖에서 1회만)
+        c_norm = F.normalize(self.centroid_emb.float(), dim=-1)  # (P, D)
+        # 전체 임베딩 정규화 (루프 밖에서 1회만)
+        X_emb_norm = F.normalize(X_emb.float(), dim=-1)          # (N, D)
 
         for p in range(self.P):
             mask = (assignments == p)
             size = int(mask.sum().item())
             sizes.append(size)
-            # nonzero → 1D 리스트로 변환
             nz = mask.nonzero(as_tuple=True)[0]
             new_groups[p] = nz.tolist()
 
             if size == 0:
                 continue
-            active += 1
 
-            # centroid_emb EMA 제거 → gradient + commitment loss로 학습
-            # centroid_x EMA 유지 → 설명용 원본 feature 공간 (gradient 없음)
+            # centroid_x = medoid 갱신
+            # latent space 기준 centroid_emb[p]에 가장 가까운 실제 훈련 샘플
             if X_raw is not None and self.centroid_x is not None:
-                mean_x = X_raw[mask].float().mean(dim=0)
-                self.centroid_x.data[p] = m * self.centroid_x.data[p] + (1 - m) * mean_x
+                emb_group  = X_emb_norm[mask]          # (n_p, D) 정규화된 그룹 임베딩
+                sims       = emb_group @ c_norm[p]     # (n_p,)   centroid_emb[p]와 유사도
+                medoid_pos = sims.argmax()              # 그룹 내 상대 인덱스
+                medoid_abs = nz[medoid_pos]             # 전체 데이터 절대 인덱스
+                self.centroid_x.data[p] = X_raw[medoid_abs].float()
 
         self.sample_groups = new_groups
         self.current_epoch += 1

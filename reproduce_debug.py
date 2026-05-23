@@ -15,6 +15,7 @@ if _pre.gpu_id >= 0:
 import joblib, json, pickle, datetime
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 
 from libs.data         import TabularDataset
@@ -47,14 +48,13 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
         ru = ", ".join(f"\"{l}\"({s:.1%})" for l, s in proto["runners_up"])
         print(f"     Runner-up: {ru}")
 
-    # centroid 원본 feature 값 출력 (Medoid 기반 대표 사례)
+    # centroid 원본 feature 값 출력 (Dual-Space의 핵심)
     cf = proto.get("centroid_features", {})
     if cf:
         feat_str = ",  ".join(
             f"{k}={v:.3f}" for k, v in sorted(cf.items(), key=lambda x: -abs(x[1]))[:6]
         )
-        print(f"     대표 사례: {feat_str}")
-        print(f"     (그룹 내 centroid 최근접 실제 훈련 샘플)")
+        print(f"     특성: {feat_str}")
 
     # ② 이웃 증거 (Attention weight)
     ev = e["evidence"]
@@ -225,6 +225,82 @@ def main():
         "seed":         args.seed,
     }, str(state_path))
     print(f"  저장: {state_path}")
+
+    # ── Routing Logit 진단 ───────────────────────────────
+    # confidence가 1/P에 수렴하는 원인 파악용
+    # (1) logit 분포, (2) entropy loss 영향, (3) centroid 분리도 확인
+    print(f"\n{'='*52}")
+    print(f"  [진단] Routing Logit 분포 분석")
+    print(f"{'='*52}")
+
+    model.eval()
+    with torch.no_grad():
+        # 전체 테스트셋 임베딩
+        query_emb_all = model.embedder(X_test)                          # (N_test, D)
+        q_norm = F.normalize(query_emb_all, dim=-1)                     # (N_test, D)
+        c_norm = F.normalize(
+            model.prototype_layer.centroid_emb.detach(), dim=-1)        # (P, D)
+        logits_all = q_norm @ c_norm.T                                  # (N_test, P)
+        soft_all   = torch.softmax(logits_all, dim=-1)                  # (N_test, P)
+
+        # ── (1) Logit 값 분포 ──────────────────────────
+        print(f"\n  [1] Logit 값 분포 (cosine similarity)")
+        print(f"      전체 min  : {logits_all.min().item():.4f}")
+        print(f"      전체 max  : {logits_all.max().item():.4f}")
+        print(f"      전체 mean : {logits_all.mean().item():.4f}")
+        print(f"      전체 std  : {logits_all.std().item():.4f}")
+
+        # 샘플별 top1 - top2 gap (얼마나 1등이 2등을 앞서는지)
+        top2_vals, _ = logits_all.topk(2, dim=-1)                       # (N_test, 2)
+        gap = top2_vals[:, 0] - top2_vals[:, 1]                         # (N_test,)
+        print(f"\n  [2] Top1 - Top2 logit gap (샘플별)")
+        print(f"      mean : {gap.mean().item():.4f}")
+        print(f"      min  : {gap.min().item():.4f}")
+        print(f"      max  : {gap.max().item():.4f}")
+        print(f"      → gap이 작을수록 confidence가 flat해짐")
+
+        # ── (2) Softmax 분포 균등도 ──────────────────
+        # 샘플별 max confidence
+        max_conf, _ = soft_all.max(dim=-1)                              # (N_test,)
+        uniform_val = 1.0 / model.prototype_layer.P
+        print(f"\n  [3] Softmax confidence 분포")
+        print(f"      1/P (균등 기준) : {uniform_val:.4f}")
+        print(f"      max_conf mean   : {max_conf.mean().item():.4f}")
+        print(f"      max_conf min    : {max_conf.min().item():.4f}")
+        print(f"      max_conf max    : {max_conf.max().item():.4f}")
+        print(f"      → mean ≈ 1/P 이면 flat, 크게 차이나면 정상")
+
+        # ── (3) Centroid 간 분리도 ───────────────────
+        sim_matrix = c_norm @ c_norm.T                                  # (P, P)
+        mask = ~torch.eye(
+            model.prototype_layer.P, dtype=torch.bool,
+            device=sim_matrix.device)
+        off_diag = sim_matrix[mask]
+        print(f"\n  [4] Centroid 간 cosine similarity")
+        print(f"      off-diagonal mean : {off_diag.mean().item():.4f}")
+        print(f"      off-diagonal max  : {off_diag.max().item():.4f}")
+        print(f"      off-diagonal min  : {off_diag.min().item():.4f}")
+        print(f"      avg_inter_dist    : {(1 - off_diag).mean().item():.4f}")
+        print(f"      → off-diagonal이 높을수록 centroid가 뭉쳐있음")
+
+        # ── (4) 샘플 3개 상세 logit ──────────────────
+        print(f"\n  [5] 테스트 샘플 #0~2 상위 5개 logit")
+        for i in range(min(3, len(X_test))):
+            top5_vals, top5_idx = logits_all[i].topk(5)
+            pairs = ", ".join(
+                f"C{idx.item()}={val.item():.4f}"
+                for val, idx in zip(top5_vals, top5_idx)
+            )
+            print(f"      Sample #{i}: {pairs}")
+
+        # ── (5) Temperature별 confidence 미리보기 ────
+        print(f"\n  [6] Temperature별 max_confidence 미리보기 (샘플 #0)")
+        for tau in [1.0, 0.5, 0.2, 0.1, 0.07, 0.05]:
+            s = torch.softmax(logits_all[0] / tau, dim=-1)
+            print(f"      tau={tau:.2f} → max={s.max().item():.4f}  "
+                  f"top3: {s.topk(3).values.tolist()}")
+
+    print(f"\n{'='*52}")
 
     # ── Feature 기여도 설명 출력 ─────────────────────────
     if args.explain:

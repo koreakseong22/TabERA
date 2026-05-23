@@ -28,9 +28,9 @@ def suggest_initial_trial() -> dict:
         "k":                16,
         "embedder_layers":  2,
         "dropout":          0.1,
-        "loss_diversity":   0.05,
+        "loss_diversity":   0.10,   # 새 하한(5e-2) 안에서 안정적인 초기값
         "loss_commitment":  0.05,
-        "loss_entropy":     0.01,
+        "loss_entropy":     0.005,  # 새 상한(1e-2) 안에서 낮게 시작
         "lr":               3e-4,
         "weight_decay":     1e-5,
         "batch_size":       256,
@@ -73,11 +73,12 @@ def get_search_space(
         "dropout":         trial.suggest_float("dropout", 0.0, 0.5, step=0.05),
 
         # ── 보조 손실 가중치 ────────────────────────────
-        # [수정] loss_diversity 하한: 1e-4 → 1e-2
-        # 근거: credit-approval(id=29) seed=1에서 loss_diversity=0.000357이
-        #       선택됐을 때 centroid collapse 발생이 실험적으로 확인됨.
-        #       diversity=0.1로 override 시 collapse 해소 확인.
-        "loss_diversity":  trial.suggest_float("loss_diversity",  1e-2, 5e-1, log=True),
+        # [수정] loss_diversity 하한: 1e-2 → 5e-2
+        # 근거: australian(id=40981) seed=1에서 loss_diversity=0.036이 선택됐을 때
+        #       off-diagonal mean=0.172로 centroid 분리 불충분 확인.
+        #       top1-top2 logit gap=0.020으로 confidence flat 심화.
+        #       하한을 5e-2로 올려 최소한의 centroid 분리도 보장.
+        "loss_diversity":  trial.suggest_float("loss_diversity",  5e-2, 5e-1, log=True),
 
         # [수정] loss_commitment 하한: 1e-4 → 1e-2
         # 근거: colic(id=25) seed=1에서 loss_diversity=0.466, loss_commitment=0.0019으로
@@ -86,7 +87,7 @@ def get_search_space(
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-2, 1e-1, log=True),
 
         # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
-        "loss_entropy":    trial.suggest_float("loss_entropy",    1e-3, 1e-1, log=True),
+        "loss_entropy": trial.suggest_float("loss_entropy", 1e-3, 1e-2, log=True),
 
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
