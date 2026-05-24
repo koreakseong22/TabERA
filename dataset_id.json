@@ -1192,9 +1192,9 @@
         "tasktype": "binclass"
     },
     "43454": {
-        "tasktype": "binclass",
-        "name": "Credit-Risk-Dataset",
+        "name": "CRD",
         "fullname": "Credit-Risk-Dataset",
+        "tasktype": "binclass",
         "target_col": "loan_status"
     },
     "1597": {
