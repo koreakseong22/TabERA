@@ -193,6 +193,13 @@ def load_dataset(
                     df_raw = df_raw.iloc[:, :-1]
 
             df = df_raw
+
+            # target_col이 dataset_info에 명시된 경우 우선 사용
+            # (OpenML default_target_attribute가 None인 데이터셋 대응)
+            explicit_target = dataset_info.get("target_col")
+            if explicit_target and explicit_target in df.columns:
+                y_s = df[explicit_target]
+                df  = df.drop(columns=[explicit_target])
             df.to_parquet(cache_X)
             np.save(str(cache_y), y_s.values, allow_pickle=True)
             y_s = pd.Series(y_s.values)
