@@ -103,9 +103,13 @@ if train:
     # output_dim: n_classes 사용 (y가 1D이므로 shape[1] 불가)
     output_dim = dataset.n_classes if tasktype == "multiclass" else 1
 
-    # n_prototypes: 가설 기반 sqrt(N) 자동 설정
-    n_proto_default = max(4, int(math.sqrt(len(y_train))))
-    print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
+    # n_prototypes: min(sqrt(N), n_features) 자동 설정
+    # 근거: prototype은 원본 feature 공간의 패턴을 대표한다.
+    #       feature가 d개인 공간에서 의미 있게 구분되는 패턴의 수는
+    #       d개를 초과할 수 없으므로 n_features를 상한으로 설정.
+    #       feature가 적고 데이터가 많은 경우에도 centroid 분리도 보장.
+    n_proto_default = max(4, min(int(math.sqrt(len(y_train))), dataset.n_features))
+    print(f"  Auto n_prototypes: min(sqrt({len(y_train)}), {dataset.n_features}) = {n_proto_default}")
 
     # ── 자동 가설 생성 (컬럼 평균 기준) ──────────────────
 
