@@ -450,6 +450,27 @@ class FeatureStore:
                 ])
             return result
 
+    @torch.no_grad()
+    def retrieve_tensor(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        빠른 tensor 직접 인덱싱 — forward 중 호출용.
+
+        기존 retrieve()는 dict 변환을 포함한 파이썬 루프로 느림.
+        이 메서드는 tensor 슬라이싱 한 번으로 (B, k, F)를 반환.
+        FeatureCrossAttention 모드 A(원본 feature 기반)에서 사용.
+
+        Parameters
+        ──────────
+        indices : (B, k) — MemoryBank topk_idx와 동일한 인덱스
+
+        Returns
+        ───────
+        (B, k, F) tensor — 이웃들의 원본 feature 값
+        """
+        idx_cpu = indices.detach().cpu().clamp(0, max(self._filled - 1, 0))
+        # 단일 fancy indexing → (B, k, F)
+        return self._store[idx_cpu]   # CPU tensor, forward에서 device 이동
+
     def top_features(self, sample_dict: Dict[str, float], n: int = 6) -> Dict[str, float]:
         return dict(sorted(sample_dict.items(), key=lambda x: abs(x[1]), reverse=True)[:n])
 
@@ -553,7 +574,15 @@ class TabERA(nn.Module):
         X: torch.Tensor,                          # (B, F)
         labels: Optional[torch.Tensor] = None,    # (B,) 학습 시 메모리 업데이트용
         return_explanations: bool = False,
+        ablation_mode: str = "none",              # ablation 모드 (학습 시에는 반드시 "none")
     ) -> Dict[str, torch.Tensor]:
+        """
+        ablation_mode 옵션:
+          "none"            : 정상 forward (기본값)
+          "no_feat_path"    : feature path 제거 → fused_agg = agg_emb_pure (gate=0 강제)
+          "random_neighbor" : neighbor 임베딩을 랜덤으로 교체 → neighbor evidence 의존도 측정
+          "gate_analysis"   : forward는 동일, gate 통계를 out에 추가 반환
+        """
         # 1. 임베딩
         query_emb = self.embedder(X)               # (B, D)
 
@@ -568,8 +597,48 @@ class TabERA(nn.Module):
                 query_emb, self.k,
                 hard_assignment=hard_assignment,
             )
+
+            # ── Ablation: random_neighbor ────────────────────────
+            # neighbor 임베딩을 가우시안 랜덤으로 교체.
+            # neighbor evidence가 실제로 의미 있게 사용되는지 검증:
+            # 랜덤 neighbor를 넣었을 때 성능이 크게 떨어지면
+            # "neighbor path가 실제로 사용된다"는 주장의 근거가 됨.
+            if ablation_mode == "random_neighbor":
+                B_abl = nk.shape[0]
+                # nk와 같은 분포(unit sphere)를 따르도록 normalize
+                nk              = F.normalize(torch.randn_like(nk), dim=-1)
+                nv              = torch.randn_like(nv)
+                # label도 랜덤 shuffle (데이터 내 레이블 분포는 유지)
+                rand_perm        = torch.randperm(B_abl, device=X.device)
+                neighbour_labels = neighbour_labels[rand_perm]
+
+            # ── 원본 feature 조회 (FeatureCrossAttention 모드 A용) ──────
+            # retrieve_tensor: dict 루프 없이 tensor 슬라이싱 한 번 → (B, k, F).
+            # 기존 retrieve()의 파이썬 루프(배치당 B*k번) 대비 수십 배 빠름.
+            # FeatureStore 미충족 시 None → embedding space fallback (모드 B).
+            neighbour_x_raw = None
+            if (self._feature_store is not None
+                    and self._feature_store._filled >= self.k):
+                neighbour_x_raw = self._feature_store.retrieve_tensor(
+                    topk_idx
+                ).to(X.device)                               # (B, k, F)
+
             fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure = \
-                self.ot_selector(query_emb, nk, nv, neighbour_labels)
+                self.ot_selector(
+                    query_emb, nk, nv, neighbour_labels,
+                    query_x=X,
+                    neighbour_x=neighbour_x_raw,
+                )
+
+            # ── Ablation: no_feat_path ───────────────────────────
+            # feature cross-attention branch를 prediction에서 제거.
+            # gate=0 강제 → fused_agg = agg_emb_pure (neighbor path만 사용).
+            # 이 ablation에서 성능이 하락하면:
+            # "feature path가 실제로 prediction에 기여한다"는 faithfulness 주장의
+            # 핵심 실험적 근거가 됨.
+            if ablation_mode == "no_feat_path":
+                fused_agg = agg_emb_pure   # gate=0 강제, feature path 완전 제거
+
         else:
             # Memory 미충족 fallback
             fused_agg      = torch.zeros_like(query_emb)
@@ -612,7 +681,22 @@ class TabERA(nn.Module):
             "gate":          gate,
             "agg_emb_pure":  agg_emb_pure,
             "fused_agg":     fused_agg,
+            "ablation_mode": ablation_mode,
         }
+
+        # ── Ablation: gate_analysis ──────────────────────────────
+        # forward는 full model과 동일, gate 통계만 추가 반환.
+        # dataset별 gate 분포를 통해 feature/neighbor path 사용 비율을 분석.
+        # gate ≈ 0.5: 두 path 균형 사용 / gate ≈ 0: neighbor 우세 / gate ≈ 1: feature 우세
+        if ablation_mode == "gate_analysis":
+            gate_vals = gate.detach()                    # (B, D)
+            out["gate_stats"] = {
+                "mean":      float(gate_vals.mean().item()),
+                "std":       float(gate_vals.std().item()),
+                "min":       float(gate_vals.min().item()),
+                "max":       float(gate_vals.max().item()),
+                "per_sample_mean": gate_vals.mean(dim=-1).cpu().tolist(),  # (B,)
+            }
 
         if return_explanations:
             # 설명용 softmax — temperature scaling 적용
