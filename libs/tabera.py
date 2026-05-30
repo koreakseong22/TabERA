@@ -553,6 +553,7 @@ class TabERA(nn.Module):
         X: torch.Tensor,                          # (B, F)
         labels: Optional[torch.Tensor] = None,    # (B,) 학습 시 메모리 업데이트용
         return_explanations: bool = False,
+        ablation_mode: str = "none",              # ablation 모드 (학습 시 "none" 유지)
     ) -> Dict[str, torch.Tensor]:
         # 1. 임베딩
         query_emb = self.embedder(X)               # (B, D)
@@ -568,8 +569,22 @@ class TabERA(nn.Module):
                 query_emb, self.k,
                 hard_assignment=hard_assignment,
             )
+
+            # ── Ablation: random_neighbor ────────────────────────
+            if ablation_mode == "random_neighbor":
+                B_abl = nk.shape[0]
+                nk              = F.normalize(torch.randn_like(nk), dim=-1)
+                nv              = torch.randn_like(nv)
+                rand_perm        = torch.randperm(B_abl, device=X.device)
+                neighbour_labels = neighbour_labels[rand_perm]
+
             fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure = \
                 self.ot_selector(query_emb, nk, nv, neighbour_labels)
+
+            # ── Ablation: no_feat_path ───────────────────────────
+            if ablation_mode == "no_feat_path":
+                fused_agg = agg_emb_pure   # gate=0 강제, feature path 완전 제거
+
         else:
             # Memory 미충족 fallback
             fused_agg      = torch.zeros_like(query_emb)
@@ -612,7 +627,19 @@ class TabERA(nn.Module):
             "gate":          gate,
             "agg_emb_pure":  agg_emb_pure,
             "fused_agg":     fused_agg,
+            "ablation_mode": ablation_mode,
         }
+
+        # ── Ablation: gate_analysis ──────────────────────────────
+        if ablation_mode == "gate_analysis":
+            gate_vals = gate.detach()
+            out["gate_stats"] = {
+                "mean":      float(gate_vals.mean().item()),
+                "std":       float(gate_vals.std().item()),
+                "min":       float(gate_vals.min().item()),
+                "max":       float(gate_vals.max().item()),
+                "per_sample_mean": gate_vals.mean(dim=-1).cpu().tolist(),
+            }
 
         if return_explanations:
             # 설명용 softmax — temperature scaling 적용
