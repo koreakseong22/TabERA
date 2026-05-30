@@ -18,9 +18,7 @@ feature_imp가 explanation에만 쓰이고 prediction 경로에 참여하지 않
 D차원으로 투영(feat_to_emb)한 뒤 agg_emb와 sample-wise gated fusion으로
 결합합니다.
 
-- gate ∈ (0,1)^D: query_emb, feat_emb, agg_emb_pure 모두 참조하여 학습
-                  → neighbor 품질과 feature 품질을 비교해 mixing 결정 가능
-                  → sample-wise adaptive gating이 구조적으로 보장됨
+- gate ∈ (0,1)^D: query_emb와 feat_emb로부터 학습
 - fused_agg = gate * feat_emb + (1 - gate) * agg_emb
 - TabERA.forward에서 head 입력에 fused_agg 사용 (차원 그대로 3D 유지)
 
@@ -42,37 +40,19 @@ import numpy as np
 
 class FeatureCrossAttention(nn.Module):
     """
-    어떤 feature 때문에 유사한지 계산하는 모듈 — 설명 경로 계층 3.
-
-    두 가지 모드를 지원:
-    ─────────────────────────────────────────────────────────────────
-    모드 A (raw feature 기반, 기본값):
-        원본 feature 공간에서 query와 neighbor의 차이를 직접 계산.
-        차이가 작을수록(유사할수록) 해당 feature의 기여도가 높음.
-        → "volatile_acidity가 비슷하기 때문에 유사하다"는 설명이
-          실제 원본 feature 값 차이로부터 직접 도출됨.
-        → faithfulness 검증 가능 (검증 3-A, 3-B 모두 통과 가능)
-
-    모드 B (embedding 기반, fallback):
-        query_x / neighbour_x가 없을 때 (예: FeatureStore 미충족)
-        기존 embedding space 방식으로 동작.
-        → 학습 초기 FeatureStore가 채워지기 전 단계에서 사용.
-    ─────────────────────────────────────────────────────────────────
+    어떤 feature 때문에 유사한지 계산하는 모듈.
+    OT 교체와 무관하게 유지 — 설명 경로 계층 3.
     """
 
     def __init__(self, embed_dim: int, n_features: int) -> None:
         super().__init__()
-        # fallback용 (embedding 방식): FeatureStore 미충족 시 사용
         self.feat_proj = nn.Linear(embed_dim, n_features, bias=False)
-        self.n_features = n_features
 
     def forward(
         self,
-        query_emb: torch.Tensor,                        # (B, D)
-        neighbour_emb: torch.Tensor,                    # (B, k, D)
-        evidence_weights: torch.Tensor,                 # (B, k)
-        query_x: Optional[torch.Tensor] = None,         # (B, F) 원본 feature
-        neighbour_x: Optional[torch.Tensor] = None,     # (B, k, F) 이웃 원본 feature
+        query_emb: torch.Tensor,          # (B, D)
+        neighbour_emb: torch.Tensor,      # (B, k, D)
+        evidence_weights: torch.Tensor,   # (B, k)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         반환
@@ -82,29 +62,18 @@ class FeatureCrossAttention(nn.Module):
         """
         B, k, D = neighbour_emb.shape
 
-        if query_x is not None and neighbour_x is not None:
-            # ── 모드 A: 원본 feature 공간에서 직접 계산 ──────────
-            # feat_diff: (B, k, F) — query와 각 neighbor의 원본 feature 차이
-            # 차이가 작을수록(값이 유사할수록) 해당 feature가 유사도에 기여
-            feat_diff = query_x.unsqueeze(1) - neighbour_x          # (B, k, F)
-            # [스케일 안정화] 역수(1/diff)는 diff≈0 시 폭발 → gradient 불안정
-            # softmax(-|diff|, dim=2):
-            #   항상 0~1 범위, 차이 작은(유사한) feature에 높은 가중치
-            feat_sim  = F.softmax(-feat_diff.abs(), dim=2)           # (B, k, F)
-            ew = evidence_weights.unsqueeze(-1)                      # (B, k, 1)
-            feature_importance = feat_sim * ew                       # (B, k, F)
-        else:
-            # ── 모드 B: embedding space fallback ─────────────────
-            q = query_emb.unsqueeze(1)                              # (B, 1, D)
-            dim_match = q * neighbour_emb                           # (B, k, D)
-            ew = evidence_weights.unsqueeze(-1)                     # (B, k, 1)
-            weighted = dim_match * ew                               # (B, k, D)
-            feat_imp_raw = self.feat_proj(weighted)                 # (B, k, F)
-            feature_importance = feat_imp_raw.abs()
+        q = query_emb.unsqueeze(1)                       # (B, 1, D)
+        # 차원별 유사도
+        dim_match = q * neighbour_emb                    # (B, k, D)
 
-        # 차원별 attention (진단용) — 항상 embedding 기반
-        q = query_emb.unsqueeze(1)
-        attn_weights = (q * neighbour_emb).abs()                    # (B, k, D)
+        # evidence_weights로 dominant 이웃 강조
+        ew = evidence_weights.unsqueeze(-1)              # (B, k, 1)
+        weighted = dim_match * ew                        # (B, k, D)
+
+        # D → F 투영
+        feat_imp_raw    = self.feat_proj(weighted)       # (B, k, F)
+        feature_importance = feat_imp_raw.abs()
+        attn_weights       = dim_match.abs()             # (B, k, D)
 
         return feature_importance, attn_weights
 
@@ -148,31 +117,16 @@ class AttentionAggregator(nn.Module):
         # (a) feature attribution (B, k, F) → evidence-weighted summary (B, F) → (B, D)
         self.feat_to_emb = nn.Linear(n_features, embed_dim)
 
-        # (b) gate network: [query_emb, feat_emb, agg_emb] → gate ∈ (0,1)^D
-        # agg_emb_pure를 포함함으로써 neighbor 품질도 gate 결정에 반영.
-        # 이전: [query, feat] → feature path만 보고 gate 결정 (neighbor 품질 무시)
-        # 이후: [query, feat, agg] → 두 path의 품질을 비교하여 gate 결정 가능
-        # → sample-wise adaptive gating이 구조적으로 가능해짐
-        # (cf. GRU: reset/update gate가 hidden state와 input을 모두 참조)
+        # (b) gate network: [query_emb, feat_emb] → gate ∈ (0,1)^D
         self.gate_net = nn.Sequential(
-            nn.LayerNorm(embed_dim * 3),
-            nn.Linear(embed_dim * 3, embed_dim),
+            nn.LayerNorm(embed_dim * 2),
+            nn.Linear(embed_dim * 2, embed_dim),
         )
 
-        # Gate 초기화: 초기 gate ≈ 0.5 (두 path 균등 출발)
-        # normal init으로 초기 분기 유도 (zeros만 쓰면 수렴 속도 느림)
+        # Gate 초기화: 초기 gate ≈ 0.5
         nn.init.zeros_(self.gate_net[-1].bias)
-        nn.init.normal_(self.gate_net[-1].weight, std=0.01)
 
-    def forward(
-        self,
-        query_emb,
-        nk,
-        nv,
-        neighbour_labels,
-        query_x: Optional[torch.Tensor] = None,      # (B, F) 원본 feature
-        neighbour_x: Optional[torch.Tensor] = None,  # (B, k, F) 이웃 원본 feature
-    ):
+    def forward(self, query_emb, nk, nv, neighbour_labels):
         """
         Parameters
         ──────────
@@ -180,8 +134,6 @@ class AttentionAggregator(nn.Module):
         nk               : (B, k, D)— 이웃 key 임베딩
         nv               : (B, k, D)— 이웃 value 임베딩 (현재 미사용, TabR 호환)
         neighbour_labels : (B, k)   — 이웃 레이블
-        query_x          : (B, F)   — 원본 feature (FeatureCrossAttention 모드 A용)
-        neighbour_x      : (B, k, F)— 이웃 원본 feature (FeatureCrossAttention 모드 A용)
         """
         # 1. TabR 방식 similarity
         # -||q||² + 2(q·k) - ||k||²
@@ -205,13 +157,7 @@ class AttentionAggregator(nn.Module):
         agg_emb_pure = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
 
         # 4. feature 수준 기여도 (설명용 + gated fusion 입력)
-        # query_x / neighbour_x가 있으면 원본 feature 공간 기반 (모드 A)
-        # 없으면 embedding space fallback (모드 B: FeatureStore 미충족 시)
-        feature_imp, attn_w = self.feat_cross(
-            query_emb, nk, evidence_w,
-            query_x=query_x,
-            neighbour_x=neighbour_x,
-        )
+        feature_imp, attn_w = self.feat_cross(query_emb, nk, evidence_w)
         # feature_imp: (B, k, F), attn_w: (B, k, D)
 
         # ── Gated Fusion ────────────────────────────────────
@@ -221,10 +167,8 @@ class AttentionAggregator(nn.Module):
         # (b) F → D 투영
         feat_emb = self.feat_to_emb(feat_summary)                  # (B, D)
 
-        # (c) Gate 계산: query, feat_emb, agg_emb_pure 모두 참조하여 mixing 결정
-        # agg_emb_pure가 포함됨으로써 "neighbor가 얼마나 유용한가"를
-        # gate가 직접 비교할 수 있게 됨
-        gate_input = torch.cat([query_emb, feat_emb, agg_emb_pure], dim=-1)  # (B, 3D)
+        # (c) Gate 계산: query와 feat_emb를 보고 mixing 결정
+        gate_input = torch.cat([query_emb, feat_emb], dim=-1)      # (B, 2D)
         gate = torch.sigmoid(self.gate_net(gate_input))            # (B, D)
 
         # (d) Sample-wise gated fusion
