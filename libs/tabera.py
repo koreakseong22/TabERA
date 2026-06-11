@@ -3,8 +3,6 @@ libs/tabera.py
 ============
 TabERA — Dual-Space Prototype Explainable TabR Model.
 
-MultiTab의 tabr.py를 대체하는 파일입니다.
-
   CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
   AttentionAggregator  : TabR 방식 similarity 기반 이웃 집계
                           + Gated Feature Fusion (faithfulness 보장)
