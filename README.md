@@ -38,7 +38,7 @@ X ∈ ℝ^(N×F)
 query_emb ∈ ℝ^D
   ├── CentroidLayer
   │     C_emb ∈ ℝ^(P×D)  — learnable, gradient + STE routing
-  │     C_x   ∈ ℝ^(P×F)  — EMA only, original-space summary (explanation)
+  │     C_x   ∈ ℝ^(P×F)  — medoid only (real sample, no gradient), original-space (explanation)
   │     → context_emb, hard_assignment, routing_probs
   │
   ├── MemoryBank.retrieve (group-constrained KNN)
@@ -57,7 +57,7 @@ query_emb ∈ ℝ^D
 
 ### Key design decisions
 
-**Dual-Space Centroid.** Each centroid maintains two representations: `centroid_emb` in embedding space (learnable, used for routing and retrieval) and `centroid_x` in original feature space (EMA-updated, used for human-readable explanations). This separation ensures that explanations show actual data statistics ("alcohol=10.24") rather than opaque embedding coordinates.
+**Dual-Space Centroid.** Each centroid maintains two representations: `centroid_emb` in embedding space (learnable, used for routing and retrieval) and `centroid_x` in original feature space (medoid-updated each epoch — the real training sample closest to `centroid_emb[p]` in embedding space, used for human-readable explanations). This separation ensures that explanations show an actual training example ("alcohol=10.24") rather than an opaque embedding coordinate or a synthetic EMA average.
 
 **STE Routing.** Hard assignment via Straight-Through Estimator (Bengio et al., 2013; VQ-VAE, van den Oord et al., 2017). Forward pass uses discrete argmax for crisp group boundaries; backward pass passes gradients through softmax.
 
@@ -79,11 +79,11 @@ The macro-micro structure draws from cognitive science, used as conceptual motiv
 
 | File | Component | Role |
 |------|-----------|------|
-| `libs/prototypes.py` | CentroidLayer | Dual-space centroids, STE routing, KMeans++ init, EMA |
+| `libs/prototypes.py` | CentroidLayer | Dual-space centroids, STE routing, KMeans++ init, medoid update |
 | `libs/evidence.py` | AttentionAggregator | TabR L2 attention, Gated Fusion, FeatureCrossAttention |
 | `libs/tabera.py` | TabERA, MemoryBank, FeatureStore | Model, KNN store (cross-group fallback), raw feature store |
 | `libs/supervised.py` | TabERAWrapper | Training loop, EMA scheduling |
-| `libs/search_space.py` | HPO space | 11 hyperparameters (Optuna) |
+| `libs/search_space.py` | HPO space | 10 hyperparameters (Optuna) + 1 auto-determined (`n_prototypes`) |
 | `libs/data.py` | TabularDataset | OpenML data loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
 
@@ -139,6 +139,7 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explana
 ① Group context
    → Centroid_3 (confidence=94.3%)
    alcohol=10.24, pH=3.31, fixed_acidity=7.21
+   (nearest real training sample to this centroid — medoid)
 
 ② Neighbor evidence
    Neighbour #0: 42.1%  →  alcohol=10.41, pH=3.28
@@ -154,21 +155,28 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explana
 
 ---
 
-## HPO parameters (11)
+## HPO parameters (10 searched + 1 auto-determined)
 
 | Parameter | Range | Role |
 |-----------|-------|------|
 | `embed_dim` | {64, 128, 256} | Embedding dimension D |
 | `k` | {8, 16, 32, 64} | Number of KNN neighbors |
-| `n_prototypes` | 4–16 (step 4) | Number of centroids P |
 | `embedder_layers` | 1–4 | ResidualMLP depth |
 | `dropout` | 0.0–0.5 | Dropout rate |
-| `loss_diversity` | 1e-2 – 5e-1 | Centroid spread |
+| `loss_diversity` | 5e-2 – 5e-1 | Centroid spread |
 | `loss_commitment` | 1e-2 – 1e-1 | VQ-VAE commitment |
-| `loss_entropy` | 1e-3 – 1e-1 | Routing entropy (collapse prevention) |
+| `loss_entropy` | 1e-3 – 1e-2 | Routing entropy (collapse prevention) |
 | `lr` | 1e-4 – 1e-2 | Learning rate |
 | `weight_decay` | 1e-6 – 1e-2 | L2 regularization |
 | `batch_size` | {128, 256, 512} | Batch size |
+
+> **`n_prototypes` (number of centroids P) is not searched by Optuna.**
+> It is automatically set per dataset as `P = min(sqrt(N_train), n_features)`
+> (clamped to a minimum of 4), and overridden onto every trial
+> (see `optimize.py`, `n_proto_default`). The actual value used is logged
+> in `trial.user_attrs["n_prototypes_actual"]` and restored by `reproduce.py`.
+> This can range well beyond a fixed small search range
+> (e.g., P≈12 for `lymph` (N=148, F=19) up to P≈185 for `nomao` (N=34,465, F=500)).
 
 ---
 
@@ -178,11 +186,11 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explana
 TabERA/
 ├── libs/
 │   ├── tabera.py            # TabERA model (TabERA, MemoryBank, FeatureStore)
-│   ├── prototypes.py        # CentroidLayer (STE, KMeans++, EMA, Dual-Space)
+│   ├── prototypes.py        # CentroidLayer (STE, KMeans++, Dual-Space, medoid update)
 │   ├── evidence.py          # AttentionAggregator, FeatureCrossAttention, Gated Fusion
 │   ├── supervised.py        # TabERAWrapper (training loop, EMA)
 │   ├── eval.py              # Evaluation metrics
-│   ├── search_space.py      # Optuna HPO space (11 params)
+│   ├── search_space.py      # Optuna HPO space (10 params; n_prototypes auto-set)
 │   └── data.py              # OpenML data loader
 ├── optim_logs/              # HPO results per seed
 ├── figures/                 # Embedding visualizations
