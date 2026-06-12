@@ -1,8 +1,8 @@
 ﻿# 실험 로그 (용량 큼)
 optim_logs/
 data_cache/
-figures/
 eda_output/
+figures/
 
 # Python
 __pycache__/
