@@ -442,19 +442,37 @@ def main():
             delta_arr  = np.array(delta_per_feat)
             delta_rank = np.argsort(np.argsort(-delta_arr))   # 0-based, 낮을수록 중요
 
-            # ── Step 2. TabERA feature_imp 순위 ─────────────────
-            print(f"  [2/4] TabERA feature_imp 순위 계산 중...")
-            with torch.no_grad():
-                out_rc      = model(X_rc)
-                feat_imp_rc = out_rc.get("feature_imp")       # (N, k, F)
+            # ── Step 2. TabERA feature_imp 순위 (Input × Gradient) ──
+            #
+            # [변경 이유]
+            # 기존 feature_imp = |feat_proj(query_emb * neighbour_emb * evidence_w)|
+            # 는 학습된 D->F 선형 projection으로, embedder(비선형)의 출력인
+            # 임베딩 공간 차원과 원본 feature 공간 사이에 수학적 연결이 없어
+            # delta(원본 feature perturbation 효과)와 무관했음
+            # (실측: ρ≈0.08~0.10 ≈ Random).
+            #
+            # 변경: agg_emb_pure(=retrieval 경로의 raw aggregation)을
+            # raw input X에 대해 직접 미분(Input × Gradient, IG의 1-step 근사).
+            # embedder의 비선형성을 grad가 그대로 통과하므로,
+            # "이 feature를 바꾸면 retrieval 결과가 얼마나 변하는가"를
+            # delta(perturbation 기반)와 같은 좌표계(원본 feature space)에서 측정.
+            # -> 모델 구조/학습 변경 없음, eval 모드에서 1차 backward만 사용.
+            print(f"  [2/4] TabERA feature_imp 순위 계산 중 (Input x Gradient)...")
+
+            X_rc_grad = X_rc.clone().detach().requires_grad_(True)
+            out_rc    = model(X_rc_grad)
+            feat_imp_rc = out_rc.get("feature_imp")       # (N, k, F) -- 참고용, 사용 안 함
+
+            target = out_rc["agg_emb_pure"].sum()
+            grad_X = torch.autograd.grad(target, X_rc_grad, retain_graph=False)[0]  # (N, F)
+
+            X_baseline = X_train.mean(dim=0)               # (F,) -- delta 계산과 동일 baseline
+            tabera_imp = (grad_X * (X_rc_grad - X_baseline)).abs().detach().cpu().numpy()  # (N, F)
 
             if feat_imp_rc is None:
-                print("  [오류] memory bank 미충족. epochs를 늘리세요.")
-            else:
-                evidence_w_rc = out_rc["evidence_w"]          # (N, k)
-                tabera_imp = (
-                    feat_imp_rc * evidence_w_rc.unsqueeze(-1)
-                ).sum(dim=1).detach().cpu().numpy()            # (N, F)
+                print("  [참고] memory bank 미충족이지만 IG는 agg_emb_pure 기반이라 계속 진행")
+
+            if True:
                 tabera_mean = tabera_imp.mean(axis=0)          # (F,)
                 tabera_rank = np.argsort(np.argsort(-tabera_mean))
 
