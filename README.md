@@ -2,29 +2,32 @@
 
 **Tabular Explainable Retrieval Architecture**
 
-Centroid-conditioned hierarchical retrieval with faithful explanations for tabular data.
+Centroid-conditioned hierarchical retrieval with example-based explanations for tabular data.
 
 ---
 
 ## Overview
 
-TabERA is a retrieval-augmented tabular model that organizes data through learnable centroids and retrieves relevant neighbors within centroid groups. The architecture produces predictions and multi-level explanations simultaneously, where the explanation pathway is architecturally guaranteed to participate in the prediction (faithfulness).
+TabERA is a retrieval-augmented tabular model that organizes data through learnable centroids and retrieves relevant neighbors within centroid groups. Beyond prediction, the forward pass itself produces **example-based explanations** — which group a sample belongs to, and which training samples it is compared against — information that post-hoc methods (SHAP, LIME, Integrated Gradients) cannot produce for *any* model, since those methods only operate on feature-level input–output relationships.
 
 ```
 Query → Embedding → Centroid Routing (macro) → Group-constrained KNN (micro) → Prediction
                           ↓                              ↓                         ↓
                     "Which group?"              "Which neighbors?"          "Which features?"
+                    (architectural)              (architectural)             (post-hoc, IG)
 ```
 
 ### Three-level explanation chain
 
-| Level | Module | Explains |
-|-------|--------|----------|
-| ① Group context | CentroidLayer (centroid_x) | "This sample belongs to the high-alcohol, low-pH group" |
-| ② Neighbor evidence | AttentionAggregator (evidence_w) | "Neighbor #1 contributes 42%" |
-| ③ Feature attribution | FeatureCrossAttention (feature_imp) | "volatile_acidity drives 15.1% of similarity" |
+| Level | Module | Type | Explains |
+|-------|--------|------|----------|
+| ① Group context | CentroidLayer (`centroid_x`) | **Architectural** (intrinsic forward-pass output) | "This sample belongs to the high-alcohol, low-pH group" |
+| ② Neighbor evidence | MemoryBank + AttentionAggregator (`evidence_w`) | **Architectural** (intrinsic forward-pass output) | "Neighbor #1 (training sample #142) contributes 42%" |
+| ③ Feature attribution | Integrated Gradients (Sundararajan et al., 2017) | Post-hoc, standard | "`volatile_acidity` has the largest attribution toward ŷ" |
 
-Levels ② and ③ participate in the prediction via **Gated Fusion**, ensuring that the explanation reflects what the model actually uses for its decision.
+①② are *case-based / example-based* explanations: they are read directly off intermediate activations of the forward pass (which centroid a sample is routed to, which training examples are retrieved as neighbors). No post-hoc method — gradient-based or perturbation-based — can produce this kind of information for an arbitrary model, because it requires an architecture that explicitly organizes and retrieves training examples at inference time.
+
+③ is feature-level attribution computed via Integrated Gradients on the trained model. We do not claim architectural novelty for ③ itself; we show empirically (§Faithfulness below) that it is substantially more faithful to the model's actual decision boundary than a learned feature-projection alternative we initially explored, and competitive with SHAP.
 
 ---
 
@@ -38,40 +41,56 @@ X ∈ ℝ^(N×F)
 query_emb ∈ ℝ^D
   ├── CentroidLayer
   │     C_emb ∈ ℝ^(P×D)  — learnable, gradient + STE routing
-  │     C_x   ∈ ℝ^(P×F)  — medoid only (real sample, no gradient), original-space (explanation)
+  │     C_x   ∈ ℝ^(P×F)  — medoid only (real sample, no gradient), original-space (explanation ①)
   │     → context_emb, hard_assignment, routing_probs
   │
   ├── MemoryBank.retrieve (group-constrained KNN)
   │     Cross-group fallback for small groups (adjacent centroid expansion)
-  │     → nk (B,K,D), neighbor_labels (B,K)
+  │     → nk (B,K,D), neighbor_labels (B,K)            (explanation ②)
   │
   └── AttentionAggregator
-        ├─ TabR L2 similarity → evidence_w (B,K)
+        ├─ TabR L2 similarity → evidence_w (B,K)        (explanation ②)
         ├─ Value construction: label_emb + T(query - neighbor)
         ├─ agg_emb = weighted sum of values
-        ├─ FeatureCrossAttention → feature_imp (B,K,F)
+        ├─ FeatureCrossAttention → feature_imp (B,K,F)  (auxiliary signal, NOT ③)
         └─ Gated Fusion: fused_agg = gate·feat_emb + (1-gate)·agg_emb
               ↓
 [query_emb ‖ context_emb ‖ fused_agg] ∈ ℝ^(3D) → MLP Head → ŷ
+
+(explanation ③, computed separately, not part of the forward pass above)
+  ŷ ──IG (Integrated Gradients, ∂ŷ/∂X · (X - X̄))──> per-feature attribution
 ```
 
 ### Key design decisions
 
-**Dual-Space Centroid.** Each centroid maintains two representations: `centroid_emb` in embedding space (learnable, used for routing and retrieval) and `centroid_x` in original feature space (medoid-updated each epoch — the real training sample closest to `centroid_emb[p]` in embedding space, used for human-readable explanations). This separation ensures that explanations show an actual training example ("alcohol=10.24") rather than an opaque embedding coordinate or a synthetic EMA average.
+**Dual-Space Centroid.** Each centroid maintains two representations: `centroid_emb` in embedding space (learnable, used for routing and retrieval) and `centroid_x` in original feature space (medoid-updated each epoch — the real training sample closest to `centroid_emb[p]` in embedding space, used for human-readable explanations). This separation ensures that explanation ① shows an actual training example ("alcohol=10.24") rather than an opaque embedding coordinate or a synthetic EMA average.
 
 **STE Routing.** Hard assignment via Straight-Through Estimator (Bengio et al., 2013; VQ-VAE, van den Oord et al., 2017). Forward pass uses discrete argmax for crisp group boundaries; backward pass passes gradients through softmax.
 
 **Cross-group Fallback.** When a centroid group has fewer than K members, the search expands to the nearest adjacent centroid group rather than falling back to global search. This preserves the centroid structure's meaning even for small groups.
 
-**Gated Fusion (Faithfulness).** The feature cross-attention output is projected to embedding space and mixed with the neighbor aggregation via a learned gate. This ensures that the features highlighted in the explanation actually participate in the prediction, providing architectural faithfulness. Without this, explanations and predictions could diverge.
+**Gated Fusion (Predictive Auxiliary Path).** `FeatureCrossAttention` produces a feature-interaction signal (`feature_imp` → `feat_emb`) that is mixed into the neighbor aggregation via a learned gate (`fused_agg = gate·feat_emb + (1-gate)·agg_emb`). This branch is validated as a **predictive** component — removing it (`--ablation no_feat_path`) measurably degrades performance (e.g., Δlogloss = +0.91 on `ada_agnostic`, id=1043). It is *not* the source of explanation ③; `feature_imp` is an internal signal that improves ŷ, but its per-feature breakdown does not correlate with each feature's actual effect on ŷ (Spearman ρ ≈ 0.08–0.10 against perturbation-based ground truth, statistically indistinguishable from random). Explanation ③ is computed independently via Integrated Gradients (see Faithfulness below).
+
+### Faithfulness of explanation ③
+
+We measure faithfulness as the Spearman rank correlation between a feature-attribution method's ranking and the ranking by *actual* effect on ŷ (each feature individually perturbed to its training-set mean; ranked by |Δlogits|).
+
+| Method | Spearman ρ vs. ground-truth ranking |
+|---|---|
+| `FeatureCrossAttention` (`feature_imp`, initial design) | ≈ 0.08–0.10 (≈ Random) |
+| SHAP (KernelExplainer) | ≈ 0.84 |
+| **Integrated Gradients (adopted for ③)** | **≈ 0.94** |
+| Random baseline | ≈ −0.17 |
+
+(Measured on `ada_agnostic`, id=1043, seed=1, n=100 test samples, 48 features. Verification across additional datasets/seeds in progress.)
 
 ### Cognitive inspiration
 
-The macro-micro structure draws from cognitive science, used as conceptual motivation rather than direct modeling:
+The macro-micro structure draws from cognitive science, used as conceptual motivation for explanations ①② rather than direct modeling:
 
-- **Central Tendency** (Posner & Keele, 1968): Centroid as group prototype
-- **Schema Theory** (Bartlett, 1932): Coarse routing before fine retrieval
-- **Dual-Process** (Kahneman, 2011): Fast group assignment, then careful neighbor comparison
+- **Central Tendency** (Posner & Keele, 1968): Centroid as group prototype (①)
+- **Schema Theory** (Bartlett, 1932): Coarse routing before fine retrieval (① → ②)
+- **Dual-Process** (Kahneman, 2011): Fast group assignment, then careful neighbor comparison (① → ②)
 
 ---
 
@@ -79,13 +98,14 @@ The macro-micro structure draws from cognitive science, used as conceptual motiv
 
 | File | Component | Role |
 |------|-----------|------|
-| `libs/prototypes.py` | CentroidLayer | Dual-space centroids, STE routing, KMeans++ init, medoid update |
-| `libs/evidence.py` | AttentionAggregator | TabR L2 attention, Gated Fusion, FeatureCrossAttention |
-| `libs/tabera.py` | TabERA, MemoryBank, FeatureStore | Model, KNN store (cross-group fallback), raw feature store |
+| `libs/prototypes.py` | CentroidLayer | Dual-space centroids, STE routing, KMeans++ init, medoid update — explanation ① |
+| `libs/tabera.py` | TabERA, MemoryBank, FeatureStore | Model, KNN store (cross-group fallback), raw feature store — explanation ② |
+| `libs/evidence.py` | AttentionAggregator | TabR L2 attention (② evidence_w), FeatureCrossAttention + Gated Fusion (predictive auxiliary path, see above) |
 | `libs/supervised.py` | TabERAWrapper | Training loop, EMA scheduling |
 | `libs/search_space.py` | HPO space | 10 hyperparameters (Optuna) + 1 auto-determined (`n_prototypes`) |
 | `libs/data.py` | TabularDataset | OpenML data loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
+| `reproduce.py` (`--ablation rank_correlation`) | Integrated Gradients attribution | Explanation ③ + faithfulness validation (vs SHAP, vs ground-truth perturbation ranking) |
 
 ---
 
@@ -121,6 +141,14 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1
 python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explanations
 ```
 
+### Faithfulness / ablations
+
+```bash
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation gate_analysis
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation no_feat_path
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlation
+```
+
 ### TabZilla benchmark (36 datasets)
 
 ```powershell
@@ -136,22 +164,22 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explana
   TabERA Explanation — Sample #0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-① Group context
+① Group context  (architectural)
    → Centroid_3 (confidence=94.3%)
    alcohol=10.24, pH=3.31, fixed_acidity=7.21
    (nearest real training sample to this centroid — medoid)
 
-② Neighbor evidence
+② Neighbor evidence  (architectural)
    Neighbour #0: 42.1%  →  alcohol=10.41, pH=3.28
    Neighbour #1: 28.3%  →  volatile_acidity=0.28
 
-③ Feature attribution
+③ Feature attribution  (Integrated Gradients, post-hoc)
    volatile_acidity  15.1%
    chlorides         14.9%
-
-   gate_mean: 0.47  (feature path ↔ neighbor path balance)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+> Note: `gate_mean` (Gated Fusion diagnostic) is reported separately via `--ablation gate_analysis`; it reflects the predictive auxiliary path's behavior, not explanation ③.
 
 ---
 
@@ -185,9 +213,9 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explana
 ```
 TabERA/
 ├── libs/
-│   ├── tabera.py            # TabERA model (TabERA, MemoryBank, FeatureStore)
-│   ├── prototypes.py        # CentroidLayer (STE, KMeans++, Dual-Space, medoid update)
-│   ├── evidence.py          # AttentionAggregator, FeatureCrossAttention, Gated Fusion
+│   ├── tabera.py            # TabERA model (TabERA, MemoryBank, FeatureStore) — explanation ②
+│   ├── prototypes.py        # CentroidLayer (STE, KMeans++, Dual-Space, medoid update) — explanation ①
+│   ├── evidence.py          # AttentionAggregator (② evidence_w), FeatureCrossAttention + Gated Fusion (predictive auxiliary path)
 │   ├── supervised.py        # TabERAWrapper (training loop, EMA)
 │   ├── eval.py              # Evaluation metrics
 │   ├── search_space.py      # Optuna HPO space (10 params; n_prototypes auto-set)
@@ -195,7 +223,7 @@ TabERA/
 ├── optim_logs/              # HPO results per seed
 ├── figures/                 # Embedding visualizations
 ├── optimize.py              # Run HPO
-├── reproduce.py             # Reproduce best config + explanations
+├── reproduce.py             # Reproduce best config + explanations (①②③) + faithfulness ablations
 ├── visualize_embeddings.py  # 3-figure embedding visualization
 └── requirements.txt
 ```
@@ -207,6 +235,7 @@ TabERA/
 - Gorishniy, Y., et al. (2023). TabR: Tabular Deep Learning Meets Nearest Neighbors. *arXiv:2307.14338*.
 - van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural Discrete Representation Learning (VQ-VAE). *NeurIPS 2017*.
 - Bengio, Y., Léonard, N., & Courville, A. (2013). Estimating or Propagating Gradients Through Stochastic Neurons. *arXiv:1308.3432*.
+- Sundararajan, M., Taly, A., & Yan, Q. (2017). Axiomatic Attribution for Deep Networks (Integrated Gradients). *ICML 2017*.
 - Arthur, D. & Vassilvitskii, S. (2007). k-means++: The Advantages of Careful Seeding. *SODA 2007*.
 - Posner, M. I. & Keele, S. W. (1968). On the genesis of abstract ideas. *Journal of Experimental Psychology*, 77(3), 353–363.
 - Bartlett, F. C. (1932). *Remembering*. Cambridge University Press.
