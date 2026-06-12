@@ -40,6 +40,7 @@ Both ① and ② therefore answer a question no feature-attribution method (post
 ---
 
 ## Architecture
+![TabERA architecture: forward flow and the 3-step explanation chain](docs/TabERA_Figure1_new3.png)
 
 TabERA processes a batch `X ∈ ℝ^(N×F)` through four stages, each producing both a prediction component and (for stages 1–2) an explanation artifact. Throughout, `D` is the embedding dimension, `P` the number of centroids, `K` the number of retrieved neighbors per sample, and `F` the number of input features.
 
