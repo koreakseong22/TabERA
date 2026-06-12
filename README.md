@@ -29,15 +29,6 @@ Query → Embedding → Centroid Routing (macro) → Group-constrained KNN (micr
 
 ③ is feature-level attribution computed via Integrated Gradients on the trained model. We do not claim architectural novelty for ③ itself; we show empirically (§Faithfulness below) that it is substantially more faithful to the model's actual decision boundary than a learned feature-projection alternative we initially explored, and competitive with SHAP.
 
-### How ① and ② work
-
-**① Group context.** Every input `X` is embedded into `query_emb ∈ ℝ^D` and routed (via STE, see below) to exactly one of `P` learnable centroids — `hard_assignment ∈ {1..P}`. This is not a soft mixture or attention weighting: the model commits to a single discrete group per sample, the same way a classifier commits to a single predicted class. Because the assignment is discrete and is read directly from `routing_probs`/`hard_assignment` (no extra computation), explanation ① is literally *"which of the P groups did the routing layer pick for this sample"* — a fact about the forward pass, not an estimate. The group is made human-readable via `centroid_x[p]`: the real training sample whose embedding is closest to `centroid_emb[p]` (the *medoid*, recomputed every epoch). So ① reads as *"this sample was routed to the same group as training sample #87 (alcohol=10.24, pH=3.31, ...)"* — an actual data point, not a synthetic average.
-
-**② Neighbor evidence.** Once a sample is routed to group `p`, `MemoryBank.retrieve` performs a K-nearest-neighbor search **restricted to the training samples routed to group `p`** (group-constrained KNN — this is what makes ② depend on ①, not just on raw embedding distance over the whole training set). If group `p` has fewer than `K` members, the search expands to the embedding-adjacent centroid group(s) (cross-group fallback) rather than silently falling back to a global search — this keeps the *meaning* of "neighbor within your group" intact even for small groups. The retrieved neighbors' similarities are turned into `evidence_w ∈ ℝ^K` via the TabR-style softmax (`AttentionAggregator`, see formula below), and `evidence_w` is the *same* tensor used to compute `agg_emb` (the aggregation that feeds the prediction head). So ② is *"these are the `evidence_w`-weighted training samples that the retrieval step actually aggregated"* — again read directly from the forward pass, not reconstructed afterward.
-
-Both ① and ② therefore answer a question no feature-attribution method (post-hoc or architectural) can answer for an arbitrary model: *"which other data points is this prediction like?"* — because answering that requires the model to maintain and query a structured index over training examples at inference time, which only retrieval-augmented architectures (TabR, TabERA) do.
-
----
 
 ## Architecture
 ![TabERA architecture: forward flow and the 3-step explanation chain](docs/TabERA_Figure1_new3.png)
@@ -50,6 +41,16 @@ TabERA processes a batch `X ∈ ℝ^(N×F)` through four stages, each producing 
 4. **Predict.** The concatenation `[query_emb ‖ context_emb ‖ fused_agg] ∈ ℝ^(N×3D)` is passed through an MLP head to produce `ŷ`.
 
 Explanation ③ is *not* part of this forward pass — it is computed afterward by differentiating `ŷ` with respect to `X` (Integrated Gradients), independent of stages 2–3's internal representations.
+
+### How ① and ② work
+
+**① Group context.** Every input `X` is embedded into `query_emb ∈ ℝ^D` and routed (via STE, see below) to exactly one of `P` learnable centroids — `hard_assignment ∈ {1..P}`. This is not a soft mixture or attention weighting: the model commits to a single discrete group per sample, the same way a classifier commits to a single predicted class. Because the assignment is discrete and is read directly from `routing_probs`/`hard_assignment` (no extra computation), explanation ① is literally *"which of the P groups did the routing layer pick for this sample"* — a fact about the forward pass, not an estimate. The group is made human-readable via `centroid_x[p]`: the real training sample whose embedding is closest to `centroid_emb[p]` (the *medoid*, recomputed every epoch). So ① reads as *"this sample was routed to the same group as training sample #87 (alcohol=10.24, pH=3.31, ...)"* — an actual data point, not a synthetic average.
+
+**② Neighbor evidence.** Once a sample is routed to group `p`, `MemoryBank.retrieve` performs a K-nearest-neighbor search **restricted to the training samples routed to group `p`** (group-constrained KNN — this is what makes ② depend on ①, not just on raw embedding distance over the whole training set). If group `p` has fewer than `K` members, the search expands to the embedding-adjacent centroid group(s) (cross-group fallback) rather than silently falling back to a global search — this keeps the *meaning* of "neighbor within your group" intact even for small groups. The retrieved neighbors' similarities are turned into `evidence_w ∈ ℝ^K` via the TabR-style softmax (`AttentionAggregator`, see formula below), and `evidence_w` is the *same* tensor used to compute `agg_emb` (the aggregation that feeds the prediction head). So ② is *"these are the `evidence_w`-weighted training samples that the retrieval step actually aggregated"* — again read directly from the forward pass, not reconstructed afterward.
+
+Both ① and ② therefore answer a question no feature-attribution method (post-hoc or architectural) can answer for an arbitrary model: *"which other data points is this prediction like?"* — because answering that requires the model to maintain and query a structured index over training examples at inference time, which only retrieval-augmented architectures (TabR, TabERA) do.
+
+---
 
 ### Forward flow
 
