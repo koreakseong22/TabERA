@@ -29,9 +29,26 @@ Query → Embedding → Centroid Routing (macro) → Group-constrained KNN (micr
 
 ③ is feature-level attribution computed via Integrated Gradients on the trained model. We do not claim architectural novelty for ③ itself; we show empirically (§Faithfulness below) that it is substantially more faithful to the model's actual decision boundary than a learned feature-projection alternative we initially explored, and competitive with SHAP.
 
+### How ① and ② work
+
+**① Group context.** Every input `X` is embedded into `query_emb ∈ ℝ^D` and routed (via STE, see below) to exactly one of `P` learnable centroids — `hard_assignment ∈ {1..P}`. This is not a soft mixture or attention weighting: the model commits to a single discrete group per sample, the same way a classifier commits to a single predicted class. Because the assignment is discrete and is read directly from `routing_probs`/`hard_assignment` (no extra computation), explanation ① is literally *"which of the P groups did the routing layer pick for this sample"* — a fact about the forward pass, not an estimate. The group is made human-readable via `centroid_x[p]`: the real training sample whose embedding is closest to `centroid_emb[p]` (the *medoid*, recomputed every epoch). So ① reads as *"this sample was routed to the same group as training sample #87 (alcohol=10.24, pH=3.31, ...)"* — an actual data point, not a synthetic average.
+
+**② Neighbor evidence.** Once a sample is routed to group `p`, `MemoryBank.retrieve` performs a K-nearest-neighbor search **restricted to the training samples routed to group `p`** (group-constrained KNN — this is what makes ② depend on ①, not just on raw embedding distance over the whole training set). If group `p` has fewer than `K` members, the search expands to the embedding-adjacent centroid group(s) (cross-group fallback) rather than silently falling back to a global search — this keeps the *meaning* of "neighbor within your group" intact even for small groups. The retrieved neighbors' similarities are turned into `evidence_w ∈ ℝ^K` via the TabR-style softmax (`AttentionAggregator`, see formula below), and `evidence_w` is the *same* tensor used to compute `agg_emb` (the aggregation that feeds the prediction head). So ② is *"these are the `evidence_w`-weighted training samples that the retrieval step actually aggregated"* — again read directly from the forward pass, not reconstructed afterward.
+
+Both ① and ② therefore answer a question no feature-attribution method (post-hoc or architectural) can answer for an arbitrary model: *"which other data points is this prediction like?"* — because answering that requires the model to maintain and query a structured index over training examples at inference time, which only retrieval-augmented architectures (TabR, TabERA) do.
+
 ---
 
 ## Architecture
+
+TabERA processes a batch `X ∈ ℝ^(N×F)` through four stages, each producing both a prediction component and (for stages 1–2) an explanation artifact. Throughout, `D` is the embedding dimension, `P` the number of centroids, `K` the number of retrieved neighbors per sample, and `F` the number of input features.
+
+1. **Embed.** `TabularEmbedder` (a stack of `L` residual MLP blocks) maps `X` to `query_emb ∈ ℝ^(N×D)`. This is the only place the raw features `X` are consumed for the prediction path; everything downstream operates in embedding space (except explanation ③, which differentiates *back* through this embedder).
+2. **Route (macro, → explanation ①).** `CentroidLayer` compares `query_emb` against `P` learnable centroid embeddings `C_emb ∈ ℝ^(P×D)` and commits each sample to exactly one group via STE hard-argmax routing. This yields `hard_assignment ∈ {1..P}^N`, a `context_emb ∈ ℝ^(N×D)` (the assigned centroid's embedding, concatenated into the head input later), and — for explanation — `centroid_x ∈ ℝ^(P×F)`, the medoid (real training sample) of each group.
+3. **Retrieve & aggregate (micro, → explanation ②).** `MemoryBank.retrieve` performs a group-constrained KNN: for each sample, it searches only among training points with the same `hard_assignment` (with cross-group fallback if the group is too small), returning `K` neighbor embeddings `nk ∈ ℝ^(N×K×D)` and labels. `AttentionAggregator` then computes TabR-style similarity weights `evidence_w ∈ ℝ^(N×K)` and aggregates the neighbors' (label, embedding-difference) values into `agg_emb ∈ ℝ^(N×D)`. In parallel, `FeatureCrossAttention` computes a feature-interaction signal `feature_imp ∈ ℝ^(N×K×F)`, which is summarized and gated together with `agg_emb` into `fused_agg ∈ ℝ^(N×D)` (Gated Fusion — a predictive auxiliary path, see below; *not* the source of explanation ③).
+4. **Predict.** The concatenation `[query_emb ‖ context_emb ‖ fused_agg] ∈ ℝ^(N×3D)` is passed through an MLP head to produce `ŷ`.
+
+Explanation ③ is *not* part of this forward pass — it is computed afterward by differentiating `ŷ` with respect to `X` (Integrated Gradients), independent of stages 2–3's internal representations.
 
 ### Forward flow
 
@@ -49,7 +66,7 @@ query_emb ∈ ℝ^D
   │     → nk (B,K,D), neighbor_labels (B,K)            (explanation ②)
   │
   └── AttentionAggregator
-        ├─ TabR L2 similarity → evidence_w (B,K)        (explanation ②)
+        ├─ TabR L2 similarity: evidence_w = softmax(2·⟨q,k⟩ - ‖q‖² - ‖k‖²)  (explanation ②)
         ├─ Value construction: label_emb + T(query - neighbor)
         ├─ agg_emb = weighted sum of values
         ├─ FeatureCrossAttention → feature_imp (B,K,F)  (auxiliary signal, NOT ③)
@@ -65,9 +82,9 @@ query_emb ∈ ℝ^D
 
 **Dual-Space Centroid.** Each centroid maintains two representations: `centroid_emb` in embedding space (learnable, used for routing and retrieval) and `centroid_x` in original feature space (medoid-updated each epoch — the real training sample closest to `centroid_emb[p]` in embedding space, used for human-readable explanations). This separation ensures that explanation ① shows an actual training example ("alcohol=10.24") rather than an opaque embedding coordinate or a synthetic EMA average.
 
-**STE Routing.** Hard assignment via Straight-Through Estimator (Bengio et al., 2013; VQ-VAE, van den Oord et al., 2017). Forward pass uses discrete argmax for crisp group boundaries; backward pass passes gradients through softmax.
+**STE Routing.** Hard assignment via Straight-Through Estimator (Bengio et al., 2013; VQ-VAE, van den Oord et al., 2017): `hard_assignment = argmax_p(-‖query_emb - C_emb[p]‖²)`, a discrete one-hot vector. Forward pass uses this discrete argmax for crisp group boundaries (this is what explanation ① reports); backward pass replaces the gradient of the argmax with the gradient of `softmax(-‖query_emb - C_emb[p]‖²))`, so `C_emb` remains trainable despite the discrete forward.
 
-**Cross-group Fallback.** When a centroid group has fewer than K members, the search expands to the nearest adjacent centroid group rather than falling back to global search. This preserves the centroid structure's meaning even for small groups.
+**Cross-group Fallback.** When a centroid group has fewer than `K` members, `MemoryBank.retrieve` expands the candidate pool to include training samples from the nearest adjacent centroid group(s) in embedding space (ranked by `‖C_emb[p] - C_emb[p']‖`), rather than falling back to a global (group-unconstrained) search. This preserves the semantics of explanation ② — "neighbors from your group (or its closest neighboring group)" — even when a group is small, instead of silently degrading ② into "neighbors from anywhere."
 
 **Gated Fusion (Predictive Auxiliary Path).** `FeatureCrossAttention` produces a feature-interaction signal (`feature_imp` → `feat_emb`) that is mixed into the neighbor aggregation via a learned gate (`fused_agg = gate·feat_emb + (1-gate)·agg_emb`). This branch is validated as a **predictive** component — removing it (`--ablation no_feat_path`) measurably degrades performance (e.g., Δlogloss = +0.91 on `ada_agnostic`, id=1043). It is *not* the source of explanation ③; `feature_imp` is an internal signal that improves ŷ, but its per-feature breakdown does not correlate with each feature's actual effect on ŷ (Spearman ρ ≈ 0.08–0.10 against perturbation-based ground truth, statistically indistinguishable from random). Explanation ③ is computed independently via Integrated Gradients (see Faithfulness below).
 
