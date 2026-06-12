@@ -75,14 +75,22 @@ query_emb ∈ ℝ^D
 
 We measure faithfulness as the Spearman rank correlation between a feature-attribution method's ranking and the ranking by *actual* effect on ŷ (each feature individually perturbed to its training-set mean; ranked by |Δlogits|).
 
-| Method | Spearman ρ vs. ground-truth ranking |
-|---|---|
-| `FeatureCrossAttention` (`feature_imp`, initial design) | ≈ 0.08–0.10 (≈ Random) |
-| SHAP (KernelExplainer) | ≈ 0.84 |
-| **Integrated Gradients (adopted for ③)** | **≈ 0.94** |
-| Random baseline | ≈ −0.17 |
+**Single-dataset breakdown** (seed=1, n=100 test samples where applicable):
 
-(Measured on `ada_agnostic`, id=1043, seed=1, n=100 test samples, 48 features. Verification across additional datasets/seeds in progress.)
+| Dataset | F | TabERA (IG) ρ | SHAP (KernelExplainer) ρ | Random ρ |
+|---|---|---|---|---|
+| `qsar-biodeg` (id=1494) | 41 | 0.713 (p<0.001) | **0.902** (p<0.001) | 0.051 |
+| `ada_agnostic` (id=1043) | 48 | **0.936** (p<0.001) | 0.841 (p<0.001) | −0.169 |
+| `nomao` (id=1486) | 118 | **0.933** (p<0.001) | 0.649 (p<0.001) | −0.038 |
+| `guillermo` (id=41159) | 4296 | **0.813** (p<0.001) | −0.066 (p<0.001) | −0.009 |
+
+For comparison, the originally-designed `FeatureCrossAttention` (`feature_imp`) projection scored ρ≈0.08–0.10 (≈Random) on `ada_agnostic` — statistically indistinguishable from the Random baseline — which motivated replacing it with Integrated Gradients (Sundararajan et al., 2017) for ③.
+
+`balance-scale` (id=11, F=4) is excluded: with only 4 features, Spearman ρ over 4 items is not statistically meaningful (p≥0.2 for every method, including SHAP).
+
+**Key finding — IG is robust to F, SHAP (sampling-based) is not.** Across F=41–4296, TabERA's IG-based ③ stays in the ρ≈0.71–0.94 range and is always significant (p<0.001). SHAP's KernelExplainer (`nsamples=100`), by contrast, degrades sharply as F grows: ρ=0.90 (F=41) → 0.84 (F=48) → 0.65 (F=118) → **−0.07 (F=4296, indistinguishable from Random)**. This is a direct consequence of SHAP's sampling-based estimation requiring more samples as F grows, whereas IG requires only a single gradient pass regardless of F.
+
+TabERA (IG) ≥ SHAP holds for the three datasets with F≥48 (3/4 valid datasets); for the smallest-F dataset tested (`qsar-biodeg`, F=41), SHAP remains stronger (0.90 vs 0.71). Verification across additional datasets/seeds is ongoing.
 
 ### Cognitive inspiration
 
