@@ -208,7 +208,7 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlati
 
 ---
 
-## HPO parameters (10 searched + 1 auto-determined)
+## HPO parameters (10 searched)
 
 | Parameter | Range | Role |
 |-----------|-------|------|
