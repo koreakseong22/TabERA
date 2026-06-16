@@ -31,7 +31,7 @@ Query → Embedding → Centroid Routing (macro) → Group-constrained KNN (micr
 
 
 ## Architecture
-![TabERA architecture: forward flow and the 3-step explanation chain](docs/TabERA_Figure1.png)
+![TabERA architecture: forward flow and the 3-step explanation chain](docs/TabERA_Figure1_drawio.png)
 
 TabERA processes a batch `X ∈ ℝ^(N×F)` through four stages, each producing both a prediction component and (for stages 1–2) an explanation artifact. Throughout, `D` is the embedding dimension, `P` the number of centroids, `K` the number of retrieved neighbors per sample, and `F` the number of input features.
 
@@ -130,6 +130,7 @@ The macro-micro structure draws from cognitive science, used as conceptual motiv
 | `libs/search_space.py` | HPO space | 10 hyperparameters (Optuna) + 1 auto-determined (`n_prototypes`) |
 | `libs/data.py` | TabularDataset | OpenML data loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
+| `optimize.py` | HPO runner | Optuna-based hyperparameter search; auto-sets `n_prototypes = sqrt(N_train)` per dataset |
 | `reproduce.py` (`--ablation rank_correlation`) | Integrated Gradients attribution | Explanation ③ + faithfulness validation (vs SHAP, vs ground-truth perturbation ranking) |
 
 ---
