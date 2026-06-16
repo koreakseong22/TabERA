@@ -224,12 +224,12 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlati
 | `batch_size` | {128, 256, 512} | Batch size |
 
 > **`n_prototypes` (number of centroids P) is not searched by Optuna.**
-> It is automatically set per dataset as `P = min(sqrt(N_train), n_features)`
+> It is automatically set per dataset as `P = sqrt(N_train)`
 > (clamped to a minimum of 4), and overridden onto every trial
 > (see `optimize.py`, `n_proto_default`). The actual value used is logged
 > in `trial.user_attrs["n_prototypes_actual"]` and restored by `reproduce.py`.
 > This can range well beyond a fixed small search range
-> (e.g., P≈12 for `lymph` (N=148, F=19) up to P≈185 for `nomao` (N=34,465, F=500)).
+> (e.g., P≈12 for `lymph` (N=148) up to P≈185 for `nomao` (N=34,465)).
 
 ---
 
