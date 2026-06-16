@@ -131,7 +131,7 @@ The macro-micro structure draws from cognitive science, used as conceptual motiv
 | `libs/data.py` | TabularDataset | OpenML data loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
 | `optimize.py` | HPO runner | Optuna-based hyperparameter search; auto-sets `n_prototypes = sqrt(N_train)` per dataset |
-| `reproduce.py` (`--ablation rank_correlation`) | Integrated Gradients attribution | Explanation ③ + faithfulness validation (vs SHAP, vs ground-truth perturbation ranking) |
+| `reproduce.py` | Best-config reproducer + Explanation + Ablations | Loads best HPO params, retrains, evaluates, and optionally runs `--explain` (①②③ per sample) or one of six `--ablation` modes: `no_feat_path` (gate=0, verifies feature path contribution), `random_neighbor` (shuffled KNN, verifies retrieval is non-trivial), `gate_analysis` (gate distribution statistics), `gradient_faithfulness` (∂logits/∂feature_imp, proves explanation is in prediction graph), `rank_correlation` (Spearman ρ of IG vs SHAP vs Random against ground-truth perturbation ranking — explanation ③), `dual_space_faithfulness` (centroid_x representation quality vs random baseline) |
 
 ---
 
