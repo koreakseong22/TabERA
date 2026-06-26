@@ -144,6 +144,25 @@ class TabERAWrapper:
         self.ema_history = []
         self.final_ema_stats = None
 
+        # ── [PATCH ⑥] 학습 임베딩 캐시 ────────────────────────────────
+        # 매 배치 forward에서 embedder 출력을 캡처 → 에폭 끝 EMA가 재사용.
+        # 에폭 내 배치별 staleness가 생기지만 EMA(과거 통계 추적) 본래 성격과 일관.
+        # 안전장치: 모든 샘플 커버 여부 검증 후 미충족 시 폴백 재임베딩.
+        N_train      = len(X_train)
+        emb_dim      = self.model.embed_dim
+        emb_cache    = torch.zeros(N_train, emb_dim, device=self.device)
+        cache_filled = torch.zeros(N_train, dtype=torch.bool, device=self.device)
+        _batch_idx: List[Optional[torch.Tensor]] = [None]  # mutable container for hook closure
+
+        def _embedder_hook(module, inputs, output):
+            bi = _batch_idx[0]
+            if bi is not None and self.model.training:
+                emb_cache[bi]    = output.detach()
+                cache_filled[bi] = True
+
+        hook_handle = self.model.embedder.register_forward_hook(_embedder_hook)
+        # ── [PATCH ⑥ END] ───────────────────────────────────────────────
+
         # MultiTab 스타일 에폭 tqdm
         pbar = tqdm(
             range(1, self.epochs + 1),
@@ -152,113 +171,127 @@ class TabERAWrapper:
             leave=True,
         )
 
-        for epoch in pbar:
-            # ── 학습 ──────────────────────────────────────
-            self.model.train()
-            perm    = torch.randperm(len(y_train), device=self.device)
-            tr_loss = 0.0
-            n_batch = 0
+        try:  # hook_handle.remove() 보장
+            for epoch in pbar:
+                # ── 학습 ──────────────────────────────────────
+                self.model.train()
+                cache_filled.zero_()                    # [PATCH ⑥] 에폭 시작 시 캐시 리셋
+                perm    = torch.randperm(len(y_train), device=self.device)
+                tr_loss = 0.0
+                n_batch = 0
 
-            for start in range(0, len(y_train), self.params["batch_size"]):
-                idx = perm[start:start + self.params["batch_size"]]
-                xb, yb = X_train[idx], y_train[idx]
+                for start in range(0, len(y_train), self.params["batch_size"]):
+                    idx = perm[start:start + self.params["batch_size"]]
+                    _batch_idx[0] = idx             # [PATCH ⑥] hook에 현재 배치 인덱스 전달
+                    xb, yb = X_train[idx], y_train[idx]
 
-                optimizer.zero_grad()
-                out = self.model(xb, labels=yb)
-                lg  = out["logits"]
+                    optimizer.zero_grad()
+                    out = self.model(xb, labels=yb)
+                    lg  = out["logits"]
 
-                if self.tasktype in ("regression", "binclass"):
-                    task_loss = criterion(lg.squeeze(-1), yb.float())
-                else:
-                    task_loss = criterion(lg, yb.long())
+                    if self.tasktype in ("regression", "binclass"):
+                        task_loss = criterion(lg.squeeze(-1), yb.float())
+                    else:
+                        task_loss = criterion(lg, yb.long())
 
-                loss = task_loss + out["aux_loss"]
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
-                tr_loss += loss.item()
-                n_batch += 1
+                    loss = task_loss + out["aux_loss"]
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    optimizer.step()
+                    tr_loss += loss.item()
+                    n_batch += 1
 
-            scheduler.step()
-            self.model.anneal(self.params.get("anneal_factor", 0.97))
+                _batch_idx[0] = None                # [PATCH ⑥] 검증 단계 캐시 오염 방지
 
-            # ── (3) EMA centroid 업데이트 ───────────────────────
-            if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
+                scheduler.step()
+                self.model.anneal(self.params.get("anneal_factor", 0.97))
+
+                # ── (3) EMA centroid 업데이트 ───────────────────────
+                if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
+                    with torch.no_grad():
+                        # [PATCH ⑥] 캐시 활용: 모든 샘플이 이번 에폭에 임베딩됐으면 재임베딩 생략.
+                        # [PATCH ⑤] 폴백 시 n_chunk 1024 → 4096 으로 확대 (결과 동일, forward 횟수 감소).
+                        if bool(cache_filled.all().item()):
+                            emb_ema = emb_cache          # [PATCH ⑥] 재임베딩 없이 캐시 재사용
+                        else:
+                            # 누락 샘플 있을 때만 폴백 재임베딩 (정상 학습 중 사실상 발생 안 함)
+                            n_chunk = 4096               # [PATCH ⑤] 구 1024 → 4096
+                            all_emb = []
+                            for s in range(0, len(X_train), n_chunk):
+                                all_emb.append(self.model.embedder(X_train[s:s+n_chunk]))
+                            emb_ema = torch.cat(all_emb, dim=0)
+
+                        x_ema     = X_train
+                        ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
+                        self.final_ema_stats = dict(ema_stats)
+                        self.ema_history.append({
+                            "epoch": float(epoch),
+                            "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
+                            "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
+                            "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
+                            "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
+                            "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
+                        })
+
+                        # 에폭당 1회: sample_groups를 GPU 텐서로 캐시 (76,800번 변환 제거)
+                        self.model.memory.cache_sample_groups(
+                            self.model.prototype_layer.sample_groups,
+                            device=torch.device(self.device),
+                            centroid_emb=self.model.prototype_layer.centroid_emb,
+                        )
+                        if epoch % 10 == 0:
+                            # 검색 범위 축소율 계산 (가설 ②)
+                            n_total = len(X_train)
+                            n_proto = self.model.prototype_layer.P
+                            avg_cand = n_total / n_proto if n_proto > 0 else n_total
+                            reduction = (1 - avg_cand / n_total) * 100
+                            pbar.write(
+                                f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
+                                f"alive={ema_stats.get('active_centroids', 0)}  "
+                                f"min={ema_stats['min_cluster_size']}  "
+                                f"max={ema_stats['max_cluster_size']}  "
+                                f"cache={'hit' if bool(cache_filled.all().item()) else 'miss'}"
+                            )
+
+                        # ── Centroid collapse 감지 → 조기 종료 ──────────
+                        if ema_stats.get("active_ratio", 1.0) < 0.1:
+                            tqdm.write(
+                                f"  [STOP] Centroid collapse at epoch {epoch} "
+                                f"(active={ema_stats['active_ratio']:.0%}). Early exit."
+                            )
+                            break
+
+                avg_loss = tr_loss / max(n_batch, 1)
+
+                # ── 검증 ──────────────────────────────────────
+                self.model.eval()
                 with torch.no_grad():
-                    # EMA: 전체 훈련 데이터 사용
-                    # 샘플링하면 일부 centroid가 배정 못 받아 dead 발생
-                    n_chunk = 1024  # GPU 메모리 고려 청크 처리
-                    all_emb = []
-                    for s in range(0, len(X_train), n_chunk):
-                        all_emb.append(self.model.embedder(X_train[s:s+n_chunk]))
-                    emb_ema  = torch.cat(all_emb, dim=0)
-                    x_ema    = X_train
-                    ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
-                    self.final_ema_stats = dict(ema_stats)
-                    self.ema_history.append({
-                        "epoch": float(epoch),
-                        "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
-                        "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
-                        "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
-                        "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
-                        "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
-                    })
+                    val_logits = self._forward_batched(X_val)
+                    val_m  = compute_metric(val_logits, y_val, self.tasktype)
+                val_v = list(val_m.values())[0]
 
-                    # 에폭당 1회: sample_groups를 GPU 텐서로 캐시 (76,800번 변환 제거)
-                    self.model.memory.cache_sample_groups(
-                        self.model.prototype_layer.sample_groups,
-                        device=torch.device(self.device),
-                        centroid_emb=self.model.prototype_layer.centroid_emb,
-                    )
-                    if epoch % 10 == 0:
-                        # 검색 범위 축소율 계산 (가설 ②)
-                        n_total = len(X_train)
-                        n_proto = self.model.prototype_layer.P
-                        avg_cand = n_total / n_proto if n_proto > 0 else n_total
-                        reduction = (1 - avg_cand / n_total) * 100
-                        pbar.write(
-                            f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
-                            f"alive={ema_stats.get('active_centroids', 0)}  "
-                            f"min={ema_stats['min_cluster_size']}  "
-                            f"max={ema_stats['max_cluster_size']}  "
-                        )
+                # best 모델 저장
+                if is_better(val_v, best_val, self.tasktype):
+                    best_val   = val_v
+                    best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-                    # ── Centroid collapse 감지 → 조기 종료 ──────────
-                    if ema_stats.get("active_ratio", 1.0) < 0.1:
-                        tqdm.write(
-                            f"  [STOP] Centroid collapse at epoch {epoch} "
-                            f"(active={ema_stats['active_ratio']:.0%}). Early exit."
-                        )
-                        break
+                # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
+                pbar.set_description(f"EPOCH: {epoch}")
+                pbar.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    id=self._data_id,
+                    refresh=False,
+                )
 
-            avg_loss = tr_loss / max(n_batch, 1)
+                # 조기 종료
+                if es.step(val_v, higher_is_better):
+                    tqdm.write(f"Early stopping at epoch {epoch}")
+                    break
 
-            # ── 검증 ──────────────────────────────────────
-            self.model.eval()
-            with torch.no_grad():
-                val_logits = self._forward_batched(X_val)
-                val_m  = compute_metric(val_logits, y_val, self.tasktype)
-            val_v = list(val_m.values())[0]
+            pbar.close()
 
-            # best 모델 저장
-            if is_better(val_v, best_val, self.tasktype):
-                best_val   = val_v
-                best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
-
-            # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
-            pbar.set_description(f"EPOCH: {epoch}")
-            pbar.set_postfix(
-                loss=f"{avg_loss:.4f}",
-                id=self._data_id,
-                refresh=False,
-            )
-
-            # 조기 종료
-            if es.step(val_v, higher_is_better):
-                tqdm.write(f"Early stopping at epoch {epoch}")
-                break
-
-        pbar.close()
+        finally:
+            hook_handle.remove()    # [PATCH ⑥] 예외 발생 시에도 hook 반드시 제거
 
         if best_state:
             self.model.load_state_dict(best_state)
