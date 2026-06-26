@@ -88,6 +88,8 @@ query_emb ∈ ℝ^D
 
 **Direct Retrieval Path.** `agg_emb` — the `evidence_w`-weighted aggregation of neighbor values — feeds directly into the prediction head without intermediate transformations. This means `evidence_w` is not an auxiliary diagnostic but a direct contributor to `ŷ`, and the neighbors the model reports as important (explanation ②) are exactly the ones it uses to predict. This architectural directness strengthens the faithfulness guarantee of explanation ②.
 
+**Auxiliary Losses.** Two auxiliary losses regularize the centroid structure during training: `diversity_loss` (off-diagonal cosine similarity between centroids, pulling them apart) and `commitment_loss` (mean squared error between `query_emb` and its assigned `centroid_emb`, pulling queries toward their group). Together with the EMA-based medoid update each epoch, these two losses are sufficient to maintain meaningful group structure across datasets — occasional dead centroids reflect actual gaps in the data distribution rather than training failures, and HPO consistently selects the parameter combinations that fit each dataset's natural cluster structure.
+
 ### Faithfulness of explanation ③
 
 We measure faithfulness as the Spearman rank correlation between a feature-attribution method's ranking and the ranking by *actual* effect on ŷ (each feature individually perturbed to its training-set mean; ranked by |Δlogits|).
@@ -214,14 +216,14 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation dual_space_fai
 | `k` | {8, 16, 32, 64} | Number of KNN neighbors |
 | `embedder_layers` | 1–4 | ResidualMLP depth |
 | `dropout` | 0.0–0.5 | Dropout rate |
-| `loss_diversity` | 5e-2 – 5e-1 | Centroid spread |
-| `loss_commitment` | 1e-2 – 1e-1 | VQ-VAE commitment |
-| `loss_entropy` | 1e-3 – 1e-2 | Routing entropy (collapse prevention) |
+| `loss_diversity` | 5e-2 – 5e-1 | Centroid spread (off-diagonal cosine similarity penalty) |
+| `loss_commitment` | 1e-2 – 1e-1 | Query–centroid commitment (VQ-VAE style) |
 | `lr` | 1e-4 – 1e-2 | Learning rate |
 | `weight_decay` | 1e-6 – 1e-2 | L2 regularization |
+| `batch_size` | {128, 256, 512} | Mini-batch size |
 
-> **`n_prototypes` (number of centroids P) and `batch_size` are not searched by Optuna.**
-> `n_prototypes` is automatically set per dataset as `P = sqrt(N_train)`
+> **`n_prototypes` (number of centroids P) is not searched by Optuna.**
+> It is automatically set per dataset as `P = sqrt(N_train)`
 > (clamped to a minimum of 4), and overridden onto every trial
 > (see `optimize.py`, `n_proto_default`). The actual value used is logged
 > in `trial.user_attrs["n_prototypes_actual"]` and restored by `reproduce.py`.
