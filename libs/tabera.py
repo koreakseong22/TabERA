@@ -471,7 +471,7 @@ class TabERA(nn.Module):
     memory_size       : 메모리 뱅크 최대 크기
     embedder_layers   : TabularEmbedder ResidualMLP 수
     dropout           : 전역 드롭아웃
-    loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': .., 'entropy': ..}
+    loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': ..}
     column_names      : 특성 컬럼명 (설명 출력용)
     """
 
@@ -497,7 +497,6 @@ class TabERA(nn.Module):
         self.loss_weights = loss_weights or {
             "diversity":    0.01,
             "commitment":   0.01,
-            "entropy":      0.01,
         }
         self.column_names = column_names
 
@@ -598,7 +597,6 @@ class TabERA(nn.Module):
             aux_loss = (
                 self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
                 + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
-                + self.loss_weights.get("entropy", 0.01) * self.prototype_layer.entropy_loss(routing_probs)
             )
 
         out = {

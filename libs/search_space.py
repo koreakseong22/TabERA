@@ -29,7 +29,6 @@ def suggest_initial_trial() -> dict:
         "dropout":          0.1,
         "loss_diversity":   0.10,   # 새 하한(5e-2) 안에서 안정적인 초기값
         "loss_commitment":  0.05,
-        "loss_entropy":     0.005,  # 새 상한(1e-2) 안에서 낮게 시작
         "lr":               3e-4,
         "weight_decay":     1e-5,
         "batch_size":       256,
@@ -85,9 +84,6 @@ def get_search_space(
         #       현상 확인. 두 loss가 같은 order of magnitude에서 탐색되도록 하한 통일.
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-2, 1e-1, log=True),
 
-        # STE collapse 방지 — 배정 분포 entropy 최대화 (VQ-VAE-2, Razavi et al., 2019)
-        "loss_entropy": trial.suggest_float("loss_entropy", 1e-3, 1e-2, log=True),
-
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
@@ -116,6 +112,5 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "loss_weights": {
             "diversity":   params["loss_diversity"],
             "commitment":  params["loss_commitment"],
-            "entropy":     params["loss_entropy"],
         },
     }

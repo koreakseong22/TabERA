@@ -438,15 +438,15 @@ class CentroidLayer(nn.Module):
 
     def entropy_loss(self, routing_probs: torch.Tensor) -> torch.Tensor:
         """
-        Codebook utilization 향상 — 배정 분포의 entropy 최대화.
+        [미사용] Codebook utilization 향상 — 배정 분포의 entropy 최대화.
 
-        근거: VQ-VAE-2 (Razavi et al., NeurIPS 2019)
-        배치 내 평균 routing 분포의 entropy를 최대화하여
-        모든 centroid가 고르게 사용되도록 유도.
+        실험 근거 (4개 데이터셋, seed=8):
+          - HPO가 일관되게 1e-3 ~ 7e-3 범위의 매우 작은 값을 선택
+          - EMA active_ratio가 대부분 100% → dead centroid 미발생
+          - diversity_loss + commitment_loss + EMA가 동일 역할을 간접 수행
 
-        routing_probs: (B, P) — STE output (soft 값 보유, gradient 연결됨)
-        soft collapse 시 avg_probs 편중 → entropy 낮음 → loss 높음
-        → gradient가 centroid_emb를 분산 방향으로 당김
+        현재 tabera.py aux_loss에서 호출하지 않음.
+        메서드는 향후 실험 비교를 위해 보존.
         """
         avg_probs = routing_probs.mean(dim=0)              # (P,) 배치 평균
         entropy   = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
