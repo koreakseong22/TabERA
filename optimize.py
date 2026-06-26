@@ -21,7 +21,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과
 
 import optuna, torch, json, joblib, datetime, math
 from libs.data import TabularDataset
-from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error
+from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
 from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
@@ -134,13 +134,13 @@ if train:
         wrapper._data_id = args.openml_id   # 에폭 tqdm에 data_id 표시
         wrapper.fit(X_train, y_train, X_val, y_val)
 
-        preds_val  = wrapper.predict(X_val)
-        preds_test = wrapper.predict(X_test)
-        if tasktype == "regression":
-            probs_val, probs_test = None, None
-        else:
-            probs_val  = wrapper.predict_proba(X_val)
-            probs_test = wrapper.predict_proba(X_test)
+        # ── 평가: logits 1회 계산 → preds/probs 동시 추출 ──────
+        wrapper.model.eval()
+        with torch.no_grad():
+            val_logits  = wrapper._forward_batched(X_val)
+            test_logits = wrapper._forward_batched(X_test)
+        preds_val,  probs_val  = get_preds_and_probs(val_logits,  tasktype)
+        preds_test, probs_test = get_preds_and_probs(test_logits, tasktype)
 
         # regression: y_std 역정규화 후 metric 계산 (MultiTab 원본과 동일)
         if tasktype == "regression":

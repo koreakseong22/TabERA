@@ -24,7 +24,6 @@ def suggest_initial_trial() -> dict:
     """
     return {
         "embed_dim":        128,
-        "n_prototypes":     8,
         "k":                16,
         "embedder_layers":  2,
         "dropout":          0.1,
@@ -66,7 +65,7 @@ def get_search_space(
     return {
         # ── 모델 구조 ───────────────────────────────────
         "embed_dim":       trial.suggest_categorical("embed_dim",   [64, 128, 256]),
-        "n_prototypes":    trial.suggest_int("n_prototypes", 4, 16, step=4),
+        # n_prototypes: optimize.py에서 sqrt(N)으로 자동 설정 (탐색 대상 아님)
         # k 확장: 소수 클래스 이웃 포함 확률 향상 → recall↑ → f1 gap 완화
         "k":               trial.suggest_categorical("k",           [8, 16, 32, 64]),
         "embedder_layers": trial.suggest_int("embedder_layers", 1, 4),
