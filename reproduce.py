@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # ─────────────────────────────────────────────────────────────
-# 설명 출력 (§3.3 feature_match 포함)
+# 설명 출력 (①② architectural + ③ IG post-hoc)
 # ─────────────────────────────────────────────────────────────
 
 def print_explanation(explanations: list, sample_idx: int, col_names: list) -> None:
@@ -71,20 +71,6 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
                 feat_str = ", ".join(f"{k}={v:.3f}" for k, v in list(nf[idx].items())[:4])
                 print(f"        → {feat_str}")
 
-    # ③ Feature 기여도 (Cross-Attention)
-    fm = e.get("feature_match")
-    if fm and "top_features" in fm:
-        print(f"\n  ③ Feature 기여도 (Cross-Attention)")
-        for feat in fm["top_features"]:
-            bar = "█" * int(feat["importance"] * 30)
-            print(f"     {feat['feature']:25s} {feat['importance']*100:5.1f}%  {bar}")
-
-    # Gated Fusion 진단
-    gate_mean = e.get("gate_mean")
-    if gate_mean is not None:
-        label = "feature path 우세" if gate_mean > 0.5 else "neighbor path 우세"
-        print(f"\n  gate_mean: {gate_mean:.2f}  ({label})")
-
     print(f"{'━'*52}")
 
 
@@ -108,19 +94,16 @@ def main():
     parser.add_argument("--explain",   action="store_true",
                         help="학습 후 feature 기여도 설명 출력")
     parser.add_argument("--ablation",  type=str, default="none",
-                        choices=["none", "no_feat_path", "random_neighbor",
-                                 "gate_analysis", "gradient_faithfulness",
+                        choices=["none", "random_neighbor",
                                  "rank_correlation", "dual_space_faithfulness"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
                             "  none                  : full model 기준 (기본값)\n"
-                            "  no_feat_path          : feature path 제거 (gate=0 강제)\n"
                             "  random_neighbor       : neighbor 임베딩 랜덤 교체\n"
-                            "  gate_analysis         : gate 분포 통계 출력\n"
-                            "  gradient_faithfulness : feature_imp → logits gradient 측정\n"
-                            "  rank_correlation      : feature_imp 순위 vs 실제 prediction\n"
+                            "  rank_correlation      : IG feature 순위 vs 실제 prediction\n"
                             "                         영향력 순위 Spearman 상관계수\n"
-                            "                         (TabERA vs SHAP vs Random 3자 비교)"
+                            "                         (TabERA vs SHAP vs Random 3자 비교)\n"
+                            "  dual_space_faithfulness : centroid_x 대표성 + 그룹 분리도 검증"
                         ))
     args = parser.parse_args()
 
@@ -214,199 +197,21 @@ def main():
 
         model.eval()
 
-        # ── gate_analysis: gate 분포 통계 ──────────────────────
-        # 전체 테스트셋에 대해 gate 분포를 측정.
-        # gate_mean ≈ 0.5: feature/neighbor path를 균형 있게 활용
-        # gate_mean ≫ 0.5: feature path 우세 / gate_mean ≪ 0.5: neighbor path 우세
-        if args.ablation == "gate_analysis":
-            all_gate_means = []
-            batch_size     = 256
-            n_test         = X_test.shape[0]
-
-            with torch.no_grad():
-                for start in range(0, n_test, batch_size):
-                    X_batch = X_test[start:start + batch_size]
-                    out_batch = model(X_batch, ablation_mode="gate_analysis")
-                    gs = out_batch.get("gate_stats", {})
-                    all_gate_means.extend(gs.get("per_sample_mean", []))
-
-            all_gate_means = np.array(all_gate_means)
-            print(f"\n  Gate Distribution (n={len(all_gate_means)} samples)")
-            print(f"  {'mean':<12}: {all_gate_means.mean():.4f}")
-            print(f"  {'std':<12}: {all_gate_means.std():.4f}")
-            print(f"  {'min':<12}: {all_gate_means.min():.4f}")
-            print(f"  {'max':<12}: {all_gate_means.max():.4f}")
-            feat_dom  = (all_gate_means > 0.6).mean()
-            neigh_dom = (all_gate_means < 0.4).mean()
-            balanced  = 1.0 - feat_dom - neigh_dom
-            print(f"  {'feat>0.6':<12}: {feat_dom:.1%}  (feature path 우세)")
-            print(f"  {'neigh<0.4':<12}: {neigh_dom:.1%}  (neighbor path 우세)")
-            print(f"  {'balanced':<12}: {balanced:.1%}  (두 path 균형)")
-
-        # ── gradient_faithfulness: feature_imp → logits gradient 측정 ──
-        #
-        # [왜 이게 SHAP/LIME과의 차별성을 증명하는가]
-        # SHAP/LIME은 explanation이 prediction graph 밖에 있어서
-        # ∂logits/∂feature_imp 자체가 정의되지 않음.
-        # TabERA는 feature_imp가 fused_agg를 통해 logits까지
-        # 미분 가능한 경로로 연결되어 있음.
-        # → gradient가 실제로 흐른다는 걸 보여주면
-        #   "explanation이 prediction graph 안에 있다"는 주장을
-        #   수학적으로 직접 증명하는 것.
-        #
-        # [비교군: random baseline]
-        # feature_imp를 랜덤 텐서로 교체했을 때의 gradient magnitude와 비교.
-        # TabERA gradient >> random baseline 이면:
-        # "의미 있는 feature attribution이 실제로 prediction에 영향을 준다"
-        elif args.ablation == "gradient_faithfulness":
-            model.eval()
-
-            # 배치 크기 제한 (gradient 계산은 메모리 사용량이 큼)
-            n_grad_samples = min(256, X_test.shape[0])
-            X_grad = X_test[:n_grad_samples]
-
-            print(f"\n  Gradient Faithfulness Analysis (n={n_grad_samples})")
-            print(f"  {'─'*54}")
-
-            # ── 1. TabERA: feature_imp → logits gradient ────────
-            # feature_imp가 prediction graph 안에 있으므로
-            # logits에 대한 gradient가 반드시 흘러야 함
-            model.zero_grad()
-            out_grad = model(X_grad)
-            feature_imp = out_grad.get("feature_imp")   # (B, k, F)
-
-            if feature_imp is None:
-                print("  [오류] memory bank 미충족. epochs를 늘리세요.")
-            else:
-                feature_imp_retained = feature_imp.requires_grad_(True)
-
-                # feature_imp → fused_agg 경로를 직접 재현
-                # (forward 내부 경로와 동일)
-                gate      = out_grad["gate"]             # (B, D)
-                agg_pure  = out_grad["agg_emb_pure"]     # (B, D)
-                evidence_w = out_grad["evidence_w"]      # (B, k)
-
-                # feat_summary: evidence-weighted feature attribution
-                feat_summary = feature_imp_retained.sum(dim=1)          # (B, F)
-                feat_emb     = model.ot_selector.feat_to_emb(feat_summary)  # (B, D)
-                fused_recomp = gate * feat_emb + (1.0 - gate) * agg_pure    # (B, D)
-
-                # fused_agg를 prediction head에 통과
-                query_emb   = out_grad["fused_agg"]   # head 입력 재구성용
-                # head 입력: [query_emb ‖ context_emb ‖ fused_recomp]
-                # 여기서는 fused_agg 차원만 교체해서 gradient 흐름 측정
-                combined_orig = torch.cat([
-                    model.embedder(X_grad).detach(),
-                    out_grad["hard_group"].float().unsqueeze(-1).expand(
-                        -1, model.embed_dim
-                    ) * 0,   # context_emb placeholder (gradient 경로 외)
-                    fused_recomp,
-                ], dim=-1)
-
-                # 더 직접적인 방법: fused_recomp만으로 gradient 측정
-                proxy_loss = fused_recomp.sum()
-                grad_feat = torch.autograd.grad(
-                    outputs=proxy_loss,
-                    inputs=feature_imp_retained,
-                    retain_graph=False,
-                    create_graph=False,
-                )[0]                                    # (B, k, F)
-
-                grad_mag_tabera = grad_feat.abs().mean().item()
-
-                # ── 2. Random baseline ──────────────────────────
-                # feature_imp를 랜덤 텐서로 교체 → gradient magnitude 비교
-                # 만약 TabERA gradient ≈ random baseline 이면
-                # "연결은 있지만 의미 없는 연결"일 수 있음
-                rand_imp = torch.randn_like(feature_imp_retained).requires_grad_(True)
-                feat_summary_r = rand_imp.sum(dim=1)
-                feat_emb_r     = model.ot_selector.feat_to_emb(feat_summary_r)
-                fused_r        = gate * feat_emb_r + (1.0 - gate) * agg_pure
-                proxy_loss_r   = fused_r.sum()
-                grad_rand = torch.autograd.grad(
-                    outputs=proxy_loss_r,
-                    inputs=rand_imp,
-                )[0]
-                grad_mag_random = grad_rand.abs().mean().item()
-
-                # ── 3. feature별 gradient 분포 ──────────────────
-                # 어떤 feature에 gradient가 집중되는지 확인
-                # → explanation이 특정 feature에 집중되면
-                #   그 feature가 실제로 prediction에 영향을 주는지 확인
-                per_feat_grad = grad_feat.abs().mean(dim=(0, 1))  # (F,)
-                top_feat_grad = per_feat_grad.topk(
-                    min(5, per_feat_grad.shape[0])
-                )
-                col_names = dataset.col_names or [
-                    f"f{i}" for i in range(model.n_features)
-                ]
-
-                faithfulness_ratio = (
-                    grad_mag_tabera / (grad_mag_random + 1e-10)
-                )
-
-                print(f"\n  [핵심 결과]")
-                print(f"  feature_imp → prediction gradient : {grad_mag_tabera:.6f}")
-                print(f"  random baseline gradient           : {grad_mag_random:.6f}")
-                print(f"  faithfulness ratio                 : {faithfulness_ratio:.2f}x")
-                print()
-
-                if faithfulness_ratio > 1.5:
-                    print(f"  ✅ feature_imp가 prediction에 의미있게 연결되어 있음")
-                    print(f"     (SHAP/LIME은 이 gradient 경로 자체가 존재하지 않음)")
-                else:
-                    print(f"  ⚠️  gradient가 흐르지만 random과 차이가 작음")
-                    print(f"     → gate 값 확인 필요 (gate가 너무 낮으면 feat path 기여 감소)")
-
-                print(f"\n  [Feature별 gradient 집중도 — 상위 5개]")
-                print(f"  (gradient가 클수록 해당 feature가 prediction에 더 직접 영향)")
-                for rank, (val, idx) in enumerate(
-                    zip(top_feat_grad.values, top_feat_grad.indices)
-                ):
-                    fname = col_names[idx] if idx < len(col_names) else f"f{idx}"
-                    bar   = "█" * int(val.item() / per_feat_grad.max().item() * 20)
-                    print(f"  #{rank+1} {fname:25s} {val.item():.6f}  {bar}")
-
-                print(f"\n  [해석]")
-                print(f"  SHAP/LIME: explanation이 prediction graph 밖에 존재")
-                print(f"             → ∂logits/∂explanation 자체가 정의 불가")
-                print(f"  TabERA   : feature_imp → feat_emb → fused_agg → logits")
-                print(f"             → gradient가 실제로 흐름 (ratio={faithfulness_ratio:.2f}x)")
-                print(f"             → architectural faithfulness 수학적 증명")
-
-                # 결과 저장
-                grad_save = {
-                    "grad_mag_tabera":   grad_mag_tabera,
-                    "grad_mag_random":   grad_mag_random,
-                    "faithfulness_ratio": faithfulness_ratio,
-                    "per_feat_grad":     per_feat_grad.tolist(),
-                    "col_names":         col_names,
-                    "openml_id":         openml_id,
-                    "seed":              args.seed,
-                }
-                grad_path = (
-                    Path(log_dir)
-                    / f"data={openml_id}..seed{args.seed}_gradient_faithfulness.pkl"
-                )
-                with open(grad_path, "wb") as f:
-                    pickle.dump(grad_save, f)
-                print(f"\n  저장: {grad_path}")
-
-        # ── rank_correlation: feature_imp 순위 vs 실제 prediction 영향력 순위 ──
+        # ── rank_correlation: IG feature 순위 vs 실제 prediction 영향력 순위 ──
         #
         # [측정 방식]
-        # 1. TabERA feature_imp → feature별 중요도 순위
+        # 1. TabERA Input × Gradient → feature별 중요도 순위
         # 2. SHAP KernelExplainer → feature별 중요도 순위
         # 3. Random attribution → baseline
         # 4. 각 feature를 평균값으로 교체 → prediction 변화량(delta) 순위
         # 5. 세 attribution의 순위와 delta 순위의 Spearman 상관계수 비교
         #
         # [왜 이게 semantic faithfulness 근거가 되는가]
-        # "feature_imp가 높다고 말한 feature를 실제로 바꿨을 때
+        # "중요하다고 판단한 feature를 실제로 바꿨을 때
         #  prediction이 더 많이 바뀐다"는 걸 순위 상관으로 보여줌.
         # TabERA ≥ SHAP >> Random 이면:
         # "TabERA explanation이 SHAP만큼 의미있으면서, prediction path 안에 있다"
-        elif args.ablation == "rank_correlation":
+        if args.ablation == "rank_correlation":
             import shap
             from scipy.stats import spearmanr
 
@@ -442,35 +247,24 @@ def main():
             delta_arr  = np.array(delta_per_feat)
             delta_rank = np.argsort(np.argsort(-delta_arr))   # 0-based, 낮을수록 중요
 
-            # ── Step 2. TabERA feature_imp 순위 (Input × Gradient) ──
+            # ── Step 2. TabERA IG 순위 (Input × Gradient) ──
             #
-            # [변경 이유]
-            # 기존 feature_imp = |feat_proj(query_emb * neighbour_emb * evidence_w)|
-            # 는 학습된 D->F 선형 projection으로, embedder(비선형)의 출력인
-            # 임베딩 공간 차원과 원본 feature 공간 사이에 수학적 연결이 없어
-            # delta(원본 feature perturbation 효과)와 무관했음
-            # (실측: ρ≈0.08~0.10 ≈ Random).
-            #
-            # 변경: agg_emb_pure(=retrieval 경로의 raw aggregation)을
+            # agg_emb(=retrieval 경로의 aggregation)을
             # raw input X에 대해 직접 미분(Input × Gradient, IG의 1-step 근사).
             # embedder의 비선형성을 grad가 그대로 통과하므로,
             # "이 feature를 바꾸면 retrieval 결과가 얼마나 변하는가"를
             # delta(perturbation 기반)와 같은 좌표계(원본 feature space)에서 측정.
             # -> 모델 구조/학습 변경 없음, eval 모드에서 1차 backward만 사용.
-            print(f"  [2/4] TabERA feature_imp 순위 계산 중 (Input x Gradient)...")
+            print(f"  [2/4] TabERA IG 순위 계산 중 (Input x Gradient)...")
 
             X_rc_grad = X_rc.clone().detach().requires_grad_(True)
             out_rc    = model(X_rc_grad)
-            feat_imp_rc = out_rc.get("feature_imp")       # (N, k, F) -- 참고용, 사용 안 함
 
-            target = out_rc["agg_emb_pure"].sum()
+            target = out_rc["agg_emb"].sum()
             grad_X = torch.autograd.grad(target, X_rc_grad, retain_graph=False)[0]  # (N, F)
 
             X_baseline = X_train.mean(dim=0)               # (F,) -- delta 계산과 동일 baseline
             tabera_imp = (grad_X * (X_rc_grad - X_baseline)).abs().detach().cpu().numpy()  # (N, F)
-
-            if feat_imp_rc is None:
-                print("  [참고] memory bank 미충족이지만 IG는 agg_emb_pure 기반이라 계속 진행")
 
             if True:
                 tabera_mean = tabera_imp.mean(axis=0)          # (F,)
@@ -632,7 +426,6 @@ def main():
             with torch.no_grad():
                 out_ds        = model(X_val_sub)
                 hard_assign   = out_ds["hard_group"].cpu()
-                feat_imp_ds   = out_ds.get("feature_imp")
                 evidence_w_ds = out_ds.get("evidence_w")
                 topk_idx_ds   = out_ds.get("topk_idx")
 
@@ -713,110 +506,10 @@ def main():
                     print(f"  max separation  : {separation.max():.3f}  ({best_f})")
                     print(f"  → 높은 separation = centroid_x 설명이 실제 그룹 경계를 반영")
 
-            # ── 검증 3: feature_imp faithfulness (두 가지 방식) ────────
-            # feature_imp가 무엇을 측정하는지에 대한 두 가지 가설을 모두 테스트.
-            #
-            # 방식 A. 그룹 정체성 기반 (Group Identity)
-            #   feature_imp 높은 feature → 같은 centroid 그룹 내 분산이 낮은가?
-            #   → "이 그룹을 정의하는 feature"를 정확히 가리키는가
-            #   → centroid 구조와 정합성 검증
-            #
-            # 방식 B. 이웃 상관 기반 (Neighbor Correlation)
-            #   feature_imp 높은 feature → query와 neighbor의 해당 값이 강한 상관?
-            #   → README가 약속하는 "similarity 기여" 의미 그대로 검증
-            #   → 샘플별 측정으로 더 직접적
-
-            if feat_imp_ds is not None and topk_idx_ds is not None:
-                feat_imp_np = feat_imp_ds.detach().cpu().numpy()
-                ew_np       = evidence_w_ds.detach().cpu().numpy()
-                topk_np     = topk_idx_ds.detach().cpu().numpy()
-
-                tabera_imp  = (feat_imp_np * ew_np[:, :, None]).sum(axis=1)
-                tabera_mean = tabera_imp.mean(axis=0)
-                imp_rank    = np.argsort(np.argsort(-tabera_mean))
-
-                # ── 방식 A: 그룹 정체성 기반 ──────────────────────
-                print(f"\n  [검증 3-A] Group Identity Faithfulness")
-                print(f"  feature_imp 높은 feature = 그룹 내 분산이 낮은 feature?")
-
-                # 샘플의 그룹 배정을 기준으로 within-group 분산 계산
-                hard_np = hard_assign.numpy()
-                within_var_per_sample = []
-                for n in range(n_val):
-                    p = hard_np[n]
-                    grp = sample_groups[p] if sample_groups else []
-                    if len(grp) < 2:
-                        continue
-                    grp_var = X_train_cpu[grp].numpy().var(axis=0)  # (F,)
-                    within_var_per_sample.append(grp_var)
-
-                if within_var_per_sample:
-                    within_var_mean = np.mean(within_var_per_sample, axis=0)  # (F,)
-                    # 분산 작을수록 그룹 정체성 → 음의 상관 기대
-                    corr_A, p_A = spearmanr(tabera_mean, -within_var_mean)
-
-                    print(f"  Spearman ρ = {corr_A:+.4f}  (p={p_A:.4f})")
-                    if corr_A > 0.3 and p_A < 0.1:
-                        print(f"  ✅ feature_imp가 그룹 정체성 feature를 정확히 가리킴")
-                    elif corr_A > 0:
-                        print(f"  △ 약한 양의 상관 (ρ={corr_A:.3f})")
-                    else:
-                        print(f"  ⚠️  feature_imp가 그룹 정체성과 불일치")
-
-                # ── 방식 B: 이웃 상관 기반 ────────────────────────
-                # 샘플별로 query 값과 neighbor 값들의 상관계수를 측정.
-                # feature 값이 유사하다는 건 단순 거리가 아니라
-                # query 값과 neighbor 값의 상관관계로 봐야 더 정확.
-                print(f"\n  [검증 3-B] Neighbor Correlation Faithfulness")
-                print(f"  feature_imp 높은 feature = query-neighbor 값 상관계수 높은 feature?")
-
-                # feature별 "query 값과 neighbor 값들의 평균 상관도" 측정
-                # 단, 단일 query에서는 neighbor들 값의 분포가 query 근처에 모여있을수록
-                # "유사한 feature"라고 볼 수 있음 → 좁은 분포 + 평균이 query에 가까움
-                # 이를 코사인 유사도 형태로 측정
-                neigh_sim_per_feat = []
-                for n in range(min(n_val, 200)):
-                    neighbors_idx = topk_np[n]
-                    valid = neighbors_idx[neighbors_idx < len(X_train_cpu)]
-                    if len(valid) < 2:
-                        continue
-                    neigh_feats = X_train_cpu[valid].numpy()  # (k, F)
-                    query_feat  = X_val_cpu[n].numpy()         # (F,)
-
-                    # feature별: 1 - normalized std (query 기준)
-                    # neighbor 값들이 query 근처에 모여있을수록 점수 높음
-                    diff_from_q = neigh_feats - query_feat[None, :]  # (k, F)
-                    feat_concentration = 1.0 / (1.0 + diff_from_q.std(axis=0) + np.abs(diff_from_q.mean(axis=0)))
-                    neigh_sim_per_feat.append(feat_concentration)
-
-                if neigh_sim_per_feat:
-                    sim_mean = np.mean(neigh_sim_per_feat, axis=0)  # (F,)
-                    corr_B, p_B = spearmanr(tabera_mean, sim_mean)
-
-                    print(f"  Spearman ρ = {corr_B:+.4f}  (p={p_B:.4f})")
-                    if corr_B > 0.3 and p_B < 0.1:
-                        print(f"  ✅ feature_imp가 이웃 유사도 기여 feature와 일치")
-                    elif corr_B > 0:
-                        print(f"  △ 약한 양의 상관 (ρ={corr_B:.3f})")
-                    else:
-                        print(f"  ⚠️  feature_imp가 이웃 유사도와 불일치")
-
-                # ── 종합 비교 테이블 ──────────────────────────────
-                print(f"\n  {'Feature':<25} {'Imp 순위':>8}  {'그룹분산':>10}  {'이웃집중도':>12}")
-                print(f"  {'─'*60}")
-                top5 = np.argsort(tabera_mean)[::-1][:5]
-                for fi in top5:
-                    fname = col_names[fi] if fi < len(col_names) else f"f{fi}"
-                    wv = within_var_mean[fi] if within_var_per_sample else float('nan')
-                    sm = sim_mean[fi]        if neigh_sim_per_feat    else float('nan')
-                    print(f"  {fname:<25} #{imp_rank[fi]+1:>4}      {wv:>10.4f}  {sm:>12.4f}")
-
             # 저장
             dsf_save = {
                 "centroid_dists":  centroid_dists,
                 "random_dists":    random_dists,
-                "corr_group":      corr_A if within_var_per_sample else None,
-                "corr_neighbor":   corr_B if neigh_sim_per_feat    else None,
                 "openml_id":       openml_id,
                 "seed":            args.seed,
             }
@@ -828,9 +521,8 @@ def main():
                 pickle.dump(dsf_save, f)
             print(f"\n  저장: {dsf_path}")
 
-        # ── no_feat_path / random_neighbor: 성능 비교 ───────────
+        # ── random_neighbor: 성능 비교 ───────────────────────
         # full model 대비 성능 하락을 측정.
-        # no_feat_path:    feature path 제거 시 성능 하락 → feature path가 prediction에 기여
         # random_neighbor: neighbor 랜덤화 시 성능 하락 → neighbor evidence가 의미 있게 사용
         else:
             with torch.no_grad():
@@ -875,10 +567,7 @@ def main():
                 print(f"  {k_name:<20} {v_full:>12.4f}  {v_abl:>12.4f}  {delta:>+9.4f} {arrow}")
 
             print(f"\n  해석:")
-            if args.ablation == "no_feat_path":
-                print(f"  → 성능 하락이 클수록 feature path가 prediction에 실제로 기여함")
-                print(f"    (faithfulness 주장의 실험적 근거)")
-            elif args.ablation == "random_neighbor":
+            if args.ablation == "random_neighbor":
                 print(f"  → 성능 하락이 클수록 neighbor evidence가 의미 있게 사용됨")
                 print(f"    (retrieval이 단순 lookup이 아님을 의미)")
 
