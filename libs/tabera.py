@@ -5,7 +5,6 @@ TabERA — Dual-Space Prototype Explainable TabR Model.
 
   CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
   AttentionAggregator  : TabR 방식 similarity 기반 이웃 집계
-                          + Gated Feature Fusion (faithfulness 보장)
   MemoryBank           : Cross-group fallback (인접 centroid 확장 검색)
 
 Forward 흐름
@@ -13,18 +12,18 @@ Forward 흐름
   X_query
     ↓  TabularEmbedder
   query_emb (B, D)
-    ├─ CentroidLayer(query_emb) → context_emb (B, D) + routing + FAISS mask
+    ├─ CentroidLayer(query_emb) → context_emb (B, D) + routing
     └─ MemoryBank.retrieve → k neighbours (cross-group fallback 포함)
          ↓ AttentionAggregator(query_emb, nk, nv, labels)
-         │  └─ Gated fusion: fused = g·feat_emb + (1-g)·agg
-       fused_agg (B, D) + evidence_w (B, k) + feature_imp (B, k, F)
+       agg_emb (B, D) + evidence_w (B, k)
     ↓
-  [query_emb ‖ context_emb ‖ fused_agg] → PredictionHead → ŷ
+  [query_emb ‖ context_emb ‖ agg_emb] → PredictionHead → ŷ
 
-[Gated Fusion 효과]
-  - 설명에 쓰이는 feature_imp가 prediction 경로에도 참여
-  - faithfulness(설명-예측 일관성) architectural 보장
-  - gate 값으로 sample-wise feature/neighbor path 사용 비율 진단 가능
+[경량화: Gated Fusion 제거]
+  실험 근거 (4개 데이터셋, seed=8):
+    - gate_mean ≈ 0.5, std ≈ 0.01~0.08 → gate_net 미학습
+    - feature_imp: ρ≈Random → IG로 대체 완료
+  결과: evidence_w가 prediction에 직접 기여 → 설명 ② faithfulness 향상
 
 [Cross-group fallback 효과]
   - 그룹 크기 < K인 소규모 그룹에서 인접 centroid 그룹까지 확장 검색
@@ -515,7 +514,7 @@ class TabERA(nn.Module):
             col_names=column_names,
         )
 
-        # ── TabR 방식 이웃 집계 + Gated Fusion (faithfulness) ──
+        # ── TabR 방식 이웃 집계 ──────────────────────────
         self.ot_selector = AttentionAggregator(
             embed_dim=embed_dim,
             k=k,
@@ -536,8 +535,7 @@ class TabERA(nn.Module):
                 col_names=column_names,
             )
 
-        # ── 예측 헤드: [query ‖ context ‖ fused_agg] → ŷ ──
-        # head 입력 차원은 그대로 3D (gated fusion 덕분에 차원 유지)
+        # ── 예측 헤드: [query ‖ context ‖ agg_emb] → ŷ ──
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim * 3),
             nn.Linear(embed_dim * 3, embed_dim), nn.GELU(), nn.Dropout(dropout),
@@ -561,7 +559,7 @@ class TabERA(nn.Module):
         context_emb, hard_assignment, routing_probs, _, _ = \
             self.prototype_layer(query_emb)
 
-        # 3. KNN 검색 + Gated Fusion
+        # 3. KNN 검색 + Attention 집계
         if self.memory.filled.item() >= self.k:
             nk, nv, neighbour_labels, topk_idx = self.memory.retrieve(
                 query_emb, self.k,
@@ -576,25 +574,16 @@ class TabERA(nn.Module):
                 rand_perm        = torch.randperm(B_abl, device=X.device)
                 neighbour_labels = neighbour_labels[rand_perm]
 
-            fused_agg, evidence_w, feature_imp, attn_w, gate, agg_emb_pure = \
-                self.ot_selector(query_emb, nk, nv, neighbour_labels)
-
-            # ── Ablation: no_feat_path ───────────────────────────
-            if ablation_mode == "no_feat_path":
-                fused_agg = agg_emb_pure   # gate=0 강제, feature path 완전 제거
+            agg_emb, evidence_w = self.ot_selector(query_emb, nk, nv, neighbour_labels)
 
         else:
             # Memory 미충족 fallback
-            fused_agg      = torch.zeros_like(query_emb)
-            agg_emb_pure   = torch.zeros_like(query_emb)
-            evidence_w     = torch.full((X.shape[0], self.k), 1.0 / self.k, device=X.device)
-            feature_imp    = None
-            attn_w         = None
-            topk_idx       = torch.zeros(X.shape[0], self.k, dtype=torch.long, device=X.device)
-            gate           = torch.full_like(query_emb, 0.5)
+            agg_emb    = torch.zeros_like(query_emb)
+            evidence_w = torch.full((X.shape[0], self.k), 1.0 / self.k, device=X.device)
+            topk_idx   = torch.zeros(X.shape[0], self.k, dtype=torch.long, device=X.device)
 
         # 4. 예측
-        combined = torch.cat([query_emb, context_emb, fused_agg], dim=-1)
+        combined = torch.cat([query_emb, context_emb, agg_emb], dim=-1)
         logits   = self.head(combined)
 
         # 5. 메모리 업데이트 (학습 시)
@@ -618,38 +607,13 @@ class TabERA(nn.Module):
             "routing":     routing_probs,
             "hard_group":  hard_assignment,
             "evidence_w":  evidence_w,
-            "feature_imp": feature_imp,
-            "attn_w":      attn_w,
             "topk_idx":    topk_idx,
-            # Gated Fusion 진단용
-            "gate":          gate,
-            "agg_emb_pure":  agg_emb_pure,
-            "fused_agg":     fused_agg,
+            "agg_emb":     agg_emb,
             "ablation_mode": ablation_mode,
         }
 
-        # ── Ablation: gate_analysis ──────────────────────────────
-        if ablation_mode == "gate_analysis":
-            gate_vals = gate.detach()
-            out["gate_stats"] = {
-                "mean":      float(gate_vals.mean().item()),
-                "std":       float(gate_vals.std().item()),
-                "min":       float(gate_vals.min().item()),
-                "max":       float(gate_vals.max().item()),
-                "per_sample_mean": gate_vals.mean(dim=-1).cpu().tolist(),
-            }
-
         if return_explanations:
             # 설명용 softmax — temperature scaling 적용
-            # ─────────────────────────────────────────────────────
-            # 문제: cosine similarity는 정규화된 벡터끼리의 내적이라
-            #       값 범위가 좁음 → softmax가 flat → confidence ≈ 1/P
-            # 원인 1: entropy_loss 과다 시 centroid 분리 실패 (australian)
-            # 원인 2: cosine similarity 범위 자체가 좁아서 발생 (vehicle 등)
-            # 해결: temperature scaling으로 logit 차이를 증폭
-            #       예측 경로(routing_probs)는 그대로 유지 — 학습에 영향 없음
-            # temperature=0.1: SimCLR, CLIP 등 contrastive learning 표준값
-            # ─────────────────────────────────────────────────────
             _temperature = 0.1
             with torch.no_grad():
                 q_norm     = F.normalize(query_emb.detach(), dim=-1)       # (B, D)
@@ -660,20 +624,10 @@ class TabERA(nn.Module):
 
             proto_exp = self.prototype_layer.explain_routing(hard_assignment, soft_probs)
             ev_exp    = self.ot_selector.explain_evidence(evidence_w)
-            feat_exp  = (
-                self.ot_selector.explain_feature_match(
-                    feature_imp, evidence_w,
-                    self.column_names or [f"f{i}" for i in range(self.n_features)]
-                )
-                if feature_imp is not None else
-                [None for _ in range(X.shape[0])]
-            )
             out["explanations"] = [
                 {
-                    "prototype":      proto_exp[b],
-                    "evidence":       ev_exp[b],
-                    "feature_match":  feat_exp[b],
-                    "gate_mean":      float(gate[b].mean().item()),
+                    "prototype": proto_exp[b],
+                    "evidence":  ev_exp[b],
                 }
                 for b in range(X.shape[0])
             ]
@@ -695,7 +649,6 @@ class TabERA(nn.Module):
                  f"  Centroids      : {self.prototype_layer.P}",
                  f"  KNN k          : {self.k}",
                  f"  Dual-Space     : {'ON' if self.prototype_layer.F > 0 else 'OFF'}",
-                 f"  Gated Fusion   : ON (faithfulness)",
                  f"  Cross-group    : ON (adjacent centroid fallback)"]
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)
