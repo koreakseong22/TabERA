@@ -27,7 +27,7 @@ Query → Embedding → Centroid Routing (macro) → Group-constrained KNN (micr
 
 ①② are *case-based / example-based* explanations: they are read directly off intermediate activations of the forward pass (which centroid a sample is routed to, which training examples are retrieved as neighbors). No post-hoc method — gradient-based or perturbation-based — can produce this kind of information for an arbitrary model, because it requires an architecture that explicitly organizes and retrieves training examples at inference time.
 
-③ is feature-level attribution computed via Integrated Gradients on the trained model. We do not claim architectural novelty for ③ itself; we show empirically (§Faithfulness below) that it is substantially more faithful to the model's actual decision boundary than a learned feature-projection alternative we initially explored, and competitive with SHAP.
+③ is feature-level attribution computed via Integrated Gradients on the trained model. We do not claim architectural novelty for ③ itself; we show empirically (§Faithfulness below) that it is competitive with SHAP while being robust to high-dimensional feature spaces.
 
 
 ## Architecture
@@ -37,8 +37,8 @@ TabERA processes a batch `X ∈ ℝ^(N×F)` through four stages, each producing 
 
 1. **Embed.** `TabularEmbedder` (a stack of `L` residual MLP blocks) maps `X` to `query_emb ∈ ℝ^(N×D)`. This is the only place the raw features `X` are consumed for the prediction path; everything downstream operates in embedding space (except explanation ③, which differentiates *back* through this embedder).
 2. **Route (macro, → explanation ①).** `CentroidLayer` compares `query_emb` against `P` learnable centroid embeddings `C_emb ∈ ℝ^(P×D)` and commits each sample to exactly one group via STE hard-argmax routing. This yields `hard_assignment ∈ {1..P}^N`, a `context_emb ∈ ℝ^(N×D)` (the assigned centroid's embedding, concatenated into the head input later), and — for explanation — `centroid_x ∈ ℝ^(P×F)`, the medoid (real training sample) of each group.
-3. **Retrieve & aggregate (micro, → explanation ②).** `MemoryBank.retrieve` performs a group-constrained KNN: for each sample, it searches only among training points with the same `hard_assignment` (with cross-group fallback if the group is too small), returning `K` neighbor embeddings `nk ∈ ℝ^(N×K×D)` and labels. `AttentionAggregator` then computes TabR-style similarity weights `evidence_w ∈ ℝ^(N×K)` and aggregates the neighbors' (label, embedding-difference) values into `agg_emb ∈ ℝ^(N×D)`. In parallel, `FeatureCrossAttention` computes a feature-interaction signal `feature_imp ∈ ℝ^(N×K×F)`, which is summarized and gated together with `agg_emb` into `fused_agg ∈ ℝ^(N×D)` (Gated Fusion — a predictive auxiliary path, see below; *not* the source of explanation ③).
-4. **Predict.** The concatenation `[query_emb ‖ context_emb ‖ fused_agg] ∈ ℝ^(N×3D)` is passed through an MLP head to produce `ŷ`.
+3. **Retrieve & aggregate (micro, → explanation ②).** `MemoryBank.retrieve` performs a group-constrained KNN: for each sample, it searches only among training points with the same `hard_assignment` (with cross-group fallback if the group is too small), returning `K` neighbor embeddings `nk ∈ ℝ^(N×K×D)` and labels. `AttentionAggregator` computes TabR-style similarity weights `evidence_w ∈ ℝ^(N×K)` and aggregates the neighbors' (label, embedding-difference) values into `agg_emb ∈ ℝ^(N×D)`. Because `agg_emb` feeds directly into the prediction head, `evidence_w` is not just an explanation artifact — it is an integral part of the prediction path, ensuring that explanation ② is architecturally faithful.
+4. **Predict.** The concatenation `[query_emb ‖ context_emb ‖ agg_emb] ∈ ℝ^(N×3D)` is passed through an MLP head to produce `ŷ`.
 
 Explanation ③ is *not* part of this forward pass — it is computed afterward by differentiating `ŷ` with respect to `X` (Integrated Gradients), independent of stages 2–3's internal representations.
 
@@ -70,11 +70,9 @@ query_emb ∈ ℝ^D
   └── AttentionAggregator
         ├─ TabR L2 similarity: evidence_w = softmax(2·⟨q,k⟩ - ‖q‖² - ‖k‖²)  (explanation ②)
         ├─ Value construction: label_emb + T(query - neighbor)
-        ├─ agg_emb = weighted sum of values
-        ├─ FeatureCrossAttention → feature_imp (B,K,F)  (auxiliary signal, NOT ③)
-        └─ Gated Fusion: fused_agg = gate·feat_emb + (1-gate)·agg_emb
+        └─ agg_emb = evidence_w-weighted sum of values
               ↓
-[query_emb ‖ context_emb ‖ fused_agg] ∈ ℝ^(3D) → MLP Head → ŷ
+[query_emb ‖ context_emb ‖ agg_emb] ∈ ℝ^(3D) → MLP Head → ŷ
 
 (explanation ③, computed separately, not part of the forward pass above)
   ŷ ──IG (Integrated Gradients, ∂ŷ/∂X · (X - X̄))──> per-feature attribution
@@ -88,7 +86,7 @@ query_emb ∈ ℝ^D
 
 **Cross-group Fallback.** When a centroid group has fewer than `K` members, `MemoryBank.retrieve` expands the candidate pool to include training samples from the nearest adjacent centroid group(s) in embedding space (ranked by `‖C_emb[p] - C_emb[p']‖`), rather than falling back to a global (group-unconstrained) search. This preserves the semantics of explanation ② — "neighbors from your group (or its closest neighboring group)" — even when a group is small, instead of silently degrading ② into "neighbors from anywhere."
 
-**Gated Fusion (Predictive Auxiliary Path).** `FeatureCrossAttention` produces a feature-interaction signal (`feature_imp` → `feat_emb`) that is mixed into the neighbor aggregation via a learned gate (`fused_agg = gate·feat_emb + (1-gate)·agg_emb`). This branch is validated as a **predictive** component — removing it (`--ablation no_feat_path`) measurably degrades performance (e.g., Δlogloss = +0.91 on `ada_agnostic`, id=1043). It is *not* the source of explanation ③; `feature_imp` is an internal signal that improves ŷ, but its per-feature breakdown does not correlate with each feature's actual effect on ŷ (Spearman ρ ≈ 0.08–0.10 against perturbation-based ground truth, statistically indistinguishable from random). Explanation ③ is computed independently via Integrated Gradients (see Faithfulness below).
+**Direct Retrieval Path.** `agg_emb` — the `evidence_w`-weighted aggregation of neighbor values — feeds directly into the prediction head without intermediate transformations. This means `evidence_w` is not an auxiliary diagnostic but a direct contributor to `ŷ`, and the neighbors the model reports as important (explanation ②) are exactly the ones it uses to predict. This architectural directness strengthens the faithfulness guarantee of explanation ②.
 
 ### Faithfulness of explanation ③
 
@@ -103,7 +101,7 @@ We measure faithfulness as the Spearman rank correlation between a feature-attri
 | `nomao` (id=1486) | 118 | **0.933** (p<0.001) | 0.649 (p<0.001) | −0.038 |
 | `guillermo` (id=41159) | 4296 | **0.813** (p<0.001) | −0.066 (p<0.001) | −0.009 |
 
-For comparison, the originally-designed `FeatureCrossAttention` (`feature_imp`) projection scored ρ≈0.08–0.10 (≈Random) on `ada_agnostic` — statistically indistinguishable from the Random baseline — which motivated replacing it with Integrated Gradients (Sundararajan et al., 2017) for ③.
+Explanation ③ uses Integrated Gradients (Sundararajan et al., 2017), which differentiates `ŷ` back through the full model to attribute each input feature's contribution. IG operates in the original feature space and requires only a single gradient pass regardless of `F`.
 
 **Key finding — IG is robust to F, SHAP (sampling-based) is not.** Across F=41–4296, TabERA's IG-based ③ stays in the ρ≈0.71–0.94 range and is always significant (p<0.001). SHAP's KernelExplainer (`nsamples=100`), by contrast, degrades sharply as F grows: ρ=0.90 (F=41) → 0.84 (F=48) → 0.65 (F=118) → **−0.07 (F=4296, indistinguishable from Random)**. This is a direct consequence of SHAP's sampling-based estimation requiring more samples as F grows, whereas IG requires only a single gradient pass regardless of F.
 
@@ -125,13 +123,13 @@ The macro-micro structure draws from cognitive science, used as conceptual motiv
 |------|-----------|------|
 | `libs/prototypes.py` | CentroidLayer | Dual-space centroids, STE routing, KMeans++ init, medoid update — explanation ① |
 | `libs/tabera.py` | TabERA, MemoryBank, FeatureStore | Model, KNN store (cross-group fallback), raw feature store — explanation ② |
-| `libs/evidence.py` | AttentionAggregator | TabR L2 attention (② evidence_w), FeatureCrossAttention + Gated Fusion (predictive auxiliary path, see above) |
-| `libs/supervised.py` | TabERAWrapper | Training loop, EMA scheduling |
-| `libs/search_space.py` | HPO space | 10 hyperparameters (Optuna) + 1 auto-determined (`n_prototypes`) |
+| `libs/evidence.py` | AttentionAggregator | TabR L2 attention, `evidence_w`-weighted neighbor aggregation — explanation ② and direct prediction input |
+| `libs/supervised.py` | TabERAWrapper | Training loop, EMA scheduling, embedder cache optimization |
+| `libs/search_space.py` | HPO space | 9 hyperparameters (Optuna) + 1 auto-determined (`n_prototypes`) |
 | `libs/data.py` | TabularDataset | OpenML data loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
 | `optimize.py` | HPO runner | Optuna-based hyperparameter search; auto-sets `n_prototypes = sqrt(N_train)` per dataset |
-| `reproduce.py` | Best-config reproducer | Retrains best HPO config, evaluates, outputs explanations ①②③ (`--explain`), and runs 6 faithfulness/ablation modes (`--ablation`) |
+| `reproduce.py` | Best-config reproducer | Retrains best HPO config, evaluates, outputs explanations ①②③ (`--explain`), and runs faithfulness/ablation modes (`--ablation`) |
 | `visualize_embeddings.py` | Embedding visualizer | Generates 3 figures: embedding space structure (A), centroid class distribution as pie charts (B), grouped KNN retrieval closeup with evidence weights (C) |
 
 ---
@@ -171,9 +169,9 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain  # with explana
 ### Faithfulness / ablations
 
 ```bash
-python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation gate_analysis
-python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation no_feat_path
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation random_neighbor
 python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlation
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation dual_space_faithfulness
 ```
 
 ### TabZilla benchmark (36 datasets)
@@ -206,11 +204,9 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlati
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-> Note: `gate_mean` (Gated Fusion diagnostic) is reported separately via `--ablation gate_analysis`; it reflects the predictive auxiliary path's behavior, not explanation ③.
-
 ---
 
-## HPO parameters (10 searched)
+## HPO parameters (9 searched)
 
 | Parameter | Range | Role |
 |-----------|-------|------|
@@ -223,10 +219,9 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlati
 | `loss_entropy` | 1e-3 – 1e-2 | Routing entropy (collapse prevention) |
 | `lr` | 1e-4 – 1e-2 | Learning rate |
 | `weight_decay` | 1e-6 – 1e-2 | L2 regularization |
-| `batch_size` | {128, 256, 512} | Batch size |
 
-> **`n_prototypes` (number of centroids P) is not searched by Optuna.**
-> It is automatically set per dataset as `P = sqrt(N_train)`
+> **`n_prototypes` (number of centroids P) and `batch_size` are not searched by Optuna.**
+> `n_prototypes` is automatically set per dataset as `P = sqrt(N_train)`
 > (clamped to a minimum of 4), and overridden onto every trial
 > (see `optimize.py`, `n_proto_default`). The actual value used is logged
 > in `trial.user_attrs["n_prototypes_actual"]` and restored by `reproduce.py`.
@@ -242,10 +237,10 @@ TabERA/
 ├── libs/
 │   ├── tabera.py            # TabERA model (TabERA, MemoryBank, FeatureStore) — explanation ②
 │   ├── prototypes.py        # CentroidLayer (STE, KMeans++, Dual-Space, medoid update) — explanation ①
-│   ├── evidence.py          # AttentionAggregator (② evidence_w), FeatureCrossAttention + Gated Fusion (predictive auxiliary path)
-│   ├── supervised.py        # TabERAWrapper (training loop, EMA)
+│   ├── evidence.py          # AttentionAggregator (② evidence_w, direct retrieval path)
+│   ├── supervised.py        # TabERAWrapper (training loop, EMA, embedder cache)
 │   ├── eval.py              # Evaluation metrics
-│   ├── search_space.py      # Optuna HPO space (10 params; n_prototypes auto-set)
+│   ├── search_space.py      # Optuna HPO space (9 params; n_prototypes auto-set)
 │   └── data.py              # OpenML data loader
 ├── optim_logs/              # HPO results per seed
 ├── figures/                 # Embedding visualizations
