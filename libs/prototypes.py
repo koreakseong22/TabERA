@@ -292,7 +292,7 @@ class CentroidLayer(nn.Module):
             "active_ratio":     n_assigned / self.P,
             "active_centroids": int(n_assigned),
             "pruned_this_epoch": 0,
-            "min_cluster_size": int(min(sizes)) if sizes else 0,
+            "min_cluster_size": int(min(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
             "max_cluster_size": int(max(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
         }
 
