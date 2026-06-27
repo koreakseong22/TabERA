@@ -249,8 +249,7 @@ class TabERAWrapper:
                                 f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
                                 f"alive={ema_stats.get('active_centroids', 0)}  "
                                 f"min={ema_stats['min_cluster_size']}  "
-                                f"max={ema_stats['max_cluster_size']}  "
-                                f"cache={'hit' if bool(cache_filled.all().item()) else 'miss'}"
+                                f"max={ema_stats['max_cluster_size']}"
                             )
 
                         # ── Centroid collapse 감지 → 조기 종료 ──────────
