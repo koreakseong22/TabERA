@@ -95,7 +95,8 @@ def main():
                         help="학습 후 feature 기여도 설명 출력")
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor",
-                                 "rank_correlation", "dual_space_faithfulness"],
+                                 "rank_correlation", "dual_space_faithfulness",
+                                 "deletion_auc", "insertion_auc"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
                             "  none                  : full model 기준 (기본값)\n"
@@ -103,7 +104,12 @@ def main():
                             "  rank_correlation      : IG feature 순위 vs 실제 prediction\n"
                             "                         영향력 순위 Spearman 상관계수\n"
                             "                         (TabERA vs SHAP vs Random 3자 비교)\n"
-                            "  dual_space_faithfulness : centroid_x 대표성 + 그룹 분리도 검증"
+                            "  dual_space_faithfulness : centroid_x 대표성 + 그룹 분리도 검증\n"
+                            "  deletion_auc          : attribution 순위로 feature 누적 마스킹 →\n"
+                            "                         ŷ 곡선의 AUC (낮을수록 좋음)\n"
+                            "  insertion_auc         : baseline에서 시작 → 중요 feature부터 복원 →\n"
+                            "                         ŷ 곡선의 AUC (높을수록 좋음)\n"
+                            "                         Deletion과 짝 (Petsiuk et al. 2018, RISE)"
                         ))
     args = parser.parse_args()
 
@@ -520,6 +526,342 @@ def main():
             with open(dsf_path, "wb") as f:
                 pickle.dump(dsf_save, f)
             print(f"\n  저장: {dsf_path}")
+
+        # ── deletion_auc: attribution 순위로 feature 누적 마스킹 → ŷ AUC ──
+        #
+        # [측정 방식]
+        # 1. 각 샘플에 대해 IG / SHAP / Random attribution 순위 계산
+        # 2. 가장 중요한 feature부터 1개씩 누적해서 X̄(평균)로 마스킹
+        # 3. 매 step마다 ŷ 측정 → 곡선 형성
+        # 4. 곡선 아래 면적 (AUC) 계산 — 낮을수록 좋은 attribution
+        #
+        # [rank_correlation과의 차이]
+        # rank_correlation: 순위 일치도만 측정
+        # deletion_auc    : 누적 효과의 크기 측정
+        # (1위 feature가 압도적인 경우와 1~5위가 골고루 영향 주는 경우 구분 가능)
+        elif args.ablation == "deletion_auc":
+            from scipy.stats import spearmanr
+
+            model.eval()
+            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
+            n_features = model.n_features
+
+            n_test = min(100, X_test.shape[0])
+            X_da   = X_test[:n_test].clone()
+            X_baseline = X_train.mean(dim=0)              # (F,) 마스킹 시 사용
+
+            print(f"\n  Deletion AUC Faithfulness (n={n_test})")
+            print(f"  {'─'*60}")
+
+            # ── Step 1. 원본 prediction (logits) ──────────────
+            with torch.no_grad():
+                logits_orig = model(X_da)["logits"]
+                if tasktype == "regression":
+                    pred_orig = logits_orig.squeeze(-1).cpu().numpy()
+                elif tasktype == "multiclass":
+                    pred_orig = torch.softmax(logits_orig, dim=-1).cpu().numpy()
+                    # 다중 클래스: argmax 클래스의 확률 추적
+                    target_class = pred_orig.argmax(axis=-1)
+                    pred_orig = pred_orig[np.arange(n_test), target_class]
+                else:  # binclass
+                    pred_orig = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
+                    target_class = None
+
+            # ── Step 2. TabERA IG attribution 순위 (Input × Gradient) ──
+            print(f"  [1/3] TabERA IG attribution 계산 중...")
+            X_grad = X_da.clone().detach().requires_grad_(True)
+            out_da = model(X_grad)
+            target = out_da["agg_emb"].sum()
+            grad_X = torch.autograd.grad(target, X_grad, retain_graph=False)[0]
+            tabera_imp = (grad_X * (X_grad - X_baseline)).abs().detach().cpu().numpy()  # (N, F)
+
+            # ── Step 3. SHAP attribution 순위 ──────────────────
+            print(f"  [2/3] SHAP attribution 계산 중...")
+            try:
+                import shap
+                from tqdm import tqdm
+
+                def model_predict_fn(x_np):
+                    x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        lg = model(x_t)["logits"]
+                        if tasktype == "regression":
+                            return lg.squeeze(-1).cpu().numpy()
+                        elif tasktype == "multiclass":
+                            return torch.softmax(lg, dim=-1).cpu().numpy()
+                        else:
+                            return torch.sigmoid(lg.squeeze(-1)).cpu().numpy()
+
+                bg_n   = min(50, len(X_train))
+                bg_idx = np.random.choice(len(X_train), size=bg_n, replace=False)
+                bg     = X_train[bg_idx].cpu().numpy()
+                explainer = shap.KernelExplainer(model_predict_fn, bg, silent=True)
+
+                shap_imp = np.zeros((n_test, n_features))
+                for i in tqdm(range(n_test), ncols=120, leave=False):
+                    sv = explainer.shap_values(X_da[i:i+1].cpu().numpy(), nsamples=100, silent=True)
+                    if isinstance(sv, list):  # multiclass
+                        sv = sv[target_class[i]] if target_class is not None else sv[0]
+                    shap_imp[i] = np.abs(np.array(sv).flatten()[:n_features])
+                shap_available = True
+            except Exception as e:
+                print(f"  [SHAP 실패: {e}] SHAP 없이 진행")
+                shap_imp = None
+                shap_available = False
+
+            # ── Step 4. Random baseline ──────────────────────
+            print(f"  [3/3] Random baseline 계산 중...")
+            random_imp = np.abs(np.random.randn(n_test, n_features))
+
+            # ── Step 5. Deletion AUC 계산 ────────────────────
+            def compute_deletion_auc(attribution):
+                """
+                attribution: (N, F) — 각 샘플의 feature 중요도
+                반환: 평균 deletion AUC (낮을수록 좋음)
+                """
+                aucs = []
+                for n in range(n_test):
+                    # 순위 (높은 importance 먼저)
+                    order = np.argsort(-attribution[n])  # (F,)
+
+                    # 곡선: 마스킹 0개 → F개
+                    masked = X_da[n].clone()
+                    preds  = [pred_orig[n]]
+                    for f_idx in order:
+                        masked[f_idx] = X_baseline[f_idx]
+                        with torch.no_grad():
+                            lg = model(masked.unsqueeze(0))["logits"]
+                            if tasktype == "regression":
+                                p = lg.squeeze(-1).item()
+                            elif tasktype == "multiclass":
+                                p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
+                            else:
+                                p = torch.sigmoid(lg.squeeze(-1))[0].item()
+                            preds.append(p)
+                    # 정규화된 AUC (trapezoidal rule)
+                    # numpy 2.0+: np.trapz → np.trapezoid
+                    try:
+                        auc = np.trapezoid(preds) / n_features
+                    except AttributeError:
+                        auc = np.trapz(preds) / n_features
+                    aucs.append(auc)
+                return np.array(aucs)
+
+            print(f"\n  Deletion curve 계산 중...")
+            tabera_aucs = compute_deletion_auc(tabera_imp)
+            shap_aucs   = compute_deletion_auc(shap_imp)   if shap_available else None
+            random_aucs = compute_deletion_auc(random_imp)
+
+            print(f"\n  {'─'*60}")
+            print(f"  {'Method':<25} {'Deletion AUC':>15} {'std':>10}")
+            print(f"  {'─'*60}")
+            print(f"  {'TabERA (ours)':<25} {tabera_aucs.mean():>15.4f} {tabera_aucs.std():>10.4f}")
+            if shap_available:
+                print(f"  {'SHAP':<25} {shap_aucs.mean():>15.4f} {shap_aucs.std():>10.4f}")
+            print(f"  {'Random':<25} {random_aucs.mean():>15.4f} {random_aucs.std():>10.4f}")
+            print(f"  {'─'*60}")
+
+            print(f"\n  [해석]")
+            print(f"  → Deletion AUC가 낮을수록 attribution이 prediction-relevant한")
+            print(f"    feature를 정확히 가리킴 (그것을 먼저 지웠을 때 ŷ가 더 빠르게 변함)")
+            if shap_available:
+                if tabera_aucs.mean() < shap_aucs.mean():
+                    print(f"  ✅ TabERA AUC ({tabera_aucs.mean():.4f}) < SHAP AUC ({shap_aucs.mean():.4f})")
+                else:
+                    print(f"  △ TabERA AUC ({tabera_aucs.mean():.4f}) ≥ SHAP AUC ({shap_aucs.mean():.4f})")
+            print(f"  Random baseline: {random_aucs.mean():.4f}")
+
+            # 저장
+            da_save = {
+                "tabera_aucs": tabera_aucs.tolist(),
+                "shap_aucs":   shap_aucs.tolist() if shap_available else None,
+                "random_aucs": random_aucs.tolist(),
+                "n_samples":   n_test,
+                "openml_id":   openml_id,
+                "seed":        args.seed,
+            }
+            da_path = (
+                Path(log_dir)
+                / f"data={openml_id}..seed{args.seed}_deletion_auc.pkl"
+            )
+            with open(da_path, "wb") as f:
+                pickle.dump(da_save, f)
+            print(f"\n  저장: {da_path}")
+
+        # ── insertion_auc: baseline에서 시작 → 중요 feature부터 복원 ──
+        #
+        # [측정 방식] — Petsiuk et al. 2018 (RISE)
+        # 1. X_baseline (평균) 상태에서 시작 → ŷ_baseline
+        # 2. 각 샘플에 대해 attribution 순위 (가장 중요한 것부터) 계산
+        # 3. 가장 중요한 feature부터 1개씩 원본 값으로 복원
+        # 4. 매 step마다 ŷ 측정 → 곡선 형성
+        # 5. 곡선 아래 면적 (AUC) 계산 — 높을수록 좋은 attribution
+        #
+        # [Deletion과의 짝]
+        # Deletion: 원본 → 중요 feature 제거 → ŷ 빠르게 감소 (낮은 AUC가 좋음)
+        # Insertion: baseline → 중요 feature 추가 → ŷ 빠르게 회복 (높은 AUC가 좋음)
+        # 두 metric은 RISE 논문에서 짝으로 제안된 표준 평가 조합.
+        elif args.ablation == "insertion_auc":
+            from scipy.stats import spearmanr
+
+            model.eval()
+            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
+            n_features = model.n_features
+
+            n_test = min(100, X_test.shape[0])
+            X_ia   = X_test[:n_test].clone()
+            X_baseline = X_train.mean(dim=0)              # (F,) 복원 시작점
+
+            print(f"\n  Insertion AUC Faithfulness (n={n_test})")
+            print(f"  {'─'*60}")
+
+            # ── Step 1. 원본 prediction (logits) — 최종 target ──
+            with torch.no_grad():
+                logits_orig = model(X_ia)["logits"]
+                if tasktype == "regression":
+                    pred_orig = logits_orig.squeeze(-1).cpu().numpy()
+                    target_class = None
+                elif tasktype == "multiclass":
+                    probs = torch.softmax(logits_orig, dim=-1).cpu().numpy()
+                    target_class = probs.argmax(axis=-1)
+                    pred_orig = probs[np.arange(n_test), target_class]
+                else:  # binclass
+                    pred_orig = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
+                    target_class = None
+
+            # ── Step 2. TabERA IG attribution 순위 ────────────
+            print(f"  [1/3] TabERA IG attribution 계산 중...")
+            X_grad = X_ia.clone().detach().requires_grad_(True)
+            out_ia = model(X_grad)
+            target = out_ia["agg_emb"].sum()
+            grad_X = torch.autograd.grad(target, X_grad, retain_graph=False)[0]
+            tabera_imp = (grad_X * (X_grad - X_baseline)).abs().detach().cpu().numpy()
+
+            # ── Step 3. SHAP attribution ──────────────────────
+            print(f"  [2/3] SHAP attribution 계산 중...")
+            try:
+                import shap
+                from tqdm import tqdm
+
+                def model_predict_fn(x_np):
+                    x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        lg = model(x_t)["logits"]
+                        if tasktype == "regression":
+                            return lg.squeeze(-1).cpu().numpy()
+                        elif tasktype == "multiclass":
+                            return torch.softmax(lg, dim=-1).cpu().numpy()
+                        else:
+                            return torch.sigmoid(lg.squeeze(-1)).cpu().numpy()
+
+                bg_n   = min(50, len(X_train))
+                bg_idx = np.random.choice(len(X_train), size=bg_n, replace=False)
+                bg     = X_train[bg_idx].cpu().numpy()
+                explainer = shap.KernelExplainer(model_predict_fn, bg, silent=True)
+
+                shap_imp = np.zeros((n_test, n_features))
+                for i in tqdm(range(n_test), ncols=120, leave=False):
+                    sv = explainer.shap_values(X_ia[i:i+1].cpu().numpy(), nsamples=100, silent=True)
+                    if isinstance(sv, list):
+                        sv = sv[target_class[i]] if target_class is not None else sv[0]
+                    shap_imp[i] = np.abs(np.array(sv).flatten()[:n_features])
+                shap_available = True
+            except Exception as e:
+                print(f"  [SHAP 실패: {e}] SHAP 없이 진행")
+                shap_imp = None
+                shap_available = False
+
+            # ── Step 4. Random baseline ──────────────────────
+            print(f"  [3/3] Random baseline 계산 중...")
+            random_imp = np.abs(np.random.randn(n_test, n_features))
+
+            # ── Step 5. Insertion AUC 계산 ────────────────────
+            def compute_insertion_auc(attribution):
+                """
+                attribution: (N, F) — 각 샘플의 feature 중요도
+                반환: 평균 insertion AUC (높을수록 좋음)
+                """
+                aucs = []
+                for n in range(n_test):
+                    # 순위 (높은 importance 먼저)
+                    order = np.argsort(-attribution[n])  # (F,)
+
+                    # baseline 상태에서 시작 → 중요 feature부터 1개씩 복원
+                    inserted = X_baseline.clone()
+                    preds    = []
+
+                    # baseline prediction
+                    with torch.no_grad():
+                        lg = model(inserted.unsqueeze(0))["logits"]
+                        if tasktype == "regression":
+                            p = lg.squeeze(-1).item()
+                        elif tasktype == "multiclass":
+                            p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
+                        else:
+                            p = torch.sigmoid(lg.squeeze(-1))[0].item()
+                        preds.append(p)
+
+                    # 중요 feature부터 복원
+                    for f_idx in order:
+                        inserted[f_idx] = X_ia[n, f_idx]
+                        with torch.no_grad():
+                            lg = model(inserted.unsqueeze(0))["logits"]
+                            if tasktype == "regression":
+                                p = lg.squeeze(-1).item()
+                            elif tasktype == "multiclass":
+                                p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
+                            else:
+                                p = torch.sigmoid(lg.squeeze(-1))[0].item()
+                            preds.append(p)
+
+                    # 정규화된 AUC (trapezoidal rule)
+                    try:
+                        auc = np.trapezoid(preds) / n_features
+                    except AttributeError:
+                        auc = np.trapz(preds) / n_features
+                    aucs.append(auc)
+                return np.array(aucs)
+
+            print(f"\n  Insertion curve 계산 중...")
+            tabera_aucs = compute_insertion_auc(tabera_imp)
+            shap_aucs   = compute_insertion_auc(shap_imp)   if shap_available else None
+            random_aucs = compute_insertion_auc(random_imp)
+
+            print(f"\n  {'─'*60}")
+            print(f"  {'Method':<25} {'Insertion AUC':>15} {'std':>10}")
+            print(f"  {'─'*60}")
+            print(f"  {'TabERA (ours)':<25} {tabera_aucs.mean():>15.4f} {tabera_aucs.std():>10.4f}")
+            if shap_available:
+                print(f"  {'SHAP':<25} {shap_aucs.mean():>15.4f} {shap_aucs.std():>10.4f}")
+            print(f"  {'Random':<25} {random_aucs.mean():>15.4f} {random_aucs.std():>10.4f}")
+            print(f"  {'─'*60}")
+
+            print(f"\n  [해석]")
+            print(f"  → Insertion AUC가 높을수록 attribution이 prediction-relevant한")
+            print(f"    feature를 정확히 가리킴 (그것을 먼저 복원했을 때 ŷ가 더 빠르게 회복)")
+            if shap_available:
+                if tabera_aucs.mean() > shap_aucs.mean():
+                    print(f"  ✅ TabERA AUC ({tabera_aucs.mean():.4f}) > SHAP AUC ({shap_aucs.mean():.4f})")
+                else:
+                    print(f"  △ TabERA AUC ({tabera_aucs.mean():.4f}) ≤ SHAP AUC ({shap_aucs.mean():.4f})")
+            print(f"  Random baseline: {random_aucs.mean():.4f}")
+
+            # 저장
+            ia_save = {
+                "tabera_aucs": tabera_aucs.tolist(),
+                "shap_aucs":   shap_aucs.tolist() if shap_available else None,
+                "random_aucs": random_aucs.tolist(),
+                "n_samples":   n_test,
+                "openml_id":   openml_id,
+                "seed":        args.seed,
+            }
+            ia_path = (
+                Path(log_dir)
+                / f"data={openml_id}..seed{args.seed}_insertion_auc.pkl"
+            )
+            with open(ia_path, "wb") as f:
+                pickle.dump(ia_save, f)
+            print(f"\n  저장: {ia_path}")
 
         # ── random_neighbor: 성능 비교 ───────────────────────
         # full model 대비 성능 하락을 측정.
