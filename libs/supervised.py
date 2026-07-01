@@ -158,24 +158,14 @@ class TabERAWrapper:
         self.ema_history = []
         self.final_ema_stats = None
 
-        # ── [PATCH ⑥] 학습 임베딩 캐시 ────────────────────────────────
-        # 매 배치 forward에서 embedder 출력을 캡처 → 에폭 끝 EMA가 재사용.
-        # 에폭 내 배치별 staleness가 생기지만 EMA(과거 통계 추적) 본래 성격과 일관.
-        # 안전장치: 모든 샘플 커버 여부 검증 후 미충족 시 폴백 재임베딩.
-        N_train      = len(X_train)
-        emb_dim      = self.model.embed_dim
-        emb_cache    = torch.zeros(N_train, emb_dim, device=self.device)
-        cache_filled = torch.zeros(N_train, dtype=torch.bool, device=self.device)
-        _batch_idx: List[Optional[torch.Tensor]] = [None]  # mutable container for hook closure
-
-        def _embedder_hook(module, inputs, output):
-            bi = _batch_idx[0]
-            if bi is not None and self.model.training:
-                emb_cache[bi]    = output.detach()
-                cache_filled[bi] = True
-
-        hook_handle = self.model.embedder.register_forward_hook(_embedder_hook)
-        # ── [PATCH ⑥ END] ───────────────────────────────────────────────
+        # [버그 수정] 이전엔 emb_cache로 X_train 전체(N_train개)를 캐시해서
+        # ema_update에 넘겼음 → sample_groups가 "X_train 행 번호"로 만들어짐.
+        # 그런데 MemoryBank는 별도의 링버퍼(크기 min(2*N_train, 10000))라서
+        # 두 인덱스 공간이 어긋남 (N_train > memory_size인 경우 특히 심각 —
+        # retrieve()에서 clamp로 인덱스가 뭉개짐). 아래에서 ema_update에
+        # MemoryBank/FeatureStore의 실제 내용을 직접 넘기도록 수정 →
+        # sample_groups가 처음부터 MemoryBank 인덱스 공간을 가리키게 됨.
+        # 이에 따라 emb_cache/hook(구 PATCH ⑥)은 더 이상 필요 없어 제거.
 
         # MultiTab 스타일 에폭 tqdm
         pbar = tqdm(
@@ -185,121 +175,117 @@ class TabERAWrapper:
             leave=True,
         )
 
-        try:  # hook_handle.remove() 보장
-            for epoch in pbar:
-                # ── 학습 ──────────────────────────────────────
-                self.model.train()
-                cache_filled.zero_()                    # [PATCH ⑥] 에폭 시작 시 캐시 리셋
-                perm    = torch.randperm(len(y_train), device=self.device)
-                tr_loss_gpu = torch.zeros((), device=self.device)  # [최적화] GPU 텐서로 누적
-                n_batch = 0
+        for epoch in pbar:
+            # ── 학습 ──────────────────────────────────────
+            self.model.train()
+            perm    = torch.randperm(len(y_train), device=self.device)
+            tr_loss_gpu = torch.zeros((), device=self.device)  # [최적화] GPU 텐서로 누적
+            n_batch = 0
 
-                for start in range(0, len(y_train), self.params["batch_size"]):
-                    idx = perm[start:start + self.params["batch_size"]]
-                    _batch_idx[0] = idx             # [PATCH ⑥] hook에 현재 배치 인덱스 전달
-                    xb, yb = X_train[idx], y_train[idx]
+            for start in range(0, len(y_train), self.params["batch_size"]):
+                idx = perm[start:start + self.params["batch_size"]]
+                xb, yb = X_train[idx], y_train[idx]
 
-                    optimizer.zero_grad()
+                optimizer.zero_grad()
 
-                    out = self.model(xb, labels=yb)
-                    lg  = out["logits"]
+                out = self.model(xb, labels=yb)
+                lg  = out["logits"]
 
-                    if self.tasktype in ("regression", "binclass"):
-                        task_loss = criterion(lg.squeeze(-1), yb.float())
+                if self.tasktype in ("regression", "binclass"):
+                    task_loss = criterion(lg.squeeze(-1), yb.float())
+                else:
+                    task_loss = criterion(lg, yb.long())
+
+                loss = task_loss + out["aux_loss"]
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+
+                tr_loss_gpu += loss.detach()          # .item() 없이 GPU에 누적 (동기화 제거)
+                n_batch += 1
+
+            scheduler.step()
+            self.model.anneal(self.params.get("anneal_factor", 0.97))
+
+            # ── (3) EMA centroid 업데이트 ───────────────────────
+            if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
+                with torch.no_grad():
+                    # [버그 수정] X_train 전체 대신 MemoryBank에 실제로 들어있는
+                    # 내용(최대 memory_size개)만 클러스터링 → sample_groups가
+                    # MemoryBank 인덱스 공간과 항상 일치하도록 보장.
+                    n_mem = self.model.memory.filled.item()
+                    if n_mem < 1:
+                        # 메모리가 아직 하나도 안 채워진 극초반 → 스킵
+                        ema_stats = {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
                     else:
-                        task_loss = criterion(lg, yb.long())
-
-                    loss = task_loss + out["aux_loss"]
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    optimizer.step()
-
-                    tr_loss_gpu += loss.detach()          # .item() 없이 GPU에 누적 (동기화 제거)
-                    n_batch += 1
-
-                _batch_idx[0] = None
-
-                scheduler.step()
-                self.model.anneal(self.params.get("anneal_factor", 0.97))
-
-                # ── (3) EMA centroid 업데이트 ───────────────────────
-                if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
-                    with torch.no_grad():
-                        if bool(cache_filled.all().item()):
-                            emb_ema = emb_cache
-                        else:
-                            n_chunk = 4096
-                            all_emb = []
-                            for s in range(0, len(X_train), n_chunk):
-                                all_emb.append(self.model.embedder(X_train[s:s+n_chunk]))
-                            emb_ema = torch.cat(all_emb, dim=0)
-
-                        x_ema     = X_train
+                        emb_ema = self.model.memory.keys[:n_mem]           # (n_mem, D) — MemoryBank 임베딩
+                        fs = self.model.feature_store
+                        x_ema = (
+                            fs._store[:n_mem].to(self.device)              # (n_mem, F) — 원본 feature
+                            if fs is not None else None
+                        )
                         ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
 
-                        self.final_ema_stats = dict(ema_stats)
-                        self.ema_history.append({
-                            "epoch": float(epoch),
-                            "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
-                            "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
-                            "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
-                            "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
-                            "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
-                        })
+                    self.final_ema_stats = dict(ema_stats)
+                    self.ema_history.append({
+                        "epoch": float(epoch),
+                        "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
+                        "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
+                        "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
+                        "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
+                        "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
+                    })
 
-                        self.model.memory.cache_sample_groups(
-                            self.model.prototype_layer.sample_groups,
-                            device=torch.device(self.device),
-                            centroid_emb=self.model.prototype_layer.centroid_emb,
+                    self.model.memory.cache_sample_groups(
+                        self.model.prototype_layer.sample_groups,
+                        device=torch.device(self.device),
+                        centroid_emb=self.model.prototype_layer.centroid_emb,
+                    )
+
+                    if epoch % 10 == 0:
+                        pbar.write(
+                            f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
+                            f"alive={ema_stats.get('active_centroids', 0)}  "
+                            f"min={ema_stats['min_cluster_size']}  "
+                            f"max={ema_stats['max_cluster_size']}"
                         )
 
-                        if epoch % 10 == 0:
-                            pbar.write(
-                                f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
-                                f"alive={ema_stats.get('active_centroids', 0)}  "
-                                f"min={ema_stats['min_cluster_size']}  "
-                                f"max={ema_stats['max_cluster_size']}"
-                            )
+                    # ── Centroid collapse 감지 → 조기 종료 ──────────
+                    if ema_stats.get("active_ratio", 1.0) < 0.1:
+                        tqdm.write(
+                            f"  [STOP] Centroid collapse at epoch {epoch} "
+                            f"(active={ema_stats['active_ratio']:.0%}). Early exit."
+                        )
+                        break
 
-                        # ── Centroid collapse 감지 → 조기 종료 ──────────
-                        if ema_stats.get("active_ratio", 1.0) < 0.1:
-                            tqdm.write(
-                                f"  [STOP] Centroid collapse at epoch {epoch} "
-                                f"(active={ema_stats['active_ratio']:.0%}). Early exit."
-                            )
-                            break
+            avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
 
-                avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
+            # ── 검증 ──────────────────────────────────────
+            self.model.eval()
+            with torch.no_grad():
+                val_logits = self._forward_batched(X_val)
+                val_m  = compute_metric(val_logits, y_val, self.tasktype)
+            val_v = list(val_m.values())[0]
 
-                # ── 검증 ──────────────────────────────────────
-                self.model.eval()
-                with torch.no_grad():
-                    val_logits = self._forward_batched(X_val)
-                    val_m  = compute_metric(val_logits, y_val, self.tasktype)
-                val_v = list(val_m.values())[0]
+            # best 모델 저장
+            if is_better(val_v, best_val, self.tasktype):
+                best_val   = val_v
+                best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-                # best 모델 저장
-                if is_better(val_v, best_val, self.tasktype):
-                    best_val   = val_v
-                    best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+            # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
+            pbar.set_description(f"EPOCH: {epoch}")
+            pbar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                id=self._data_id,
+                refresh=False,
+            )
 
-                # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
-                pbar.set_description(f"EPOCH: {epoch}")
-                pbar.set_postfix(
-                    loss=f"{avg_loss:.4f}",
-                    id=self._data_id,
-                    refresh=False,
-                )
+            # 조기 종료
+            if es.step(val_v, higher_is_better):
+                tqdm.write(f"Early stopping at epoch {epoch}")
+                break
 
-                # 조기 종료
-                if es.step(val_v, higher_is_better):
-                    tqdm.write(f"Early stopping at epoch {epoch}")
-                    break
-
-            pbar.close()
-
-        finally:
-            hook_handle.remove()    # [PATCH ⑥] 예외 발생 시에도 hook 반드시 제거
+        pbar.close()
 
         if best_state:
             self.model.load_state_dict(best_state)
