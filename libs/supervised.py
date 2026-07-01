@@ -119,11 +119,25 @@ class TabERAWrapper:
         y_val: torch.Tensor,
     ) -> None:
         criterion  = get_criterion(self.tasktype)  # weight_matrix GPU 이동
-        optimizer  = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.params["lr"],
-            weight_decay=self.params["weight_decay"],
-        )
+
+        # [최적화] AdamW.step()이 프로파일에서 retrieve() 전체보다 더 큰
+        # 단일 비용으로 확인됨 (파라미터 텐서별로 개별 커널을 발사하기 때문).
+        # fused=True는 전체 업데이트를 커널 1개로 묶어 처리 (CUDA + PyTorch 2.0+).
+        # 일부 dtype/파라미터 구성에서 미지원일 수 있어 실패 시 foreach로 폴백.
+        try:
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.params["lr"],
+                weight_decay=self.params["weight_decay"],
+                fused=(self.device.startswith("cuda")),
+            )
+        except (RuntimeError, TypeError):
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.params["lr"],
+                weight_decay=self.params["weight_decay"],
+                foreach=True,
+            )
         scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
         es         = EarlyStopping(patience=self.patience)
 
@@ -177,7 +191,7 @@ class TabERAWrapper:
                 self.model.train()
                 cache_filled.zero_()                    # [PATCH ⑥] 에폭 시작 시 캐시 리셋
                 perm    = torch.randperm(len(y_train), device=self.device)
-                tr_loss = 0.0
+                tr_loss_gpu = torch.zeros((), device=self.device)  # [최적화] GPU 텐서로 누적
                 n_batch = 0
 
                 for start in range(0, len(y_train), self.params["batch_size"]):
@@ -186,6 +200,7 @@ class TabERAWrapper:
                     xb, yb = X_train[idx], y_train[idx]
 
                     optimizer.zero_grad()
+
                     out = self.model(xb, labels=yb)
                     lg  = out["logits"]
 
@@ -198,10 +213,11 @@ class TabERAWrapper:
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     optimizer.step()
-                    tr_loss += loss.item()
+
+                    tr_loss_gpu += loss.detach()          # .item() 없이 GPU에 누적 (동기화 제거)
                     n_batch += 1
 
-                _batch_idx[0] = None                # [PATCH ⑥] 검증 단계 캐시 오염 방지
+                _batch_idx[0] = None
 
                 scheduler.step()
                 self.model.anneal(self.params.get("anneal_factor", 0.97))
@@ -209,13 +225,10 @@ class TabERAWrapper:
                 # ── (3) EMA centroid 업데이트 ───────────────────────
                 if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
                     with torch.no_grad():
-                        # [PATCH ⑥] 캐시 활용: 모든 샘플이 이번 에폭에 임베딩됐으면 재임베딩 생략.
-                        # [PATCH ⑤] 폴백 시 n_chunk 1024 → 4096 으로 확대 (결과 동일, forward 횟수 감소).
                         if bool(cache_filled.all().item()):
-                            emb_ema = emb_cache          # [PATCH ⑥] 재임베딩 없이 캐시 재사용
+                            emb_ema = emb_cache
                         else:
-                            # 누락 샘플 있을 때만 폴백 재임베딩 (정상 학습 중 사실상 발생 안 함)
-                            n_chunk = 4096               # [PATCH ⑤] 구 1024 → 4096
+                            n_chunk = 4096
                             all_emb = []
                             for s in range(0, len(X_train), n_chunk):
                                 all_emb.append(self.model.embedder(X_train[s:s+n_chunk]))
@@ -223,6 +236,7 @@ class TabERAWrapper:
 
                         x_ema     = X_train
                         ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
+
                         self.final_ema_stats = dict(ema_stats)
                         self.ema_history.append({
                             "epoch": float(epoch),
@@ -233,18 +247,13 @@ class TabERAWrapper:
                             "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
                         })
 
-                        # 에폭당 1회: sample_groups를 GPU 텐서로 캐시 (76,800번 변환 제거)
                         self.model.memory.cache_sample_groups(
                             self.model.prototype_layer.sample_groups,
                             device=torch.device(self.device),
                             centroid_emb=self.model.prototype_layer.centroid_emb,
                         )
+
                         if epoch % 10 == 0:
-                            # 검색 범위 축소율 계산 (가설 ②)
-                            n_total = len(X_train)
-                            n_proto = self.model.prototype_layer.P
-                            avg_cand = n_total / n_proto if n_proto > 0 else n_total
-                            reduction = (1 - avg_cand / n_total) * 100
                             pbar.write(
                                 f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
                                 f"alive={ema_stats.get('active_centroids', 0)}  "
@@ -260,7 +269,7 @@ class TabERAWrapper:
                             )
                             break
 
-                avg_loss = tr_loss / max(n_batch, 1)
+                avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
 
                 # ── 검증 ──────────────────────────────────────
                 self.model.eval()

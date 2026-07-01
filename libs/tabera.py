@@ -70,14 +70,19 @@ class TabularEmbedder(nn.Module):
 
 class MemoryBank(nn.Module):
     """학습 임베딩 저장소 (KNN 검색용)."""
-    def __init__(self, max_size: int, embed_dim: int):
+    def __init__(self, max_size: int, embed_dim: int, n_size_buckets: int = 4):
         super().__init__()
         self.max_size = max_size
+        # 그룹-크기 버킷 개수 (retrieve()의 normal_mask 처리용, 상수 반복 횟수)
+        self.n_size_buckets = n_size_buckets
         self.register_buffer("keys",   torch.zeros(max_size, embed_dim))
         self.register_buffer("vals",   torch.zeros(max_size, embed_dim))
         self.register_buffer("labels", torch.zeros(max_size))
         self.register_buffer("ptr",    torch.tensor(0, dtype=torch.long))
         self.register_buffer("filled", torch.tensor(0, dtype=torch.long))
+        # ── 정규화 캐시: retrieve() 내부의 반복 F.normalize 제거용 ──────
+        # update() 시 O(B)로 증분 갱신, retrieve()에서는 그대로 gather만 함.
+        self.register_buffer("_keys_norm", torch.zeros(max_size, embed_dim))
 
     @torch.no_grad()
     def update(self, keys, vals, labels):
@@ -88,6 +93,8 @@ class MemoryBank(nn.Module):
         self.keys[ptr:end]   = keys[:n].detach()
         self.vals[ptr:end]   = vals[:n].detach()
         self.labels[ptr:end] = labels[:n].float().detach()
+        # 정규화도 여기서 O(B)로 한 번만 계산 (retrieve 매 배치 재계산 제거)
+        self._keys_norm[ptr:end] = F.normalize(keys[:n].detach(), dim=-1)
         self.ptr    = torch.tensor(end % self.max_size, dtype=torch.long)
         self.filled = torch.tensor(min(self.filled.item() + n, self.max_size), dtype=torch.long)
 
@@ -190,7 +197,7 @@ class MemoryBank(nn.Module):
         # ── 캐시 없거나 초기화 전 → 전체 검색 fallback ──────────
         cached = getattr(self, '_cached_groups', None)
         if hard_assignment is None or cached is None or n < k:
-            keys_all = F.normalize(keys_full, dim=-1)
+            keys_all = self._keys_norm[:n]  # 정규화 캐시 재사용
             sim      = q_norm @ keys_all.T
             _, idx   = sim.topk(min(k, n), dim=-1)
             idx      = idx.clamp(0, n - 1)
@@ -211,58 +218,76 @@ class MemoryBank(nn.Module):
         out_labels = torch.zeros(B, k,            device=dev)
         top_k_idx = torch.zeros(B, k, dtype=torch.long, device=dev)
 
-        # ── 정상 샘플: 청크 단위 처리 (OOM 방지) ───────────────────
+        # ── 정상 샘플: centroid dedup(전체 1회, 티어링 없음) ──────────────
+        # [프로파일링 결과 반영] N=35,855 / D≤256 / B=256 규모에서는 실제
+        # GPU 연산(Self CUDA)이 1ms도 안 될 만큼 작은데, 이전 버전(사이즈-티어
+        # + dedup)은 티어마다 argsort/unique_consecutive/remap/nonzero/
+        # repeat_interleave를 반복 호출해 CPU 25.4ms 중 대부분을
+        # aten::index(71회)/aten::nonzero(21회)/aten::index_put_(30회)/
+        # aten::repeat_interleave(콜당 728us) 같은 "부기(bookkeeping)"
+        # 연산에 소모했음 (실제 topk/bmm은 933us 중 260us뿐).
+        #
+        # 이 규모에서는 FLOP을 아끼는 것보다 커널 발사 횟수를 줄이는 게
+        # 훨씬 중요 → 티어링을 제거하고 dedup만 남김:
+        #   - centroid dedup은 여전히 유지 (같은 centroid를 가리키는 쿼리가
+        #     후보를 중복 gather하는 것만 막아도 가장 큰 낭비는 해결됨)
+        #   - 폭(local_max_g)은 "이 배치에 실제로 등장한 centroid들 중
+        #     최댓값"으로만 제한 (여전히 전역 max_g보다 훨씬 작음)
+        #   - repeat_interleave → bucketize로 교체 (동일 결과, 훨씬 가벼움)
+        #   - nonzero 호출을 배치 전체에서 1회로 축소 (티어당 반복 없음)
         if normal_mask.any():
-            nm_idx   = normal_mask.nonzero(as_tuple=True)[0]  # (Bn,)
-            ha_nm    = ha[nm_idx]                              # (Bn,)
-            q_nm     = q_norm[nm_idx]                          # (Bn, D)
+            nm_idx = normal_mask.nonzero(as_tuple=True)[0]  # (Bn,)
+            ha_nm  = ha[nm_idx]                              # (Bn,)
+            q_nm   = q_norm[nm_idx]                          # (Bn, D)
+            Bn = nm_idx.shape[0]                              # python int, 동기화 없음
 
-            cand_idx   = self._cached_groups[ha_nm]            # (Bn, max_g)
-            max_g      = cand_idx.shape[1]
-            valid_mask = (cand_idx >= 0)                       # (Bn, max_g)
-            safe_idx   = cand_idx.clamp(min=0, max=n - 1)
-            k_eff      = min(k, max_g)
+            # ── centroid dedup: 배치 전체 1회 ──
+            csort_idx   = torch.argsort(ha_nm)                # (Bn,)
+            ha_c_sorted = ha_nm[csort_idx]
+            q_c_sorted  = q_nm[csort_idx]
 
-            Bn = nm_idx.shape[0]
+            uniq, counts = torch.unique_consecutive(ha_c_sorted, return_counts=True)  # (U,)
+            U = uniq.shape[0]
 
-            # 청크 크기: max_g × D × 4bytes 기준 256MB 이하로 제한
-            chunk = max(1, min(Bn, (256 * 1024 * 1024) // max(max_g * D * 4, 1)))
+            offsets = counts.cumsum(0)                          # (U,) 각 그룹의 끝 위치(배타적 경계)
+            # repeat_interleave 대신 bucketize 사용 (콜당 수백us → 수십us 수준)
+            group_id = torch.bucketize(
+                torch.arange(Bn, device=dev), offsets, right=True
+            )                                                    # (Bn,) 0..U-1
+            rank = torch.arange(Bn, device=dev) - (offsets[group_id] - counts[group_id])  # (Bn,) centroid 내 0-index
 
-            i_final_all    = torch.zeros(Bn, k_eff, dtype=torch.long, device=dev)
-            out_nk_chunk   = torch.zeros(Bn, k_eff, D, device=dev)
-            out_nv_chunk   = torch.zeros(Bn, k_eff, D, device=dev)
-            out_labels_chunk = torch.zeros(Bn, k_eff, device=dev)
+            max_q       = int(counts.max())                     # 배치 전체 스칼라 변환 1회
+            local_max_g = max(int(self._cached_group_sizes[uniq].max()), k)  # 배치에 등장한 centroid 중 최댓값만
 
-            for start in range(0, Bn, chunk):
-                end = min(start + chunk, Bn)
-                sl  = slice(start, end)
+            Q_pad = torch.zeros(U, max_q, D, device=dev)
+            Q_pad[group_id, rank] = q_c_sorted                   # (U, max_q, D)
 
-                si_c  = safe_idx[sl]      # (c, max_g)
-                vm_c  = valid_mask[sl]    # (c, max_g)
-                q_c   = q_nm[sl]          # (c, D)
+            cand_u  = self._cached_groups[uniq, :local_max_g]    # (U, local_max_g) — centroid당 1회만 gather
+            valid_u = cand_u >= 0
+            safe_u  = cand_u.clamp(min=0, max=n - 1)
 
-                keys_c = F.normalize(
-                    keys_full[si_c.reshape(-1)].view(end - start, max_g, D),
-                    dim=-1,
-                )                                              # (c, max_g, D)
+            keys_u = self._keys_norm[:n][safe_u.reshape(-1)].view(U, local_max_g, D)
 
-                sim_c = torch.bmm(
-                    q_c.unsqueeze(1), keys_c.transpose(1, 2)
-                ).squeeze(1)                                   # (c, max_g)
-                sim_c = sim_c.masked_fill(~vm_c, -1e9)
+            sim_u = torch.bmm(Q_pad, keys_u.transpose(1, 2))      # (U, max_q, local_max_g)
+            sim_u = sim_u.masked_fill(~valid_u.unsqueeze(1), -1e9)
 
-                _, top_c   = sim_c.topk(k_eff, dim=-1)        # (c, k)
-                i_final_c  = si_c.gather(1, top_c)            # (c, k)
+            k_eff = min(k, local_max_g)
+            _, top_u  = sim_u.topk(k_eff, dim=-1)                 # (U, max_q, k_eff)
+            i_final_u = safe_u.unsqueeze(1).expand(-1, max_q, -1).gather(2, top_u)  # (U, max_q, k_eff)
 
-                i_final_all[sl]      = i_final_c
-                out_nk_chunk[sl]     = keys_full[i_final_c.reshape(-1)].view(end - start, k_eff, D)
-                out_nv_chunk[sl]     = vals_full[i_final_c.reshape(-1)].view(end - start, k_eff, D)
-                out_labels_chunk[sl] = labels_full[i_final_c.clamp(0, n - 1)]
+            i_final_c_sorted = i_final_u[group_id, rank]          # (Bn, k_eff) — csorted 순서
 
-            out_nk[nm_idx]     = out_nk_chunk
-            out_nv[nm_idx]     = out_nv_chunk
-            out_labels[nm_idx] = out_labels_chunk
-            top_k_idx[nm_idx]  = i_final_all
+            # [이번 수정] 중간 _chunk 버퍼(out_nk_chunk 등) + 2단계 복사를 없애고
+            # out_nk/out_nv/out_labels/top_k_idx에 "한 번에" 바로 씀.
+            # 기존: i_final_all(zeros)+scatter → out_nk_chunk(zeros)+scatter → out_nk[nm_idx]=chunk (복사 2단계)
+            # 개선: final_pos(csorted → 원래 B 내 위치)를 미리 계산해 딱 1번의 index_put_로 끝냄
+            #   → aten::index_put_/aten::copy_ 호출 수 및 CPU total 추가 절감
+            final_pos = nm_idx[csort_idx]                          # (Bn,) 원래 배치(B) 내 최종 위치
+
+            top_k_idx[final_pos, :k_eff]  = i_final_c_sorted
+            out_nk[final_pos, :k_eff]     = keys_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
+            out_nv[final_pos, :k_eff]     = vals_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
+            out_labels[final_pos, :k_eff] = labels_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff)
 
         # fallback 샘플: 인접 centroid 그룹까지 확장하여 검색 (cross-group)
         # 기존: zeros 유지 (사실상 전체 검색 포기)
@@ -297,10 +322,10 @@ class MemoryBank(nn.Module):
                         vm_e  = valid_ext[i]                    # (max_eg,)
                         q_e   = q_fb[i:i+1]                     # (1, D)
 
-                        keys_e = F.normalize(keys_full[si_e[vm_e]], dim=-1)  # (valid, D)
+                        keys_e = self._keys_norm[:n][si_e[vm_e]]  # (valid, D) 정규화 캐시 재사용
                         if keys_e.shape[0] < k:
                             # 그래도 부족하면 전체 검색
-                            keys_all = F.normalize(keys_full, dim=-1)
+                            keys_all = self._keys_norm[:n]
                             sim_all  = q_e @ keys_all.T
                             _, idx_all = sim_all.topk(min(k, n), dim=-1)
                             idx_all = idx_all.squeeze(0).clamp(0, n - 1)
@@ -326,7 +351,7 @@ class MemoryBank(nn.Module):
                         i = i.item()
                         b_pos = fb_idx[i]
                         q_s   = q_fb[i:i+1]
-                        keys_all = F.normalize(keys_full, dim=-1)
+                        keys_all = self._keys_norm[:n]
                         sim_all  = q_s @ keys_all.T
                         _, idx_all = sim_all.topk(min(k, n), dim=-1)
                         idx_all = idx_all.squeeze(0).clamp(0, n - 1)
@@ -336,7 +361,7 @@ class MemoryBank(nn.Module):
                         top_k_idx[b_pos]  = idx_all
             else:
                 # 확장 캐시 없으면 전체 검색 (기존 동작)
-                keys_all = F.normalize(keys_full, dim=-1)
+                keys_all = self._keys_norm[:n]
                 for i in range(Bf):
                     b_pos = fb_idx[i]
                     q_s   = q_fb[i:i+1]
