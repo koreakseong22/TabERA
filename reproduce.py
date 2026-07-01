@@ -75,6 +75,122 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
 
 
 # ─────────────────────────────────────────────────────────────
+# Integrated Gradients (Sundararajan et al. 2017, ICML)
+# ─────────────────────────────────────────────────────────────
+#
+# [1-step Gradient×Input과의 차이]
+# 1-step: grad(x) * (x - baseline)
+#   → α=1 지점(원본 입력)의 gradient만 사용
+#   → sigmoid/softmax가 saturate된 영역에서 gradient ≈ 0
+#   → Sensitivity, Completeness axiom을 만족하지 못함
+#     (Shrikumar et al. 2016, "Gradient * Input"과 동일한 방법)
+#
+# Multi-step IG: baseline → input 경로를 n_steps개 지점에서 샘플링,
+#   각 지점의 gradient를 평균 → (x - baseline)과 곱함
+#   → fundamental theorem of calculus에 의해 Completeness axiom 만족
+#   → saturation 구간도 경로 적분으로 우회 가능
+def compute_integrated_gradients(
+    model, X, X_baseline, target_fn, n_steps: int = 20,
+    check_convergence: bool = False,
+):
+    """
+    Parameters
+    ──────────
+    model      : TabERA 모델 (eval 모드)
+    X          : (N, F) 입력 배치
+    X_baseline : (F,) 또는 (N, F) baseline
+    target_fn  : model(x) 출력(dict)을 받아 (N,) 형태의 per-sample 스칼라를
+                 리턴하는 함수. 배치를 sum()해서 단일 스칼라로 합치면 안 됨
+                 (개별 샘플의 completeness 검증이 불가능해짐).
+                 예: lambda out: out["logits"].gather(1, target_class.unsqueeze(1)).squeeze(1)
+                     (multiclass, 예측 클래스의 logit)
+                 예: lambda out: out["logits"].squeeze(-1)
+                     (binclass/regression, 단일 출력)
+    n_steps    : 적분 근사에 사용할 step 수 (기본 20)
+    check_convergence : True면 Completeness axiom 오차를 샘플별로 측정해 출력
+                 (IG_i(x).sum() ≈ f(x) - f(baseline) 이어야 함 — Riemann sum
+                 근사 오차이므로 n_steps가 부족하면 이 값이 커짐)
+
+    Returns
+    ──────────
+    attribution : (N, F) — |IG| (절댓값, 순위 비교용)
+    """
+    if X_baseline.dim() == 1:
+        X_baseline = X_baseline.unsqueeze(0).expand_as(X)
+
+    alphas = torch.linspace(0.0, 1.0, n_steps, device=X.device)
+    grads_accum = torch.zeros_like(X)
+
+    for alpha in alphas:
+        x_interp = (X_baseline + alpha * (X - X_baseline)).clone().detach().requires_grad_(True)
+        out = model(x_interp)
+        target = target_fn(out)                              # (N,) per-sample
+        # 배치의 각 샘플 출력은 서로 다른 입력에서 나오므로 (배치 내 cross term 없음),
+        # target.sum()의 gradient = 각 샘플 target의 gradient를 합친 것과 동일.
+        # 이렇게 하면 1회 backward로 (N, F) gradient를 모두 얻으면서도
+        # per-sample completeness 검증에 필요한 분리된 의미를 유지함.
+        grad = torch.autograd.grad(target.sum(), x_interp, retain_graph=False)[0]
+        grads_accum = grads_accum + grad
+
+    avg_grad = grads_accum / n_steps
+    ig_signed = avg_grad * (X - X_baseline)             # (N, F) 부호 보존 (completeness 검증용)
+
+    if check_convergence:
+        # Completeness axiom (per-sample): Σ_i IG_i(x) ≈ f(x) - f(baseline)
+        # 오차가 클수록 n_steps가 적분 근사에 부족하다는 신호.
+        # 배치 합산이 아니라 샘플별로 직접 비교해야 상쇄/증폭으로 인한
+        # 진단 오류를 피할 수 있음.
+        with torch.no_grad():
+            f_x        = target_fn(model(X))                 # (N,)
+            f_baseline = target_fn(model(X_baseline))         # (N,)
+        ig_sum_per_sample  = ig_signed.sum(dim=-1)             # (N,)
+        actual_diff_per_sample = f_x - f_baseline              # (N,)
+
+        abs_error = (ig_sum_per_sample - actual_diff_per_sample).abs()
+        rel_error = abs_error / (actual_diff_per_sample.abs() + 1e-8)
+
+        print(f"    [IG convergence check] n_steps={n_steps}  "
+              f"mean|Σ IG_i - (f(x)-f(baseline))| = {abs_error.mean().item():.4f}  "
+              f"(median relative: {rel_error.median().item():.2%}, "
+              f"mean relative: {rel_error.mean().item():.2%})")
+
+    return ig_signed.abs().detach()
+
+
+def make_logit_target_fn(tasktype: str, target_class=None):
+    """
+    compute_integrated_gradients에 넘길 per-sample target_fn 생성.
+
+    IG는 "최종 예측"에 대한 feature 기여도를 측정해야 하므로,
+    agg_emb(중간 retrieval 표현)가 아니라 logits을 target으로 삼는다.
+
+    Parameters
+    ──────────
+    tasktype     : "regression" | "multiclass" | 그 외(binclass)
+    target_class : multiclass일 때 각 샘플의 추적 대상 클래스 인덱스, shape (N,)
+                   numpy array 또는 torch tensor. None이면 호출 시점에
+                   model 출력에서 argmax로 자동 결정(단, baseline 평가 시
+                   클래스가 바뀌면 completeness가 깨지므로 고정해서 넘기는
+                   것을 권장).
+    """
+    if tasktype == "regression":
+        return lambda out: out["logits"].squeeze(-1)            # (N,)
+
+    elif tasktype == "multiclass":
+        def _fn(out):
+            logits = out["logits"]                              # (N, C)
+            if target_class is None:
+                tc = logits.argmax(dim=-1)
+            else:
+                tc = torch.as_tensor(target_class, device=logits.device, dtype=torch.long)
+            return logits.gather(1, tc.unsqueeze(1)).squeeze(1)  # (N,)
+        return _fn
+
+    else:  # binclass — 단일 logit, 그 자체가 곧 class=1 방향의 점수
+        return lambda out: out["logits"].squeeze(-1)             # (N,)
+
+
+# ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
 
@@ -193,6 +309,32 @@ def main():
     print(f"  val  : {val_metrics}")
     print(f"  test : {test_metrics}")
 
+    # ── 예측 확신도(overconfidence) 진단 ──────────────────────
+    # deletion/insertion AUC가 multiclass에서 Random과 잘 구별되지 않는 원인 후보:
+    # 모델이 거의 항상 한 클래스에 매우 쏠린(overconfident) 예측을 한다면,
+    # 개별 feature 하나를 지워도 그 확신이 잘 안 흔들려 deletion 효과가 둔감해질 수 있음
+    # (attribution 방법의 문제가 아니라 prediction surface 자체가 saturate된 경우).
+    if tasktype != "regression" and probs_test is not None:
+        probs_test_cpu = probs_test.detach().cpu() if torch.is_tensor(probs_test) else probs_test
+        probs_np = np.asarray(probs_test_cpu)
+        if tasktype == "multiclass":
+            max_probs = probs_np.max(axis=-1)
+        else:  # binclass — predict_proba가 (N,) 또는 (N,2) 형태일 수 있음
+            if probs_np.ndim == 2:
+                max_probs = probs_np.max(axis=-1)
+            else:
+                max_probs = np.where(probs_np >= 0.5, probs_np, 1.0 - probs_np)
+
+        print(f"\n  [예측 확신도 진단]")
+        print(f"    평균 max_prob : {max_probs.mean():.4f}")
+        print(f"    표준편차      : {max_probs.std():.4f}")
+        print(f"    median        : {np.median(max_probs):.4f}")
+        print(f"    >0.9 비율     : {(max_probs > 0.9).mean()*100:.1f}%")
+        print(f"    >0.99 비율    : {(max_probs > 0.99).mean()*100:.1f}%")
+        if tasktype == "multiclass":
+            n_classes = probs_np.shape[-1]
+            print(f"    (참고: uniform이면 max_prob ≈ {1.0/n_classes:.3f}, n_classes={n_classes})")
+
     # ── Ablation 평가 ──────────────────────────────────────────
     # 학습된 모델 가중치는 고정한 채, inference 단계에서만 ablation 적용.
     # 따라서 별도 재학습 없이 동일 가중치로 3가지 ablation을 빠르게 비교 가능.
@@ -206,7 +348,7 @@ def main():
         # ── rank_correlation: IG feature 순위 vs 실제 prediction 영향력 순위 ──
         #
         # [측정 방식]
-        # 1. TabERA Input × Gradient → feature별 중요도 순위
+        # 1. TabERA Integrated Gradients (50-step) → feature별 중요도 순위
         # 2. SHAP KernelExplainer → feature별 중요도 순위
         # 3. Random attribution → baseline
         # 4. 각 feature를 평균값으로 교체 → prediction 변화량(delta) 순위
@@ -253,24 +395,31 @@ def main():
             delta_arr  = np.array(delta_per_feat)
             delta_rank = np.argsort(np.argsort(-delta_arr))   # 0-based, 낮을수록 중요
 
-            # ── Step 2. TabERA IG 순위 (Input × Gradient) ──
+            # ── Step 2. TabERA IG 순위 (Integrated Gradients, multi-step) ──
             #
-            # agg_emb(=retrieval 경로의 aggregation)을
-            # raw input X에 대해 직접 미분(Input × Gradient, IG의 1-step 근사).
-            # embedder의 비선형성을 grad가 그대로 통과하므로,
-            # "이 feature를 바꾸면 retrieval 결과가 얼마나 변하는가"를
-            # delta(perturbation 기반)와 같은 좌표계(원본 feature space)에서 측정.
-            # -> 모델 구조/학습 변경 없음, eval 모드에서 1차 backward만 사용.
-            print(f"  [2/4] TabERA IG 순위 계산 중 (Input x Gradient)...")
-
-            X_rc_grad = X_rc.clone().detach().requires_grad_(True)
-            out_rc    = model(X_rc_grad)
-
-            target = out_rc["agg_emb"].sum()
-            grad_X = torch.autograd.grad(target, X_rc_grad, retain_graph=False)[0]  # (N, F)
+            # Sundararajan et al. 2017 (ICML)의 정의를 따라 baseline → input
+            # 경로를 50-step으로 적분 근사. target은 retrieval 중간 표현인
+            # agg_emb가 아니라 최종 logits — "이 feature를 바꾸면 최종 예측이
+            # 얼마나 변하는가"를 delta(perturbation 기반)와 같은 좌표계에서 측정.
+            # -> 모델 구조/학습 변경 없음, eval 모드에서 50회 backward만 사용.
+            print(f"  [2/4] TabERA IG 순위 계산 중 (Integrated Gradients, 50-step)...")
 
             X_baseline = X_train.mean(dim=0)               # (F,) -- delta 계산과 동일 baseline
-            tabera_imp = (grad_X * (X_rc_grad - X_baseline)).abs().detach().cpu().numpy()  # (N, F)
+
+            with torch.no_grad():
+                _logits_for_class = model(X_rc)["logits"]
+                _target_class = (
+                    _logits_for_class.argmax(dim=-1).cpu().numpy()
+                    if tasktype == "multiclass" else None
+                )
+            ig_target_fn = make_logit_target_fn(tasktype, target_class=_target_class)
+
+            tabera_imp = compute_integrated_gradients(
+                model, X_rc, X_baseline,
+                target_fn=ig_target_fn,
+                n_steps=50,
+                check_convergence=True,
+            ).cpu().numpy()  # (N, F)
 
             if True:
                 tabera_mean = tabera_imp.mean(axis=0)          # (F,)
@@ -558,22 +707,33 @@ def main():
                 logits_orig = model(X_da)["logits"]
                 if tasktype == "regression":
                     pred_orig = logits_orig.squeeze(-1).cpu().numpy()
+                    target_class = None
                 elif tasktype == "multiclass":
                     pred_orig = torch.softmax(logits_orig, dim=-1).cpu().numpy()
                     # 다중 클래스: argmax 클래스의 확률 추적
                     target_class = pred_orig.argmax(axis=-1)
                     pred_orig = pred_orig[np.arange(n_test), target_class]
                 else:  # binclass
-                    pred_orig = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
-                    target_class = None
+                    probs = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
+                    # 모델이 예측한 클래스(0 또는 1) 방향으로 확률 통일
+                    # (그렇지 않으면 class=0으로 예측된 샘플에서 deletion 효과의
+                    #  방향이 반대로 해석됨 — class=1 확률만 추적하면
+                    #  "정답 클래스 확신도"가 아니라 임의 방향의 수치가 됨)
+                    target_class = (probs >= 0.5).astype(int)            # (N,) predicted class
+                    pred_orig = np.where(target_class == 1, probs, 1.0 - probs)
 
-            # ── Step 2. TabERA IG attribution 순위 (Input × Gradient) ──
-            print(f"  [1/3] TabERA IG attribution 계산 중...")
-            X_grad = X_da.clone().detach().requires_grad_(True)
-            out_da = model(X_grad)
-            target = out_da["agg_emb"].sum()
-            grad_X = torch.autograd.grad(target, X_grad, retain_graph=False)[0]
-            tabera_imp = (grad_X * (X_grad - X_baseline)).abs().detach().cpu().numpy()  # (N, F)
+            # ── Step 2. TabERA IG attribution (Integrated Gradients, multi-step) ──
+            print(f"  [1/3] TabERA IG attribution 계산 중 (50-step)...")
+            ig_target_fn = make_logit_target_fn(
+                tasktype,
+                target_class=target_class if tasktype == "multiclass" else None,
+            )
+            tabera_imp = compute_integrated_gradients(
+                model, X_da, X_baseline,
+                target_fn=ig_target_fn,
+                n_steps=50,
+                check_convergence=True,
+            ).cpu().numpy()  # (N, F)
 
             # ── Step 3. SHAP attribution 순위 ──────────────────
             print(f"  [2/3] SHAP attribution 계산 중...")
@@ -635,8 +795,9 @@ def main():
                                 p = lg.squeeze(-1).item()
                             elif tasktype == "multiclass":
                                 p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
-                            else:
-                                p = torch.sigmoid(lg.squeeze(-1))[0].item()
+                            else:  # binclass — predicted class 방향으로 통일
+                                prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
+                                p = prob1 if target_class[n] == 1 else 1.0 - prob1
                             preds.append(p)
                     # 정규화된 AUC (trapezoidal rule)
                     # numpy 2.0+: np.trapz → np.trapezoid
@@ -725,17 +886,23 @@ def main():
                     probs = torch.softmax(logits_orig, dim=-1).cpu().numpy()
                     target_class = probs.argmax(axis=-1)
                     pred_orig = probs[np.arange(n_test), target_class]
-                else:  # binclass
-                    pred_orig = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
-                    target_class = None
+                else:  # binclass — predicted class 방향으로 확률 통일
+                    probs = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
+                    target_class = (probs >= 0.5).astype(int)            # (N,)
+                    pred_orig = np.where(target_class == 1, probs, 1.0 - probs)
 
-            # ── Step 2. TabERA IG attribution 순위 ────────────
-            print(f"  [1/3] TabERA IG attribution 계산 중...")
-            X_grad = X_ia.clone().detach().requires_grad_(True)
-            out_ia = model(X_grad)
-            target = out_ia["agg_emb"].sum()
-            grad_X = torch.autograd.grad(target, X_grad, retain_graph=False)[0]
-            tabera_imp = (grad_X * (X_grad - X_baseline)).abs().detach().cpu().numpy()
+            # ── Step 2. TabERA IG attribution (Integrated Gradients, multi-step) ──
+            print(f"  [1/3] TabERA IG attribution 계산 중 (50-step)...")
+            ig_target_fn = make_logit_target_fn(
+                tasktype,
+                target_class=target_class if tasktype == "multiclass" else None,
+            )
+            tabera_imp = compute_integrated_gradients(
+                model, X_ia, X_baseline,
+                target_fn=ig_target_fn,
+                n_steps=50,
+                check_convergence=True,
+            ).cpu().numpy()
 
             # ── Step 3. SHAP attribution ──────────────────────
             print(f"  [2/3] SHAP attribution 계산 중...")
@@ -797,8 +964,9 @@ def main():
                             p = lg.squeeze(-1).item()
                         elif tasktype == "multiclass":
                             p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
-                        else:
-                            p = torch.sigmoid(lg.squeeze(-1))[0].item()
+                        else:  # binclass — predicted class 방향으로 통일
+                            prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
+                            p = prob1 if target_class[n] == 1 else 1.0 - prob1
                         preds.append(p)
 
                     # 중요 feature부터 복원
@@ -810,8 +978,9 @@ def main():
                                 p = lg.squeeze(-1).item()
                             elif tasktype == "multiclass":
                                 p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
-                            else:
-                                p = torch.sigmoid(lg.squeeze(-1))[0].item()
+                            else:  # binclass — predicted class 방향으로 통일
+                                prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
+                                p = prob1 if target_class[n] == 1 else 1.0 - prob1
                             preds.append(p)
 
                     # 정규화된 AUC (trapezoidal rule)
