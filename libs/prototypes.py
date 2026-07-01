@@ -392,12 +392,19 @@ class CentroidLayer(nn.Module):
         # M=1: 기존 STE 동작 유지 (entropy_loss 호환)
         # M>1: 일반 softmax (hierarchical 경로에서는 STE 의미 없음)
         if top_m_eff == 1:
-            # 기존 STE: forward는 hard, backward는 soft gradient
+            # STE: forward는 hard (argmax), backward는 soft gradient
+            # training/eval 무관하게 항상 STE 유지.
+            #
+            # [근거]
+            # VQ-VAE (van den Oord et al. 2017)와 Bengio et al. 2013의 STE 원 정의는
+            # training/eval 구분 없이 forward=hard, backward=soft를 유지한다.
+            # eval에서 STE를 끄면 ∂context_emb/∂query_emb = 0이 되어
+            # IG가 context_emb 경로의 기여를 측정하지 못한다.
+            # eval에서도 STE를 유지하면 forward 값은 hard와 동일하면서
+            # (∵ soft + (hard-soft).detach() = hard, 값 기준)
+            # backward는 soft gradient가 흘러 IG가 context_emb 기여를 반영한다.
             hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
-            if self.training:
-                routing_probs = soft + (hard_one_hot - soft).detach()
-            else:
-                routing_probs = hard_one_hot
+            routing_probs = soft + (hard_one_hot - soft).detach()      # STE (always)
 
             # topM_weights = 1.0 (단일 centroid)
             topM_weights = torch.ones_like(topM_logits)   # (B, 1)
@@ -438,15 +445,15 @@ class CentroidLayer(nn.Module):
 
     def entropy_loss(self, routing_probs: torch.Tensor) -> torch.Tensor:
         """
-        [미사용] Codebook utilization 향상 — 배정 분포의 entropy 최대화.
+        Codebook utilization 향상 — 배정 분포의 entropy 최대화.
 
-        실험 근거 (4개 데이터셋, seed=8):
-          - HPO가 일관되게 1e-3 ~ 7e-3 범위의 매우 작은 값을 선택
-          - EMA active_ratio가 대부분 100% → dead centroid 미발생
-          - diversity_loss + commitment_loss + EMA가 동일 역할을 간접 수행
+        근거: VQ-VAE-2 (Razavi et al., NeurIPS 2019)
+        배치 내 평균 routing 분포의 entropy를 최대화하여
+        모든 centroid가 고르게 사용되도록 유도.
 
-        현재 tabera.py aux_loss에서 호출하지 않음.
-        메서드는 향후 실험 비교를 위해 보존.
+        routing_probs: (B, P) — STE output (soft 값 보유, gradient 연결됨)
+        soft collapse 시 avg_probs 편중 → entropy 낮음 → loss 높음
+        → gradient가 centroid_emb를 분산 방향으로 당김
         """
         avg_probs = routing_probs.mean(dim=0)              # (P,) 배치 평균
         entropy   = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
