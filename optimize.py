@@ -126,7 +126,12 @@ if train:
         model = TabERA(
             **model_kwargs,
             column_names=dataset.col_names,
-            memory_size=min(int(len(y_train) * 2), 10_000),
+            # [수정] 기존 min(2*N, 10_000) 캡은 N_train > 10,000인 데이터셋에서
+            # MemoryBank가 X_train 전체를 담지 못하게 만들어 sample_groups가
+            # 실제 그룹의 일부(최대 28%, id=41027 기준)만 반영하게 됨.
+            # keys+vals 메모리 비용은 N=35,855, D=256 기준 ~73MB로 미미하므로
+            # X_train 전체를 담도록 캡을 없앰 (그룹-제약 KNN의 원래 설계 의도 복원).
+            memory_size=len(y_train),
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,

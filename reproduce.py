@@ -281,7 +281,9 @@ def main():
     model = TabERA(
         **model_kwargs,
         column_names=dataset.col_names,
-        memory_size=min(int(len(y_train) * 2), 10_000),
+        # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
+        # HPO 때 찾은 best_params가 이 재현 실행에서 재현되지 않음)
+        memory_size=len(y_train),
     )
 
     # ── 학습 ──────────────────────────────────────────────
