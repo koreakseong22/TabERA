@@ -15,6 +15,15 @@ parser.add_argument("--n_trials",  type=int, default=100,    help="Number of opt
 parser.add_argument("--metric",    type=str, default="l2",
                     choices=["l2", "l1", "cosine", "mahalanobis", "wasserstein", "kl"],
                     help="Distance metric for TabR Retriever")
+parser.add_argument("--no_offset_correction", action="store_true",
+                    help=(
+                        "[ablation] AttentionAggregator의 value 구성에서 "
+                        "TabR 스타일 T(query-neighbour) 오프셋 보정을 끄고 "
+                        "value=label_emb만 사용. 저장 파일명이 구분되도록 "
+                        "savepath 하위에 자동으로 표시됨. Optuna 탐색 대상이 "
+                        "아니라 이 실행 전체에 고정 적용되는 구조 선택임 "
+                        "(HPO 노이즈와 ablation 신호를 분리하기 위함)."
+                    ))
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
@@ -51,7 +60,8 @@ else:
 if not os.path.exists(savepath):
     os.makedirs(savepath)
 
-fname = os.path.join(savepath, f"data={args.openml_id}..model=tabera.pkl")
+_ablation_tag = "..no_offset" if args.no_offset_correction else ""
+fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
 # ─────────────────────────────────────────────────────────────
 # 중복 실행 방지  (MultiTab 원본과 동일)
@@ -88,6 +98,8 @@ if train:
     print(f"  Dataset : {data_info[str(args.openml_id)]['fullname']} (id={args.openml_id})")
     print(f"  Task    : {tasktype}  |  Device : {device}")
     print(f"  Trials  : {completed_trials_count} done / {args.n_trials} total  ({remaining_trials} remaining)")
+    if args.no_offset_correction:
+        print(f"  Ablation: T(query-neighbour) offset correction OFF (value=label_emb only)")
     print(f"  Save    : {fname}")
     print("=" * 60)
 
@@ -132,6 +144,10 @@ if train:
             # keys+vals 메모리 비용은 N=35,855, D=256 기준 ~73MB로 미미하므로
             # X_train 전체를 담도록 캡을 없앰 (그룹-제약 KNN의 원래 설계 의도 복원).
             memory_size=len(y_train),
+            # [ablation] --no_offset_correction 플래그로 T(query-neighbour)
+            # 오프셋 보정을 켜고 끔. Optuna 탐색 대상이 아니라 이 실행 전체에
+            # 고정 적용 (기본값 True = 기존 TabR 방식 그대로).
+            use_offset_correction=not args.no_offset_correction,
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,
@@ -202,7 +218,7 @@ if train:
     print(env_info)
     print(study.best_trial.user_attrs)
     df = study.trials_dataframe()
-    df.to_csv(os.path.join(savepath, f"data={args.openml_id}..seed={args.seed}..model=tabera.csv"), index=False)
+    df.to_csv(os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..seed={args.seed}..model=tabera.csv"), index=False)
     joblib.dump(study, fname)
     print(fname)
     print("#############################################")
