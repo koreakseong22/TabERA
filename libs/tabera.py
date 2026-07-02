@@ -249,33 +249,59 @@ class MemoryBank(nn.Module):
             uniq, counts = torch.unique_consecutive(ha_c_sorted, return_counts=True)  # (U,)
             U = uniq.shape[0]
 
+            # [단편화 대응] U(배치 내 서로 다른 centroid 수)가 배치마다
+            # 계속 바뀌면(로그 기준 40~150+), keys_u/Q_pad/sim_u의 첫 축이
+            # 매번 다른 크기가 되어 CUDA allocator가 캐시를 재사용 못 하고
+            # 계속 새 블록을 확보 → 수만 배치 누적 시 갈수록 느려지는
+            # 단편화로 이어짐 (VRAM이 빠듯할 때 특히 심함, 실측으로 확인됨).
+            # U를 고정 배수로 올려서 더미(무효) centroid 행을 추가— 결과에는
+            # 전혀 영향 없음: group_id/rank는 원래 U 범위(0..U-1)만 참조하므로
+            # 더미 행(U..U_pad-1)은 계산은 되지만 절대 읽히지 않음.
+            _round_u = 8
+            U_pad = ((U + _round_u - 1) // _round_u) * _round_u
+            if U_pad > U:
+                pad_ids = uniq[:1].expand(U_pad - U)   # 임의의 유효 centroid id로 채움 (계산만 되고 결과는 안 씀)
+                uniq_p  = torch.cat([uniq, pad_ids], dim=0)          # (U_pad,)
+            else:
+                uniq_p = uniq
+
             offsets = counts.cumsum(0)                          # (U,) 각 그룹의 끝 위치(배타적 경계)
             # repeat_interleave 대신 bucketize 사용 (콜당 수백us → 수십us 수준)
             group_id = torch.bucketize(
                 torch.arange(Bn, device=dev), offsets, right=True
-            )                                                    # (Bn,) 0..U-1
+            )                                                    # (Bn,) 0..U-1 (U_pad 무관, 원래 U 범위만)
             rank = torch.arange(Bn, device=dev) - (offsets[group_id] - counts[group_id])  # (Bn,) centroid 내 0-index
 
-            max_q       = int(counts.max())                     # 배치 전체 스칼라 변환 1회
-            local_max_g = max(int(self._cached_group_sizes[uniq].max()), k)  # 배치에 등장한 centroid 중 최댓값만
+            max_q_raw   = int(counts.max())                     # 배치 전체 스칼라 변환 1회
+            _round_q = 16
+            max_q = ((max_q_raw + _round_q - 1) // _round_q) * _round_q
+            max_q = min(max_q, Bn)   # Bn을 넘을 이유 없음 (넘으면 그냥 낭비)
 
-            Q_pad = torch.zeros(U, max_q, D, device=dev)
-            Q_pad[group_id, rank] = q_c_sorted                   # (U, max_q, D)
+            local_max_g_raw = max(int(self._cached_group_sizes[uniq].max()), k)  # 배치에 등장한 centroid 중 최댓값만
+            # local_max_g도 고정 배수로 올림 (U만큼 지배적이진 않지만 보조적으로 도움)
+            _round_g = 256
+            local_max_g = ((local_max_g_raw + _round_g - 1) // _round_g) * _round_g
+            # _cached_groups의 실제 폭(전역 max group size로 패딩된 값)을
+            # 넘어서면 안 됨 — 넘으면 아래 .view()가 shape mismatch로 깨짐.
+            local_max_g = min(local_max_g, self._cached_groups.shape[1])
 
-            cand_u  = self._cached_groups[uniq, :local_max_g]    # (U, local_max_g) — centroid당 1회만 gather
+            Q_pad = torch.zeros(U_pad, max_q, D, device=dev)
+            Q_pad[group_id, rank] = q_c_sorted                   # (U_pad, max_q, D) — U..U_pad-1행은 0으로 남음(무효)
+
+            cand_u  = self._cached_groups[uniq_p, :local_max_g]  # (U_pad, local_max_g) — centroid당 1회만 gather
             valid_u = cand_u >= 0
             safe_u  = cand_u.clamp(min=0, max=n - 1)
 
-            keys_u = self._keys_norm[:n][safe_u.reshape(-1)].view(U, local_max_g, D)
+            keys_u = self._keys_norm[:n][safe_u.reshape(-1)].view(U_pad, local_max_g, D)
 
-            sim_u = torch.bmm(Q_pad, keys_u.transpose(1, 2))      # (U, max_q, local_max_g)
+            sim_u = torch.bmm(Q_pad, keys_u.transpose(1, 2))      # (U_pad, max_q, local_max_g)
             sim_u = sim_u.masked_fill(~valid_u.unsqueeze(1), -1e9)
 
             k_eff = min(k, local_max_g)
-            _, top_u  = sim_u.topk(k_eff, dim=-1)                 # (U, max_q, k_eff)
-            i_final_u = safe_u.unsqueeze(1).expand(-1, max_q, -1).gather(2, top_u)  # (U, max_q, k_eff)
+            _, top_u  = sim_u.topk(k_eff, dim=-1)                 # (U_pad, max_q, k_eff)
+            i_final_u = safe_u.unsqueeze(1).expand(-1, max_q, -1).gather(2, top_u)  # (U_pad, max_q, k_eff)
 
-            i_final_c_sorted = i_final_u[group_id, rank]          # (Bn, k_eff) — csorted 순서
+            i_final_c_sorted = i_final_u[group_id, rank]          # (Bn, k_eff) — csorted 순서, U_pad 부분은 참조 안 됨
 
             # [이번 수정] 중간 _chunk 버퍼(out_nk_chunk 등) + 2단계 복사를 없애고
             # out_nk/out_nv/out_labels/top_k_idx에 "한 번에" 바로 씀.
@@ -513,6 +539,7 @@ class TabERA(nn.Module):
         dropout: float = 0.1,
         loss_weights: Optional[Dict[str, float]] = None,
         column_names: Optional[List[str]] = None,
+        use_offset_correction: bool = True,
     ) -> None:
         super().__init__()
         self.k            = k
@@ -524,6 +551,7 @@ class TabERA(nn.Module):
             "commitment":   0.01,
         }
         self.column_names = column_names
+        self.use_offset_correction = use_offset_correction
 
         # ── 임베더 ──────────────────────────────────
         self.embedder = TabularEmbedder(n_features, embed_dim, embedder_layers, dropout)
@@ -539,12 +567,14 @@ class TabERA(nn.Module):
         )
 
         # ── TabR 방식 이웃 집계 ──────────────────────────
+        # use_offset_correction=False → value=label_emb만 사용 (T() ablation)
         self.ot_selector = AttentionAggregator(
             embed_dim=embed_dim,
             k=k,
             n_features=n_features,
             n_output=n_output,
             dropout=dropout,
+            use_offset_correction=use_offset_correction,
         )
 
         # ── 메모리 뱅크 (검색 전용) ──────────────────
@@ -672,6 +702,7 @@ class TabERA(nn.Module):
                  f"  Centroids      : {self.prototype_layer.P}",
                  f"  KNN k          : {self.k}",
                  f"  Dual-Space     : {'ON' if self.prototype_layer.F > 0 else 'OFF'}",
-                 f"  Cross-group    : ON (adjacent centroid fallback)"]
+                 f"  Cross-group    : ON (adjacent centroid fallback)",
+                 f"  Offset T()     : {'ON' if self.use_offset_correction else 'OFF (ablation)'}"]
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)
