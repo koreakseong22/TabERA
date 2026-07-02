@@ -15,6 +15,45 @@ parser.add_argument("--n_trials",  type=int, default=100,    help="Number of opt
 parser.add_argument("--metric",    type=str, default="l2",
                     choices=["l2", "l1", "cosine", "mahalanobis", "wasserstein", "kl"],
                     help="Distance metric for TabR Retriever")
+parser.add_argument("--no_offset_correction", action="store_true",
+                    help=(
+                        "[ablation] AttentionAggregator의 value 구성에서 "
+                        "TabR 스타일 T(query-neighbour) 오프셋 보정을 끄고 "
+                        "value=label_emb만 사용. 저장 파일명이 구분되도록 "
+                        "savepath 하위에 자동으로 표시됨. Optuna 탐색 대상이 "
+                        "아니라 이 실행 전체에 고정 적용되는 구조 선택임 "
+                        "(HPO 노이즈와 ablation 신호를 분리하기 위함)."
+                    ))
+parser.add_argument("--global_retrieve", action="store_true",
+                    help=(
+                        "[진단용] retrieve()에서 centroid 그룹 제약을 끄고 "
+                        "전체 memory bank에서 순수 전역 KNN 검색. "
+                        "context_emb(설명①)는 그대로 유지되고 evidence_w/"
+                        "agg_emb(설명②)만 영향받음. '그룹-제약 KNN이 정확도에 "
+                        "요구하는 대가'를 격리해서 재기 위한 일회성 진단용 — "
+                        "본 실험에는 쓰지 않음."
+                    ))
+parser.add_argument("--detach_context_grad", action="store_true",
+                    help=(
+                        "[진단용] context_emb는 head 입력으로 그대로 전달하되, "
+                        "그쪽에서 오는 gradient만 centroid_emb로 안 흐르게 끊음 "
+                        "(diversity_loss gradient는 그대로 흐름). task_loss와 "
+                        "diversity_loss가 centroid_emb를 두고 충돌하는지 검증용. "
+                        "reproduce.py 단발 재학습으로는 best_params가 이 설정을 "
+                        "전제로 찾아진 게 아니라서, 이 플래그를 켠 채로 HPO를 "
+                        "새로 돌려 loss_diversity/loss_commitment 최적값이 "
+                        "바뀌는지 확인하기 위함."
+                    ))
+parser.add_argument("--context_projection", action="store_true",
+                    help=(
+                        "[구조 조정] context_emb를 head로 보내기 전 학습 가능한 "
+                        "Linear를 하나 거치게 함. detach_context_grad(gradient "
+                        "완전 차단)와 달리 task_loss의 gradient는 여전히 "
+                        "centroid_emb까지 도달하되, 프로젝션 행렬이 예측 최적화의 "
+                        "일부를 대신 떠맡아 centroid_emb 왜곡을 줄이길 기대하는 "
+                        "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
+                        "centroid_x/confidence) 계산에는 관여하지 않음."
+                    ))
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
@@ -51,7 +90,11 @@ else:
 if not os.path.exists(savepath):
     os.makedirs(savepath)
 
-fname = os.path.join(savepath, f"data={args.openml_id}..model=tabera.pkl")
+_ablation_tag = ("..no_offset" if args.no_offset_correction else "") + \
+                ("..global_retrieve" if args.global_retrieve else "") + \
+                ("..detach_ctx" if args.detach_context_grad else "") + \
+                ("..ctx_proj" if args.context_projection else "")
+fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
 # ─────────────────────────────────────────────────────────────
 # 중복 실행 방지  (MultiTab 원본과 동일)
@@ -88,6 +131,14 @@ if train:
     print(f"  Dataset : {data_info[str(args.openml_id)]['fullname']} (id={args.openml_id})")
     print(f"  Task    : {tasktype}  |  Device : {device}")
     print(f"  Trials  : {completed_trials_count} done / {args.n_trials} total  ({remaining_trials} remaining)")
+    if args.no_offset_correction:
+        print(f"  Ablation: T(query-neighbour) offset correction OFF (value=label_emb only)")
+    if args.global_retrieve:
+        print(f"  Diagnostic: retrieve() group-constraint OFF (global KNN, context_emb unaffected)")
+    if args.detach_context_grad:
+        print(f"  Diagnostic: task_loss gradient to centroid_emb DETACHED (diversity_loss only)")
+    if args.context_projection:
+        print(f"  Adjustment: context_emb routed through learned Linear projection before head")
     print(f"  Save    : {fname}")
     print("=" * 60)
 
@@ -132,6 +183,13 @@ if train:
             # keys+vals 메모리 비용은 N=35,855, D=256 기준 ~73MB로 미미하므로
             # X_train 전체를 담도록 캡을 없앰 (그룹-제약 KNN의 원래 설계 의도 복원).
             memory_size=len(y_train),
+            # [ablation] --no_offset_correction 플래그로 T(query-neighbour)
+            # 오프셋 보정을 켜고 끔. Optuna 탐색 대상이 아니라 이 실행 전체에
+            # 고정 적용 (기본값 True = 기존 TabR 방식 그대로).
+            use_offset_correction=not args.no_offset_correction,
+            global_retrieve=args.global_retrieve,
+            detach_context_grad=args.detach_context_grad,
+            use_context_projection=args.context_projection,
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,
@@ -171,10 +229,17 @@ if train:
         trial.set_user_attr("training_time", duration.total_seconds())
 
         # 최적화 목표: regression → rmse_val 최소화 / classification → acc_val 최대화
-        if tasktype == "regression":
-            return val_metrics["rmse_val"]
-        else:
-            return val_metrics["acc_val"]
+        result = val_metrics["rmse_val"] if tasktype == "regression" else val_metrics["acc_val"]
+
+        # [메모리 정리] trial마다 새 모델/옵티마이저를 만드는데, PyTorch가
+        # 이전 trial에서 쓴 GPU 메모리를 내부 캐시로 들고 있으면 다음 trial의
+        # collapse 안전장치(supervised.py)가 "여유 메모리 0"으로 오판할 수
+        # 있음 (실측 확인됨). trial 사이에 명시적으로 반납.
+        del model, wrapper
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return result
 
     # ── 콜백  (MultiTab 원본과 동일) ──────────────────────
     def stop_when_reached_optimal(study, trial):
@@ -202,7 +267,7 @@ if train:
     print(env_info)
     print(study.best_trial.user_attrs)
     df = study.trials_dataframe()
-    df.to_csv(os.path.join(savepath, f"data={args.openml_id}..seed={args.seed}..model=tabera.csv"), index=False)
+    df.to_csv(os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..seed={args.seed}..model=tabera.csv"), index=False)
     joblib.dump(study, fname)
     print(fname)
     print("#############################################")

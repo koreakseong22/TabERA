@@ -157,6 +157,7 @@ class TabERAWrapper:
         best_val   = None
         self.ema_history = []
         self.final_ema_stats = None
+        _low_active_streak = 0   # 연속으로 active_ratio<10%인 EMA 체크 횟수 (runaway collapse 감지용)
 
         # [버그 수정] 이전엔 emb_cache로 X_train 전체(N_train개)를 캐시해서
         # ema_update에 넘겼음 → sample_groups가 "X_train 행 번호"로 만들어짐.
@@ -236,6 +237,83 @@ class TabERAWrapper:
                         "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
                     })
 
+                    # ── 안전장치 1: retrieve()의 다음 배치 메모리 요구량 추정 ──
+                    # active_ratio 스트릭과 무관하게 독립적으로 체크한다.
+                    # 이유: active_ratio가 9%→8%→11%처럼 매 epoch 미세하게
+                    # 오르내리면 streak 카운터가 계속 리셋되어 아래 스트릭
+                    # 조건을 영영 못 채울 수 있음 (실제로 이렇게 빠져나간 사례
+                    # 확인됨).
+                    #
+                    # [정정] cache_sample_groups()의 (P, max_g) 캐시는 int64
+                    # 인덱스만 담아 실제로는 작음(수십MB 수준) — OOM의 원인이
+                    # 아니었음. 진짜 위험은 retrieve() 내부에서 이 max_g와
+                    # embed_dim(D)을 곱한 배치별 텐서(keys_u 등)이며, D는
+                    # trial마다 64~256으로 다름. "N_train 대비 비율" 같은
+                    # 고정 임계값은 D를 반영 못 해 또 다른 임의의 숫자가 될
+                    # 뿐이라, 대신 실제 남은 GPU 메모리와 직접 비교한다.
+                    max_cluster_now = ema_stats.get("max_cluster_size", 0)
+                    if (torch.cuda.is_available()
+                            and str(self.device).startswith("cuda")
+                            and max_cluster_now > 0):
+                        try:
+                            D = self.model.embed_dim
+                            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                            # retrieve()에서 이 큰 그룹이 배치에 걸리면 필요한
+                            # 텐서(keys_u, sim_u, Q_pad 등 여러 개)를 대략적으로
+                            # 추정 — U_pad 최소 8(라운딩 단위), 부수 텐서 포함
+                            # 안전 마진으로 4배를 곱함 (정확한 수치가 아니라
+                            # "이 정도 자릿수면 위험하다"는 대략적 판단용).
+                            projected_bytes = 8 * max_cluster_now * D * 4 * 4
+                            if projected_bytes > free_bytes * 0.7:
+                                # [버그 수정] mem_get_info()는 "CUDA 드라이버에
+                                # 반납된" 메모리만 보고함 — PyTorch가 이전 trial
+                                # 에서 쓰고 내부 캐시에 쌓아둔(재사용 가능한) 메모리는
+                                # "사용 중"으로 잘못 잡힘. 그 결과 한 번이라도 크게
+                                # 메모리를 쓴 뒤로는 이후 모든(사실은 안전한) trial도
+                                # "여유 0"으로 오판해 즉시 종료되는 버그가 있었음
+                                # (실측: trial 2 이후 trial 3~14가 전부 epoch 1에서
+                                # 즉시 종료됨, 실제로는 필요 메모리가 0.02~0.2GB뿐).
+                                # → 위험해 보일 때만 empty_cache()로 캐시를 드라이버에
+                                # 반납시켜 재확인 (매 epoch 호출 X, 오탐일 때만 1회).
+                                torch.cuda.empty_cache()
+                                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+
+                            if projected_bytes > free_bytes * 0.7:
+                                tqdm.write(
+                                    f"  [STOP] Runaway centroid collapse at epoch {epoch} "
+                                    f"(max_cluster_size={int(max_cluster_now)}, D={D} → "
+                                    f"다음 배치 예상 메모리 {projected_bytes/1e9:.2f}GB "
+                                    f"vs 남은 GPU 메모리 {free_bytes/1e9:.2f}GB, "
+                                    f"empty_cache() 이후에도 부족). Early exit (OOM 방지)."
+                                )
+                                break
+                        except Exception:
+                            pass  # 메모리 조회 실패 시 이 안전장치만 건너뜀 (학습은 계속)
+
+                    # ── 안전장치 2: active_ratio 지속 저하 감지 ──────────
+                    # 단발성 dip(일시적으로 낮았다가 회복되는 경우)은 봐주고,
+                    # "연속으로 계속 나쁜 상태가 유지"될 때만 중단한다.
+                    # 매 에폭 체크(로그 출력 주기 10epoch과는 별개) — 추세가
+                    # 뚜렷해지는 즉시 반응하기 위함. 그냥 낮은 값 한 번이
+                    # 아니라 2회 연속(=최소 2 에폭 연속, 보통 10epoch 단위
+                    # 로그 사이에도 매 에폭 계산되므로 실제로는 곧바로 반응)
+                    # 유지될 때만 중단하여, 회복 가능한 dip을 살려둔다.
+                    # (이것도 cache_sample_groups() 이전에 체크 — 어차피
+                    # 중단할 거면 불필요한 텐서 할당을 피함)
+                    active_ratio_now = ema_stats.get("active_ratio", 1.0)
+                    if active_ratio_now < 0.1:
+                        _low_active_streak += 1
+                    else:
+                        _low_active_streak = 0   # 회복하면 카운터 리셋
+
+                    if _low_active_streak >= 5:
+                        tqdm.write(
+                            f"  [STOP] Runaway centroid collapse at epoch {epoch} "
+                            f"(active={active_ratio_now:.0%}, {_low_active_streak}epoch 연속 "
+                            f"10% 미만). Early exit."
+                        )
+                        break
+
                     self.model.memory.cache_sample_groups(
                         self.model.prototype_layer.sample_groups,
                         device=torch.device(self.device),
@@ -249,14 +327,6 @@ class TabERAWrapper:
                             f"min={ema_stats['min_cluster_size']}  "
                             f"max={ema_stats['max_cluster_size']}"
                         )
-
-                    # ── Centroid collapse 감지 → 조기 종료 ──────────
-                    if ema_stats.get("active_ratio", 1.0) < 0.1:
-                        tqdm.write(
-                            f"  [STOP] Centroid collapse at epoch {epoch} "
-                            f"(active={ema_stats['active_ratio']:.0%}). Early exit."
-                        )
-                        break
 
             avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
 
