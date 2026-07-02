@@ -1,340 +1,274 @@
 """
 libs/data.py
 ============
-MultiTab 스타일의 데이터 로더.
-dataset_id.json 기반으로 OpenML 데이터셋을 로드하고
-train(80%) / val(10%) / test(10%) 고정 분할을 제공합니다.
+TabERA 데이터 로더 — MultiTab 원본 파이프라인 기준.
 
-CA(999999)는 sklearn에서 로드하며, 나머지는 openml 라이브러리를 사용합니다.
+[통합 배경]
+논문에서 MultiTab 계열 baseline(TabM 등)과 공정 비교하려면 동일한
+train/val/test 분할이 필요함. 기존에는 TabERA 자체 80/10/10 stratified
+split(QuantileTransformer, mean imputation)을 썼는데, MultiTab은
+StratifiedKFold(10-fold) 분할에 NaN 행 제거 방식을 씀 — 두 파이프라인이
+달라서 초기 TabM 비교(id=41027)가 무효였던 사건이 있었음. 이후
+`libs/data_multitab.py` + `optimize_multitab_split.py`를 별도로 만들어
+검증했고, 이제 이 파이프라인을 본 실험 기본값으로 승격.
 
-[변경] NaN imputation: median → mean  (TabZilla 원논문 전처리와 통일)
-[변경] X 정규화: z-score → QuantileTransformer(output_distribution='uniform')
-       (Gorishniy et al. 2023, TabR 논문 표준 전처리와 통일)
-       categorical features(label-encoded)는 정규화 제외,
-       numerical features에만 적용.
+[MultiTab 원본 대비 유일한 추가 사항]
+TabularDataset이 optimize.py/reproduce.py가 기대하는 인터페이스
+(.n_features, .n_classes, .col_names)를 추가로 제공하고, multiclass
+y를 원-핫에서 정수 클래스 인덱스로 변환함 (TabERA의 CrossEntropyLoss/
+eval.py가 정수 라벨을 전제로 하기 때문 — 원-핫 → argmax는 정보 손실
+없는 역변환).
+
+split_data()의 seed 의미: "몇 번째 fold를 test로 쓸지"
+(StratifiedKFold random_state=42로 고정, seed는 fold 인덱스 선택용).
 """
 
-from __future__ import annotations
-
-import json
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import torch
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import LabelEncoder
+import openml, torch
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, QuantileTransformer
-
-warnings.filterwarnings("ignore")
-
-RANDOM_SEED = 42
-SPLIT_RATIO  = (0.8, 0.1, 0.1)   # train / val / test
+import sklearn.datasets
+import scipy.stats
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
 
 
-# ─────────────────────────────────────────────────────────────
-# 내부 유틸
-# ─────────────────────────────────────────────────────────────
-
-def _sanitize_col(name: str) -> str:
-    """Python 식별자로 사용할 수 있도록 컬럼명 정규화."""
-    import re
-    s = re.sub(r"[^a-zA-Z0-9_]", "_", str(name))
-    if s and s[0].isdigit():
-        s = "f_" + s
-    return s
-
-
-def _encode_target(y: pd.Series, tasktype: str):
-    if tasktype == "regression":
-        return y.astype(np.float32).values, None
-    le = LabelEncoder()
-    y_enc = le.fit_transform(y.astype(str)).astype(np.int64)
-    return y_enc, le
-
-
-def _split_data(arrays, seed=RANDOM_SEED, stratify_by=None):
-    """80/10/10 stratified 분할.
-    stratify_by가 주어지면 클래스 비율을 보존 (auroc NaN 방지)."""
-    N = len(arrays[0])
-    idx = np.arange(N)
-    idx_tv, idx_te = train_test_split(
-        idx, test_size=0.1, random_state=seed,
-        stratify=stratify_by
-    )
-    strat_tv = stratify_by[idx_tv] if stratify_by is not None else None
-    idx_tr, idx_va = train_test_split(
-        idx_tv, test_size=1/9, random_state=seed,
-        stratify=strat_tv
-    )
-    splits = []
-    for arr in arrays:
-        splits.append((arr[idx_tr], arr[idx_va], arr[idx_te]))
-    return splits
-
-
-def _preprocess_X(df: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[int], List[int]]:
-    """
-    수치형 + 범주형을 모두 float32로 변환 (Label-encode cat).
-    컬럼명은 sanitize 처리.
-
-    NaN imputation: mean (TabZilla 원논문 전처리와 통일)
-
-    반환:
-        X          : (N, F) float32
-        col_names  : list[str]
-        num_indices: numerical feature의 열 인덱스 (QuantileTransformer 적용 대상)
-        cat_indices: categorical feature의 열 인덱스 (정규화 제외)
-    """
-    out_cols    = []
-    out_parts   = []
-    num_indices = []
-    cat_indices = []
-
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-
-    if num_cols:
-        # TabZilla 원논문: NaN → mean imputation
-        X_num = df[num_cols].astype(np.float32).fillna(df[num_cols].mean())
-        start = len(out_cols)
-        for i, c in enumerate(num_cols):
-            out_cols.append(_sanitize_col(c))
-            num_indices.append(start + i)
-        out_parts.append(X_num.values)
-
-    for c in cat_cols:
-        le = LabelEncoder()
-        enc = le.fit_transform(df[c].astype(str)).astype(np.float32)
-        cat_indices.append(len(out_cols))
-        out_cols.append(_sanitize_col(c))
-        out_parts.append(enc.reshape(-1, 1))
-
-    X = np.concatenate(out_parts, axis=1) if out_parts else np.zeros((len(df), 0), dtype=np.float32)
-    return X, out_cols, num_indices, cat_indices
-
-
-# ─────────────────────────────────────────────────────────────
-# 공개 API
-# ─────────────────────────────────────────────────────────────
-
-def load_dataset(
-    openml_id: int | str,
-    dataset_info: dict,
-    cache_dir: str | Path = "./data_cache",
-    seed: int = RANDOM_SEED,
-) -> dict:
-    """
-    단일 데이터셋 로드.
-
-    Parameters
-    ----------
-    openml_id  : OpenML dataset ID (999999 → California Housing)
-    dataset_info : dict from dataset_id.json (name, fullname, tasktype)
-    cache_dir  : parquet 캐시 디렉토리
-    seed       : 분할 시드
-
-    Returns
-    -------
-    dict:
-        X_train, X_val, X_test : np.ndarray float32 (N, F)  — 정규화 완료
-        y_train, y_val, y_test : np.ndarray
-        col_names              : list[str]
-        n_features             : int
-        n_classes              : int or None
-        tasktype               : str
-        name / fullname        : str
-        label_encoder          : LabelEncoder or None
-        qt                     : QuantileTransformer (numerical features용)
-        num_indices            : list[int] — QuantileTransformer 적용된 열 인덱스
-        cat_indices            : list[int] — categorical 열 인덱스 (정규화 미적용)
-    """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    tasktype = dataset_info["tasktype"]
-    name     = dataset_info["name"]
-    fullname = dataset_info["fullname"]
-    oid      = str(openml_id)
-
-    # ── 로드 ──────────────────────────────────────────
-    if oid == "999999":
-        from sklearn.datasets import fetch_california_housing
-        raw = fetch_california_housing()
-        df  = pd.DataFrame(raw.data, columns=raw.feature_names)
-        y_s = pd.Series(raw.target, name="MedHouseVal")
-    else:
-        cache_X = cache_dir / f"{oid}_X.parquet"
-        cache_y = cache_dir / f"{oid}_y.npy"
-
-        if cache_X.exists() and cache_y.exists():
-            df  = pd.read_parquet(cache_X)
-            y_s = pd.Series(np.load(str(cache_y), allow_pickle=True))
-        else:
-            import openml
-            ds = openml.datasets.get_dataset(
-                int(oid),
-                download_data=True,
-                download_qualities=False,
-                download_features_meta_data=False,
-            )
-            df_raw, y_s, _, _ = ds.get_data(dataset_format="dataframe")
-
-            # OpenML이 target을 DataFrame 안에 포함해서 반환하는 경우 처리
-            if y_s is None:
-                target_col = ds.default_target_attribute
-                if target_col and target_col in df_raw.columns:
-                    y_s = df_raw[target_col]
-                    df_raw = df_raw.drop(columns=[target_col])
-                else:
-                    # 마지막 컬럼을 target으로 간주
-                    y_s = df_raw.iloc[:, -1]
-                    df_raw = df_raw.iloc[:, :-1]
-
-            df = df_raw
-
-            # target_col이 dataset_info에 명시된 경우 우선 사용
-            # (OpenML default_target_attribute가 None인 데이터셋 대응)
-            explicit_target = dataset_info.get("target_col")
-            if explicit_target and explicit_target in df.columns:
-                y_s = df[explicit_target]
-                df  = df.drop(columns=[explicit_target])
-            df.to_parquet(cache_X)
-            np.save(str(cache_y), y_s.values, allow_pickle=True)
-            y_s = pd.Series(y_s.values)
-
-    # ── 전처리 ────────────────────────────────────────
-    X, col_names, num_indices, cat_indices = _preprocess_X(df)
-    y, label_encoder = _encode_target(y_s, tasktype)
-    n_classes = len(np.unique(y)) if tasktype != "regression" else None
-
-    # ── 분할 ──────────────────────────────────────────
-    # stratify=y로 클래스 비율 보존 → auroc/logloss NaN 방지
-    strat = y if tasktype != 'regression' else None
-    (X_tr, X_va, X_te), (y_tr, y_va, y_te) = _split_data([X, y], seed=seed, stratify_by=strat)
-
-    # ── X 정규화: QuantileTransformer (numerical features만) ──
-    # Gorishniy et al. 2023 (TabR) 표준 전처리.
-    # categorical features(label-encoded 정수)는 정규화하지 않음.
-    # train에서만 fit → val/test에 transform (leakage 방지).
-    qt = None
-    if num_indices:
-        qt = QuantileTransformer(output_distribution='uniform', random_state=42)
-        X_tr[:, num_indices] = qt.fit_transform(X_tr[:, num_indices]).astype(np.float32)
-        X_va[:, num_indices] = qt.transform(X_va[:, num_indices]).astype(np.float32)
-        X_te[:, num_indices] = qt.transform(X_te[:, num_indices]).astype(np.float32)
-
-    # ── regression y 정규화 (MultiTab: y_std 저장) ──────
-    y_std = np.array(1.0, dtype=np.float32)
-    if tasktype == "regression":
-        y_mean_tr = y_tr.mean()
-        y_std_tr  = y_tr.std() + 1e-8
-        y_tr = (y_tr - y_mean_tr) / y_std_tr
-        y_va = (y_va - y_mean_tr) / y_std_tr
-        y_te = (y_te - y_mean_tr) / y_std_tr
-        y_std = np.float32(y_std_tr)
-
-    return dict(
-        X_train=X_tr, X_val=X_va, X_test=X_te,
-        y_train=y_tr, y_val=y_va, y_test=y_te,
-        col_names=col_names,
-        n_features=X_tr.shape[1],
-        n_classes=n_classes,
-        tasktype=tasktype,
-        name=name,
-        fullname=fullname,
-        openml_id=oid,
-        label_encoder=label_encoder,
-        qt=qt,                    # QuantileTransformer (inference 시 역변환용)
-        num_indices=num_indices,  # numerical feature 열 인덱스
-        cat_indices=cat_indices,  # categorical feature 열 인덱스
-        y_std=y_std,              # regression 역정규화용 (MultiTab 호환)
-    )
-
-
-def load_registry(json_path: str | Path = "dataset_id.json") -> dict:
-    with open(json_path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def get_batch_size(n_samples: int) -> int:
-    """
-    MultiTab 원본과 동일한 배치 사이즈 자동 결정 함수.
-    샘플 수에 따라 적절한 배치 사이즈를 반환합니다.
-    """
-    if n_samples < 1000:
-        return 64
-    elif n_samples < 10000:
-        return 128
-    elif n_samples < 50000:
-        return 256
-    else:
+def get_batch_size(n):
+    ### n = train data size
+    if n > 50000:
+        return 1024
+    elif n > 10000:
         return 512
+    elif n > 5000:
+        return 256
+    elif n > 1000:
+        return 128
+    else:
+        return 64
 
 
-# ─────────────────────────────────────────────────────────────
-# TabularDataset  (MultiTab TabularDataset 호환 클래스)
-# ─────────────────────────────────────────────────────────────
+def load_data(openml_id):
+    if openml_id == 999999:
+        dataset = sklearn.datasets.fetch_california_housing()
+        X = pd.DataFrame(dataset['data'])
+        y = pd.DataFrame(dataset['target'])
+        categorical_indicator = []
+        attribute_names = X.columns.tolist()
+    elif openml_id == 43611:
+        dataset = openml.datasets.get_dataset(openml_id)
+        print(f'Dataset is loaded.. Data name: {dataset.name}, Target feature: class')
+        X, y, categorical_indicator, attribute_names = dataset.get_data(
+            target="class"
+        )
+    elif openml_id == 43454:
+        dataset = openml.datasets.get_dataset(openml_id)
+        print(f'Dataset is loaded.. Data name: {dataset.name}, Target feature: loan_status')
+        X, y, categorical_indicator, attribute_names = dataset.get_data(
+            target="loan_status"
+        )
+    elif openml_id == 43823:
+        dataset = openml.datasets.get_dataset(openml_id)
+        print(f'Dataset is loaded.. Data name: {dataset.name}, Target feature: Heart_Disease')
+        X, y, categorical_indicator, attribute_names = dataset.get_data(
+            target="Heart_Disease"
+        )
+    else:
+        dataset = openml.datasets.get_dataset(openml_id)
+        print(f'Dataset is loaded.. Data name: {dataset.name}, Target feature: {dataset.default_target_attribute}')
+        X, y, categorical_indicator, attribute_names = dataset.get_data(
+            target=dataset.default_target_attribute
+        )
 
-class TabularDataset:
+    if openml_id == 537:
+        y = y / 10000
+
+    nan_counts = X.isna().values.sum()
+    cell_counts = X.shape[0] * X.shape[1]
+    n_samples = X.shape[0]
+    n_cols = X.shape[1]
+
+    ### Preprocess NaN
+    # 1. Remove columns containing more than 50% NaN values
+    nan_cols = X.isna().sum(0)
+    valid_cols = nan_cols.loc[nan_cols < (0.5 * len(X))].index.tolist()
+    total_features = len(valid_cols)
+    X = X[valid_cols]
+    # 2. Exclude samples containing any NaN values in either inputs or labels
+    nan_idx = X.isna().any(axis=1)
+    X = X[~nan_idx].reset_index(drop=True)
+    y = y[~nan_idx].reset_index(drop=True)
+
+    # 3. convert categorical features into integers (but still they are categorical)
+    cat_features = np.array(attribute_names)[categorical_indicator]
+    cat_features = [c for c in cat_features if c in valid_cols]
+    for v in valid_cols:
+        if not v in cat_features:
+            try:
+                X[v].astype(np.float32)
+            except ValueError:
+                valid_cols.remove(v)
+    X = X[valid_cols]
+
+    cat_cols = [valid_cols.index(x) for x in cat_features]
+    num_cols = [valid_cols.index(x) for x in valid_cols if not x in cat_features]
+    cat_cardinality = [X[c].cat.categories.size for c in cat_features]
+    for col in cat_features:
+        colencoder = LabelEncoder()
+        X[col] = colencoder.fit_transform(X[col])
+    X = X.values
+    invalid_num_cols = []
+    for col in num_cols:
+        if X[:, col].dtype == np.object_:
+            try:
+                X[:, col] = X[:, col].astype(np.float32)
+            except (ValueError, TypeError):
+                invalid_num_cols.append(col)
+    if invalid_num_cols:
+        print(f"  [data.py] categorical_indicator 미반영 문자열 컬럼 제거: {invalid_num_cols}")
+        keep_mask = [i for i in range(X.shape[1]) if i not in invalid_num_cols]
+        X = X[:, keep_mask]
+        num_cols = [keep_mask.index(i) for i in num_cols if i not in invalid_num_cols]
+        cat_cols = [keep_mask.index(i) for i in cat_cols if i not in invalid_num_cols]
+    X = X.astype(np.float32)
+
+    y = y.values
+    labelencoder = LabelEncoder()
+    y = labelencoder.fit_transform(y)
+
+    print("full data size", X.shape)
+    return X, y, cat_cols, cat_cardinality, num_cols
+
+
+def one_hot(y):
+    num_classes = len(np.unique(y))
+    min_class = y.min()
+    enc = LabelEncoder()
+    y_ = enc.fit_transform(y - min_class)
+    return np.eye(num_classes)[y_]
+
+
+def split_data(X, y, tasktype, num_indices=[], seed=0, device='cuda'):
+    if tasktype == "multiclass":
+        y = one_hot(y)
+
+    # StratifiedKFold: 클래스 비율 보존 (TabZilla/MultiTab 벤치마크 기준 통일)
+    from sklearn.model_selection import StratifiedKFold
+    y_for_split = np.argmax(y, axis=1) if y.ndim > 1 else y
+    kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    fold_idx = list(kf.split(X, y_for_split))
+    tr_idx, te_idx = fold_idx[seed]
+    val_split_idx = (seed + 1) % 10
+    _, val_idx = fold_idx[val_split_idx]
+    tr_idx = np.setdiff1d(tr_idx, val_idx)
+
+    X_train = torch.from_numpy(X[tr_idx]).type(torch.float32).to(device)
+    X_val = torch.from_numpy(X[val_idx]).type(torch.float32).to(device)
+    X_test = torch.from_numpy(X[te_idx]).type(torch.float32).to(device)
+
+    y_train = torch.from_numpy(y[tr_idx]).type(torch.float32).to(device)
+    y_val = torch.from_numpy(y[val_idx]).type(torch.float32).to(device)
+    y_test = torch.from_numpy(y[te_idx]).type(torch.float32).to(device)
+
+    (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std = prep_data(
+        X_train, X_val, X_test, y_train, y_val, y_test, num_indices=num_indices, tasktype=tasktype
+    )
+
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std
+
+
+## following Gorishniy et al., 2021
+def prep_data(X_train, X_val, X_test, y_train, y_val, y_test, num_indices=[], tasktype='multiclass'):
+    device = X_train.device
+    if len(num_indices) > 0:
+        quantile_transformer = QuantileTransformer(output_distribution='uniform', random_state=42)
+        X_train[:, num_indices] = torch.as_tensor(
+            quantile_transformer.fit_transform(X_train[:, num_indices].cpu().numpy()),
+            device=device, dtype=X_train.dtype,
+        )
+        X_val[:, num_indices] = torch.as_tensor(
+            quantile_transformer.transform(X_val[:, num_indices].cpu().numpy()),
+            device=device, dtype=X_val.dtype,
+        )
+        X_test[:, num_indices] = torch.as_tensor(
+            quantile_transformer.transform(X_test[:, num_indices].cpu().numpy()),
+            device=device, dtype=X_test.dtype,
+        )
+    if tasktype == "regression":
+        standard_transformer = StandardScaler()
+        y_train = torch.as_tensor(
+            standard_transformer.fit_transform(y_train.reshape(-1, 1).cpu().numpy()).reshape(-1),
+            device=device, dtype=y_train.dtype,
+        )
+        y_std = standard_transformer.scale_.item()
+        y_val = torch.as_tensor(
+            standard_transformer.transform(y_val.reshape(-1, 1).cpu().numpy()).reshape(-1),
+            device=device, dtype=y_val.dtype,
+        )
+        y_test = torch.as_tensor(
+            standard_transformer.transform(y_test.reshape(-1, 1).cpu().numpy()).reshape(-1),
+            device=device, dtype=y_test.dtype,
+        )
+    else:
+        y_std = 1.
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std
+
+
+class TabularDataset(torch.utils.data.Dataset):
     """
-    MultiTab의 TabularDataset과 동일한 인터페이스.
-
     optimize.py / reproduce.py 에서:
         dataset = TabularDataset(openml_id, tasktype, device=device, seed=seed)
         (X_train, y_train), (X_val, y_val), (X_test, y_test) = dataset._indv_dataset()
-        y_std = dataset.y_std
-    형태로 사용합니다.
+        dataset.n_features / dataset.n_classes / dataset.col_names / dataset.y_std
+    형태로 사용.
     """
 
-    def __init__(
-        self,
-        openml_id: int,
-        tasktype: str,
-        device: "torch.device | str" = "cpu",
-        seed: int = RANDOM_SEED,
-        cache_dir: str | Path = "./data_cache",
-        json_path: str | Path = "dataset_id.json",
-    ) -> None:
-        import torch
+    def __init__(self, openml_id, tasktype, device, seed=1):
+        X, y, self.X_cat, self.X_cat_cardinality, self.X_num = load_data(openml_id)
+        self.tasktype = tasktype
 
-        registry = load_registry(json_path)
-        dataset_info = registry[str(openml_id)]
+        (self.X_train, self.y_train), (self.X_val, self.y_val), (self.X_test, self.y_test), self.y_std = \
+            split_data(X, y, self.tasktype, num_indices=self.X_num, seed=seed, device=device)
 
-        data = load_dataset(openml_id, dataset_info, cache_dir=cache_dir, seed=seed)
+        # multiclass: one-hot((N,C)) → 정수 클래스 인덱스
+        # (TabERA의 CrossEntropyLoss/eval.py가 정수 라벨을 전제로 함;
+        #  원-핫 → argmax는 정보 손실 없는 역변환)
+        if self.tasktype == "multiclass":
+            self.n_classes = self.y_train.shape[1]
+            self.y_train = self.y_train.argmax(dim=-1).long()
+            self.y_val   = self.y_val.argmax(dim=-1).long()
+            self.y_test  = self.y_test.argmax(dim=-1).long()
+        elif self.tasktype == "binclass":
+            self.n_classes = 2
+            self.y_train = self.y_train.float()
+            self.y_val   = self.y_val.float()
+            self.y_test  = self.y_test.float()
+        else:
+            self.n_classes = None
 
-        def _t(arr, is_label=False):
-            if tasktype == "multiclass" and is_label:
-                return torch.tensor(arr, dtype=torch.long).to(device)
-            return torch.tensor(arr, dtype=torch.float32).to(device)
+        self.n_features = self.X_train.shape[1]
+        # 원본 컬럼명은 보존되지 않음 (openml categorical_indicator 처리
+        # 과정에서 유실) — 설명① 텍스트 표시("alcohol=10.24" 등)에만
+        # 영향을 주고 학습/정확도에는 전혀 무관.
+        self.col_names = [f"f{i}" for i in range(self.n_features)]
 
-        self._X_train = _t(data["X_train"])
-        self._y_train = _t(data["y_train"], is_label=True)
-        self._X_val   = _t(data["X_val"])
-        self._y_val   = _t(data["y_val"],   is_label=True)
-        self._X_test  = _t(data["X_test"])
-        self._y_test  = _t(data["y_test"],  is_label=True)
+        print("input dim: %i, cat: %i, num: %i" % (self.n_features, len(self.X_cat), len(self.X_num)))
+        self.batch_size = get_batch_size(len(self.X_train))
 
-        self.y_std       = data["y_std"]
-        self.col_names   = data["col_names"]
-        self.n_features  = data["n_features"]
-        self.n_classes   = data["n_classes"]
-        self.tasktype    = tasktype
-        self.name        = data["name"]
-        self.fullname    = data["fullname"]
-        self.openml_id   = str(openml_id)
-        self.qt          = data["qt"]           # QuantileTransformer
-        self.num_indices = data["num_indices"]  # numerical 열 인덱스
-        self.cat_indices = data["cat_indices"]  # categorical 열 인덱스
+    def __len__(self, data):
+        if data == "train":
+            return len(self.X_train)
+        elif data == "val":
+            return len(self.X_val)
+        else:
+            return len(self.X_test)
 
     def _indv_dataset(self):
-        """
-        MultiTab과 동일한 반환 형식:
-            (X_train, y_train), (X_val, y_val), (X_test, y_test)
-        """
-        return (
-            (self._X_train, self._y_train),
-            (self._X_val,   self._y_val),
-            (self._X_test,  self._y_test),
-        )
+        return (self.X_train, self.y_train), (self.X_val, self.y_val), (self.X_test, self.y_test)
+
+    def __getitem__(self, idx, data):
+        if data == "train":
+            return self.X_train[idx], self.y_train[idx]
+        elif data == "val":
+            return self.X_val[idx], self.y_val[idx]
+        else:
+            return self.X_test[idx], self.y_test[idx]
