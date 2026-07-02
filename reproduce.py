@@ -212,7 +212,8 @@ def main():
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor",
                                  "rank_correlation", "dual_space_faithfulness",
-                                 "deletion_auc", "insertion_auc"],
+                                 "deletion_auc", "insertion_auc",
+                                 "value_diagnosis"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
                             "  none                  : full model 기준 (기본값)\n"
@@ -225,7 +226,18 @@ def main():
                             "                         ŷ 곡선의 AUC (낮을수록 좋음)\n"
                             "  insertion_auc         : baseline에서 시작 → 중요 feature부터 복원 →\n"
                             "                         ŷ 곡선의 AUC (높을수록 좋음)\n"
-                            "                         Deletion과 짝 (Petsiuk et al. 2018, RISE)"
+                            "                         Deletion과 짝 (Petsiuk et al. 2018, RISE)\n"
+                            "  value_diagnosis        : AttentionAggregator의 value 구성 진단 —\n"
+                            "                         value=label_emb+T(query-neighbour)에서\n"
+                            "                         T() 항이 label_emb 대비 얼마나 큰지 측정\n"
+                            "                         (재학습 없음, 저비용 사전 진단)"
+                        ))
+    parser.add_argument("--no_offset_correction", action="store_true",
+                        help=(
+                            "[ablation] optimize.py --no_offset_correction으로 학습한 "
+                            "study를 불러와 재현. T(query-neighbour) 오프셋 보정 없이 "
+                            "value=label_emb만 사용한 모델. optimize.py와 반드시 일치시켜야 "
+                            "같은 study 파일을 정확히 찾음."
                         ))
     args = parser.parse_args()
 
@@ -260,11 +272,13 @@ def main():
     else:
         log_dir = args.savepath
 
-    fname = os.path.join(log_dir, f"data={openml_id}..model=tabera.pkl")
+    _ablation_tag = "..no_offset" if args.no_offset_correction else ""
+    fname = os.path.join(log_dir, f"data={openml_id}{_ablation_tag}..model=tabera.pkl")
     if not os.path.exists(fname):
+        _flag_hint = " --no_offset_correction" if args.no_offset_correction else ""
         raise FileNotFoundError(
             f"최적화 로그 없음: {fname}\n"
-            f"먼저 optimize.py --openml_id {openml_id} --seed {args.seed} 를 실행하세요."
+            f"먼저 optimize.py --openml_id {openml_id} --seed {args.seed}{_flag_hint} 를 실행하세요."
         )
 
     study       = joblib.load(fname)
@@ -284,6 +298,8 @@ def main():
         # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
         # HPO 때 찾은 best_params가 이 재현 실행에서 재현되지 않음)
         memory_size=len(y_train),
+        # [ablation] optimize.py에서 학습할 때 쓴 것과 반드시 일치해야 함
+        use_offset_correction=not args.no_offset_correction,
     )
 
     # ── 학습 ──────────────────────────────────────────────
@@ -672,11 +688,85 @@ def main():
             }
             dsf_path = (
                 Path(log_dir)
-                / f"data={openml_id}..seed{args.seed}_dual_space_faithfulness.pkl"
+                / f"data={openml_id}{_ablation_tag}..seed{args.seed}_dual_space_faithfulness.pkl"
             )
             with open(dsf_path, "wb") as f:
                 pickle.dump(dsf_save, f)
             print(f"\n  저장: {dsf_path}")
+
+        # ── value_diagnosis: AttentionAggregator value 구성 진단 ──────────
+        #
+        # [측정 방식]
+        # value = label_emb + T(query - neighbour) 에서 두 항의 L2 norm을
+        # 직접 비교. 재학습 없이 학습된 가중치로 측정하는 저비용 사전
+        # 진단으로, Gated Fusion 제거 때 썼던 방식(gate 값이 항상 ≈0.5로
+        # 고정돼 학습이 안 됐음을 진단)과 같은 부류의 검증이다.
+        #
+        # [주의] 이건 "T()가 필요한가"에 대한 확정적 증거가 아니라 정황
+        # 증거임. 확실한 ablation은 T() 없는 아키텍처를 처음부터 재학습해서
+        # 비교하는 것 — 여기서 ratio가 작게 나오면 그 재학습이 해볼 만한
+        # 가치가 있다는 신호로 쓰면 된다.
+        elif args.ablation == "value_diagnosis":
+            model.eval()
+            n_val     = min(512, X_test.shape[0])
+            X_val_sub = X_test[:n_val]
+
+            print(f"\n  Value Component Diagnosis (label_emb vs T(query-neighbour))")
+            print(f"  {'─'*58}")
+
+            with torch.no_grad():
+                # query_emb는 model(X_val_sub) 내부에서도 계산되지만, nk를
+                # 재구성하려면 topk_idx가 필요해서 forward를 그대로 한 번
+                # 호출하고 embedder만 별도로 다시 불러 query_emb를 얻는다.
+                # (eval 모드라 dropout 등 확률적 요소 없음 → 완전히 동일한 값)
+                query_emb_vd = model.embedder(X_val_sub)              # (n_val, D)
+                out_vd       = model(X_val_sub)
+                topk_idx_vd  = out_vd.get("topk_idx")                 # (n_val, k)
+                n_mem        = model.memory.filled.item()
+
+            if not model.use_offset_correction:
+                print("  (진단 불가 — 이 모델은 --no_offset_correction으로 학습되어 "
+                      "T()가 없습니다. value_diagnosis는 T()가 있는 모델 전용입니다.)")
+            elif topk_idx_vd is None or n_mem < 1:
+                print("  (진단 불가 — memory bank가 아직 채워지지 않았습니다)")
+            else:
+                with torch.no_grad():
+                    safe_idx  = topk_idx_vd.clamp(0, n_mem - 1)
+                    nk_vd     = model.memory.keys[safe_idx]            # (n_val, k, D)
+                    labels_vd = model.memory.labels[safe_idx]          # (n_val, k)
+
+                    stats = model.ot_selector.diagnose_value_components(
+                        query_emb_vd, nk_vd, labels_vd
+                    )
+
+                print(f"  label_emb  norm : {stats['label_emb_norm_mean']:.4f} "
+                      f"± {stats['label_emb_norm_std']:.4f}")
+                print(f"  T(offset)  norm : {stats['offset_norm_mean']:.4f} "
+                      f"± {stats['offset_norm_std']:.4f}")
+                print(f"  ratio (offset/label) : {stats['ratio_mean']:.4f} "
+                      f"± {stats['ratio_std']:.4f}")
+
+                if stats["ratio_mean"] < 0.1:
+                    print(f"\n  ⚠️  T(query-neighbour)가 label_emb 대비 매우 작습니다 "
+                          f"(ratio={stats['ratio_mean']:.2%}) — Gated Fusion 때와 유사한 패턴.")
+                    print(f"     T()가 유의미한 보정을 학습하지 못했을 가능성이 있습니다 — "
+                          f"T() 없는 아키텍처로 재학습 비교를 권장합니다.")
+                elif stats["ratio_mean"] > 0.5:
+                    print(f"\n  ✅ T(query-neighbour)가 label_emb와 비슷하거나 더 큽니다 "
+                          f"(ratio={stats['ratio_mean']:.2%}) — 유의미한 보정을 학습했을 가능성이 높습니다.")
+                else:
+                    print(f"\n  ℹ️  중간 수준입니다 (ratio={stats['ratio_mean']:.2%}) — "
+                          f"결정적이지 않으니 재학습 비교로 확인을 권장합니다.")
+
+                # 저장
+                vd_save = {**stats, "openml_id": openml_id, "seed": args.seed}
+                vd_path = (
+                    Path(log_dir)
+                    / f"data={openml_id}{_ablation_tag}..seed{args.seed}_value_diagnosis.pkl"
+                )
+                with open(vd_path, "wb") as f:
+                    pickle.dump(vd_save, f)
+                print(f"\n  저장: {vd_path}")
 
         # ── deletion_auc: attribution 순위로 feature 누적 마스킹 → ŷ AUC ──
         #
@@ -1092,7 +1182,7 @@ def main():
                 "openml_id":      openml_id,
                 "seed":           args.seed,
             }
-            abl_path = Path(log_dir) / f"data={openml_id}..seed{args.seed}_ablation_{args.ablation}.pkl"
+            abl_path = Path(log_dir) / f"data={openml_id}{_ablation_tag}..seed{args.seed}_ablation_{args.ablation}.pkl"
             with open(abl_path, "wb") as f:
                 pickle.dump(abl_save, f)
             print(f"\n  저장: {abl_path}")
@@ -1101,8 +1191,8 @@ def main():
 
     # ── 결과 저장 ──────────────────────────────────────────
     save_dir  = Path(log_dir)
-    pred_path = save_dir / f"data={openml_id}..seed{args.seed}_preds.npy"
-    meta_path = save_dir / f"data={openml_id}..seed{args.seed}_meta.pkl"
+    pred_path = save_dir / f"data={openml_id}{_ablation_tag}..seed{args.seed}_preds.npy"
+    meta_path = save_dir / f"data={openml_id}{_ablation_tag}..seed{args.seed}_meta.pkl"
 
     model.eval()
     with torch.no_grad():
@@ -1116,6 +1206,7 @@ def main():
         "val_metrics": val_metrics,
         "test_metrics":test_metrics,
         "seed":        args.seed,
+        "use_offset_correction": not args.no_offset_correction,
     }
     with open(meta_path, "wb") as f:
         pickle.dump(meta, f)
@@ -1123,10 +1214,13 @@ def main():
     print(f"\n  저장: {pred_path}")
 
     # ── model state 저장 (visualize_embeddings.py --from_state 용) ──
-    state_path = save_dir / f"data={openml_id}..seed{args.seed}_model_state.pt"
+    # model_kwargs에 use_offset_correction을 명시적으로 넣어둠 — best_params
+    # (Optuna 탐색 대상)에는 없는 값이라, 이걸 안 넣으면 --from_state로
+    # 복원할 때 기본값(True)으로 되돌아가 버려 재현이 어긋남.
+    state_path = save_dir / f"data={openml_id}{_ablation_tag}..seed{args.seed}_model_state.pt"
     torch.save({
         "state_dict":   model.state_dict(),
-        "model_kwargs": model_kwargs,
+        "model_kwargs": {**model_kwargs, "use_offset_correction": not args.no_offset_correction},
         "col_names":    dataset.col_names,
         "n_train":      len(X_train),
         "tasktype":     tasktype,
