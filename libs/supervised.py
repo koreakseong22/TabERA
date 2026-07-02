@@ -157,6 +157,7 @@ class TabERAWrapper:
         best_val   = None
         self.ema_history = []
         self.final_ema_stats = None
+        _low_active_streak = 0   # 연속으로 active_ratio<10%인 EMA 체크 횟수 (runaway collapse 감지용)
 
         # [버그 수정] 이전엔 emb_cache로 X_train 전체(N_train개)를 캐시해서
         # ema_update에 넘겼음 → sample_groups가 "X_train 행 번호"로 만들어짐.
@@ -242,6 +243,28 @@ class TabERAWrapper:
                         centroid_emb=self.model.prototype_layer.centroid_emb,
                     )
 
+                    # ── Runaway collapse 감지 ────────────────────────
+                    # 단발성 dip(일시적으로 낮았다가 회복되는 경우)은 봐주고,
+                    # "연속으로 계속 나쁜 상태가 유지"될 때만 중단한다.
+                    # 매 에폭 체크(로그 출력 주기 10epoch과는 별개) — 추세가
+                    # 뚜렷해지는 즉시 반응하기 위함. 그냥 낮은 값 한 번이
+                    # 아니라 2회 연속(=최소 2 에폭 연속, 보통 10epoch 단위
+                    # 로그 사이에도 매 에폭 계산되므로 실제로는 곧바로 반응)
+                    # 유지될 때만 중단하여, 회복 가능한 dip을 살려둔다.
+                    active_ratio_now = ema_stats.get("active_ratio", 1.0)
+                    if active_ratio_now < 0.05:
+                        _low_active_streak += 1
+                    else:
+                        _low_active_streak = 0   # 회복하면 카운터 리셋
+
+                    if _low_active_streak >= 5:
+                        tqdm.write(
+                            f"  [STOP] Runaway centroid collapse at epoch {epoch} "
+                            f"(active={active_ratio_now:.0%}, {_low_active_streak}epoch 연속 "
+                            f"5% 미만). Early exit."
+                        )
+                        break
+
                     if epoch % 10 == 0:
                         pbar.write(
                             f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
@@ -249,14 +272,6 @@ class TabERAWrapper:
                             f"min={ema_stats['min_cluster_size']}  "
                             f"max={ema_stats['max_cluster_size']}"
                         )
-
-                    # ── Centroid collapse 감지 → 조기 종료 ──────────
-                    if ema_stats.get("active_ratio", 1.0) < 0.1:
-                        tqdm.write(
-                            f"  [STOP] Centroid collapse at epoch {epoch} "
-                            f"(active={ema_stats['active_ratio']:.0%}). Early exit."
-                        )
-                        break
 
             avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
 
