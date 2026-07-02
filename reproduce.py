@@ -3,7 +3,6 @@
 ## Based on: MultiTab (Kyungeun Lee, kyungeun.lee@lgresearch.ai)
 
 import sys, os, argparse
-from xml.parsers.expat import model
 
 # ── CUDA_VISIBLE_DEVICES: torch import 전 설정 ──────────────
 _parser_pre = argparse.ArgumentParser(add_help=False)
@@ -25,7 +24,6 @@ from libs.eval         import calculate_metric
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -239,6 +237,40 @@ def main():
                             "value=label_emb만 사용한 모델. optimize.py와 반드시 일치시켜야 "
                             "같은 study 파일을 정확히 찾음."
                         ))
+    parser.add_argument("--global_retrieve", action="store_true",
+                        help=(
+                            "[진단용] 기존(그룹-제약) study의 best_params를 그대로 불러오되, "
+                            "retrieve()만 그룹 제약 없이 전역 검색으로 바꿔서 1회 재학습. "
+                            "별도 study를 요구하지 않음 — --no_offset_correction과 달리 "
+                            "불러오는 study 파일은 바뀌지 않고, 모델 구성에만 반영됨."
+                        ))
+    parser.add_argument("--no_context_emb", action="store_true",
+                        help=(
+                            "[진단용] context_emb(설명① 신호)를 head 입력에서 제외하고 "
+                            "1회 재학습. STE 라우팅/centroid 학습 자체는 그대로 유지됨 "
+                            "(diversity_loss/commitment_loss는 계속 작동) — 'context_emb가 "
+                            "head에 보이는 것 자체가 예측에 얼마나 기여하는지'만 격리해서 "
+                            "측정. --global_retrieve와 마찬가지로 별도 study 불필요."
+                        ))
+    parser.add_argument("--detach_context_grad", action="store_true",
+                        help=(
+                            "[진단용] context_emb는 head 입력으로 그대로 전달하되, "
+                            "그쪽에서 오는 gradient만 centroid_emb로 안 흐르게 끊음 "
+                            "(commitment_loss는 원래도 detach라 영향 없음, diversity_loss "
+                            "gradient는 그대로 흐름). 'task_loss와 diversity_loss가 "
+                            "centroid_emb를 두고 서로 다른 방향으로 당기며 충돌하고 있는지' "
+                            "검증용. --no_context_emb와 동시 사용 시 의미 없음(그땐 애초에 "
+                            "context_emb가 head에 안 들어감)."
+                        ))
+    parser.add_argument("--context_projection", action="store_true",
+                        help=(
+                            "[구조 조정] context_emb를 head로 보내기 전 학습 가능한 "
+                            "Linear를 하나 거치게 함. detach_context_grad와 달리 "
+                            "gradient가 여전히 centroid_emb까지 도달함. optimize.py "
+                            "--context_projection으로 학습한 study가 있으면 그 "
+                            "best_params를 쓰는 게 이상적이지만, 없으면 기존 study "
+                            "best_params 위에 이 구조만 얹어 1회 재학습(별도 study 불필요)."
+                        ))
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -276,10 +308,17 @@ def main():
     fname = os.path.join(log_dir, f"data={openml_id}{_ablation_tag}..model=tabera.pkl")
     if not os.path.exists(fname):
         _flag_hint = " --no_offset_correction" if args.no_offset_correction else ""
+        _hint_cmd = f"optimize.py --openml_id {openml_id} --seed {args.seed}{_flag_hint}"
         raise FileNotFoundError(
             f"최적화 로그 없음: {fname}\n"
-            f"먼저 optimize.py --openml_id {openml_id} --seed {args.seed}{_flag_hint} 를 실행하세요."
+            f"먼저 {_hint_cmd} 를 실행하세요."
         )
+    # 출력 파일명 태그: global_retrieve는 별도 study를 요구하지 않으므로
+    # 로딩(_ablation_tag)엔 영향 없이, 저장 파일명에만 추가로 반영.
+    _save_tag = _ablation_tag + ("..global_retrieve" if args.global_retrieve else "") \
+                              + ("..no_context" if args.no_context_emb else "") \
+                              + ("..detach_ctx" if args.detach_context_grad else "") \
+                              + ("..ctx_proj" if args.context_projection else "")
 
     study       = joblib.load(fname)
     best_params = study.best_params
@@ -300,6 +339,15 @@ def main():
         memory_size=len(y_train),
         # [ablation] optimize.py에서 학습할 때 쓴 것과 반드시 일치해야 함
         use_offset_correction=not args.no_offset_correction,
+        # [진단용] best_params는 그룹-제약 study에서 그대로 가져오되,
+        # retrieve()만 전역 검색으로 바꿈 (context_emb/설명①은 안 바뀜)
+        global_retrieve=args.global_retrieve,
+        # [진단용] context_emb를 head 입력에서 제외 (STE/centroid 학습은 그대로)
+        use_context_emb=not args.no_context_emb,
+        # [진단용] context_emb는 head에 그대로 전달하되 gradient만 끊음
+        detach_context_grad=args.detach_context_grad,
+        # [구조 조정] context_emb를 head 직전 Linear 프로젝션에 통과시킴
+        use_context_projection=args.context_projection,
     )
 
     # ── 학습 ──────────────────────────────────────────────
@@ -688,7 +736,7 @@ def main():
             }
             dsf_path = (
                 Path(log_dir)
-                / f"data={openml_id}{_ablation_tag}..seed{args.seed}_dual_space_faithfulness.pkl"
+                / f"data={openml_id}{_save_tag}..seed{args.seed}_dual_space_faithfulness.pkl"
             )
             with open(dsf_path, "wb") as f:
                 pickle.dump(dsf_save, f)
@@ -762,7 +810,7 @@ def main():
                 vd_save = {**stats, "openml_id": openml_id, "seed": args.seed}
                 vd_path = (
                     Path(log_dir)
-                    / f"data={openml_id}{_ablation_tag}..seed{args.seed}_value_diagnosis.pkl"
+                    / f"data={openml_id}{_save_tag}..seed{args.seed}_value_diagnosis.pkl"
                 )
                 with open(vd_path, "wb") as f:
                     pickle.dump(vd_save, f)
@@ -1182,7 +1230,7 @@ def main():
                 "openml_id":      openml_id,
                 "seed":           args.seed,
             }
-            abl_path = Path(log_dir) / f"data={openml_id}{_ablation_tag}..seed{args.seed}_ablation_{args.ablation}.pkl"
+            abl_path = Path(log_dir) / f"data={openml_id}{_save_tag}..seed{args.seed}_ablation_{args.ablation}.pkl"
             with open(abl_path, "wb") as f:
                 pickle.dump(abl_save, f)
             print(f"\n  저장: {abl_path}")
@@ -1191,8 +1239,8 @@ def main():
 
     # ── 결과 저장 ──────────────────────────────────────────
     save_dir  = Path(log_dir)
-    pred_path = save_dir / f"data={openml_id}{_ablation_tag}..seed{args.seed}_preds.npy"
-    meta_path = save_dir / f"data={openml_id}{_ablation_tag}..seed{args.seed}_meta.pkl"
+    pred_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_preds.npy"
+    meta_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_meta.pkl"
 
     model.eval()
     with torch.no_grad():
@@ -1207,6 +1255,10 @@ def main():
         "test_metrics":test_metrics,
         "seed":        args.seed,
         "use_offset_correction": not args.no_offset_correction,
+        "global_retrieve": args.global_retrieve,
+        "use_context_emb": not args.no_context_emb,
+        "detach_context_grad": args.detach_context_grad,
+        "use_context_projection": args.context_projection,
     }
     with open(meta_path, "wb") as f:
         pickle.dump(meta, f)
@@ -1217,10 +1269,10 @@ def main():
     # model_kwargs에 use_offset_correction을 명시적으로 넣어둠 — best_params
     # (Optuna 탐색 대상)에는 없는 값이라, 이걸 안 넣으면 --from_state로
     # 복원할 때 기본값(True)으로 되돌아가 버려 재현이 어긋남.
-    state_path = save_dir / f"data={openml_id}{_ablation_tag}..seed{args.seed}_model_state.pt"
+    state_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_model_state.pt"
     torch.save({
         "state_dict":   model.state_dict(),
-        "model_kwargs": {**model_kwargs, "use_offset_correction": not args.no_offset_correction},
+        "model_kwargs": {**model_kwargs, "use_offset_correction": not args.no_offset_correction, "global_retrieve": args.global_retrieve, "use_context_emb": not args.no_context_emb, "detach_context_grad": args.detach_context_grad, "use_context_projection": args.context_projection},
         "col_names":    dataset.col_names,
         "n_train":      len(X_train),
         "tasktype":     tasktype,
