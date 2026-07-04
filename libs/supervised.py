@@ -353,16 +353,26 @@ class TabERAWrapper:
             avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
 
             # ── 검증 ──────────────────────────────────────
+            _val_t0 = time.perf_counter()   # [임시 진단]
             self.model.eval()
             with torch.no_grad():
                 val_logits = self._forward_batched(X_val)
                 val_m  = compute_metric(val_logits, y_val, self.tasktype)
             val_v = list(val_m.values())[0]
+            _val_elapsed = time.perf_counter() - _val_t0   # [임시 진단]
 
             # best 모델 저장
+            _save_t0 = time.perf_counter()   # [임시 진단]
             if is_better(val_v, best_val, self.tasktype):
                 best_val   = val_v
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+            _save_elapsed = time.perf_counter() - _save_t0   # [임시 진단]
+
+            if _val_elapsed > 1.0 or _save_elapsed > 1.0:   # [임시 진단] 눈에 띄게 느릴 때만 출력
+                tqdm.write(
+                    f"  [DIAG-VAL] epoch={epoch}  val_forward={_val_elapsed:.1f}s  "
+                    f"best_state_save={_save_elapsed:.1f}s"
+                )
 
             # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
             pbar.set_description(f"EPOCH: {epoch}")
