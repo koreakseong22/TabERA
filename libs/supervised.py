@@ -13,6 +13,7 @@ TabERA 전용으로 재작성한 버전입니다.
 """
 
 import math
+import time
 import torch
 import torch.nn as nn
 import logging
@@ -177,6 +178,7 @@ class TabERAWrapper:
         )
 
         for epoch in pbar:
+            _epoch_t0 = time.perf_counter()   # [임시 진단] 문제 해결되면 제거
             # ── 학습 ──────────────────────────────────────
             self.model.train()
             perm    = torch.randperm(len(y_train), device=self.device)
@@ -236,6 +238,26 @@ class TabERAWrapper:
                         "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
                         "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
                     })
+
+                    # [임시 진단] 41150(N=104,050, P=322) 원인 파악 전용 —
+                    # 매 epoch마다(10epoch 단위 아님) 상태 + 그 epoch 학습에
+                    # 걸린 시간을 바로 출력. 원인 확인되면 제거할 것.
+                    _epoch_elapsed = time.perf_counter() - _epoch_t0
+                    _diag_mem = ""
+                    if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                        try:
+                            _free_b, _total_b = torch.cuda.mem_get_info(self.device)
+                            _diag_mem = f"  free_gpu={_free_b/1e9:.2f}/{_total_b/1e9:.2f}GB"
+                        except Exception:
+                            pass
+                    tqdm.write(
+                        f"  [DIAG] epoch={epoch}  elapsed={_epoch_elapsed:.1f}s  "
+                        f"active={ema_stats.get('active_ratio', 0)*100:.0f}%  "
+                        f"alive={ema_stats.get('active_centroids', 0)}  "
+                        f"min={ema_stats.get('min_cluster_size', 0)}  "
+                        f"max={ema_stats.get('max_cluster_size', 0)}"
+                        f"{_diag_mem}"
+                    )
 
                     # ── 안전장치 1: retrieve()의 다음 배치 메모리 요구량 추정 ──
                     # active_ratio 스트릭과 무관하게 독립적으로 체크한다.
