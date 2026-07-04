@@ -13,7 +13,6 @@ TabERA 전용으로 재작성한 버전입니다.
 """
 
 import math
-import time
 import torch
 import torch.nn as nn
 import logging
@@ -178,7 +177,6 @@ class TabERAWrapper:
         )
 
         for epoch in pbar:
-            _epoch_t0 = time.perf_counter()   # [임시 진단] 문제 해결되면 제거
             # ── 학습 ──────────────────────────────────────
             self.model.train()
             perm    = torch.randperm(len(y_train), device=self.device)
@@ -239,44 +237,19 @@ class TabERAWrapper:
                         "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
                     })
 
-                    # [임시 진단] 41150(N=104,050, P=322) 원인 파악 전용 —
-                    # 매 epoch마다(10epoch 단위 아님) 상태 + 그 epoch 학습에
-                    # 걸린 시간을 바로 출력. 원인 확인되면 제거할 것.
-                    _epoch_elapsed = time.perf_counter() - _epoch_t0
-                    _diag_mem = ""
-                    _free_b_for_threshold = None   # 아래 update_outlier_threshold()에서 재사용
+                    # ── retrieve()의 하이브리드 임계값을 실제 GPU 여유 메모리
+                    # 기준으로 매 epoch 갱신 (근거 없는 고정 상수 대신).
+                    # retrieve() 자체(배치마다 호출됨)에서는 GPU를 조회하지
+                    # 않도록, 조회는 여기서 epoch당 1회만 수행.
                     if torch.cuda.is_available() and str(self.device).startswith("cuda"):
                         try:
-                            _free_b, _total_b = torch.cuda.mem_get_info(self.device)
-                            _free_b_for_threshold = _free_b
-                            _reserved_b = torch.cuda.memory_reserved(self.device)
-                            _allocated_b = torch.cuda.memory_allocated(self.device)
-                            _diag_mem = (
-                                f"  free_gpu={_free_b/1e9:.2f}/{_total_b/1e9:.2f}GB"
-                                f"  torch_reserved={_reserved_b/1e9:.2f}GB"
-                                f"  torch_allocated={_allocated_b/1e9:.2f}GB"
+                            _free_b, _ = torch.cuda.mem_get_info(self.device)
+                            self.model.memory.update_outlier_threshold(
+                                n_prototypes=self.model.prototype_layer.P,
+                                free_bytes=_free_b,
                             )
                         except Exception:
                             pass
-                    tqdm.write(
-                        f"  [DIAG] epoch={epoch}  elapsed={_epoch_elapsed:.1f}s  "
-                        f"active={ema_stats.get('active_ratio', 0)*100:.0f}%  "
-                        f"alive={ema_stats.get('active_centroids', 0)}  "
-                        f"min={ema_stats.get('min_cluster_size', 0)}  "
-                        f"max={ema_stats.get('max_cluster_size', 0)}"
-                        f"{_diag_mem}"
-                    )
-
-                    # ── retrieve()의 하이브리드 임계값을 실제 GPU 여유 메모리
-                    # 기준으로 매 epoch 갱신 (근거 없는 고정 상수 대신).
-                    # 위에서 이미 조회한 free_gpu 값을 재사용 — retrieve()
-                    # 자체(배치마다 호출됨)에서 따로 GPU를 조회하지 않도록
-                    # 하기 위함 (매 배치 조회하면 동기화 오버헤드 재발).
-                    if _free_b_for_threshold is not None:
-                        self.model.memory.update_outlier_threshold(
-                            n_prototypes=self.model.prototype_layer.P,
-                            free_bytes=_free_b_for_threshold,
-                        )
 
                     # ── 안전장치 1: retrieve()의 다음 배치 메모리 요구량 추정 ──
                     # active_ratio 스트릭과 무관하게 독립적으로 체크한다.
@@ -372,33 +345,25 @@ class TabERAWrapper:
             avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
 
             # ── 검증 ──────────────────────────────────────
-            _val_t0 = time.perf_counter()   # [임시 진단]
             self.model.eval()
             with torch.no_grad():
-                # [임시 진단/가설 검증] X_val은 항상 고정된 순서라, 특정 구간에
-                # 비슷한 샘플이 몰려있으면 그 구간 배치들이 매 epoch 계속
+                # [버그 수정] X_val을 항상 고정된 순서로 처리하면, 특정 구간에
+                # 비슷한 샘플이 몰려있을 경우 그 구간 배치들이 매 epoch 계속
                 # 같은(적은 수의) centroid로만 라우팅되어 U는 작고
-                # local_max_g만 큰 최악의 조합이 반복될 수 있음. 학습은
-                # randperm으로 매 epoch 섞여서 이런 편중이 평균화되는데
-                # 검증만 고정 순서였음 — 매 epoch 셔플해서 이 가설을 검증.
+                # local_max_g만 큰 최악의 조합이 반복되는 현상이 실측 확인됨
+                # (val_forward가 1초→76초까지 폭증). 학습은 randperm으로 매
+                # epoch 섞여서 이런 편중이 평균화되는데 검증만 고정 순서였던
+                # 것이 원인 중 하나 — 매 epoch 셔플해서 동일하게 평균화되게 함
+                # (집계 지표 계산에는 순서가 무관하므로 결과에 영향 없음).
                 _val_perm  = torch.randperm(len(X_val), device=self.device)
                 val_logits = self._forward_batched(X_val[_val_perm])
                 val_m  = compute_metric(val_logits, y_val[_val_perm], self.tasktype)
             val_v = list(val_m.values())[0]
-            _val_elapsed = time.perf_counter() - _val_t0   # [임시 진단]
 
             # best 모델 저장
-            _save_t0 = time.perf_counter()   # [임시 진단]
             if is_better(val_v, best_val, self.tasktype):
                 best_val   = val_v
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
-            _save_elapsed = time.perf_counter() - _save_t0   # [임시 진단]
-
-            if _val_elapsed > 1.0 or _save_elapsed > 1.0:   # [임시 진단] 눈에 띄게 느릴 때만 출력
-                tqdm.write(
-                    f"  [DIAG-VAL] epoch={epoch}  val_forward={_val_elapsed:.1f}s  "
-                    f"best_state_save={_save_elapsed:.1f}s"
-                )
 
             # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
             pbar.set_description(f"EPOCH: {epoch}")
