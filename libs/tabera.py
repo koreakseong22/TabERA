@@ -249,71 +249,127 @@ class MemoryBank(nn.Module):
             uniq, counts = torch.unique_consecutive(ha_c_sorted, return_counts=True)  # (U,)
             U = uniq.shape[0]
 
-            # [단편화 대응] U(배치 내 서로 다른 centroid 수)가 배치마다
-            # 계속 바뀌면(로그 기준 40~150+), keys_u/Q_pad/sim_u의 첫 축이
-            # 매번 다른 크기가 되어 CUDA allocator가 캐시를 재사용 못 하고
-            # 계속 새 블록을 확보 → 수만 배치 누적 시 갈수록 느려지는
-            # 단편화로 이어짐 (VRAM이 빠듯할 때 특히 심함, 실측으로 확인됨).
-            # U를 고정 배수로 올려서 더미(무효) centroid 행을 추가— 결과에는
-            # 전혀 영향 없음: group_id/rank는 원래 U 범위(0..U-1)만 참조하므로
-            # 더미 행(U..U_pad-1)은 계산은 되지만 절대 읽히지 않음.
-            _round_u = 8
-            U_pad = ((U + _round_u - 1) // _round_u) * _round_u
-            if U_pad > U:
-                pad_ids = uniq[:1].expand(U_pad - U)   # 임의의 유효 centroid id로 채움 (계산만 되고 결과는 안 씀)
-                uniq_p  = torch.cat([uniq, pad_ids], dim=0)          # (U_pad,)
-            else:
-                uniq_p = uniq
-
             offsets = counts.cumsum(0)                          # (U,) 각 그룹의 끝 위치(배타적 경계)
-            # repeat_interleave 대신 bucketize 사용 (콜당 수백us → 수십us 수준)
             group_id = torch.bucketize(
                 torch.arange(Bn, device=dev), offsets, right=True
-            )                                                    # (Bn,) 0..U-1 (U_pad 무관, 원래 U 범위만)
+            )                                                    # (Bn,) 0..U-1
             rank = torch.arange(Bn, device=dev) - (offsets[group_id] - counts[group_id])  # (Bn,) centroid 내 0-index
 
-            max_q_raw   = int(counts.max())                     # 배치 전체 스칼라 변환 1회
-            _round_q = 16
-            max_q = ((max_q_raw + _round_q - 1) // _round_q) * _round_q
-            max_q = min(max_q, Bn)   # Bn을 넘을 이유 없음 (넘으면 그냥 낭비)
+            grp_sizes_u = self._cached_group_sizes[uniq]         # (U,) 이 배치에 등장한 centroid들의 진짜 그룹 크기
+            local_max_g_raw = max(int(grp_sizes_u.max()), k)
 
-            local_max_g_raw = max(int(self._cached_group_sizes[uniq].max()), k)  # 배치에 등장한 centroid 중 최댓값만
-            # local_max_g도 고정 배수로 올림 (U만큼 지배적이진 않지만 보조적으로 도움)
-            _round_g = 256
-            local_max_g = ((local_max_g_raw + _round_g - 1) // _round_g) * _round_g
-            # _cached_groups의 실제 폭(전역 max group size로 패딩된 값)을
-            # 넘어서면 안 됨 — 넘으면 아래 .view()가 shape mismatch로 깨짐.
-            local_max_g = min(local_max_g, self._cached_groups.shape[1])
+            # [하이브리드 대응] local_max_g_raw가 이례적으로 크면(예: centroid
+            # 하나가 데이터의 상당 부분을 흡수한 상태), 모든 U개 centroid를
+            # 이 큰 폭에 맞춰 패딩하는 게 메모리/연산량을 폭증시킴 (id=41150,
+            # N=104,050에서 max_cluster_size가 3,526→34,195까지 커지며 실측
+            # 됨 — 대부분 centroid는 건강한데 소수만 비대해지는 경우라
+            # active_ratio 기반 collapse 감지로는 못 잡음).
+            # 정상 규모(임계값 이하)에서는 기존 단일-텐서 빠른 경로를 그대로
+            # 써서 추가 오버헤드가 전혀 없게 하고, 임계값을 넘는 드문 경우만
+            # "큰 그룹" / "작은 그룹"으로 나눠 각자에 맞는 폭으로 처리한다.
+            _OUTLIER_THRESHOLD = 4096
 
-            Q_pad = torch.zeros(U_pad, max_q, D, device=dev)
-            Q_pad[group_id, rank] = q_c_sorted                   # (U_pad, max_q, D) — U..U_pad-1행은 0으로 남음(무효)
+            if local_max_g_raw <= _OUTLIER_THRESHOLD:
+                # ── 정상 경로: 기존과 완전히 동일 (오버헤드 없음) ──────
+                _round_u = 8
+                U_pad = ((U + _round_u - 1) // _round_u) * _round_u
+                if U_pad > U:
+                    pad_ids = uniq[:1].expand(U_pad - U)
+                    uniq_p  = torch.cat([uniq, pad_ids], dim=0)
+                else:
+                    uniq_p = uniq
 
-            cand_u  = self._cached_groups[uniq_p, :local_max_g]  # (U_pad, local_max_g) — centroid당 1회만 gather
-            valid_u = cand_u >= 0
-            safe_u  = cand_u.clamp(min=0, max=n - 1)
+                max_q_raw = int(counts.max())
+                max_q = ((max_q_raw + 15) // 16) * 16
+                max_q = min(max_q, Bn)
 
-            keys_u = self._keys_norm[:n][safe_u.reshape(-1)].view(U_pad, local_max_g, D)
+                local_max_g = ((local_max_g_raw + 255) // 256) * 256
+                local_max_g = min(local_max_g, self._cached_groups.shape[1])
 
-            sim_u = torch.bmm(Q_pad, keys_u.transpose(1, 2))      # (U_pad, max_q, local_max_g)
-            sim_u = sim_u.masked_fill(~valid_u.unsqueeze(1), -1e9)
+                Q_pad = torch.zeros(U_pad, max_q, D, device=dev)
+                Q_pad[group_id, rank] = q_c_sorted
 
-            k_eff = min(k, local_max_g)
-            _, top_u  = sim_u.topk(k_eff, dim=-1)                 # (U_pad, max_q, k_eff)
-            i_final_u = safe_u.unsqueeze(1).expand(-1, max_q, -1).gather(2, top_u)  # (U_pad, max_q, k_eff)
+                cand_u  = self._cached_groups[uniq_p, :local_max_g]
+                valid_u = cand_u >= 0
+                safe_u  = cand_u.clamp(min=0, max=n - 1)
 
-            i_final_c_sorted = i_final_u[group_id, rank]          # (Bn, k_eff) — csorted 순서, U_pad 부분은 참조 안 됨
+                keys_u = self._keys_norm[:n][safe_u.reshape(-1)].view(U_pad, local_max_g, D)
 
-            # [이번 수정] 중간 _chunk 버퍼(out_nk_chunk 등) + 2단계 복사를 없애고
-            # out_nk/out_nv/out_labels/top_k_idx에 "한 번에" 바로 씀.
-            # 기존: i_final_all(zeros)+scatter → out_nk_chunk(zeros)+scatter → out_nk[nm_idx]=chunk (복사 2단계)
-            # 개선: final_pos(csorted → 원래 B 내 위치)를 미리 계산해 딱 1번의 index_put_로 끝냄
-            #   → aten::index_put_/aten::copy_ 호출 수 및 CPU total 추가 절감
-            final_pos = nm_idx[csort_idx]                          # (Bn,) 원래 배치(B) 내 최종 위치
+                sim_u = torch.bmm(Q_pad, keys_u.transpose(1, 2))
+                sim_u = sim_u.masked_fill(~valid_u.unsqueeze(1), -1e9)
 
-            top_k_idx[final_pos, :k_eff]  = i_final_c_sorted
-            out_nk[final_pos, :k_eff]     = keys_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
-            out_nv[final_pos, :k_eff]     = vals_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
-            out_labels[final_pos, :k_eff] = labels_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff)
+                k_eff = min(k, local_max_g)
+                _, top_u  = sim_u.topk(k_eff, dim=-1)
+                i_final_u = safe_u.unsqueeze(1).expand(-1, max_q, -1).gather(2, top_u)
+                i_final_c_sorted = i_final_u[group_id, rank]
+
+                final_pos = nm_idx[csort_idx]
+                top_k_idx[final_pos, :k_eff]  = i_final_c_sorted
+                out_nk[final_pos, :k_eff]     = keys_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
+                out_nv[final_pos, :k_eff]     = vals_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
+                out_labels[final_pos, :k_eff] = labels_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff)
+
+            else:
+                # ── 이례적 경로: 큰 그룹 / 작은 그룹 분리 (드문 경우만) ──
+                big_mask = grp_sizes_u > _OUTLIER_THRESHOLD          # (U,) bool
+                for tier_mask in (~big_mask, big_mask):
+                    if not tier_mask.any():
+                        continue
+                    query_in_tier = tier_mask[group_id]              # (Bn,) bool
+                    if not query_in_tier.any():
+                        continue
+                    sel_pos = query_in_tier.nonzero(as_tuple=True)[0]  # (Bt,) csorted 좌표계 위치
+
+                    tier_uniq_local = tier_mask.nonzero(as_tuple=True)[0]  # (Ut,) 0..U-1 인덱스
+                    Ut = tier_uniq_local.shape[0]
+                    remap = torch.full((U,), -1, dtype=torch.long, device=dev)
+                    remap[tier_uniq_local] = torch.arange(Ut, device=dev)
+
+                    local_gid  = remap[group_id[sel_pos]]            # (Bt,) 0..Ut-1
+                    local_rank = rank[sel_pos]                        # (Bt,)
+                    q_sel      = q_c_sorted[sel_pos]                  # (Bt, D)
+
+                    tier_centroid_ids = uniq[tier_uniq_local]         # (Ut,) 실제 centroid id
+                    tier_counts       = counts[tier_uniq_local]       # (Ut,)
+
+                    Ut_pad = ((Ut + 7) // 8) * 8
+                    if Ut_pad > Ut:
+                        pad_ids2 = tier_centroid_ids[:1].expand(Ut_pad - Ut)
+                        tier_centroid_ids_p = torch.cat([tier_centroid_ids, pad_ids2], dim=0)
+                    else:
+                        tier_centroid_ids_p = tier_centroid_ids
+
+                    max_q_tier_raw = int(tier_counts.max())
+                    max_q_tier = ((max_q_tier_raw + 15) // 16) * 16
+                    max_q_tier = min(max_q_tier, Bn)
+
+                    local_max_g_tier_raw = max(
+                        int(self._cached_group_sizes[tier_centroid_ids].max()), k
+                    )
+                    local_max_g_tier = ((local_max_g_tier_raw + 255) // 256) * 256
+                    local_max_g_tier = min(local_max_g_tier, self._cached_groups.shape[1])
+
+                    Q_pad_t = torch.zeros(Ut_pad, max_q_tier, D, device=dev)
+                    Q_pad_t[local_gid, local_rank] = q_sel
+
+                    cand_t  = self._cached_groups[tier_centroid_ids_p, :local_max_g_tier]
+                    valid_t = cand_t >= 0
+                    safe_t  = cand_t.clamp(min=0, max=n - 1)
+                    keys_t  = self._keys_norm[:n][safe_t.reshape(-1)].view(Ut_pad, local_max_g_tier, D)
+
+                    sim_t = torch.bmm(Q_pad_t, keys_t.transpose(1, 2))
+                    sim_t = sim_t.masked_fill(~valid_t.unsqueeze(1), -1e9)
+
+                    k_eff_t = min(k, local_max_g_tier)
+                    _, top_t  = sim_t.topk(k_eff_t, dim=-1)
+                    i_final_t = safe_t.unsqueeze(1).expand(-1, max_q_tier, -1).gather(2, top_t)
+                    i_final_sel = i_final_t[local_gid, local_rank]      # (Bt, k_eff_t)
+
+                    final_pos_t = nm_idx[csort_idx[sel_pos]]            # (Bt,) 원래 배치(B) 내 최종 위치
+                    top_k_idx[final_pos_t, :k_eff_t]  = i_final_sel
+                    out_nk[final_pos_t, :k_eff_t]     = keys_full[i_final_sel.reshape(-1)].view(-1, k_eff_t, D)
+                    out_nv[final_pos_t, :k_eff_t]     = vals_full[i_final_sel.reshape(-1)].view(-1, k_eff_t, D)
+                    out_labels[final_pos_t, :k_eff_t] = labels_full[i_final_sel.reshape(-1)].view(-1, k_eff_t)
 
         # fallback 샘플: 인접 centroid 그룹까지 확장하여 검색 (cross-group)
         # 기존: zeros 유지 (사실상 전체 검색 포기)
