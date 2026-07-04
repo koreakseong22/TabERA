@@ -244,10 +244,18 @@ class TabERAWrapper:
                     # 걸린 시간을 바로 출력. 원인 확인되면 제거할 것.
                     _epoch_elapsed = time.perf_counter() - _epoch_t0
                     _diag_mem = ""
+                    _free_b_for_threshold = None   # 아래 update_outlier_threshold()에서 재사용
                     if torch.cuda.is_available() and str(self.device).startswith("cuda"):
                         try:
                             _free_b, _total_b = torch.cuda.mem_get_info(self.device)
-                            _diag_mem = f"  free_gpu={_free_b/1e9:.2f}/{_total_b/1e9:.2f}GB"
+                            _free_b_for_threshold = _free_b
+                            _reserved_b = torch.cuda.memory_reserved(self.device)
+                            _allocated_b = torch.cuda.memory_allocated(self.device)
+                            _diag_mem = (
+                                f"  free_gpu={_free_b/1e9:.2f}/{_total_b/1e9:.2f}GB"
+                                f"  torch_reserved={_reserved_b/1e9:.2f}GB"
+                                f"  torch_allocated={_allocated_b/1e9:.2f}GB"
+                            )
                         except Exception:
                             pass
                     tqdm.write(
@@ -258,6 +266,17 @@ class TabERAWrapper:
                         f"max={ema_stats.get('max_cluster_size', 0)}"
                         f"{_diag_mem}"
                     )
+
+                    # ── retrieve()의 하이브리드 임계값을 실제 GPU 여유 메모리
+                    # 기준으로 매 epoch 갱신 (근거 없는 고정 상수 대신).
+                    # 위에서 이미 조회한 free_gpu 값을 재사용 — retrieve()
+                    # 자체(배치마다 호출됨)에서 따로 GPU를 조회하지 않도록
+                    # 하기 위함 (매 배치 조회하면 동기화 오버헤드 재발).
+                    if _free_b_for_threshold is not None:
+                        self.model.memory.update_outlier_threshold(
+                            n_prototypes=self.model.prototype_layer.P,
+                            free_bytes=_free_b_for_threshold,
+                        )
 
                     # ── 안전장치 1: retrieve()의 다음 배치 메모리 요구량 추정 ──
                     # active_ratio 스트릭과 무관하게 독립적으로 체크한다.

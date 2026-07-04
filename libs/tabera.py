@@ -84,6 +84,65 @@ class MemoryBank(nn.Module):
         # update() 시 O(B)로 증분 갱신, retrieve()에서는 그대로 gather만 함.
         self.register_buffer("_keys_norm", torch.zeros(max_size, embed_dim))
 
+        # [출처 명확화] retrieve()가 "그룹 하나가 이례적으로 커서 나머지
+        # 모두를 그 폭에 맞춰 패딩하는 게 낭비인지"를 판단하는 임계값.
+        # 기본값 4096은 어떤 계산/문헌 근거도 없는 값 — 초기화 시점(에폭 0,
+        # GPU 메모리 조회 전)이나 CPU 환경에서만 쓰이는 안전한 폴백일 뿐.
+        # 학습 중에는 매 epoch update_outlier_threshold()가 실제 GPU 여유
+        # 메모리를 반영해서 이 값을 다시 계산해 덮어씀 — retrieve()가 매
+        # 배치 GPU를 조회하면(동기화 오버헤드) 예전에 없앤 문제가 재발하므로,
+        # 조회는 epoch당 1회(supervised.py)로 제한.
+        self._outlier_threshold = 4096
+
+    def update_outlier_threshold(
+        self,
+        n_prototypes: int,
+        free_bytes: "Optional[int]" = None,
+        device: "Optional[torch.device]" = None,
+        safety_fraction: float = 0.3,
+    ) -> None:
+        """
+        retrieve()의 "정상 경로"(단일 텐서)가 만들 것으로 예상되는 텐서 크기가
+        현재 남은 GPU 메모리의 safety_fraction을 넘지 않도록, local_max_g의
+        임계값을 역산한다. 근거 없는 고정 상수(4096) 대신 실제 자원 제약에
+        직접 결부시키기 위함 — supervised.py의 collapse 안전장치와 동일한
+        원칙. epoch당 1회만 호출할 것을 전제로 함(배치마다 부르면 GPU 조회로
+        인한 동기화 오버헤드가 재발함).
+
+        Parameters
+        ──────────
+        n_prototypes : 전체 centroid 수(P) — 한 배치에 등장 가능한 unique
+                       centroid 수(U)의 최악의 경우 상한으로 사용.
+        free_bytes   : 이미 조회한 남은 GPU 메모리(바이트). None이면 함수
+                       내부에서 직접 조회(추가 동기화 1회 발생).
+        device       : free_bytes를 안 넘겼을 때 조회에 쓸 device.
+        safety_fraction : 정상 경로 텐서가 남은 메모리의 이 비율을 넘으면
+                       위험하다고 판단 (기본 0.3 — keys_u 외 Q_pad/sim_u
+                       등 부수 텐서도 있어 여유를 둠).
+        """
+        if free_bytes is None:
+            if device is None or not torch.cuda.is_available() or not str(device).startswith("cuda"):
+                return  # CPU 등 GPU 메모리 개념이 없는 환경 → 폴백(4096) 유지
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(device)
+            except Exception:
+                return  # 조회 실패 → 폴백 유지
+
+        D = self.keys.shape[1]
+        U_pad_worst = ((n_prototypes + 7) // 8) * 8  # 배치 내 unique centroid 수의 최악의 경우 상한
+        # keys_u + Q_pad + sim_u 등 부수 텐서를 대략 3배로 어림 (정확한
+        # 수치가 아니라 "이 정도면 위험하다"는 자릿수 판단용 — 이 3배율도
+        # 검증된 상수는 아니고 supervised.py의 안전장치에서 쓴 것과 같은
+        # 수준의 어림값임을 명시)
+        denom = U_pad_worst * D * 4 * 3
+        if denom <= 0:
+            return
+        new_threshold = int((free_bytes * safety_fraction) / denom)
+        # 256배수로 내림 (retrieve()의 라운딩 단위와 맞춤), 너무 작아지지
+        # 않도록 최소 k*4 이상은 보장
+        new_threshold = max((new_threshold // 256) * 256, 512)
+        self._outlier_threshold = new_threshold
+
     @torch.no_grad()
     def update(self, keys, vals, labels):
         B   = keys.shape[0]
@@ -189,6 +248,13 @@ class MemoryBank(nn.Module):
         D   = query.shape[1]
         dev = query.device
 
+        # [임시 진단] 하이브리드(이례적) 경로가 실제로 발동하는지 배치 단위로
+        # 카운트 — 41150 검증 완료되면 제거할 것. supervised.py에서 epoch마다
+        # 읽어서 로그로 보여줌.
+        if not hasattr(self, "_normal_path_count"):
+            self._normal_path_count = 0
+            self._hybrid_path_count = 0
+
         keys_full   = self.keys[:n]    # (n, D)
         vals_full   = self.vals[:n]    # (n, D)
         labels_full = self.labels[:n]  # (n,)
@@ -264,12 +330,16 @@ class MemoryBank(nn.Module):
             # N=104,050에서 max_cluster_size가 3,526→34,195까지 커지며 실측
             # 됨 — 대부분 centroid는 건강한데 소수만 비대해지는 경우라
             # active_ratio 기반 collapse 감지로는 못 잡음).
-            # 정상 규모(임계값 이하)에서는 기존 단일-텐서 빠른 경로를 그대로
-            # 써서 추가 오버헤드가 전혀 없게 하고, 임계값을 넘는 드문 경우만
-            # "큰 그룹" / "작은 그룹"으로 나눠 각자에 맞는 폭으로 처리한다.
-            _OUTLIER_THRESHOLD = 4096
+            # [출처 명확화] 이 임계값은 self._outlier_threshold — 근거 없는
+            # 고정 상수가 아니라 update_outlier_threshold()가 실제 GPU 여유
+            # 메모리 기준으로 계산해 넣어둔 값 (supervised.py가 epoch당 1회
+            # 갱신). 아직 한 번도 갱신 안 됐거나 CPU 환경이면 __init__의
+            # 폴백값(4096, 이것도 근거 없는 값)이 쓰임 — 이 경우는 문서화된
+            # 한계로 남겨둠.
+            _OUTLIER_THRESHOLD = self._outlier_threshold
 
             if local_max_g_raw <= _OUTLIER_THRESHOLD:
+                self._normal_path_count += 1   # [임시 진단]
                 # ── 정상 경로: 기존과 완전히 동일 (오버헤드 없음) ──────
                 _round_u = 8
                 U_pad = ((U + _round_u - 1) // _round_u) * _round_u
@@ -310,6 +380,7 @@ class MemoryBank(nn.Module):
                 out_labels[final_pos, :k_eff] = labels_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff)
 
             else:
+                self._hybrid_path_count += 1   # [임시 진단]
                 # ── 이례적 경로: 큰 그룹 / 작은 그룹 분리 (드문 경우만) ──
                 big_mask = grp_sizes_u > _OUTLIER_THRESHOLD          # (U,) bool
                 for tier_mask in (~big_mask, big_mask):
