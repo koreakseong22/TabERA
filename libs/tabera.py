@@ -864,10 +864,184 @@ class TabERA(nn.Module):
     def feature_store(self) -> Optional[FeatureStore]:
         return self._feature_store
 
+    # ─────────────────────────────────────────────────────────
+    # IG 계산 전용 soft-forward (예측/학습에는 전혀 사용하지 않음)
+    # ─────────────────────────────────────────────────────────
+    def forward_soft_for_ig(
+        self,
+        X: torch.Tensor,                       # (B, F)
+        target_fn,                              # out(dict) -> (B,) 스칼라
+    ) -> torch.Tensor:
+        """
+        Integrated Gradients 계산 전용 대체 forward.
+
+        실제 예측(forward)은 hard_assignment = argmax로 계산되는
+        불연속 함수이며, 이 불연속성이 IG의 completeness axiom을
+        깨뜨리는 근본 원인이다 (baseline→input 경로에서 centroid
+        경계를 넘을 때 context_emb가 점프하기 때문).
+
+        이 메서드는 그 불연속을 제거한 "soft" 버전의 forward를
+        별도로 정의한다:
+
+            forward (실제 예측, 변경 없음):
+                context_emb = C_emb[argmax(sim)]        — 불연속
+
+            forward_soft_for_ig (설명 전용, 이 메서드):
+                context_emb_soft = Σ_p softmax(sim)_p · C_emb[p]  — 연속
+
+        학습된 파라미터(embedder, centroid_emb, ot_selector, head)는
+        전부 그대로 재사용한다. 이 함수는 예측값을 생성하지 않으며,
+        오직 IG의 completeness axiom이 엄밀히 성립하는 대체 함수
+        F_soft(x)를 만들기 위한 것이다.
+
+        Sanity check: 반환된 logits로 계산한 예측과 실제 forward()의
+        예측 사이의 차이 |F_soft(x) - ŷ(x)|를 별도로 측정해,
+        routing이 confident할수록(hard_assignment의 top-1 softmax
+        확률이 1에 가까울수록) 이 갭이 작아지는지 확인할 수 있다.
+
+        Parameters
+        ──────────
+        X         : (B, F) 입력
+        target_fn : model(x) 출력 dict를 받아 (B,) per-sample 스칼라를
+                    반환하는 함수. compute_integrated_gradients와
+                    동일한 시그니처 (예: make_logit_target_fn 결과).
+
+        Returns
+        ──────────
+        target : (B,) target_fn이 반환하는 값 (보통 logits 기반)
+        """
+        query_emb = self.embedder(X)                                # (B, D)
+
+        # ── soft context_emb (연속) ──────────────────────────────
+        q = F.normalize(query_emb, dim=-1)
+        c = F.normalize(self.prototype_layer.centroid_emb, dim=-1)  # (P, D)
+        sim = q @ c.T                                                # (B, P)
+        routing_probs_soft = F.softmax(sim, dim=-1)                  # (B, P), 연속
+        context_emb_soft = routing_probs_soft @ self.prototype_layer.centroid_emb  # (B, D)
+
+        # hard_assignment는 retrieve(그룹 제약 검색)에 필요 — 이 부분은
+        # 원래도 미분 대상이 아니므로(no_grad) soft로 바꿔도 얻는 것이 없다.
+        hard_assignment = sim.argmax(dim=-1)
+
+        # ── agg_emb: 기존 forward와 동일 경로 (이미 연속, query_emb 경유) ──
+        if self.memory.filled.item() >= self.k:
+            nk, nv, neighbour_labels, _ = self.memory.retrieve(
+                query_emb, self.k,
+                hard_assignment=(None if self.global_retrieve else hard_assignment),
+            )
+            agg_emb, _ = self.ot_selector(query_emb, nk, nv, neighbour_labels)
+        else:
+            agg_emb = torch.zeros_like(query_emb)
+
+        # ── head 입력 구성 (기존과 동일한 구조, context_emb만 soft) ──
+        if self.use_context_emb:
+            _ctx_for_head = context_emb_soft
+            if self.context_proj is not None:
+                _ctx_for_head = self.context_proj(_ctx_for_head)
+            combined = torch.cat([query_emb, _ctx_for_head, agg_emb], dim=-1)
+        else:
+            combined = torch.cat([query_emb, agg_emb], dim=-1)
+
+        logits_soft = self.head(combined)
+
+        return target_fn({"logits": logits_soft, "agg_emb": agg_emb})
+
+    def get_fixed_neighbors_for_ig(self, X: torch.Tensor):
+        """
+        forward_fixed_neighbors_for_ig에서 사용할 "고정 이웃"을 input
+        시점(X) 기준으로 미리 계산해 반환한다. IG의 baseline→input 경로
+        전체에서 이 고정된 (nk, nv, neighbour_labels)를 그대로 재사용해,
+        경로 중간에 hard_assignment가 바뀌어도 이웃 집합이 재계산되지
+        않도록 한다.
+        """
+        with torch.no_grad():
+            query_emb = self.embedder(X)
+            q = F.normalize(query_emb, dim=-1)
+            c = F.normalize(self.prototype_layer.centroid_emb, dim=-1)
+            hard_assignment = (q @ c.T).argmax(dim=-1)
+            if self.memory.filled.item() >= self.k:
+                nk, nv, neighbour_labels, _ = self.memory.retrieve(
+                    query_emb, self.k,
+                    hard_assignment=(None if self.global_retrieve else hard_assignment),
+                )
+            else:
+                nk = nv = neighbour_labels = None
+        return nk, nv, neighbour_labels
+
+    def forward_fixed_neighbors_for_ig(
+        self,
+        X: torch.Tensor,                       # (B, F)
+        target_fn,                              # out(dict) -> (B,) 스칼라
+        fixed_nk: "Optional[torch.Tensor]" = None,
+        fixed_nv: "Optional[torch.Tensor]" = None,
+        fixed_neighbour_labels: "Optional[torch.Tensor]" = None,
+    ) -> torch.Tensor:
+        """
+        agg_emb 경로의 이산적 전환을 제거한 대체 forward (인과 검증 전용).
+
+        [배경] neighbor_change(baseline→input 경로에서 top-K 이웃 집합이
+        얼마나 바뀌는지)와 completeness error 사이에 유의미한 상관관계가
+        확인됐다 (Spearman ρ≈0.23, jackknife+partial correlation 통과).
+        하지만 이는 관찰적 상관관계일 뿐, agg_emb 경로의 불연속이 진짜
+        원인이라는 인과적 증거는 아니다.
+
+        이 메서드는 retrieve()가 baseline→input 경로 중간에 hard_assignment
+        변화에 따라 이웃을 다시 뽑는 것을 막고, **input(X) 시점에 뽑힌
+        이웃(fixed_nk, fixed_nv, fixed_neighbour_labels)을 경로 전체에서
+        고정**해서 사용한다. 즉 agg_emb 계산에서 "어떤 이웃을 쓰는가"는
+        더 이상 경로 위치(alpha)에 의존하지 않는다 — 이산적 전환이 인위적으로
+        제거된 상태.
+
+        이 상태에서 IG를 계산했을 때 completeness error가 실제로 줄어들면,
+        neighbor_change와 completeness error의 관계가 상관관계를 넘어
+        인과관계라는 gold-standard 증거가 된다. 동시에 이는 향후 개선
+        방향("retrieve top-K 내에서 evidence_w를 soft하게 유지")이 실제로
+        completeness를 개선할지에 대한 저비용 사전 검증(pilot)이기도 하다.
+
+        Parameters
+        ──────────
+        X                      : (B, F) 입력 (baseline→input 경로의 보간점)
+        target_fn              : compute_integrated_gradients와 동일 시그니처
+        fixed_nk/nv/labels     : get_fixed_neighbors_for_ig(X_input)으로 미리
+                                  계산해둔, input 시점 기준 고정 이웃
+
+        Returns
+        ──────────
+        target : (B,) target_fn이 반환하는 값
+        """
+        query_emb = self.embedder(X)                                # (B, D)
+
+        # context_emb는 실제 forward와 동일하게 hard argmax 사용
+        # (여기서 검증하려는 건 agg_emb 경로 단독의 효과이므로, context_emb
+        # 경로는 건드리지 않고 그대로 둔다 — 두 경로를 한 번에 바꾸면
+        # 어느 쪽 효과인지 구분할 수 없어짐)
+        q = F.normalize(query_emb, dim=-1)
+        c = F.normalize(self.prototype_layer.centroid_emb, dim=-1)
+        hard_assignment = (q @ c.T).argmax(dim=-1)
+        context_emb = self.prototype_layer.centroid_emb[hard_assignment]
+
+        # ── agg_emb: 고정된 이웃 사용 (경로 위치와 무관) ──────────
+        if fixed_nk is not None:
+            agg_emb, _ = self.ot_selector(query_emb, fixed_nk, fixed_nv, fixed_neighbour_labels)
+        else:
+            agg_emb = torch.zeros_like(query_emb)
+
+        if self.use_context_emb:
+            _ctx_for_head = context_emb
+            if self.context_proj is not None:
+                _ctx_for_head = self.context_proj(_ctx_for_head)
+            combined = torch.cat([query_emb, _ctx_for_head, agg_emb], dim=-1)
+        else:
+            combined = torch.cat([query_emb, agg_emb], dim=-1)
+
+        logits_fixed = self.head(combined)
+
+        return target_fn({"logits": logits_fixed, "agg_emb": agg_emb})
+
     def anneal(self, factor: float = 0.95) -> None:
         self.prototype_layer.anneal(factor)
 
-    def summary(self) -> str:
+    def summary(self, n_train: Optional[int] = None) -> str:
         total = sum(p.numel() for p in self.parameters())
         lines = ["=" * 48, "TabERA", "=" * 48,
                  f"  Parameters     : {total:,}",
@@ -881,5 +1055,26 @@ class TabERA(nn.Module):
                  f"  context_emb    : {'IN head input' if self.use_context_emb else 'EXCLUDED (진단용, ablation)'}",
                  f"  context grad   : {'STOP (진단용, ablation)' if self.detach_context_grad else 'flows to centroid_emb'}",
                  f"  context proj   : {'Linear projection (구조 조정)' if self.context_proj is not None else 'none (raw concat)'}"]
+
+        # [Limitation 진단] k가 평균 그룹 크기(N_train/P)보다 크면
+        # cross-group fallback이 상시 발동할 위험이 있음 — 4개 데이터셋
+        # 진단(dataset_profile)에서 실측: vehicle(k=64, 평균 그룹=28.2)은
+        # fallback 75.3%, ada/qsar/wine(k ≤ 평균 그룹 크기)은 7~14%.
+        # "group-constrained KNN"이라는 설명②의 클레임이 데이터셋 크기와
+        # k 선택에 따라 실제로 지켜지는 정도가 다름을 알리기 위한 경고.
+        if n_train is not None and self.prototype_layer.P > 0:
+            avg_group_size = n_train / self.prototype_layer.P
+            ratio = self.k / avg_group_size
+            lines.append(f"  Avg group size : {avg_group_size:.1f}  (N_train={n_train:,} / P={self.prototype_layer.P})")
+            if ratio > 1.0:
+                lines.append(
+                    f"  ⚠️  k({self.k}) > 평균 그룹 크기({avg_group_size:.1f}) "
+                    f"— cross-group fallback이 상시 발동할 가능성 높음"
+                )
+                lines.append(
+                    f"     (설명②의 'group-constrained' 클레임이 이 설정에서는 "
+                    f"약화될 수 있음 — 참고: reproduce.py --ablation dataset_profile)"
+                )
+
         lines.append(self.prototype_layer.centroid_summary(top_n=3))
         return "\n".join(lines)

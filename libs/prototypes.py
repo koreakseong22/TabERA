@@ -255,32 +255,40 @@ class CentroidLayer(nn.Module):
             c = F.normalize(self.centroid_emb, dim=-1)
             assignments = (q @ c.T).argmax(dim=-1)
 
-        sizes = []
-        new_groups: List[List[int]] = [[] for _ in range(self.P)]
+        # ── 벡터화된 medoid 계산 ────────────────────────────────
+        # 기존: for p in range(P) → P번 GPU→CPU sync 발생
+        # 개선: 전체를 한 번에 행렬 연산 → GPU에서 한 번에 처리
+        P   = self.P
+        c_norm     = F.normalize(self.centroid_emb.float(), dim=-1)  # (P, D)
+        X_emb_norm = F.normalize(X_emb.float(), dim=-1)              # (N, D)
 
-        # centroid_emb 정규화 (medoid 계산용, 루프 밖에서 1회만)
-        c_norm = F.normalize(self.centroid_emb.float(), dim=-1)  # (P, D)
-        # 전체 임베딩 정규화 (루프 밖에서 1회만)
-        X_emb_norm = F.normalize(X_emb.float(), dim=-1)          # (N, D)
+        # (N, P) similarity matrix — 각 샘플이 각 centroid와 얼마나 가까운가
+        # 한 번의 행렬곱으로 모든 (sample, centroid) similarity 계산
+        all_sims = X_emb_norm @ c_norm.T                             # (N, P)
 
-        for p in range(self.P):
-            mask = (assignments == p)
-            size = int(mask.sum().item())
-            sizes.append(size)
-            nz = mask.nonzero(as_tuple=True)[0]
-            new_groups[p] = nz.tolist()
+        # 각 centroid p에 대해: 그 centroid에 배정된 샘플 중 similarity 최대인 샘플 = medoid
+        # assignments가 p인 샘플은 all_sims[:, p]에서 해당 위치만 유효
+        # 배정 안 된 centroid는 -inf로 마스킹
+        INF = torch.finfo(all_sims.dtype).min
+        # assignments를 one-hot처럼 사용: (N, P)에서 배정된 위치만 유효
+        assigned_mask = (assignments.unsqueeze(1) == torch.arange(P, device=assignments.device).unsqueeze(0))  # (N, P)
+        masked_sims = torch.where(assigned_mask, all_sims, torch.tensor(INF, device=all_sims.device))  # (N, P)
+        medoid_indices = masked_sims.argmax(dim=0)  # (P,) — 각 centroid의 medoid 샘플 인덱스
 
-            if size == 0:
-                continue
+        # centroid_x 일괄 업데이트 (medoid가 있는 centroid만)
+        if X_raw is not None and self.centroid_x is not None:
+            for p in range(P):
+                if assigned_mask[:, p].any():
+                    self.centroid_x.data[p] = X_raw[medoid_indices[p]].float()
 
-            # centroid_x = medoid 갱신
-            # latent space 기준 centroid_emb[p]에 가장 가까운 실제 훈련 샘플
-            if X_raw is not None and self.centroid_x is not None:
-                emb_group  = X_emb_norm[mask]          # (n_p, D) 정규화된 그룹 임베딩
-                sims       = emb_group @ c_norm[p]     # (n_p,)   centroid_emb[p]와 유사도
-                medoid_pos = sims.argmax()              # 그룹 내 상대 인덱스
-                medoid_abs = nz[medoid_pos]             # 전체 데이터 절대 인덱스
-                self.centroid_x.data[p] = X_raw[medoid_abs].float()
+        # sample_groups: assignments를 CPU에서 한 번만 변환
+        assignments_cpu = assignments.cpu()
+        new_groups: List[List[int]] = [[] for _ in range(P)]
+        sizes = [0] * P
+        for p in range(P):
+            mask_cpu = (assignments_cpu == p).nonzero(as_tuple=True)[0]
+            new_groups[p] = mask_cpu.tolist()
+            sizes[p] = len(new_groups[p])
 
         self.sample_groups = new_groups
         self.current_epoch += 1
