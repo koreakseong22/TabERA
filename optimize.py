@@ -58,7 +58,7 @@ args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
 
-import optuna, torch, json, joblib, datetime, math
+import optuna, torch, json, joblib, datetime, math, gc
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
 from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs
@@ -235,7 +235,15 @@ if train:
         # 이전 trial에서 쓴 GPU 메모리를 내부 캐시로 들고 있으면 다음 trial의
         # collapse 안전장치(supervised.py)가 "여유 메모리 0"으로 오판할 수
         # 있음 (실측 확인됨). trial 사이에 명시적으로 반납.
+        # [추가] del만으로는 부족할 수 있음 — autograd 그래프(tensor↔grad_fn)가
+        # 참조 순환을 만들면 CPython의 단순 참조 카운팅으로는 즉시 회수가
+        # 안 되고, 순환 GC(gc.collect())가 돌아야 풀림. 작은 데이터셋
+        # (id=41027, N=35,855)에서는 trial당 찌꺼기가 작아 눈에 안 띄었지만,
+        # 더 큰 데이터셋(id=41150, N=104,050)+무거운 하이퍼파라미터 조합에서
+        # trial을 거듭할수록(7번째 trial쯤) GPU가 서서히 채워지다 못해
+        # collapse 안전장치가 오작동하는 현상으로 실측 확인됨.
         del model, wrapper
+        gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
