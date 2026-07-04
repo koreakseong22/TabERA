@@ -415,7 +415,16 @@ class TabERAWrapper:
 
     # ── 배치 추론 ────────────────────────────────────────────
 
-    def _forward_batched(self, X: torch.Tensor, batch_size: int = 1024) -> torch.Tensor:
+    def _forward_batched(self, X: torch.Tensor, batch_size: Optional[int] = None) -> torch.Tensor:
+        # [버그 수정] 기본값 1024가 학습 배치 크기(HPO가 고른 128~512)보다
+        # 커서, centroid collapse로 그룹이 비대해진 상황에서 검증이 학습보다
+        # 훨씬 느려지는 현상이 실측됨(val_forward가 몇 epoch 만에 1초→76초로
+        # 폭증, 학습 자체는 5~6초로 안정적이었음). 배치가 클수록 그 배치 안에
+        # 거대 그룹을 가리키는 쿼리가 포함될 확률이 높아지고, retrieve()의
+        # U/local_max_g 라운딩까지 겹쳐 배치별 텐서가 학습 때보다 커짐.
+        # 검증도 학습과 같은 배치 크기를 쓰도록 통일.
+        if batch_size is None:
+            batch_size = self.params.get("batch_size", 512)
         parts = []
         for start in range(0, len(X), batch_size):
             parts.append(self.model(X[start:start + batch_size])["logits"])
