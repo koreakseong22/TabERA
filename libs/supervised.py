@@ -356,8 +356,15 @@ class TabERAWrapper:
             _val_t0 = time.perf_counter()   # [임시 진단]
             self.model.eval()
             with torch.no_grad():
-                val_logits = self._forward_batched(X_val)
-                val_m  = compute_metric(val_logits, y_val, self.tasktype)
+                # [임시 진단/가설 검증] X_val은 항상 고정된 순서라, 특정 구간에
+                # 비슷한 샘플이 몰려있으면 그 구간 배치들이 매 epoch 계속
+                # 같은(적은 수의) centroid로만 라우팅되어 U는 작고
+                # local_max_g만 큰 최악의 조합이 반복될 수 있음. 학습은
+                # randperm으로 매 epoch 섞여서 이런 편중이 평균화되는데
+                # 검증만 고정 순서였음 — 매 epoch 셔플해서 이 가설을 검증.
+                _val_perm  = torch.randperm(len(X_val), device=self.device)
+                val_logits = self._forward_batched(X_val[_val_perm])
+                val_m  = compute_metric(val_logits, y_val[_val_perm], self.tasktype)
             val_v = list(val_m.values())[0]
             _val_elapsed = time.perf_counter() - _val_t0   # [임시 진단]
 
