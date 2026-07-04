@@ -248,13 +248,6 @@ class MemoryBank(nn.Module):
         D   = query.shape[1]
         dev = query.device
 
-        # [임시 진단] 하이브리드(이례적) 경로가 실제로 발동하는지 배치 단위로
-        # 카운트 — 41150 검증 완료되면 제거할 것. supervised.py에서 epoch마다
-        # 읽어서 로그로 보여줌.
-        if not hasattr(self, "_normal_path_count"):
-            self._normal_path_count = 0
-            self._hybrid_path_count = 0
-
         keys_full   = self.keys[:n]    # (n, D)
         vals_full   = self.vals[:n]    # (n, D)
         labels_full = self.labels[:n]  # (n,)
@@ -339,7 +332,6 @@ class MemoryBank(nn.Module):
             _OUTLIER_THRESHOLD = self._outlier_threshold
 
             if local_max_g_raw <= _OUTLIER_THRESHOLD:
-                self._normal_path_count += 1   # [임시 진단]
                 # ── 정상 경로: 기존과 완전히 동일 (오버헤드 없음) ──────
                 _round_u = 8
                 U_pad = ((U + _round_u - 1) // _round_u) * _round_u
@@ -380,7 +372,6 @@ class MemoryBank(nn.Module):
                 out_labels[final_pos, :k_eff] = labels_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff)
 
             else:
-                self._hybrid_path_count += 1   # [임시 진단]
                 # ── 이례적 경로: 큰 그룹 / 작은 그룹 분리 (드문 경우만) ──
                 big_mask = grp_sizes_u > _OUTLIER_THRESHOLD          # (U,) bool
                 for tier_mask in (~big_mask, big_mask):
