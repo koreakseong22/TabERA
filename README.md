@@ -51,24 +51,33 @@ Explanation ③ is computed afterward via IG, independent of stages 2–3's inte
 
 ### Faithfulness of explanation ③
 
-IG attributes `ŷ(x) - ŷ(x̄)` to each feature along a straight-line path from baseline `x̄` to `x`. Its *Completeness* axiom (attributions sum exactly to `ŷ(x)-ŷ(x̄)`) is directly measurable, and turns out to hinge heavily on `x̄`.
+We evaluate ③ on two axes: how well its attributions satisfy IG's own Completeness axiom (attributions sum to `ŷ(x) - ŷ(x̄)`), and how well they perform against SHAP on standard deletion/insertion faithfulness.
 
-With the dataset **mean** as baseline, completeness error is large and inconsistent (median relative error 19–319% across datasets) — the mean typically doesn't fall inside any centroid's region, so the IG path often crosses a routing boundary where `context_emb` jumps discretely, a discontinuity IG's theory doesn't account for.
+**Completeness, by baseline choice.** Median relative completeness error, dataset mean vs. centroid medoid as baseline `x̄`:
 
-TabERA already has a fix built in: using the **medoid** (`centroid_x`, same one used for ①) as baseline instead collapses completeness error 8–78× across every dataset tested:
+| Dataset | Mean baseline | Medoid baseline |
+|---|---|---|
+| `vehicle` | 146.5% | 17.5% |
+| `ada_agnostic` | 19.4% | 1.5% |
+| `qsar-biodeg` | 53.4% | 1.8% |
+| `wine_quality` | 319.1% | 4.1% |
 
-| Dataset | Mean-baseline error (median %) | Medoid-baseline error (median %) | Improvement |
-|---|---|---|---|
-| `vehicle` | 146.5% | 17.5% | 8.4× |
-| `ada_agnostic` | 19.4% | 1.5% | 13× |
-| `qsar-biodeg` | 53.4% | 1.8% | 30× |
-| `wine_quality` | 319.1% | 4.1% | 78× |
+We use the centroid medoid (`centroid_x`, the same one used for ①) as the default baseline throughout, since it consistently gives the lower completeness error.
 
-This is a genuine secondary contribution — TabERA's own retrieval structure supplies a principled solution to IG's baseline-selection problem that a plain feedforward network doesn't have.
+**Deletion/Insertion AUC vs. SHAP** (medoid baseline for TabERA; SHAP background also set to the medoids for a like-for-like comparison; paired Wilcoxon signed-rank test per dataset):
 
-Better completeness doesn't automatically mean better attributions, so we checked directly: comparing TabERA's IG (medoid baseline) against SHAP (background also set to medoids, for a fair comparison) on deletion/insertion AUC, with paired Wilcoxon tests, across the same four datasets — only 3 of 8 comparisons reached significance, and they didn't agree in direction (SHAP better on `ada`/`wine` deletion, TabERA better on `wine` insertion, no significant difference elsewhere). We read this as an honest null: under a rigorous baseline, ③ is not consistently more or less faithful than SHAP. Explanations ①② remain TabERA's primary contribution; ③ is a reasonably-behaved, "comes for free" complement, not evidence that TabERA beats post-hoc attribution.
+| Dataset | Deletion AUC ↓ (TabERA / SHAP) | Insertion AUC ↑ (TabERA / SHAP) |
+|---|---|---|
+| `vehicle` | 0.676 / 0.623 (n.s.) | 0.736 / 0.716 (n.s.) |
+| `ada_agnostic` | 0.794 / 0.784 (SHAP, p=0.01) | 0.854 / 0.850 (n.s.) |
+| `qsar-biodeg` | 0.724 / 0.732 (n.s.) | 0.885 / 0.848 (n.s., p=0.08) |
+| `wine_quality` | 0.466 / 0.512 (SHAP, p<0.01) | 0.569 / 0.516 (TabERA, p<0.001) |
 
-*(Caveat on ②: cross-group fallback can trigger far more often than the name "group-constrained" suggests when HPO's chosen K exceeds the average group size — 75% of samples on the smallest dataset tested (`vehicle`, N=676) vs. 7–14% on larger ones. Worth keeping in mind when reading ② on small datasets.)*
+*n.s. = not significant (paired Wilcoxon signed-rank test, p≥0.05) — i.e., the observed difference between TabERA and SHAP cannot be distinguished from sample noise.*
+
+Across the 8 dataset×metric comparisons, 3 reach significance and the direction is mixed (2 favoring SHAP, 1 favoring TabERA). ③ is therefore best read as on par with SHAP rather than superior to it — its practical advantages are that it requires no background distribution or sampling budget, just a single gradient pass, and (with the medoid baseline above) a completeness guarantee we can verify directly. Explanations ①② remain TabERA's primary and architecturally distinctive contribution.
+
+*(Caveat on ②: cross-group fallback can trigger far more often than "group-constrained" suggests when HPO's chosen K exceeds the average group size — 75% of samples on the smallest dataset tested (`vehicle`, N=676) vs. 7–14% on larger ones.)*
 
 ### Cognitive inspiration
 
