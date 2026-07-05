@@ -92,22 +92,35 @@ query_emb ∈ ℝ^D
 
 ### Faithfulness of explanation ③
 
-We measure faithfulness as the Spearman rank correlation between a feature-attribution method's ranking and the ranking by *actual* effect on ŷ (each feature individually perturbed to its training-set mean; ranked by |Δlogits|).
+Explanation ③ uses Integrated Gradients (Sundararajan et al., 2017), which differentiates `ŷ` back through the full model along a straight-line path from a baseline `x̄` to the input `x`, and attributes the difference `ŷ(x) - ŷ(x̄)` to each input feature. That attribution is only as trustworthy as the axiom it's built on: IG's *Completeness* property (attributions sum exactly to `ŷ(x) - ŷ(x̄)`) is a sanity check we can measure directly, and it turns out to depend heavily on how `x̄` is chosen.
 
-**Single-dataset breakdown** (seed=1, n=100 test samples where applicable):
+**Baseline choice matters more than we expected.** With the dataset mean as `x̄` — the conventional choice — completeness error is large and inconsistent across datasets (median relative error 19–319%). The reason traces back to `CentroidLayer`'s discrete routing: the mean of the training set doesn't reliably fall inside any single centroid's region, so the straight-line IG path often crosses a routing boundary, where `context_emb` jumps discretely from one centroid's embedding to another's. That jump is exactly the kind of discontinuity IG's underlying theory assumes away, and no amount of increasing the integration step count (`n_steps`) makes it disappear.
 
-| Dataset | F | TabERA (IG) ρ | SHAP (KernelExplainer) ρ | Random ρ |
-|---|---|---|---|---|
-| `qsar-biodeg` (id=1494) | 41 | 0.713 (p<0.001) | **0.902** (p<0.001) | 0.051 |
-| `ada_agnostic` (id=1043) | 48 | **0.936** (p<0.001) | 0.841 (p<0.001) | −0.169 |
-| `nomao` (id=1486) | 118 | **0.933** (p<0.001) | 0.649 (p<0.001) | −0.038 |
-| `guillermo` (id=41159) | 4296 | **0.813** (p<0.001) | −0.066 (p<0.001) | −0.009 |
+TabERA already has a structural fix for this sitting in the architecture: `centroid_x`, the medoid used for explanation ①, is by construction inside the sample's own routing region. Using it as the IG baseline instead of the dataset mean collapses completeness error by 8–78× across every dataset we tested:
 
-Explanation ③ uses Integrated Gradients (Sundararajan et al., 2017), which differentiates `ŷ` back through the full model to attribute each input feature's contribution. IG operates in the original feature space and requires only a single gradient pass regardless of `F`.
+| Dataset | Mean-baseline completeness error (median %) | Medoid-baseline completeness error (median %) | Improvement |
+|---|---|---|---|
+| `vehicle` (id=54) | 146.5% | 17.5% | 8.4× |
+| `ada_agnostic` (id=1043) | 19.4% | 1.5% | 13× |
+| `qsar-biodeg` (id=1494) | 53.4% | 1.8% | 30× |
+| `wine_quality` (id=43986) | 319.1% | 4.1% | 78× |
 
-**Key finding — IG is robust to F, SHAP (sampling-based) is not.** Across F=41–4296, TabERA's IG-based ③ stays in the ρ≈0.71–0.94 range and is always significant (p<0.001). SHAP's KernelExplainer (`nsamples=100`), by contrast, degrades sharply as F grows: ρ=0.90 (F=41) → 0.84 (F=48) → 0.65 (F=118) → **−0.07 (F=4296, indistinguishable from Random)**. This is a direct consequence of SHAP's sampling-based estimation requiring more samples as F grows, whereas IG requires only a single gradient pass regardless of F.
+We take this as a genuine (if secondary) contribution: TabERA's own retrieval structure supplies a principled solution to IG's baseline-selection problem, something a plain feedforward network doesn't have available.
 
-TabERA (IG) ≥ SHAP holds for the three datasets with F≥48 (3/4 valid datasets); for the smallest-F dataset tested (`qsar-biodeg`, F=41), SHAP remains stronger (0.90 vs 0.71). Verification across additional datasets/seeds is ongoing.
+**Completeness improving doesn't automatically mean better attributions, and we checked.** We compared TabERA's IG (medoid baseline) against SHAP (KernelExplainer, background also set to the centroid medoids for a fair comparison) on deletion/insertion AUC — how much `ŷ` moves when the top-attributed features are removed or restored — across the same four datasets, with a paired Wilcoxon signed-rank test on a per-sample basis:
+
+| Dataset | Deletion AUC (TabERA vs SHAP) | Insertion AUC (TabERA vs SHAP) |
+|---|---|---|
+| `vehicle` | 0.676 vs 0.623 (n.s., p=0.22) | 0.736 vs 0.716 (n.s., p=0.81) |
+| `ada_agnostic` | 0.794 vs 0.784 (SHAP better, p=0.01) | 0.854 vs 0.850 (n.s., p=0.25) |
+| `qsar-biodeg` | 0.724 vs 0.732 (n.s., p=0.82) | 0.885 vs 0.848 (n.s., p=0.08) |
+| `wine_quality` | 0.466 vs 0.512 (SHAP better, p=0.001) | 0.569 vs 0.516 (TabERA better, p<0.001) |
+
+Of these eight comparisons, only three reach significance, and they don't point the same direction. We read this as an honest null result rather than a win: under a rigorously chosen baseline, TabERA's IG-based ③ is *not* consistently more or less faithful than SHAP. Completeness (an axiomatic property of the attribution method itself) and deletion/insertion faithfulness (a measure of whether the attribution is actually useful) turned out to be separate questions, and improving one didn't move the other.
+
+**Where this leaves ③.** We don't claim IG outperforms SHAP for TabERA, and we no longer make the earlier (weaker-evidence) claim that it does. What IG does offer here is that it comes "for free" — the same gradient pass used for the medoid-baseline completeness check, no sampling, no background-distribution tuning — and, with the medoid baseline, its own completeness guarantee is now something we can actually stand behind. Explanations ①② remain TabERA's primary and architecturally distinctive contribution; ③ is best read as a reasonably-behaved but non-exclusive complement to them, not as evidence that TabERA "beats" post-hoc attribution.
+
+*(A related caveat on ②: `MemoryBank`'s group-constrained KNN can fall back to adjacent centroids far more often than the name suggests when `K` (HPO-selected) exceeds the average group size — we saw this reach 75% of samples on the smallest dataset we tested (`vehicle`, N=676) versus 7–14% on larger ones. This doesn't affect ③'s faithfulness numbers above, but it's a limit on how literally "neighbors from your group" should be read on small datasets.)*
 
 ### Cognitive inspiration
 
