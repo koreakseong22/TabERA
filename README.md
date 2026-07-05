@@ -68,7 +68,7 @@ A third explanation, ③ (feature attribution via Integrated Gradients), is comp
 
 *(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones.)*
 
-③ (IG) is post-hoc, so it's measured rather than guaranteed. Its Completeness axiom (attributions sum to `ŷ(x)-ŷ(x̄)`) depends on baseline choice — using the centroid medoid instead of the dataset mean cuts median relative error from 19–319% down to 1.5–17.5% across four datasets, so we use the medoid as default. Against SHAP (medoid background, deletion/insertion AUC, paired Wilcoxon):
+③ (IG) is post-hoc and measured, not guaranteed — but the case for it isn't attribution quality. Against SHAP (medoid background, deletion/insertion AUC, paired Wilcoxon), only 3 of 8 comparisons reach significance and direction is mixed:
 
 | Dataset | Deletion ↓ (TabERA / SHAP) | Insertion ↑ (TabERA / SHAP) |
 |---|---|---|
@@ -77,7 +77,9 @@ A third explanation, ③ (feature attribution via Integrated Gradients), is comp
 | `qsar-biodeg` | 0.724 / 0.732 (n.s.) | 0.885 / 0.848 (n.s., p=0.08) |
 | `wine_quality` | 0.466 / 0.512 (SHAP, p<0.01) | 0.569 / 0.516 (TabERA, p<0.001) |
 
-*(n.s. = not significant, Wilcoxon p≥0.05.)* Only 3 of 8 comparisons reach significance and the direction is mixed — ③ is on par with SHAP, with the practical advantage of needing one gradient pass instead of a sampling budget. ①② are TabERA's primary, architecturally distinctive contribution.
+*(n.s. = not significant, Wilcoxon p≥0.05.)*
+
+We use IG anyway because it fits the architecture: it needs only the gradient TabERA's STE routing already produces and a single baseline point, versus SHAP's per-feature sampling budget and background distribution. That baseline is also already sitting in the architecture — using the centroid medoid (the same one behind ①) instead of the dataset mean cuts IG's completeness error from 19–319% to 1.5–17.5%, since the mean typically falls outside any centroid's region. So the case for IG here is cost and structural fit, not superior accuracy — ①② remain TabERA's primary contribution regardless.
 
 **Cognitive inspiration** (conceptual motivation only): Central Tendency (Posner & Keele, 1968), Schema Theory (Bartlett, 1932), Dual-Process theory (Kahneman, 2011).
 
@@ -102,7 +104,7 @@ These are single-run illustrative numbers rather than a full leaderboard; `run_t
 
 - **Architecturally-guaranteed explanations (①②)** that no post-hoc method can produce for an arbitrary model — group membership and neighbor evidence are read directly off the forward pass, not estimated afterward.
 - **A structural fix for IG's baseline-selection problem**: reusing the model's own centroid medoid as the Integrated Gradients baseline improves completeness by 8–78× over the conventional dataset-mean baseline, something only a retrieval-augmented architecture can offer.
-- **An honest empirical comparison** of IG-based attribution against SHAP under a rigorous baseline, showing the two are on par rather than claiming an unsupported advantage for either.
+- **A principled, low-cost case for gradient-based attribution over sampling-based attribution here**: IG needs only the gradient TabERA's STE routing already produces and one baseline point, performs on par with SHAP empirically, and is cheaper — not a quality trade-off, just the right tool for this architecture.
 - **A documented limitation** of group-constrained retrieval: cross-group fallback rate depends on how `K` compares to the automatically-determined group size (`P = √N_train`), and can dominate on small datasets — a concrete design consideration for anyone adapting this architecture.
 
 ---
