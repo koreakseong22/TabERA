@@ -48,20 +48,18 @@ Given `X ∈ ℝ^(N×F)` (D = embedding dim, P = centroids, K = neighbors):
 
 ---
 
-## Faithfulness of explanation ③
+## Faithfulness of ①②③
 
-**Completeness** (attributions should sum to `ŷ(x)-ŷ(x̄)`) depends on the baseline `x̄`. Median relative completeness error, mean vs. medoid baseline:
+①② are guaranteed by construction, not measured: `hard_assignment` (①) and `evidence_w` (②) are read directly off the forward pass, so what's reported is exactly what the model used.
 
-| Dataset | Mean baseline | Medoid baseline |
+| Explanation | Guarantee | Verified by |
 |---|---|---|
-| `vehicle` | 146.5% | 17.5% |
-| `ada_agnostic` | 19.4% | 1.5% |
-| `qsar-biodeg` | 53.4% | 1.8% |
-| `wine_quality` | 319.1% | 4.1% |
+| ① Group context | `hard_assignment` read directly from `routing_probs` — a fact about the forward pass | `--ablation dual_space_faithfulness` (medoid stays representative of its group) |
+| ② Neighbor evidence | `evidence_w` is the same tensor used to compute `agg_emb` | `--ablation random_neighbor` (random same-group neighbors degrade performance) |
 
-We use the centroid medoid as the default baseline, since it consistently gives lower completeness error.
+*(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones.)*
 
-**Deletion/Insertion AUC vs. SHAP** (medoid baseline for both; paired Wilcoxon test):
+③ (IG) is post-hoc, so it's measured instead. Its Completeness axiom depends on baseline choice — using the centroid medoid instead of the dataset mean cuts median relative error from 19–319% down to 1.5–17.5% across four datasets, so we use the medoid as default. Compared against SHAP (medoid background, deletion/insertion AUC, paired Wilcoxon):
 
 | Dataset | Deletion ↓ (TabERA / SHAP) | Insertion ↑ (TabERA / SHAP) |
 |---|---|---|
@@ -70,11 +68,7 @@ We use the centroid medoid as the default baseline, since it consistently gives 
 | `qsar-biodeg` | 0.724 / 0.732 (n.s.) | 0.885 / 0.848 (n.s., p=0.08) |
 | `wine_quality` | 0.466 / 0.512 (SHAP, p<0.01) | 0.569 / 0.516 (TabERA, p<0.001) |
 
-*n.s. = not significant (Wilcoxon, p≥0.05) — the difference can't be distinguished from sample noise.*
-
-Of 8 comparisons, 3 reach significance and the direction is mixed. ③ is best read as on par with SHAP, with the practical advantage of needing no background distribution or sampling budget — just one gradient pass. Explanations ①② remain TabERA's primary, architecturally distinctive contribution.
-
-*(Caveat on ②: cross-group fallback triggers more often than "group-constrained" suggests when K exceeds average group size — 75% of samples on the smallest dataset tested (`vehicle`, N=676) vs. 7–14% on larger ones.)*
+*(n.s. = not significant, Wilcoxon p≥0.05)* Only 3 of 8 comparisons reach significance and the direction is mixed — ③ is best read as on par with SHAP, with the practical edge of needing just one gradient pass instead of a sampling budget. ①② remain TabERA's primary, architecturally distinctive contribution.
 
 **Cognitive inspiration** (conceptual motivation only): Central Tendency (Posner & Keele, 1968), Schema Theory (Bartlett, 1932), Dual-Process theory (Kahneman, 2011).
 
