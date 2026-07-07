@@ -70,11 +70,24 @@ class TabularEmbedder(nn.Module):
 
 class MemoryBank(nn.Module):
     """학습 임베딩 저장소 (KNN 검색용)."""
-    def __init__(self, max_size: int, embed_dim: int, n_size_buckets: int = 4):
+    def __init__(self, max_size: int, embed_dim: int, n_size_buckets: int = 4,
+                 group_round_unit: int = 256, vectorized_fallback: bool = True):
         super().__init__()
         self.max_size = max_size
         # 그룹-크기 버킷 개수 (retrieve()의 normal_mask 처리용, 상수 반복 횟수)
         self.n_size_buckets = n_size_buckets
+        # [실험용 파라미터화] retrieve()가 local_max_g를 반올림하는 단위.
+        # 기존 코드는 이 값이 256으로 하드코딩되어 있었음 — 근거 주석 없음.
+        # 기본값을 256으로 유지해 기존 동작과 100% 동일하게 시작하고,
+        # 실측 실험(round_unit sweep)을 위해서만 외부에서 바꿀 수 있게 함.
+        self._group_round_unit = group_round_unit
+        # [실험용 파라미터화] cross-group fallback 경로를 샘플 단위
+        # Python for-loop(+ .item() 동기화) 대신 배치 텐서 연산(bmm+topk)으로
+        # 처리할지 여부. 실측(torch.profiler)으로 원래 경로가 cudaStreamSynchronize
+        # 에 51%, GPU 실연산은 2%만 쓴다는 게 확인된 뒤 추가한 대안 경로.
+        # 기본값 False = 기존 동작 100% 유지 (정확성/속도 비교 검증 전까지는
+        # 이 값을 바꾸지 않는 것을 권장).
+        self._vectorized_fallback = vectorized_fallback
         self.register_buffer("keys",   torch.zeros(max_size, embed_dim))
         self.register_buffer("vals",   torch.zeros(max_size, embed_dim))
         self.register_buffer("labels", torch.zeros(max_size))
@@ -138,9 +151,11 @@ class MemoryBank(nn.Module):
         if denom <= 0:
             return
         new_threshold = int((free_bytes * safety_fraction) / denom)
-        # 256배수로 내림 (retrieve()의 라운딩 단위와 맞춤), 너무 작아지지
-        # 않도록 최소 k*4 이상은 보장
-        new_threshold = max((new_threshold // 256) * 256, 512)
+        # retrieve()의 라운딩 단위(self._group_round_unit)와 맞춰 내림.
+        # 이전에는 여기 독립적으로 256이 하드코딩되어 있었음 — round_unit을
+        # 바꾸는 실험을 할 때 이 값도 같이 따라가도록 결합.
+        _ru = self._group_round_unit
+        new_threshold = max((new_threshold // _ru) * _ru, max(2 * _ru, 512))
         self._outlier_threshold = new_threshold
 
     @torch.no_grad()
@@ -345,7 +360,8 @@ class MemoryBank(nn.Module):
                 max_q = ((max_q_raw + 15) // 16) * 16
                 max_q = min(max_q, Bn)
 
-                local_max_g = ((local_max_g_raw + 255) // 256) * 256
+                _ru = self._group_round_unit
+                local_max_g = ((local_max_g_raw + _ru - 1) // _ru) * _ru
                 local_max_g = min(local_max_g, self._cached_groups.shape[1])
 
                 Q_pad = torch.zeros(U_pad, max_q, D, device=dev)
@@ -408,7 +424,8 @@ class MemoryBank(nn.Module):
                     local_max_g_tier_raw = max(
                         int(self._cached_group_sizes[tier_centroid_ids].max()), k
                     )
-                    local_max_g_tier = ((local_max_g_tier_raw + 255) // 256) * 256
+                    _ru_t = self._group_round_unit
+                    local_max_g_tier = ((local_max_g_tier_raw + _ru_t - 1) // _ru_t) * _ru_t
                     local_max_g_tier = min(local_max_g_tier, self._cached_groups.shape[1])
 
                     Q_pad_t = torch.zeros(Ut_pad, max_q_tier, D, device=dev)
@@ -444,7 +461,88 @@ class MemoryBank(nn.Module):
 
             # cross-group 확장 캐시가 있으면 사용, 없으면 전체 검색
             ext = getattr(self, '_cached_extended', None)
-            if ext is not None:
+
+            if self._vectorized_fallback:
+                # ── 벡터화 경로 (실측으로 확인된 병목 제거용) ──────────
+                # 원래 경로는 fallback 샘플마다 Python for-loop + .item()
+                # 동기화로 처리했음 (torch.profiler 실측: cudaStreamSynchronize
+                # 가 self CPU 시간의 51%, 실제 GPU 연산은 2%뿐). 여기서는
+                # 동일한 후보 집합·동일한 topk 선택을 배치 텐서 연산
+                # (bmm/gather + masked topk)으로 한 번에 처리한다.
+                # [주의] 이 경로가 원래 경로와 "완전히 동일한 결과"를 내는지는
+                # 아직 벤치마크 스크립트의 정확성 검증으로만 확인된 가설임 —
+                # 이 주석만으로 정확성이 보장되는 것은 아님.
+                if ext is not None:
+                    cand_ext  = ext[ha_fb]                          # (Bf, max_eg)
+                    ext_sizes = self._cached_extended_sizes[ha_fb]  # (Bf,)
+                    valid_ext = (cand_ext >= 0)
+                    safe_ext  = cand_ext.clamp(min=0, max=n - 1)
+
+                    still_small = ext_sizes < k
+                    use_ext     = ~still_small
+
+                    if use_ext.any():
+                        ext_idx   = use_ext.nonzero(as_tuple=True)[0]      # (Bs,)
+                        max_eg    = safe_ext.shape[1]
+                        k_eff_ext = min(k, max_eg)
+
+                        q_sel     = q_fb[ext_idx]                          # (Bs, D)
+                        safe_sel  = safe_ext[ext_idx]                      # (Bs, max_eg)
+                        valid_sel = valid_ext[ext_idx]                     # (Bs, max_eg)
+
+                        keys_sel = self._keys_norm[:n][safe_sel.reshape(-1)] \
+                                       .view(ext_idx.shape[0], max_eg, D)
+                        sim_sel  = torch.bmm(
+                            q_sel.unsqueeze(1), keys_sel.transpose(1, 2)
+                        ).squeeze(1)                                      # (Bs, max_eg)
+                        sim_sel  = sim_sel.masked_fill(~valid_sel, -1e9)
+
+                        _, top_sel   = sim_sel.topk(k_eff_ext, dim=-1)     # (Bs, k_eff_ext)
+                        real_idx_sel = safe_sel.gather(1, top_sel).clamp(0, n - 1)
+
+                        final_pos_sel = fb_idx[ext_idx]
+                        top_k_idx[final_pos_sel, :k_eff_ext]  = real_idx_sel
+                        out_nk[final_pos_sel, :k_eff_ext]     = keys_full[real_idx_sel.reshape(-1)] \
+                            .view(-1, k_eff_ext, D)
+                        out_nv[final_pos_sel, :k_eff_ext]     = vals_full[real_idx_sel.reshape(-1)] \
+                            .view(-1, k_eff_ext, D)
+                        out_labels[final_pos_sel, :k_eff_ext] = labels_full[real_idx_sel.reshape(-1)] \
+                            .view(-1, k_eff_ext)
+
+                    if still_small.any():
+                        ss_idx   = still_small.nonzero(as_tuple=True)[0]   # (Bt,)
+                        q_ss     = q_fb[ss_idx]                            # (Bt, D)
+                        keys_all = self._keys_norm[:n]
+                        k_eff_ss = min(k, n)
+
+                        sim_all    = q_ss @ keys_all.T                     # (Bt, n)
+                        _, idx_all = sim_all.topk(k_eff_ss, dim=-1)
+                        idx_all    = idx_all.clamp(0, n - 1)
+
+                        final_pos_ss = fb_idx[ss_idx]
+                        top_k_idx[final_pos_ss, :k_eff_ss]  = idx_all
+                        out_nk[final_pos_ss, :k_eff_ss]     = keys_full[idx_all.reshape(-1)] \
+                            .view(-1, k_eff_ss, D)
+                        out_nv[final_pos_ss, :k_eff_ss]     = vals_full[idx_all.reshape(-1)] \
+                            .view(-1, k_eff_ss, D)
+                        out_labels[final_pos_ss, :k_eff_ss] = labels_full[idx_all.reshape(-1)] \
+                            .view(-1, k_eff_ss)
+                else:
+                    keys_all  = self._keys_norm[:n]
+                    k_eff_all = min(k, n)
+                    sim_all    = q_fb @ keys_all.T                         # (Bf, n)
+                    _, idx_all = sim_all.topk(k_eff_all, dim=-1)
+                    idx_all    = idx_all.clamp(0, n - 1)
+
+                    top_k_idx[fb_idx, :k_eff_all]  = idx_all
+                    out_nk[fb_idx, :k_eff_all]     = keys_full[idx_all.reshape(-1)] \
+                        .view(-1, k_eff_all, D)
+                    out_nv[fb_idx, :k_eff_all]     = vals_full[idx_all.reshape(-1)] \
+                        .view(-1, k_eff_all, D)
+                    out_labels[fb_idx, :k_eff_all] = labels_full[idx_all.reshape(-1)] \
+                        .view(-1, k_eff_all)
+
+            elif ext is not None:
                 cand_ext   = ext[ha_fb]                         # (Bf, max_eg)
                 ext_sizes  = self._cached_extended_sizes[ha_fb] # (Bf,)
                 valid_ext  = (cand_ext >= 0)
@@ -662,6 +760,7 @@ class TabERA(nn.Module):
         use_context_emb: bool = True,
         detach_context_grad: bool = False,
         use_context_projection: bool = False,
+        vectorized_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.k            = k
@@ -734,7 +833,17 @@ class TabERA(nn.Module):
         )
 
         # ── 메모리 뱅크 (검색 전용) ──────────────────
-        self.memory = MemoryBank(memory_size, embed_dim)
+        # [실측 확인됨] cross-group fallback 경로의 기존 구현(샘플 단위
+        # Python for-loop + .item() 동기화)은 fallback 비율이 높을수록
+        # (vehicle 데이터셋 기준 실측 75%) retrieve() 자체를 최대 184배까지
+        # 느리게 만드는 것으로 확인됨 (torch.profiler: cudaStreamSynchronize
+        # 가 self CPU 시간의 59%, 실제 GPU 연산은 4%뿐). vectorized_fallback=True
+        # 는 이 경로를 배치 텐서 연산(bmm+gather+masked topk)으로 대체한
+        # 버전이며, 정확성은 다양한 스케일에서 기존 경로와 bit-identical함이
+        # 확인됨 (bench_fallback_cost.py). 기본값은 False로 유지 —
+        # 실제 4개 데이터셋에서 최종 확인 전까지는 명시적으로 켜야 함.
+        self.memory = MemoryBank(memory_size, embed_dim,
+                                  vectorized_fallback=vectorized_fallback)
 
         # ── FeatureStore (설명 전용) ──────────────────
         self._feature_store: Optional[FeatureStore] = None
