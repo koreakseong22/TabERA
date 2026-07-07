@@ -221,16 +221,27 @@ def main():
     parser.add_argument("--explain",   action="store_true",
                         help="학습 후 feature 기여도 설명 출력")
     parser.add_argument("--ablation",  type=str, default="none",
-                        choices=["none", "random_neighbor",
+                        choices=["none", "random_neighbor", "neighbor_noise",
                                  "rank_correlation", "dual_space_faithfulness",
                                  "deletion_auc", "insertion_auc",
-                                 "value_diagnosis", "soft_ig_check",
+                                 "value_diagnosis",
+                                 "soft_ig_check",
                                  "nsteps_sweep", "illusion_check",
                                  "dataset_profile"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
                             "  none                  : full model 기준 (기본값)\n"
-                            "  random_neighbor       : neighbor 임베딩 랜덤 교체\n"
+                            "  random_neighbor       : nk/labels를 같은 permutation으로\n"
+                            "                         통째로 셔플 — 배치 내 다른 쿼리의 진짜\n"
+                            "                         (real) 이웃 세트로 통째로 교체.\n"
+                            "                         retrieval이 '맞는 이웃'을 찾았는지만\n"
+                            "                         순수하게 검증 (이웃 정보 자체는 real).\n"
+                            "  neighbor_noise        : nk/labels 전부 실제 데이터와 무관한\n"
+                            "                         노이즈/재추출 라벨로 교체. '이웃 정보가\n"
+                            "                         조금이라도 존재하는가' 자체를 검증.\n"
+                            "                         (random_neighbor와 함께 봐야 함 —\n"
+                            "                         이 둘의 성능 하락 차이가 '틀린 이웃'과\n"
+                            "                         '이웃 없음'의 영향을 분리해서 보여줌)\n"
                             "  rank_correlation      : IG feature 순위 vs 실제 prediction\n"
                             "                         영향력 순위 Spearman 상관계수\n"
                             "                         (TabERA vs SHAP vs Random 3자 비교)\n"
@@ -878,6 +889,15 @@ def main():
                     pickle.dump(vd_save, f)
                 print(f"\n  저장: {vd_path}")
 
+        # ── nv_utility_probe: 제거됨 ──────────────────────────
+        # [이력] nv(이웃의 과거 context_emb)가 AttentionAggregator에서 실제로
+        # 쓰이는지를 재학습 없이 진단하던 ablation이었다. mfeat-zernike/vehicle/
+        # credit-approval 3개 데이터셋 실측(RepeatedKFold + noise 대조군) 결과,
+        # nv가 nk/label로 이미 설명되는 잔차 이상의 추가 정보를 noise 대조군과
+        # 통계적으로 구분되게 보여주지 못해 (설계 가치 없음 판단), nv 자체를
+        # MemoryBank/AttentionAggregator에서 완전히 제거했다. 지난 전체
+        # 결과물은 optim_logs의 *_nv_utility_probe.pkl 파일에 남아 있다.
+
         # ── soft_ig_check: hard-forward IG vs soft-forward IG 비교 ──
         #
         # [배경]
@@ -1426,11 +1446,11 @@ def main():
             if model.memory.filled.item() >= model.k:
                 print(f"\n  [6/6] Gold-standard 인과 검증: 이웃을 input 시점으로 고정...")
 
-                fixed_nk, fixed_nv, fixed_labels = model.get_fixed_neighbors_for_ig(X_sc)
+                fixed_nk, fixed_labels = model.get_fixed_neighbors_for_ig(X_sc)
 
                 def _fixed_neighbors_target_fn(x_batch, target_fn_inner):
                     return model.forward_fixed_neighbors_for_ig(
-                        x_batch, target_fn_inner, fixed_nk, fixed_nv, fixed_labels
+                        x_batch, target_fn_inner, fixed_nk, fixed_labels
                     )
 
                 alphas_fixed = torch.linspace(0.0, 1.0, n_steps_scan, device=X_sc.device)
@@ -2453,21 +2473,32 @@ def main():
                 pickle.dump(ia_save, f)
             print(f"\n  저장: {ia_path}")
 
-        # ── random_neighbor: 성능 비교 ───────────────────────
+        # ── random_neighbor / neighbor_noise: 성능 비교 ─────────────
         # full model 대비 성능 하락을 측정.
-        # random_neighbor: neighbor 랜덤화 시 성능 하락 → neighbor evidence가 의미 있게 사용
+        # random_neighbor: 틀린(그러나 real) 이웃로 교체 시 하락 → retrieval 정확도의 가치
+        # neighbor_noise : 이웃 정보 자체를 노이즈로 교체 시 하락 → neighbor evidence 자체의 가치
+        # 두 값을 같이 보면: neighbor_noise 하락폭이 random_neighbor보다 커야
+        # "틀린 이웃이라도 real data가 낫다"는 게 일관되게 확인됨
         else:
             with torch.no_grad():
                 abl_logits_list, abl_labels_list = [], []
+                full_evw_list, abl_evw_list = [], []
                 batch_size = 256
                 n_test     = X_test.shape[0]
 
                 for start in range(0, n_test, batch_size):
                     X_batch = X_test[start:start + batch_size]
-                    out_batch = model(X_batch, ablation_mode=args.ablation)
+                    out_batch      = model(X_batch, ablation_mode=args.ablation)
+                    out_batch_full = model(X_batch, ablation_mode="none")
                     abl_logits_list.append(out_batch["logits"].cpu())
+                    if out_batch.get("evidence_w") is not None:
+                        abl_evw_list.append(out_batch["evidence_w"].cpu())
+                    if out_batch_full.get("evidence_w") is not None:
+                        full_evw_list.append(out_batch_full["evidence_w"].cpu())
 
                 abl_logits = torch.cat(abl_logits_list, dim=0)
+                abl_evw    = torch.cat(abl_evw_list, dim=0) if abl_evw_list else None
+                full_evw   = torch.cat(full_evw_list, dim=0) if full_evw_list else None
 
             if tasktype == "regression":
                 abl_preds   = abl_logits.squeeze(-1).numpy()
@@ -2498,16 +2529,64 @@ def main():
                 arrow = "▼" if delta < -0.001 else ("▲" if delta > 0.001 else "─")
                 print(f"  {k_name:<20} {v_full:>12.4f}  {v_abl:>12.4f}  {delta:>+9.4f} {arrow}")
 
+            # ── evidence_w 엔트로피 비교 ──────────────────────────
+            # 목적: neighbor_noise/random_neighbor에서 성능 하락이 왜
+            # 다른지, evidence_w(attention weight)가 얼마나 uniform하게
+            # 퍼졌는지로 설명되는지 확인. nk가 진짜 임베딩이면 유사도가
+            # 뾰족(집중)할 수 있고, nk가 순수 노이즈면 고차원에서 거의
+            # 직교라 유사도가 다 비슷해져 evidence_w가 uniform에 가까워질
+            # 것이라는 가설을 직접 검증.
+            evw_stats = {}
+            if full_evw is not None and abl_evw is not None:
+                k_dim = full_evw.shape[-1]
+
+                def _norm_entropy(w):
+                    ent = -(w * (w + 1e-8).log()).sum(dim=-1)   # (N,)
+                    return (ent / torch.log(torch.tensor(float(k_dim)))).numpy()
+
+                full_ent = _norm_entropy(full_evw)
+                abl_ent  = _norm_entropy(abl_evw)
+                full_max = full_evw.max(dim=-1).values.numpy()
+                abl_max  = abl_evw.max(dim=-1).values.numpy()
+
+                print(f"\n  evidence_w 엔트로피 (0=한 이웃에 완전 집중, 1=완전 uniform, k={k_dim})")
+                print(f"  {'-'*58}")
+                print(f"  {'':<20} {'Full Model':>12}  {'Ablation':>12}")
+                print(f"  {'정규화 엔트로피 평균':<18} {full_ent.mean():>12.4f}  {abl_ent.mean():>12.4f}")
+                print(f"  {'최대 가중치 평균':<18} {full_max.mean():>12.4f}  {abl_max.mean():>12.4f}")
+
+                evw_stats = {
+                    "full_entropy_mean": float(full_ent.mean()),
+                    "abl_entropy_mean":  float(abl_ent.mean()),
+                    "full_max_w_mean":   float(full_max.mean()),
+                    "abl_max_w_mean":    float(abl_max.mean()),
+                }
+
             print(f"\n  해석:")
             if args.ablation == "random_neighbor":
-                print(f"  → 성능 하락이 클수록 neighbor evidence가 의미 있게 사용됨")
-                print(f"    (retrieval이 단순 lookup이 아님을 의미)")
+                print(f"  → 성능 하락 = '검색이 틀린 이웃을 찾았을 때'의 대가")
+                print(f"    (이웃 정보 자체는 여전히 real data — retrieval 정확도의 가치)")
+            elif args.ablation == "neighbor_noise":
+                print(f"  → 성능 하락 = '이웃 정보가 조금이라도 있는가'의 대가")
+                print(f"    (real이든 아니든 neighbor evidence 자체의 존재 가치)")
+                print(f"  참고: random_neighbor보다 여기서 하락폭이 훨씬 커야 정상")
+                print(f"    (같은 배치 크기지만 '틀린 진짜 이웃' < '이웃 자체 없음'이 더")
+                print(f"    나쁜 상황이어야 두 ablation이 일관된 이야기를 함)")
+                if evw_stats and evw_stats["abl_entropy_mean"] > evw_stats["full_entropy_mean"] + 0.1:
+                    print(f"  → evidence_w가 실제로 uniform 쪽으로 이동함 "
+                          f"(엔트로피 {evw_stats['full_entropy_mean']:.3f} → "
+                          f"{evw_stats['abl_entropy_mean']:.3f}). nk가 노이즈가 되면서")
+                    print(f"    attention이 '누구를 볼지 못 정하는' 상태가 됐다는 뜻 —")
+                    print(f"    성능이 덜 떨어진 건 uniform 평균이 이 데이터셋에서")
+                    print(f"    우연히 나쁘지 않은 예측이기 때문일 수 있음 (value_diagnosis로")
+                    print(f"    T() 항의 크기도 같이 봐야 완전한 그림이 됨).")
 
             # ablation 결과 저장
             abl_save = {
                 "ablation_mode":  args.ablation,
                 "full_metrics":   test_metrics,
                 "abl_metrics":    abl_metrics,
+                "evidence_w_stats": evw_stats,
                 "openml_id":      openml_id,
                 "seed":           args.seed,
             }
@@ -2562,6 +2641,50 @@ def main():
         "seed":         args.seed,
     }, str(state_path))
     print(f"  저장: {state_path}")
+
+    # ── vectorized_fallback 정확성 검증 (학습된 모델 그대로, 재학습 없음) ──
+    # 목적: retrieve()의 cross-group fallback 경로를 벡터화(bmm+gather+
+    # masked topk)로 바꾼 게, 지금 막 학습이 끝난 이 모델의 실제 가중치와
+    # 실제 테스트 데이터에서도 출력을 하나도 안 바꾸는지 확인.
+    # (optimize.py 전체 재학습 비교와는 다른 검증임 — 여기는 재학습 없이
+    # 같은 가중치로 vectorized_fallback만 스위칭해서 순수 forward만 비교)
+    if hasattr(model.memory, "_vectorized_fallback"):
+        print(f"\n{'='*52}")
+        print(f"  vectorized_fallback 정확성 검증")
+        print(f"{'='*52}")
+
+        model.eval()
+        with torch.no_grad():
+            model.memory._vectorized_fallback = False
+            out_false = model(X_test, return_explanations=True)
+
+            model.memory._vectorized_fallback = True
+            out_true = model(X_test, return_explanations=True)
+
+        same_logits = torch.equal(out_false["logits"], out_true["logits"])
+        same_topk   = torch.equal(out_false["topk_idx"], out_true["topk_idx"])
+        same_evw    = torch.equal(out_false["evidence_w"], out_true["evidence_w"])
+
+        print(f"  logits 완전 동일:        {same_logits}")
+        print(f"  topk_idx(이웃) 완전 동일: {same_topk}")
+        print(f"  evidence_w(설명) 완전 동일: {same_evw}")
+
+        if not same_logits:
+            diff = (out_false["logits"] - out_true["logits"]).abs()
+            print(f"    logits 최대 절대오차: {diff.max().item():.2e}")
+        if not same_topk:
+            n_diff = (out_false["topk_idx"] != out_true["topk_idx"]).any(dim=-1).sum().item()
+            print(f"    topk_idx가 다른 샘플 수: {n_diff} / {X_test.shape[0]}")
+        if not same_evw:
+            diff_evw = (out_false["evidence_w"] - out_true["evidence_w"]).abs()
+            print(f"    evidence_w 최대 절대오차: {diff_evw.max().item():.2e}")
+
+        # 학습 종료 후 검증용으로만 forward를 두 번 더 돌렸으므로, 이후
+        # (--explain 등) 로직이 기존 설정(False)으로 계속 진행되도록 복원.
+        model.memory._vectorized_fallback = False
+    else:
+        print("  (참고: 이 libs/tabera.py는 vectorized_fallback을 지원하지 않는 "
+              "버전입니다 — 검증을 건너뜁니다.)")
 
     # ── Feature 기여도 설명 출력 ─────────────────────────
     if args.explain:

@@ -14,7 +14,7 @@ Forward 흐름
   query_emb (B, D)
     ├─ CentroidLayer(query_emb) → context_emb (B, D) + routing
     └─ MemoryBank.retrieve → k neighbours (cross-group fallback 포함)
-         ↓ AttentionAggregator(query_emb, nk, nv, labels)
+         ↓ AttentionAggregator(query_emb, nk, labels)
        agg_emb (B, D) + evidence_w (B, k)
     ↓
   [query_emb ‖ context_emb ‖ agg_emb] → PredictionHead → ŷ
@@ -85,11 +85,9 @@ class MemoryBank(nn.Module):
         # Python for-loop(+ .item() 동기화) 대신 배치 텐서 연산(bmm+topk)으로
         # 처리할지 여부. 실측(torch.profiler)으로 원래 경로가 cudaStreamSynchronize
         # 에 51%, GPU 실연산은 2%만 쓴다는 게 확인된 뒤 추가한 대안 경로.
-        # 기본값 False = 기존 동작 100% 유지 (정확성/속도 비교 검증 전까지는
-        # 이 값을 바꾸지 않는 것을 권장).
+        # 기본값 True = vectorized fallback 사용 
         self._vectorized_fallback = vectorized_fallback
         self.register_buffer("keys",   torch.zeros(max_size, embed_dim))
-        self.register_buffer("vals",   torch.zeros(max_size, embed_dim))
         self.register_buffer("labels", torch.zeros(max_size))
         self.register_buffer("ptr",    torch.tensor(0, dtype=torch.long))
         self.register_buffer("filled", torch.tensor(0, dtype=torch.long))
@@ -159,13 +157,12 @@ class MemoryBank(nn.Module):
         self._outlier_threshold = new_threshold
 
     @torch.no_grad()
-    def update(self, keys, vals, labels):
+    def update(self, keys, labels):
         B   = keys.shape[0]
         ptr = self.ptr.item()
         end = min(ptr + B, self.max_size)
         n   = end - ptr
         self.keys[ptr:end]   = keys[:n].detach()
-        self.vals[ptr:end]   = vals[:n].detach()
         self.labels[ptr:end] = labels[:n].float().detach()
         # 정규화도 여기서 O(B)로 한 번만 계산 (retrieve 매 배치 재계산 제거)
         self._keys_norm[ptr:end] = F.normalize(keys[:n].detach(), dim=-1)
@@ -248,15 +245,22 @@ class MemoryBank(nn.Module):
         k: int,
         hard_assignment: "Optional[torch.Tensor]" = None,
         sample_groups:   "Optional[List[List[int]]]" = None,  # 미사용 (캐시 우선)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         완전 벡터화 k-NN 검색.
 
-        반환: (nk, nv, neighbour_labels, top_k_idx)
+        반환: (nk, neighbour_labels, top_k_idx)
           nk              : (B, k, D) — 이웃 key 임베딩
-          nv              : (B, k, D) — 이웃 value 임베딩
           neighbour_labels: (B, k)    — 이웃 레이블 (TabR 방식 value 구성용)
           top_k_idx       : (B, k)    — MemoryBank 내 실제 인덱스 (FeatureStore 조회용)
+
+        [변경 이력] 이전에는 nv(이웃이 저장 당시 가졌던 context_emb)도
+        반환했으나, AttentionAggregator가 이를 전혀 사용하지 않았고
+        (value = label_emb + T(query-neighbour)만 계산), nv_utility_probe로
+        "nv가 nk/label로 설명되는 잔차 이상의 추가 정보를 갖는지" 실측한
+        결과 3개 데이터셋(mfeat-zernike/vehicle/credit-approval) 모두에서
+        noise 대조군과 통계적으로 구분되지 않았음 — 실질적 근거 없이
+        저장/검색 비용만 발생시키고 있어 제거함.
         """
         n   = self.filled.item()
         B   = query.shape[0]
@@ -264,7 +268,6 @@ class MemoryBank(nn.Module):
         dev = query.device
 
         keys_full   = self.keys[:n]    # (n, D)
-        vals_full   = self.vals[:n]    # (n, D)
         labels_full = self.labels[:n]  # (n,)
         q_norm      = F.normalize(query, dim=-1)  # (B, D)
 
@@ -276,7 +279,7 @@ class MemoryBank(nn.Module):
             _, idx   = sim.topk(min(k, n), dim=-1)
             idx      = idx.clamp(0, n - 1)
             neighbour_labels = labels_full[idx]              # (B, k)
-            return keys_full[idx], vals_full[idx], neighbour_labels, idx
+            return keys_full[idx], neighbour_labels, idx
 
         # ── 완전 벡터화 (for loop 없음) ────────────────────────
         ha        = hard_assignment.to(dev)             # (B,)
@@ -288,7 +291,6 @@ class MemoryBank(nn.Module):
 
         # 결과 버퍼 (fallback 샘플은 zeros 유지)
         out_nk    = torch.zeros(B, k, D,          device=dev)
-        out_nv    = torch.zeros(B, k, D,          device=dev)
         out_labels = torch.zeros(B, k,            device=dev)
         top_k_idx = torch.zeros(B, k, dtype=torch.long, device=dev)
 
@@ -384,7 +386,6 @@ class MemoryBank(nn.Module):
                 final_pos = nm_idx[csort_idx]
                 top_k_idx[final_pos, :k_eff]  = i_final_c_sorted
                 out_nk[final_pos, :k_eff]     = keys_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
-                out_nv[final_pos, :k_eff]     = vals_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff, D)
                 out_labels[final_pos, :k_eff] = labels_full[i_final_c_sorted.reshape(-1)].view(Bn, k_eff)
 
             else:
@@ -447,7 +448,6 @@ class MemoryBank(nn.Module):
                     final_pos_t = nm_idx[csort_idx[sel_pos]]            # (Bt,) 원래 배치(B) 내 최종 위치
                     top_k_idx[final_pos_t, :k_eff_t]  = i_final_sel
                     out_nk[final_pos_t, :k_eff_t]     = keys_full[i_final_sel.reshape(-1)].view(-1, k_eff_t, D)
-                    out_nv[final_pos_t, :k_eff_t]     = vals_full[i_final_sel.reshape(-1)].view(-1, k_eff_t, D)
                     out_labels[final_pos_t, :k_eff_t] = labels_full[i_final_sel.reshape(-1)].view(-1, k_eff_t)
 
         # fallback 샘플: 인접 centroid 그룹까지 확장하여 검색 (cross-group)
@@ -504,8 +504,6 @@ class MemoryBank(nn.Module):
                         top_k_idx[final_pos_sel, :k_eff_ext]  = real_idx_sel
                         out_nk[final_pos_sel, :k_eff_ext]     = keys_full[real_idx_sel.reshape(-1)] \
                             .view(-1, k_eff_ext, D)
-                        out_nv[final_pos_sel, :k_eff_ext]     = vals_full[real_idx_sel.reshape(-1)] \
-                            .view(-1, k_eff_ext, D)
                         out_labels[final_pos_sel, :k_eff_ext] = labels_full[real_idx_sel.reshape(-1)] \
                             .view(-1, k_eff_ext)
 
@@ -523,8 +521,6 @@ class MemoryBank(nn.Module):
                         top_k_idx[final_pos_ss, :k_eff_ss]  = idx_all
                         out_nk[final_pos_ss, :k_eff_ss]     = keys_full[idx_all.reshape(-1)] \
                             .view(-1, k_eff_ss, D)
-                        out_nv[final_pos_ss, :k_eff_ss]     = vals_full[idx_all.reshape(-1)] \
-                            .view(-1, k_eff_ss, D)
                         out_labels[final_pos_ss, :k_eff_ss] = labels_full[idx_all.reshape(-1)] \
                             .view(-1, k_eff_ss)
                 else:
@@ -536,8 +532,6 @@ class MemoryBank(nn.Module):
 
                     top_k_idx[fb_idx, :k_eff_all]  = idx_all
                     out_nk[fb_idx, :k_eff_all]     = keys_full[idx_all.reshape(-1)] \
-                        .view(-1, k_eff_all, D)
-                    out_nv[fb_idx, :k_eff_all]     = vals_full[idx_all.reshape(-1)] \
                         .view(-1, k_eff_all, D)
                     out_labels[fb_idx, :k_eff_all] = labels_full[idx_all.reshape(-1)] \
                         .view(-1, k_eff_all)
@@ -572,7 +566,6 @@ class MemoryBank(nn.Module):
                             _, idx_all = sim_all.topk(min(k, n), dim=-1)
                             idx_all = idx_all.squeeze(0).clamp(0, n - 1)
                             out_nk[b_pos]     = keys_full[idx_all]
-                            out_nv[b_pos]     = vals_full[idx_all]
                             out_labels[b_pos] = labels_full[idx_all]
                             top_k_idx[b_pos]  = idx_all
                         else:
@@ -582,7 +575,6 @@ class MemoryBank(nn.Module):
                             real_idx = real_idx.clamp(0, n - 1)
                             kk = real_idx.shape[0]
                             out_nk[b_pos, :kk]     = keys_full[real_idx]
-                            out_nv[b_pos, :kk]     = vals_full[real_idx]
                             out_labels[b_pos, :kk] = labels_full[real_idx]
                             top_k_idx[b_pos, :kk]  = real_idx
 
@@ -598,7 +590,6 @@ class MemoryBank(nn.Module):
                         _, idx_all = sim_all.topk(min(k, n), dim=-1)
                         idx_all = idx_all.squeeze(0).clamp(0, n - 1)
                         out_nk[b_pos]     = keys_full[idx_all]
-                        out_nv[b_pos]     = vals_full[idx_all]
                         out_labels[b_pos] = labels_full[idx_all]
                         top_k_idx[b_pos]  = idx_all
             else:
@@ -611,11 +602,10 @@ class MemoryBank(nn.Module):
                     _, idx_all = sim_all.topk(min(k, n), dim=-1)
                     idx_all = idx_all.squeeze(0).clamp(0, n - 1)
                     out_nk[b_pos]     = keys_full[idx_all]
-                    out_nv[b_pos]     = vals_full[idx_all]
                     out_labels[b_pos] = labels_full[idx_all]
                     top_k_idx[b_pos]  = idx_all
 
-        return out_nk, out_nv, out_labels, top_k_idx
+        return out_nk, out_labels, top_k_idx
 
     @torch.no_grad()
     def retrieve_hierarchical(
@@ -884,7 +874,7 @@ class TabERA(nn.Module):
 
         # 3. KNN 검색 + Attention 집계
         if self.memory.filled.item() >= self.k:
-            nk, nv, neighbour_labels, topk_idx = self.memory.retrieve(
+            nk, neighbour_labels, topk_idx = self.memory.retrieve(
                 query_emb, self.k,
                 # [진단용] global_retrieve=True면 그룹 무시하고 전체 검색.
                 # context_emb(위 2번)는 hard_assignment와 무관하게 이미
@@ -892,15 +882,43 @@ class TabERA(nn.Module):
                 hard_assignment=(None if self.global_retrieve else hard_assignment),
             )
 
-            # ── Ablation: random_neighbor ────────────────────────
+            # ── Ablation: random_neighbor / neighbor_noise ───────
+            # [수정 이력] 기존 random_neighbor는 nk/nv는 순수 노이즈로,
+            # neighbour_labels는 배치 내 셔플로 서로 "다른 방식"으로
+            # 조작했음 — 그러면 성능 하락이 "이웃이 틀려서"인지 "이웃
+            # 정보 자체가 없어서"인지 구분이 안 됨 (두 가설이 뒤섞임).
+            # 이제 두 가설을 분리된 모드로 나눔 (nv는 제거되어 더는
+            # 등장하지 않음 — nv_utility_probe로 잔차 설명력이 noise
+            # 대조군과 구분 안 됨을 실측한 뒤 삭제):
+            #   random_neighbor : nk/labels를 "같은" permutation으로
+            #                     통째로 셔플 → 배치 내 다른 쿼리의
+            #                     진짜(실존하는) 이웃 세트로 통째로
+            #                     바꿔치기. retrieval이 "맞는 이웃"을
+            #                     찾았는지만 순수하게 검증 (이웃 정보
+            #                     자체는 여전히 real).
+            #   neighbor_noise  : nk/labels 전부 실제 데이터와 무관한
+            #                     것으로 교체. "이웃 정보가 조금이라도
+            #                     존재하는가" 자체를 검증.
             if ablation_mode == "random_neighbor":
                 B_abl = nk.shape[0]
-                nk              = F.normalize(torch.randn_like(nk), dim=-1)
-                nv              = torch.randn_like(nv)
-                rand_perm        = torch.randperm(B_abl, device=X.device)
+                rand_perm = torch.randperm(B_abl, device=X.device)
+                nk               = nk[rand_perm]
                 neighbour_labels = neighbour_labels[rand_perm]
 
-            agg_emb, evidence_w = self.ot_selector(query_emb, nk, nv, neighbour_labels)
+            elif ablation_mode == "neighbor_noise":
+                nk = F.normalize(torch.randn_like(nk), dim=-1)
+                # neighbour_labels: uniform random class가 아니라, 이번
+                # 배치에서 실제로 검색된 라벨들의 empirical pool에서
+                # 재추출 — 실제 클래스 비율(marginal)은 유지한 채
+                # 쿼리-라벨 연결만 완전히 끊음.
+                B_abl, K_abl = neighbour_labels.shape[0], neighbour_labels.shape[1]
+                label_pool = neighbour_labels.reshape(-1)
+                rand_pos = torch.randint(
+                    0, label_pool.numel(), (B_abl, K_abl), device=X.device
+                )
+                neighbour_labels = label_pool[rand_pos]
+
+            agg_emb, evidence_w = self.ot_selector(query_emb, nk, neighbour_labels)
 
         else:
             # Memory 미충족 fallback
@@ -924,7 +942,7 @@ class TabERA(nn.Module):
 
         # 5. 메모리 업데이트 (학습 시)
         if self.training and labels is not None:
-            self.memory.update(query_emb.detach(), context_emb.detach(), labels.float())
+            self.memory.update(query_emb.detach(), labels.float())
             if self._feature_store is not None:
                 self._feature_store.update(X)
 
@@ -1034,11 +1052,11 @@ class TabERA(nn.Module):
 
         # ── agg_emb: 기존 forward와 동일 경로 (이미 연속, query_emb 경유) ──
         if self.memory.filled.item() >= self.k:
-            nk, nv, neighbour_labels, _ = self.memory.retrieve(
+            nk, neighbour_labels, _ = self.memory.retrieve(
                 query_emb, self.k,
                 hard_assignment=(None if self.global_retrieve else hard_assignment),
             )
-            agg_emb, _ = self.ot_selector(query_emb, nk, nv, neighbour_labels)
+            agg_emb, _ = self.ot_selector(query_emb, nk, neighbour_labels)
         else:
             agg_emb = torch.zeros_like(query_emb)
 
@@ -1059,7 +1077,7 @@ class TabERA(nn.Module):
         """
         forward_fixed_neighbors_for_ig에서 사용할 "고정 이웃"을 input
         시점(X) 기준으로 미리 계산해 반환한다. IG의 baseline→input 경로
-        전체에서 이 고정된 (nk, nv, neighbour_labels)를 그대로 재사용해,
+        전체에서 이 고정된 (nk, neighbour_labels)를 그대로 재사용해,
         경로 중간에 hard_assignment가 바뀌어도 이웃 집합이 재계산되지
         않도록 한다.
         """
@@ -1069,20 +1087,19 @@ class TabERA(nn.Module):
             c = F.normalize(self.prototype_layer.centroid_emb, dim=-1)
             hard_assignment = (q @ c.T).argmax(dim=-1)
             if self.memory.filled.item() >= self.k:
-                nk, nv, neighbour_labels, _ = self.memory.retrieve(
+                nk, neighbour_labels, _ = self.memory.retrieve(
                     query_emb, self.k,
                     hard_assignment=(None if self.global_retrieve else hard_assignment),
                 )
             else:
-                nk = nv = neighbour_labels = None
-        return nk, nv, neighbour_labels
+                nk = neighbour_labels = None
+        return nk, neighbour_labels
 
     def forward_fixed_neighbors_for_ig(
         self,
         X: torch.Tensor,                       # (B, F)
         target_fn,                              # out(dict) -> (B,) 스칼라
         fixed_nk: "Optional[torch.Tensor]" = None,
-        fixed_nv: "Optional[torch.Tensor]" = None,
         fixed_neighbour_labels: "Optional[torch.Tensor]" = None,
     ) -> torch.Tensor:
         """
@@ -1096,7 +1113,7 @@ class TabERA(nn.Module):
 
         이 메서드는 retrieve()가 baseline→input 경로 중간에 hard_assignment
         변화에 따라 이웃을 다시 뽑는 것을 막고, **input(X) 시점에 뽑힌
-        이웃(fixed_nk, fixed_nv, fixed_neighbour_labels)을 경로 전체에서
+        이웃(fixed_nk, fixed_neighbour_labels)을 경로 전체에서
         고정**해서 사용한다. 즉 agg_emb 계산에서 "어떤 이웃을 쓰는가"는
         더 이상 경로 위치(alpha)에 의존하지 않는다 — 이산적 전환이 인위적으로
         제거된 상태.
@@ -1111,7 +1128,7 @@ class TabERA(nn.Module):
         ──────────
         X                      : (B, F) 입력 (baseline→input 경로의 보간점)
         target_fn              : compute_integrated_gradients와 동일 시그니처
-        fixed_nk/nv/labels     : get_fixed_neighbors_for_ig(X_input)으로 미리
+        fixed_nk/labels        : get_fixed_neighbors_for_ig(X_input)으로 미리
                                   계산해둔, input 시점 기준 고정 이웃
 
         Returns
@@ -1131,7 +1148,7 @@ class TabERA(nn.Module):
 
         # ── agg_emb: 고정된 이웃 사용 (경로 위치와 무관) ──────────
         if fixed_nk is not None:
-            agg_emb, _ = self.ot_selector(query_emb, fixed_nk, fixed_nv, fixed_neighbour_labels)
+            agg_emb, _ = self.ot_selector(query_emb, fixed_nk, fixed_neighbour_labels)
         else:
             agg_emb = torch.zeros_like(query_emb)
 

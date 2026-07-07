@@ -73,14 +73,21 @@ class AttentionAggregator(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query_emb, nk, nv, neighbour_labels):
+    def forward(self, query_emb, nk, neighbour_labels):
         """
         Parameters
         ──────────
         query_emb        : (B, D)   — 임베더 출력
         nk               : (B, k, D)— 이웃 key 임베딩
-        nv               : (B, k, D)— 이웃 value 임베딩 (현재 미사용, TabR 호환)
         neighbour_labels : (B, k)   — 이웃 레이블
+
+        [변경 이력] nv(이웃 value 임베딩) 파라미터를 제거함. 본문 로직은
+        원래도 nv를 쓰지 않았음(TabR 원본 그대로 value=label_emb+T(...)만
+        사용) — nv_utility_probe로 실측한 결과(mfeat-zernike/vehicle/
+        credit-approval 3개 데이터셋), nv가 nk/label로 이미 설명되는
+        잔차 이상의 추가 정보를 noise 대조군과 통계적으로 구분되게
+        보여주지 못해, MemoryBank/TabERA에서 nv 자체를 완전히 제거하며
+        여기 시그니처에서도 제거함.
         """
         # 1. TabR 방식 similarity: -||q||² + 2(q·k) - ||k||²
         similarities = (
