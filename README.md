@@ -39,7 +39,7 @@ A third explanation, ③ (feature attribution via Integrated Gradients), is comp
 **Key design decisions:**
 - **Dual-Space Centroid** — each centroid keeps a learnable `centroid_emb` (routing/retrieval) and a `centroid_x` (real training sample, medoid-updated each epoch), so ① shows an actual data point rather than a synthetic average.
 - **STE Routing** — forward uses discrete argmax for crisp groups; backward substitutes the softmax gradient so `C_emb` stays trainable, active at both train and eval time.
-- **Cross-group Fallback** — expands to the nearest adjacent centroid rather than a global search when a group is small, preserving the semantics of ②.
+- **Cross-group Fallback** — expands to the nearest adjacent centroid rather than a global search when a group is small, preserving the semantics of ②. Originally implemented as a per-sample Python loop, which profiling traced to up to 348× slower retrieval on high-fallback-rate datasets (nearly all of it CPU–GPU sync overhead, not real compute); now fully vectorized (`MemoryBank._vectorized_fallback`), verified bit-identical to the original on trained checkpoints across three datasets.
 - **Auxiliary Losses** — `diversity_loss` (spreads centroids apart) and `commitment_loss` (pulls queries to their assigned centroid), together with epoch-wise medoid updates, maintain meaningful group structure across datasets.
 
 ---
@@ -66,7 +66,7 @@ A third explanation, ③ (feature attribution via Integrated Gradients), is comp
 | ① Group context | `hard_assignment` read directly from `routing_probs` | `--ablation dual_space_faithfulness` |
 | ② Neighbor evidence | `evidence_w` is the same tensor used to compute `agg_emb` | `--ablation random_neighbor` |
 
-*(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones.)*
+*(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones. This affects which neighbors get retrieved, not speed — the retrieval cost of a high fallback rate was itself a major performance bug, since fixed; see Cross-group Fallback above.)*
 
 ③ (IG) is post-hoc and measured, not guaranteed — but the case for it isn't attribution quality. Against SHAP (medoid background, deletion/insertion AUC, paired Wilcoxon), only 3 of 8 comparisons reach significance and direction is mixed:
 
