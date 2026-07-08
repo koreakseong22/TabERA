@@ -901,86 +901,361 @@ def main():
                 topk_idx_ds   = out_ds.get("topk_idx")
 
             cx            = model.prototype_layer.centroid_x
+            cx_cpu        = cx.detach().cpu()
             sample_groups = model.prototype_layer.sample_groups
-            X_train_cpu   = X_train.detach().cpu()
             X_val_cpu     = X_val_sub.detach().cpu()
 
-            # ── 검증 1: centroid_x representation quality ─────────────
-            # centroid_x[p]가 그룹 p 샘플들의 feature 분포를 얼마나 잘 대표하는가.
-            # medoid 기반이므로 항상 실제 훈련 샘플이고,
-            # gradient로 최적화된 centroid_emb와 가장 가까운 샘플.
-            # random centroid 대비 얼마나 더 가까운지(compression ratio)로 측정.
-            print(f"\n  [검증 1] centroid_x Representation Quality")
+            # ── [수정] sample_groups의 실제 인덱스 공간 ────────────────
+            # libs/supervised.py의 학습 루프를 추적한 결과: ema_update()는
+            # X_train 전체가 아니라 model.memory(MemoryBank)의 실제 내용
+            # (model.memory.keys[:n_mem], model.feature_store._store[:n_mem])
+            # 을 받아 sample_groups를 만든다 (supervised.py 162~169행,
+            # 212~228행 주석 — "MemoryBank 인덱스 공간과 항상 일치하도록
+            # 보장"하기 위해 의도적으로 그렇게 바꾼 것). MemoryBank는 크기
+            # min(2*N_train, memory_size)의 FIFO 링버퍼이고, 매 에폭 학습
+            # 순서가 랜덤 셔플(perm)되기 때문에, 링버퍼 슬롯 j번째 내용물이
+            # X_train의 j번째 행과 같다는 보장이 전혀 없다.
+            # → sample_groups[p]의 인덱스는 "X_train 행 번호"가 아니라
+            #   "MemoryBank/FeatureStore 슬롯 번호"이므로, 검증도 반드시
+            #   같은 슬롯 번호로 embedder를 다시 태우는 게 아니라
+            #   model.memory.keys / model.feature_store._store에서 직접
+            #   가져와야 한다.
+            n_mem = model.memory.filled.item()
+            ref_emb = model.memory.keys[:n_mem].detach().cpu()          # (n_mem, D)
+            ref_raw = (
+                model.feature_store._store[:n_mem].detach().cpu()
+                if model.feature_store is not None else None
+            )                                                            # (n_mem, F)
 
-            centroid_dists, random_dists = [], []
-            torch.manual_seed(args.seed)
-            cx_cpu = cx.detach().cpu()
-            random_cx = (
-                torch.rand_like(cx_cpu)
-                * (X_train_cpu.max(0).values - X_train_cpu.min(0).values)
-                + X_train_cpu.min(0).values
-            )
+            # ── [수정] 명목형(categorical) feature의 거리 계산 ─────────
+            # libs/data.py를 확인한 결과, categorical 컬럼은 QuantileTransformer를
+            # 거치지 않고 LabelEncoder 정수 코드(0, 1, 2, ...) 그대로 X에 남는다
+            # (numeric 컬럼만 [0,1] uniform으로 정규화됨). 아래 feat_centrality가
+            # 이 정수 코드에 그대로 L1 거리를 적용하면, 순서가 없는 명목형
+            # 카테고리에 "카테고리 0과 3이 0과 1보다 멀다"는 우연한(그리고
+            # 의미 없는) 인코딩 순서를 실제 거리로 잘못 해석하게 된다
+            # (splice처럼 cat 비율이 높은 데이터셋에서 correspondence ρ가
+            # 계속 약하게 나온 원인 중 하나로 확인됨).
+            # → Gower distance 방식으로 교체: numeric은 그대로 L1(이미
+            #   [0,1] 정규화돼 있어 추가 range 정규화 불필요), categorical은
+            #   "같으면 0, 다르면 1"의 불일치 카운트로 대체한다. (참고:
+            #   원-핫으로 펼친 뒤 L1을 재는 것과 동치이나, 원-핫은 불일치당
+            #   거리가 2가 되어 categorical에 암묵적으로 2배 가중치를 주는
+            #   함정이 있어 이 방식이 더 안전함.)
+            cat_cols = list(dataset.X_cat)
+            num_cols = list(dataset.X_num)
 
-            for p in range(model.prototype_layer.P):
-                grp = sample_groups[p] if sample_groups else []
-                if len(grp) < 2:
-                    continue
-                grp_samples = X_train_cpu[grp]
-                cx_p        = cx_cpu[p]
-                rand_p      = random_cx[p]
-                centroid_dists.append((grp_samples - cx_p).abs().mean().item())
-                random_dists.append((grp_samples - rand_p).abs().mean().item())
+            # ── 검증 1: embedding-space ↔ feature-space 대응(correspondence) ──
+            # [재설계 2차] 1차 수정(group_mean과 비교)은 여전히 불공정했음:
+            # group_mean은 L1 거리를 최소화하도록 "정의"된 값이라 실제
+            # 샘플인 medoid가 이길 수 없는 게 수학적으로 당연하고, 게다가
+            # centroid_x는애초에 "임베딩 공간"에서 centroid_emb와 가장
+            # 가까운 실제 샘플로 뽑히는데(코사인 유사도 argmax), 그걸
+            # "feature 공간" L1 거리로 재고 있었음 — 애초에 다른 공간의
+            # 기준을 비교하고 있었음.
+            #
+            # [진짜 질문] "dual-space"라는 설계가 성립하려면, 임베딩 공간에서
+            # 중심적인 샘플이 feature 공간에서도 중심적이어야 함. 이제 이걸
+            # 직접 측정:
+            #   ① correspondence  : 그룹 내에서 "centroid_emb와의 코사인 유사도
+            #      (medoid를 뽑을 때 쓰는 바로 그 기준)"와 "feature 공간에서
+            #      같은 그룹 동료들과의 평균 근접도"의 순위가 얼마나 일치하는가
+            #      (그룹별 Spearman ρ, 그룹 크기로 가중 평균)
+            #   ② 실제 뽑힌 centroid_x가, 그 그룹의 "진짜 동료들"(인위적
+            #      baseline 없음) 기준으로 feature 공간 중심성 몇 백분위에
+            #      해당하는가 — 이게 유일하게 완전히 공정한 기준선임
+            #      (medoid도 실제 샘플이어야 하니, 비교 대상도 반드시
+            #      실제 샘플이어야 공평함)
+            print(f"\n  [검증 1] Embedding-Space ↔ Feature-Space Correspondence")
 
-            if centroid_dists:
-                mean_cx   = float(np.mean(centroid_dists))
-                mean_rand = float(np.mean(random_dists))
-                compression = mean_rand / (mean_cx + 1e-8)
-                print(f"  centroid_x  평균 L1 거리: {mean_cx:.4f}")
-                print(f"  random      평균 L1 거리: {mean_rand:.4f}")
-                print(f"  compression ratio       : {compression:.2f}x")
-                if compression > 1.5:
-                    print(f"  ✅ centroid_x가 random 대비 {compression:.1f}x 더 그룹을 잘 대표함")
-                    print(f"     (medoid가 gradient-optimized centroid_emb를 정확히 반영)")
+            valid_p_all = [p for p in range(model.prototype_layer.P)
+                           if sample_groups and len(sample_groups[p]) >= 2]
+            valid_p = valid_p_all
+            if ref_raw is None:
+                print(f"    ⚠️  model.feature_store가 없어 원본 feature 공간 비교를 할 수 없습니다 —")
+                print(f"       검증 1/2를 건너뜁니다 (인덱스 정합성 확인만 아래에서 진행).")
+                valid_p = []
+
+            centroid_emb_cpu = model.prototype_layer.centroid_emb.detach().cpu()  # (P, D)
+
+            # ── [사전 검증, 필수] sample_groups 인덱스 정합성 재확인 ──────
+            # [배경 — 확인된 사실] libs/supervised.py를 추적한 결과, ema_update()는
+            # 매 에폭 X_train 전체가 아니라 MemoryBank/FeatureStore의 실제
+            # 내용(emb_ema = model.memory.keys[:n_mem], x_ema = feature_store
+            # 의 슬롯)을 받아 sample_groups를 만든다(162~228행 주석 참고).
+            # 즉 sample_groups[p]의 인덱스는 애초부터 "MemoryBank 슬롯 번호"
+            # 이지 "X_train 행 번호"가 아니다. 이번 수정 전에는 여기서 X_train
+            # 을 처음부터 다시 embedder에 태워 X_train 행 순서로 비교했으므로,
+            # 두 인덱스 공간(슬롯 번호 vs 행 번호)이 애초에 다른 것을 같다고
+            # 가정하고 검증한 셈 — 이게 7.8%(≈무작위 2.5%) 결과의 원인이다.
+            #
+            # [이번 수정] X_train을 재-embed하지 않고, ema_update가 실제로
+            # 받았던 것과 같은 소스(model.memory.keys / model.feature_store)
+            # 에서 ref_emb/ref_raw를 가져와 같은 슬롯 번호로 비교한다.
+            #
+            # [해석 기준 — 재설정] reproduce.py는 학습이 끝난 뒤 모델을 그대로
+            # eval()에서 평가만 하고, 이 시점 이후 추가 gradient step은 없다.
+            # 즉 마지막 ema_update() 호출과 이 검증 사이에 centroid_emb가
+            # 전혀 움직이지 않으므로, 인덱스가 맞다면 일치율은 100%에 매우
+            # 가까워야 한다(자연스러운 EMA 지연이 성립하려면 그 사이에 추가
+            # 학습 스텝이 있어야 하는데, 여기엔 없음). 따라서 "70~95%면
+            # 지연, 3배 이상이면 안전" 같은 관대한 기준은 이 시점에는 근거가
+            # 없다 — 검증 시점 기준으로는 사실상 100% 아니면 버그다.
+            with torch.no_grad():
+                q_check = F.normalize(ref_emb, dim=-1)
+                c_check = F.normalize(centroid_emb_cpu, dim=-1)
+                assign_check = (q_check @ c_check.T).argmax(dim=-1).numpy()  # (n_mem,)
+
+            match_count, total_count = 0, 0
+            for p in valid_p_all:
+                grp = sample_groups[p]
+                total_count += len(grp)
+                match_count += int((assign_check[grp] == p).sum())
+            chance_rate = 1.0 / model.prototype_layer.P
+
+            print(f"  [사전 검증] sample_groups 인덱스 정합성 확인 (MemoryBank 슬롯 기준)")
+            if total_count == 0:
+                print(f"    ⚠️  검증 가능한 그룹(크기≥2)이 없어 일치율을 계산할 수 없습니다.")
+                index_ok = False
+            else:
+                match_rate = match_count / total_count
+                print(f"    재배정 일치율: {match_rate:.1%}  (무작위 기대치: {chance_rate:.1%})")
+                # 100%는 부동소수점 argmax의 동률(tie) 등으로 아주 드물게 못 미칠
+                # 수 있어 약간의 여유(0.99)만 둔다. 그 밑은 "지연"으로 설명되지
+                # 않으므로(위 근거 참고) 전부 인덱스/소스 불일치로 취급한다.
+                index_ok = match_rate >= 0.99
+                if not index_ok:
+                    print(f"    ❌ 검증 시점에는 추가 학습이 없어 EMA 지연으로 설명될 수 없습니다 —")
+                    print(f"       sample_groups가 가리키는 소스(MemoryBank/FeatureStore)와 지금")
+                    print(f"       비교에 쓴 소스가 여전히 어긋나 있을 가능성이 높습니다.")
+                    print(f"       아래 검증 1/2 및 하이브리드 medoid 결과는 재확인 전까지 신뢰할 수 없습니다.")
                 else:
-                    print(f"  ⚠️  centroid_x 대표성이 낮음 (ratio={compression:.2f}x)")
+                    print(f"    ✅ 인덱스 정합성 확인됨 (MemoryBank 슬롯 기준) — 아래 결과를 신뢰할 수 있습니다.")
+
+            if not index_ok:
+                valid_p = []
+
+            correspondence_rhos, group_weights = [], []
+            centroid_x_percentiles = []
+
+            for p in valid_p:
+                grp      = sample_groups[p]
+                n_p      = len(grp)
+                grp_feat = ref_raw[grp].numpy()              # (n_p, F)
+                grp_emb  = ref_emb[grp]                       # (n_p, D)
+
+                # 임베딩 공간 중심성: centroid_x를 뽑을 때 쓰는 것과 정확히
+                # 같은 기준 (centroid_emb와의 코사인 유사도, 높을수록 중심적)
+                c_emb   = centroid_emb_cpu[p]
+                emb_sim = F.cosine_similarity(
+                    grp_emb, c_emb.unsqueeze(0).expand(n_p, -1), dim=-1
+                ).numpy()                                      # (n_p,)
+
+                # feature 공간 중심성: 그룹 내 다른 실제 멤버들과의 평균
+                # Gower-style 거리 (leave-one-out) — 높을수록(음수 거리가
+                # 클수록) 중심적. numeric은 L1(이미 [0,1] 정규화됨),
+                # categorical은 불일치 카운트(같으면 0, 다르면 1)로 계산해
+                # LabelEncoder 정수 코드의 우연한 순서가 거리에 반영되지
+                # 않도록 함.
+                diffs = np.zeros((n_p, n_p))
+                if num_cols:
+                    num_part = grp_feat[:, num_cols]
+                    diffs += np.abs(num_part[:, None, :] - num_part[None, :, :]).sum(axis=-1)
+                if cat_cols:
+                    cat_part = grp_feat[:, cat_cols]
+                    diffs += (cat_part[:, None, :] != cat_part[None, :, :]).sum(axis=-1)
+                np.fill_diagonal(diffs, np.nan)
+                feat_centrality = -np.nanmean(diffs, axis=1)    # (n_p,)
+
+                if n_p >= 4:
+                    rho, _ = spearmanr(emb_sim, feat_centrality)
+                    if not np.isnan(rho):
+                        correspondence_rhos.append(rho)
+                        group_weights.append(n_p)
+
+                # 실제 medoid 위치(임베딩 유사도 argmax — 선택 기준과 동일)가
+                # feature 중심성 기준으로 그 그룹 안에서 몇 백분위인지
+                medoid_local_idx = int(np.argmax(emb_sim))
+                percentile = float((feat_centrality <= feat_centrality[medoid_local_idx]).mean()) * 100
+                centroid_x_percentiles.append(percentile)
+
+            if correspondence_rhos:
+                correspondence_rhos = np.array(correspondence_rhos)
+                group_weights       = np.array(group_weights, dtype=float)
+                weighted_rho        = float(np.average(correspondence_rhos, weights=group_weights))
+                median_rho          = float(np.median(correspondence_rhos))
+                frac_positive       = float((correspondence_rhos > 0).mean())
+
+                print(f"  ① 그룹 내 대응(correspondence): 임베딩 유사도 순위 vs "
+                      f"feature 중심성 순위")
+                print(f"    그룹 크기 가중 평균 ρ : {weighted_rho:+.3f}")
+                print(f"    중앙값 ρ              : {median_rho:+.3f}")
+                print(f"    ρ>0인 그룹 비율        : {frac_positive:.0%}  ({len(correspondence_rhos)}개 그룹 중)")
+                if weighted_rho > 0.3:
+                    print(f"    → 두 공간이 어느 정도 일관되게 대응함")
+                elif weighted_rho > 0.1:
+                    print(f"    ⚠️  대응이 약함 — 임베딩 공간 중심성이 feature 공간 "
+                          f"중심성을 부분적으로만 반영")
+                else:
+                    print(f"    ⚠️  대응이 거의 없음(ρ≈0) — 임베딩 공간에서 중심적이어도 "
+                          f"feature 공간과는 무관할 수 있음. centroid_x 설명이 그 그룹을")
+                    print(f"       feature 관점에서 대표한다는 주장이 이 데이터셋에서는")
+                    print(f"       약하다는 뜻")
+            else:
+                weighted_rho = None
+                print(f"  ① 대응 분석 불가 (그룹 크기 4 미만이 대부분)")
+
+            if centroid_x_percentiles:
+                cxp = np.array(centroid_x_percentiles)
+                from scipy.stats import wilcoxon
+                # 귀무가설: medoid가 그룹 내에서 무작위 멤버와 다를 바 없다
+                # (기대 백분위 50) — 이 귀무값과의 짝지은 비교
+                try:
+                    stat_w, p_w = wilcoxon(cxp - 50.0)
+                except ValueError:
+                    p_w = float("nan")
+
+                print(f"\n  ② 실제 centroid_x의 feature-중심성 백분위 (같은 그룹 진짜 동료 기준)")
+                print(f"    평균 백분위   : {cxp.mean():.1f}  (50=무작위 멤버와 동급, 100=그룹 내 최고)")
+                print(f"    중앙값 백분위 : {np.median(cxp):.1f}")
+                print(f"    50 대비 p-value (Wilcoxon): "
+                      f"{p_w:.4f}" if not np.isnan(p_w) else "    계산 불가")
+                if not np.isnan(p_w) and p_w < 0.05 and cxp.mean() > 50:
+                    print(f"    ✅ centroid_x가 무작위 멤버보다 유의하게 feature-중심적임")
+                elif not np.isnan(p_w) and p_w < 0.05 and cxp.mean() < 50:
+                    print(f"    ⚠️  centroid_x가 무작위 멤버보다 오히려 feature-주변부에 있음")
+                else:
+                    print(f"    ℹ️  centroid_x가 무작위 멤버와 유의한 차이 없음 (백분위 50 근처)")
+            else:
+                cxp, p_w = None, None
 
             # ── 검증 2: between-group feature separation ──────────────
             # centroid_x들 간 feature 분산 (between) vs 그룹 내 분산 (within).
             # separation이 높은 feature = centroid가 실제로 그 feature로 그룹을 구분.
             # 이게 높아야 "이 그룹은 high-alcohol, low-pH 그룹" 설명이 의미있음.
+            #
+            # [재설계] 기존엔 (1) within_var를 그룹별 분산의 비가중 평균으로
+            # 계산해서 표본 1~2개짜리 노이즈 많은 그룹이 큰 그룹과 동일하게
+            # 취급됐고, (2) between_var는 모든 P개 centroid를, within_var는
+            # size>=2인 그룹만 써서 두 항이 서로 다른 그룹 집합 기준이었으며,
+            # (3) 유의성 검정이 전혀 없어 "separation이 몇이면 의미 있는지"
+            # 판단 기준이 없었음. → 표준 one-way ANOVA F-검정으로 교체.
+            #
+            # [추가 수정] F-test는 값이 연속형(등간/비율 척도)이라는 가정을
+            # 깔고 있는데, categorical 컬럼은 libs/data.py에서 LabelEncoder로
+            # 매긴 정수 코드일 뿐 순서가 없는 명목형이다. 이 코드에 그대로
+            # 분산 기반 F-test를 적용하면, "카테고리 0과 3이 0과 1보다
+            # 멀다"는 우연한 인코딩 순서를 실제 분산으로 잘못 해석하게 된다
+            # (검증1에서 L1 거리에 있었던 것과 동일한 문제). numeric 컬럼만
+            # F-test를 쓰고, categorical 컬럼은 "그룹 소속 × 카테고리 값"
+            # 분할표에 대한 카이제곱 독립성 검정으로 교체한다 — 그룹마다
+            # 카테고리 분포가 실제로 다른지(=그 카테고리로 그룹이 구분되는지)
+            # 순서 가정 없이 직접 검정한다.
             print(f"\n  [검증 2] Between-Group Feature Separation")
+            print(f"  (numeric: One-way ANOVA F-test / categorical: Chi-square 독립성 검정)")
 
-            if cx is not None and sample_groups:
-                cx_np       = cx_cpu.numpy()
-                between_var = cx_np.var(axis=0)
+            if cx is not None and valid_p:
+                from scipy.stats import f as f_dist, chi2_contingency
 
-                within_vars = []
-                for p in range(model.prototype_layer.P):
-                    grp = sample_groups[p] if sample_groups else []
-                    if len(grp) < 2:
+                group_sizes = np.array([len(sample_groups[p]) for p in valid_p])
+                P_valid     = len(valid_p)
+
+                stat_arr  = np.full(n_features, np.nan)
+                p_arr     = np.full(n_features, np.nan)
+                test_type = np.array(["-"] * n_features, dtype=object)
+
+                # ── numeric 컬럼: 그룹 크기로 가중한 pooled MSW/MSB F-test ──
+                if num_cols:
+                    cx_valid_num = cx_cpu.numpy()[valid_p][:, num_cols]      # (P_valid, F_num)
+                    ss_within = np.zeros(len(num_cols))
+                    total_n   = 0
+                    for p in valid_p:
+                        grp_data = ref_raw[sample_groups[p]].numpy()[:, num_cols]
+                        grp_mean = grp_data.mean(axis=0)
+                        ss_within += ((grp_data - grp_mean) ** 2).sum(axis=0)
+                        total_n   += grp_data.shape[0]
+                    df_within = max(total_n - P_valid, 1)
+                    msw       = ss_within / df_within
+
+                    grand_mean = np.average(cx_valid_num, axis=0, weights=group_sizes)
+                    ssb        = np.sum(group_sizes[:, None] * (cx_valid_num - grand_mean) ** 2, axis=0)
+                    df_between = max(P_valid - 1, 1)
+                    msb        = ssb / df_between
+
+                    F_stat_num = msb / (msw + 1e-8)
+                    p_num      = f_dist.sf(F_stat_num, df_between, df_within)
+
+                    for j, fi in enumerate(num_cols):
+                        stat_arr[fi]  = F_stat_num[j]
+                        p_arr[fi]     = p_num[j]
+                        test_type[fi] = "F"
+
+                # ── categorical 컬럼: 그룹×카테고리 분할표 카이제곱 검정 ──
+                if cat_cols:
+                    for fi in cat_cols:
+                        cats_per_group = [
+                            np.rint(ref_raw[sample_groups[p]].numpy()[:, fi]).astype(int)
+                            for p in valid_p
+                        ]
+                        all_cats = np.unique(np.concatenate(cats_per_group))
+                        table = np.zeros((P_valid, len(all_cats)), dtype=int)
+                        for gi, vals in enumerate(cats_per_group):
+                            for c in vals:
+                                table[gi, np.searchsorted(all_cats, c)] += 1
+                        # 카이제곱 검정이 성립하려면 카테고리 2종 이상 +
+                        # 모든 행/열 합이 0보다 커야 함
+                        if table.shape[1] >= 2 and (table.sum(axis=0) > 0).all() and (table.sum(axis=1) > 0).all():
+                            try:
+                                chi2, p, dof, _ = chi2_contingency(table)
+                                stat_arr[fi]  = chi2
+                                p_arr[fi]     = p
+                                test_type[fi] = "χ²"
+                            except ValueError:
+                                pass   # 검정 불가(예: 기대빈도 문제) → NaN 유지
+
+                valid_mask       = ~np.isnan(p_arr)
+                bonferroni_alpha = 0.05 / n_features   # 다중비교 보정 (전체 feature 수 기준)
+                n_significant    = int((p_arr[valid_mask] < bonferroni_alpha).sum())
+
+                # 랭킹/표시용: 검정 종류가 달라도 비교 가능하도록 -log10(p)로 통일
+                neglogp = np.full(n_features, -1.0)
+                neglogp[valid_mask] = -np.log10(np.clip(p_arr[valid_mask], 1e-300, 1.0))
+                top_sep_idx = np.argsort(neglogp)[::-1][:5]
+
+                print(f"  (유효 그룹 {P_valid}개 / numeric {len(num_cols)}개 F-test / "
+                      f"categorical {len(cat_cols)}개 χ²-test, 검정 가능 {int(valid_mask.sum())}/{n_features})")
+                print(f"  {'Feature':<20} {'Test':>6} {'Stat':>10}  {'p-value':>12}")
+                print(f"  {'─'*52}")
+                for fi in top_sep_idx:
+                    fname = col_names[fi] if fi < len(col_names) else f"f{fi}"
+                    if np.isnan(p_arr[fi]):
+                        print(f"  {fname:<20} {'-':>6} {'(검정 불가)':>21}")
                         continue
-                    within_vars.append(X_train_cpu[grp].numpy().var(axis=0))
+                    sig_mark = "*" if p_arr[fi] < bonferroni_alpha else " "
+                    print(f"  {fname:<20} {test_type[fi]:>6} {stat_arr[fi]:>10.3f}  {p_arr[fi]:>10.4f}{sig_mark}")
 
-                if within_vars:
-                    within_var  = np.mean(within_vars, axis=0)
-                    separation  = between_var / (within_var + 1e-8)
-                    top_sep_idx = np.argsort(separation)[::-1][:5]
+                print(f"\n  Bonferroni 보정(α={bonferroni_alpha:.2e}) 후 유의한 feature 수: "
+                      f"{n_significant}/{n_features}")
+                if n_significant > 0:
+                    print(f"  → centroid가 최소 {n_significant}개 feature에서 통계적으로 "
+                          f"유의하게 그룹을 구분함")
+                else:
+                    print(f"  ⚠️  다중비교 보정 후 유의한 feature가 하나도 없음 — "
+                          f"'이 그룹은 X, Y 특성이 다르다'는 설명의 통계적 근거가 약함")
 
-                    print(f"  {'Feature':<25} {'Separation':>12}  {'Between':>10}  {'Within':>10}")
-                    print(f"  {'─'*62}")
-                    for fi in top_sep_idx:
-                        fname = col_names[fi] if fi < len(col_names) else f"f{fi}"
-                        print(f"  {fname:<25} {separation[fi]:>12.3f}  {between_var[fi]:>10.4f}  {within_var[fi]:>10.4f}")
-
-                    best_f = col_names[separation.argmax()] if separation.argmax() < len(col_names) else f"f{separation.argmax()}"
-                    print(f"\n  mean separation : {separation.mean():.3f}")
-                    print(f"  max separation  : {separation.max():.3f}  ({best_f})")
-                    print(f"  → 높은 separation = centroid_x 설명이 실제 그룹 경계를 반영")
+                F_stat, p_values = stat_arr, p_arr   # 저장용 변수명 유지(하위 호환)
+            else:
+                F_stat, p_values, test_type = None, None, None
 
             # 저장
             dsf_save = {
-                "centroid_dists":  centroid_dists,
-                "random_dists":    random_dists,
+                "correspondence_rhos":      correspondence_rhos.tolist() if isinstance(correspondence_rhos, np.ndarray) else correspondence_rhos,
+                "correspondence_weighted_rho": weighted_rho,
+                "centroid_x_percentiles":   centroid_x_percentiles,
+                "percentile_wilcoxon_p":    float(p_w) if (p_w is not None and not np.isnan(p_w)) else None,
+                "anova_F_stat":     F_stat.tolist() if F_stat is not None else None,
+                "anova_p_values":   p_values.tolist() if p_values is not None else None,
+                "anova_test_type":  test_type.tolist() if test_type is not None else None,
                 "openml_id":       openml_id,
                 "seed":            args.seed,
             }
