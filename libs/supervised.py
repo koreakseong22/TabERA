@@ -13,6 +13,7 @@ TabERA 전용으로 재작성한 버전입니다.
 """
 
 import math
+import copy
 import torch
 import torch.nn as nn
 import logging
@@ -155,6 +156,8 @@ class TabERAWrapper:
 
         best_state = None
         best_val   = None
+        best_sample_groups = None
+        best_feature_store = None
         self.ema_history = []
         self.final_ema_stats = None
         _low_active_streak = 0   # 연속으로 active_ratio<10%인 EMA 체크 횟수 (runaway collapse 감지용)
@@ -364,6 +367,24 @@ class TabERAWrapper:
             if is_better(val_v, best_val, self.tasktype):
                 best_val   = val_v
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                # [버그 수정] sample_groups(CentroidLayer의 일반 Python 리스트
+                # 속성)와 feature_store._store(nn.Module이 아님)는 위
+                # state_dict()에 포함되지 않는다. load_state_dict()로
+                # centroid_emb/centroid_x/memory.keys 등은 "best 검증 epoch"
+                # 시점으로 되돌아가는데, 이 둘만 "마지막 학습 epoch" 시점에
+                # 남아있게 되어 서로 다른 시점의 스냅샷이 섞이는 문제가 있었음
+                # (reproduce.py의 dual_space_faithfulness 사전 검증에서
+                # sample_groups 재배정 일치율이 무작위 수준으로 나온 원인).
+                # → best_state와 함께 별도로 스냅샷/복원한다.
+                best_sample_groups = copy.deepcopy(self.model.prototype_layer.sample_groups)
+                if self.model.feature_store is not None:
+                    best_feature_store = (
+                        self.model.feature_store._store.clone(),
+                        self.model.feature_store._ptr,
+                        self.model.feature_store._filled,
+                    )
+                else:
+                    best_feature_store = None
 
             # tqdm postfix: dict 형태로 전달 → 터미널 너비 초과 시 자동 축약
             pbar.set_description(f"EPOCH: {epoch}")
@@ -382,6 +403,16 @@ class TabERAWrapper:
 
         if best_state:
             self.model.load_state_dict(best_state)
+            # [버그 수정] state_dict에 없는 sample_groups/feature_store도
+            # 같은 best epoch 시점으로 함께 복원 — centroid_emb/memory.keys와
+            # 시점이 어긋나지 않도록 함.
+            if best_sample_groups is not None:
+                self.model.prototype_layer.sample_groups = best_sample_groups
+            if best_feature_store is not None:
+                store, ptr, filled = best_feature_store
+                self.model.feature_store._store  = store
+                self.model.feature_store._ptr    = ptr
+                self.model.feature_store._filled = filled
         self._best_state = best_state
 
     # ── predict ─────────────────────────────────────────────
