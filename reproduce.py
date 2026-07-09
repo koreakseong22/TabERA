@@ -31,6 +31,19 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # 설명 출력 (①② architectural + ③ IG post-hoc)
 # ─────────────────────────────────────────────────────────────
 
+def _format_target_info(tinfo) -> str:
+    """target_info(label_groups_by_target() 결과) 하나를 짧은 텍스트로."""
+    if tinfo is None:
+        return "(target 정보 없음)"
+    if tinfo["kind"] == "classification":
+        s = f"\"{tinfo['top_class_name']}\" ({tinfo['top_prop']:.0%})"
+        if tinfo["second"] is not None:
+            s += f", \"{tinfo['second']['name']}\" {tinfo['second']['prop']:.0%}"
+        return s
+    else:
+        return f"target≈{tinfo['group_mean']:.3g}(p{tinfo['percentile']:.0f})"
+
+
 def print_explanation(explanations: list, sample_idx: int, col_names: list) -> None:
     e = explanations[sample_idx]
 
@@ -38,22 +51,41 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
     print(f"  TabERA Explanation — Sample #{sample_idx}")
     print(f"{'━'*52}")
 
-    # ① 프로토타입 그룹 (centroid_features — 역정규화 없이 원본값 표시)
+    # ① 프로토타입 그룹 (target 분포 — 이 그룹이 어떤 부류인지)
     proto = e["prototype"]
     print(f"\n  ① 프로토타입 그룹")
     print(f"     → \"{proto['assigned_group']}\"  (confidence={proto['group_confidence']:.1%})")
     if proto["runners_up"]:
-        ru = ", ".join(f"\"{l}\"({s:.1%})" for l, s in proto["runners_up"])
+        ru = ", ".join(
+            f"\"{r['label']}\"({r['confidence']:.1%}, {_format_target_info(r['target_info'])})"
+            for r in proto["runners_up"]
+        )
         print(f"     Runner-up: {ru}")
 
-    # centroid 원본 feature 값 출력 (Medoid 기반 대표 사례)
-    cf = proto.get("centroid_features", {})
-    if cf:
-        feat_str = ",  ".join(
-            f"{k}={v:.3f}" for k, v in sorted(cf.items(), key=lambda x: -abs(x[1]))[:6]
-        )
-        print(f"     대표 사례: {feat_str}")
-        print(f"     (그룹 내 centroid 최근접 실제 훈련 샘플)")
+    # 이 그룹의 target(클래스) 분포 — ①의 주 콘텐츠 (libs/group_labels.py
+    # label_groups_by_target(), ema_update() 직후 캐싱됨). ②(실제 이웃의
+    # raw feature 값)와 정보 종류가 겹치지 않도록, feature 요약이 아니라
+    # "이 그룹이 어떤 부류인가"만 보여준다.
+    tinfo = proto.get("target_info")
+    if tinfo is not None:
+        if tinfo["kind"] == "classification":
+            s = f"     이 그룹은: \"{tinfo['top_class_name']}\" ({tinfo['top_prop']:.0%}, n={tinfo['n']})"
+            if tinfo["second"] is not None:
+                s += f"  — \"{tinfo['second']['name']}\"도 {tinfo['second']['prop']:.0%} 포함"
+            print(s)
+        else:
+            print(f"     이 그룹은: target 평균 {tinfo['group_mean']:.3g} "
+                  f"(전체 분포 기준 백분위 {tinfo['percentile']:.0f}, n={tinfo['n']})")
+    else:
+        print(f"     (그룹 target 정보 없음 — 학습 시 target_labels가 캐싱되지 않았을 수 있습니다)")
+
+    # 이 그룹을 다른 그룹들과 가장 뚜렷이 구별시키는 feature의 실제
+    # 그룹 평균값(libs/group_labels.py의 label_all_groups, 그룹 간
+    # 대비(distinctiveness) 상위 K개)
+    labels = proto.get("group_feature_labels", [])
+    if labels:
+        label_str = ",  ".join(f"{fl.feature_name}={fl.label}" for fl in labels)
+        print(f"     두드러진 특징: {label_str}")
 
     # ② 이웃 증거 (Attention weight)
     ev = e["evidence"]
@@ -242,7 +274,8 @@ def main():
                             "  rank_correlation      : IG feature 순위 vs 실제 prediction\n"
                             "                         영향력 순위 Spearman 상관계수\n"
                             "                         (TabERA vs SHAP vs Random 3자 비교)\n"
-                            "  dual_space_faithfulness : centroid_x 대표성 + 그룹 분리도 검증\n"
+                            "  dual_space_faithfulness : sample_groups 인덱스 정합성 +\n"
+                            "                         그룹 분리도(F-test/χ²) 검증\n"
                             "  deletion_auc          : attribution 순위로 feature 누적 마스킹 →\n"
                             "                         ŷ 곡선의 AUC (낮을수록 좋음)\n"
                             "  insertion_auc         : baseline에서 시작 → 중요 feature부터 복원 →\n"
@@ -380,6 +413,10 @@ def main():
     wrapper = TabERAWrapper(
         model, best_params, tasktype,
         device=str(device), epochs=args.epochs, patience=args.patience,
+        # 그룹 텍스트 라벨링(libs/group_labels.py)에 필요 — ①의 그룹 특징 설명은
+        # 텍스트 요약(medoid 아님)으로 대체됐고, 이 캐시가 그 역할을 함
+        cat_cols=list(dataset.X_cat), num_cols=list(dataset.X_num),
+        col_names=dataset.col_names,
     )
     wrapper._data_id = args.openml_id
     wrapper.fit(X_train, y_train, X_val, y_val)
@@ -400,32 +437,6 @@ def main():
     print(f"\n  {env_info}  {openml_id}  {dataset_info['name']}  tabera  {log_dir}")
     print(f"  val  : {val_metrics}")
     print(f"  test : {test_metrics}")
-
-    # ── 예측 확신도(overconfidence) 진단 ──────────────────────
-    # deletion/insertion AUC가 multiclass에서 Random과 잘 구별되지 않는 원인 후보:
-    # 모델이 거의 항상 한 클래스에 매우 쏠린(overconfident) 예측을 한다면,
-    # 개별 feature 하나를 지워도 그 확신이 잘 안 흔들려 deletion 효과가 둔감해질 수 있음
-    # (attribution 방법의 문제가 아니라 prediction surface 자체가 saturate된 경우).
-    if tasktype != "regression" and probs_test is not None:
-        probs_test_cpu = probs_test.detach().cpu() if torch.is_tensor(probs_test) else probs_test
-        probs_np = np.asarray(probs_test_cpu)
-        if tasktype == "multiclass":
-            max_probs = probs_np.max(axis=-1)
-        else:  # binclass — predict_proba가 (N,) 또는 (N,2) 형태일 수 있음
-            if probs_np.ndim == 2:
-                max_probs = probs_np.max(axis=-1)
-            else:
-                max_probs = np.where(probs_np >= 0.5, probs_np, 1.0 - probs_np)
-
-        print(f"\n  [예측 확신도 진단]")
-        print(f"    평균 max_prob : {max_probs.mean():.4f}")
-        print(f"    표준편차      : {max_probs.std():.4f}")
-        print(f"    median        : {np.median(max_probs):.4f}")
-        print(f"    >0.9 비율     : {(max_probs > 0.9).mean()*100:.1f}%")
-        print(f"    >0.99 비율    : {(max_probs > 0.99).mean()*100:.1f}%")
-        if tasktype == "multiclass":
-            n_classes = probs_np.shape[-1]
-            print(f"    (참고: uniform이면 max_prob ≈ {1.0/n_classes:.3f}, n_classes={n_classes})")
 
     # ── Ablation 평가 ──────────────────────────────────────────
     # 학습된 모델 가중치는 고정한 채, inference 단계에서만 ablation 적용.
@@ -826,8 +837,6 @@ def main():
                 print(f"\n  저장: {rc_path}")
         # ── dual_space_faithfulness: dual-space centroid 설계 검증 ──────
         elif args.ablation == "dual_space_faithfulness":
-            from scipy.stats import spearmanr
-
             model.eval()
             col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
             n_features = model.n_features
@@ -843,8 +852,6 @@ def main():
                 evidence_w_ds = out_ds.get("evidence_w")
                 topk_idx_ds   = out_ds.get("topk_idx")
 
-            cx            = model.prototype_layer.centroid_x
-            cx_cpu        = cx.detach().cpu()
             sample_groups = model.prototype_layer.sample_groups
             X_val_cpu     = X_val_sub.detach().cpu()
 
@@ -870,53 +877,19 @@ def main():
                 if model.feature_store is not None else None
             )                                                            # (n_mem, F)
 
-            # ── [수정] 명목형(categorical) feature의 거리 계산 ─────────
-            # libs/data.py를 확인한 결과, categorical 컬럼은 QuantileTransformer를
-            # 거치지 않고 LabelEncoder 정수 코드(0, 1, 2, ...) 그대로 X에 남는다
-            # (numeric 컬럼만 [0,1] uniform으로 정규화됨). 아래 feat_centrality가
-            # 이 정수 코드에 그대로 L1 거리를 적용하면, 순서가 없는 명목형
-            # 카테고리에 "카테고리 0과 3이 0과 1보다 멀다"는 우연한(그리고
-            # 의미 없는) 인코딩 순서를 실제 거리로 잘못 해석하게 된다
-            # (splice처럼 cat 비율이 높은 데이터셋에서 correspondence ρ가
-            # 계속 약하게 나온 원인 중 하나로 확인됨).
-            # → Gower distance 방식으로 교체: numeric은 그대로 L1(이미
-            #   [0,1] 정규화돼 있어 추가 range 정규화 불필요), categorical은
-            #   "같으면 0, 다르면 1"의 불일치 카운트로 대체한다. (참고:
-            #   원-핫으로 펼친 뒤 L1을 재는 것과 동치이나, 원-핫은 불일치당
-            #   거리가 2가 되어 categorical에 암묵적으로 2배 가중치를 주는
-            #   함정이 있어 이 방식이 더 안전함.)
+            # ── categorical/numeric 컬럼 분리 (검증2의 F-test/χ² 분기에 사용) ──
+            # libs/data.py에서 categorical 컬럼은 LabelEncoder 정수 코드로만
+            # 인코딩되고(순서 없는 명목형), numeric 컬럼만 QuantileTransformer로
+            # [0,1] 정규화된다. 검증2에서 이 둘을 각각 다른 검정으로 다룬다.
             cat_cols = list(dataset.X_cat)
             num_cols = list(dataset.X_num)
-
-            # ── 검증 1: embedding-space ↔ feature-space 대응(correspondence) ──
-            # [재설계 2차] 1차 수정(group_mean과 비교)은 여전히 불공정했음:
-            # group_mean은 L1 거리를 최소화하도록 "정의"된 값이라 실제
-            # 샘플인 medoid가 이길 수 없는 게 수학적으로 당연하고, 게다가
-            # centroid_x는애초에 "임베딩 공간"에서 centroid_emb와 가장
-            # 가까운 실제 샘플로 뽑히는데(코사인 유사도 argmax), 그걸
-            # "feature 공간" L1 거리로 재고 있었음 — 애초에 다른 공간의
-            # 기준을 비교하고 있었음.
-            #
-            # [진짜 질문] "dual-space"라는 설계가 성립하려면, 임베딩 공간에서
-            # 중심적인 샘플이 feature 공간에서도 중심적이어야 함. 이제 이걸
-            # 직접 측정:
-            #   ① correspondence  : 그룹 내에서 "centroid_emb와의 코사인 유사도
-            #      (medoid를 뽑을 때 쓰는 바로 그 기준)"와 "feature 공간에서
-            #      같은 그룹 동료들과의 평균 근접도"의 순위가 얼마나 일치하는가
-            #      (그룹별 Spearman ρ, 그룹 크기로 가중 평균)
-            #   ② 실제 뽑힌 centroid_x가, 그 그룹의 "진짜 동료들"(인위적
-            #      baseline 없음) 기준으로 feature 공간 중심성 몇 백분위에
-            #      해당하는가 — 이게 유일하게 완전히 공정한 기준선임
-            #      (medoid도 실제 샘플이어야 하니, 비교 대상도 반드시
-            #      실제 샘플이어야 공평함)
-            print(f"\n  [검증 1] Embedding-Space ↔ Feature-Space Correspondence")
 
             valid_p_all = [p for p in range(model.prototype_layer.P)
                            if sample_groups and len(sample_groups[p]) >= 2]
             valid_p = valid_p_all
             if ref_raw is None:
                 print(f"    ⚠️  model.feature_store가 없어 원본 feature 공간 비교를 할 수 없습니다 —")
-                print(f"       검증 1/2를 건너뜁니다 (인덱스 정합성 확인만 아래에서 진행).")
+                print(f"       검증 2를 건너뜁니다 (인덱스 정합성 확인만 아래에서 진행).")
                 valid_p = []
 
             centroid_emb_cpu = model.prototype_layer.centroid_emb.detach().cpu()  # (P, D)
@@ -971,106 +944,12 @@ def main():
                     print(f"    ❌ 검증 시점에는 추가 학습이 없어 EMA 지연으로 설명될 수 없습니다 —")
                     print(f"       sample_groups가 가리키는 소스(MemoryBank/FeatureStore)와 지금")
                     print(f"       비교에 쓴 소스가 여전히 어긋나 있을 가능성이 높습니다.")
-                    print(f"       아래 검증 1/2 및 하이브리드 medoid 결과는 재확인 전까지 신뢰할 수 없습니다.")
+                    print(f"       아래 검증 2 결과는 재확인 전까지 신뢰할 수 없습니다.")
                 else:
                     print(f"    ✅ 인덱스 정합성 확인됨 (MemoryBank 슬롯 기준) — 아래 결과를 신뢰할 수 있습니다.")
 
             if not index_ok:
                 valid_p = []
-
-            correspondence_rhos, group_weights = [], []
-            centroid_x_percentiles = []
-
-            for p in valid_p:
-                grp      = sample_groups[p]
-                n_p      = len(grp)
-                grp_feat = ref_raw[grp].numpy()              # (n_p, F)
-                grp_emb  = ref_emb[grp]                       # (n_p, D)
-
-                # 임베딩 공간 중심성: centroid_x를 뽑을 때 쓰는 것과 정확히
-                # 같은 기준 (centroid_emb와의 코사인 유사도, 높을수록 중심적)
-                c_emb   = centroid_emb_cpu[p]
-                emb_sim = F.cosine_similarity(
-                    grp_emb, c_emb.unsqueeze(0).expand(n_p, -1), dim=-1
-                ).numpy()                                      # (n_p,)
-
-                # feature 공간 중심성: 그룹 내 다른 실제 멤버들과의 평균
-                # Gower-style 거리 (leave-one-out) — 높을수록(음수 거리가
-                # 클수록) 중심적. numeric은 L1(이미 [0,1] 정규화됨),
-                # categorical은 불일치 카운트(같으면 0, 다르면 1)로 계산해
-                # LabelEncoder 정수 코드의 우연한 순서가 거리에 반영되지
-                # 않도록 함.
-                diffs = np.zeros((n_p, n_p))
-                if num_cols:
-                    num_part = grp_feat[:, num_cols]
-                    diffs += np.abs(num_part[:, None, :] - num_part[None, :, :]).sum(axis=-1)
-                if cat_cols:
-                    cat_part = grp_feat[:, cat_cols]
-                    diffs += (cat_part[:, None, :] != cat_part[None, :, :]).sum(axis=-1)
-                np.fill_diagonal(diffs, np.nan)
-                feat_centrality = -np.nanmean(diffs, axis=1)    # (n_p,)
-
-                if n_p >= 4:
-                    rho, _ = spearmanr(emb_sim, feat_centrality)
-                    if not np.isnan(rho):
-                        correspondence_rhos.append(rho)
-                        group_weights.append(n_p)
-
-                # 실제 medoid 위치(임베딩 유사도 argmax — 선택 기준과 동일)가
-                # feature 중심성 기준으로 그 그룹 안에서 몇 백분위인지
-                medoid_local_idx = int(np.argmax(emb_sim))
-                percentile = float((feat_centrality <= feat_centrality[medoid_local_idx]).mean()) * 100
-                centroid_x_percentiles.append(percentile)
-
-            if correspondence_rhos:
-                correspondence_rhos = np.array(correspondence_rhos)
-                group_weights       = np.array(group_weights, dtype=float)
-                weighted_rho        = float(np.average(correspondence_rhos, weights=group_weights))
-                median_rho          = float(np.median(correspondence_rhos))
-                frac_positive       = float((correspondence_rhos > 0).mean())
-
-                print(f"  ① 그룹 내 대응(correspondence): 임베딩 유사도 순위 vs "
-                      f"feature 중심성 순위")
-                print(f"    그룹 크기 가중 평균 ρ : {weighted_rho:+.3f}")
-                print(f"    중앙값 ρ              : {median_rho:+.3f}")
-                print(f"    ρ>0인 그룹 비율        : {frac_positive:.0%}  ({len(correspondence_rhos)}개 그룹 중)")
-                if weighted_rho > 0.3:
-                    print(f"    → 두 공간이 어느 정도 일관되게 대응함")
-                elif weighted_rho > 0.1:
-                    print(f"    ⚠️  대응이 약함 — 임베딩 공간 중심성이 feature 공간 "
-                          f"중심성을 부분적으로만 반영")
-                else:
-                    print(f"    ⚠️  대응이 거의 없음(ρ≈0) — 임베딩 공간에서 중심적이어도 "
-                          f"feature 공간과는 무관할 수 있음. centroid_x 설명이 그 그룹을")
-                    print(f"       feature 관점에서 대표한다는 주장이 이 데이터셋에서는")
-                    print(f"       약하다는 뜻")
-            else:
-                weighted_rho = None
-                print(f"  ① 대응 분석 불가 (그룹 크기 4 미만이 대부분)")
-
-            if centroid_x_percentiles:
-                cxp = np.array(centroid_x_percentiles)
-                from scipy.stats import wilcoxon
-                # 귀무가설: medoid가 그룹 내에서 무작위 멤버와 다를 바 없다
-                # (기대 백분위 50) — 이 귀무값과의 짝지은 비교
-                try:
-                    stat_w, p_w = wilcoxon(cxp - 50.0)
-                except ValueError:
-                    p_w = float("nan")
-
-                print(f"\n  ② 실제 centroid_x의 feature-중심성 백분위 (같은 그룹 진짜 동료 기준)")
-                print(f"    평균 백분위   : {cxp.mean():.1f}  (50=무작위 멤버와 동급, 100=그룹 내 최고)")
-                print(f"    중앙값 백분위 : {np.median(cxp):.1f}")
-                print(f"    50 대비 p-value (Wilcoxon): "
-                      f"{p_w:.4f}" if not np.isnan(p_w) else "    계산 불가")
-                if not np.isnan(p_w) and p_w < 0.05 and cxp.mean() > 50:
-                    print(f"    ✅ centroid_x가 무작위 멤버보다 유의하게 feature-중심적임")
-                elif not np.isnan(p_w) and p_w < 0.05 and cxp.mean() < 50:
-                    print(f"    ⚠️  centroid_x가 무작위 멤버보다 오히려 feature-주변부에 있음")
-                else:
-                    print(f"    ℹ️  centroid_x가 무작위 멤버와 유의한 차이 없음 (백분위 50 근처)")
-            else:
-                cxp, p_w = None, None
 
             # ── 검증 2: between-group feature separation ──────────────
             # centroid_x들 간 feature 분산 (between) vs 그룹 내 분산 (within).
@@ -1097,7 +976,7 @@ def main():
             print(f"\n  [검증 2] Between-Group Feature Separation")
             print(f"  (numeric: One-way ANOVA F-test / categorical: Chi-square 독립성 검정)")
 
-            if cx is not None and valid_p:
+            if valid_p:
                 from scipy.stats import f as f_dist, chi2_contingency
 
                 group_sizes = np.array([len(sample_groups[p]) for p in valid_p])
@@ -1109,7 +988,17 @@ def main():
 
                 # ── numeric 컬럼: 그룹 크기로 가중한 pooled MSW/MSB F-test ──
                 if num_cols:
-                    cx_valid_num = cx_cpu.numpy()[valid_p][:, num_cols]      # (P_valid, F_num)
+                    # [수정] centroid_x(medoid)를 between-group 대표값으로
+                    # 쓰던 걸 실제 그룹 평균으로 교체 — medoid를 아키텍처에서
+                    # 제거하면서 자연히 필요해진 변경이지만, 사실 표준
+                    # one-way ANOVA의 MSB 정의(그룹 평균 기반)에도 이쪽이
+                    # 원래 더 맞다. medoid는 "centroid_emb와 가장 가까운
+                    # 실제 샘플 1개"일 뿐이라 outlier성 특성을 가질 수 있어,
+                    # between-group 대표값으로는 오히려 그룹 평균보다 부정확했다.
+                    group_means_num = np.array([
+                        ref_raw[sample_groups[p]].numpy()[:, num_cols].mean(axis=0)
+                        for p in valid_p
+                    ])                                                    # (P_valid, F_num)
                     ss_within = np.zeros(len(num_cols))
                     total_n   = 0
                     for p in valid_p:
@@ -1120,8 +1009,8 @@ def main():
                     df_within = max(total_n - P_valid, 1)
                     msw       = ss_within / df_within
 
-                    grand_mean = np.average(cx_valid_num, axis=0, weights=group_sizes)
-                    ssb        = np.sum(group_sizes[:, None] * (cx_valid_num - grand_mean) ** 2, axis=0)
+                    grand_mean = np.average(group_means_num, axis=0, weights=group_sizes)
+                    ssb        = np.sum(group_sizes[:, None] * (group_means_num - grand_mean) ** 2, axis=0)
                     df_between = max(P_valid - 1, 1)
                     msb        = ssb / df_between
 
@@ -1192,10 +1081,6 @@ def main():
 
             # 저장
             dsf_save = {
-                "correspondence_rhos":      correspondence_rhos.tolist() if isinstance(correspondence_rhos, np.ndarray) else correspondence_rhos,
-                "correspondence_weighted_rho": weighted_rho,
-                "centroid_x_percentiles":   centroid_x_percentiles,
-                "percentile_wilcoxon_p":    float(p_w) if (p_w is not None and not np.isnan(p_w)) else None,
                 "anova_F_stat":     F_stat.tolist() if F_stat is not None else None,
                 "anova_p_values":   p_values.tolist() if p_values is not None else None,
                 "anova_test_type":  test_type.tolist() if test_type is not None else None,
@@ -1304,7 +1189,7 @@ def main():
                 q_med_dp = F.normalize(model.embedder(X_dp), dim=-1)
                 c_med_dp = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
                 ha_med_dp = (q_med_dp @ c_med_dp.T).argmax(dim=-1)
-                X_baseline_medoid_dp = model.prototype_layer.centroid_x[ha_med_dp].to(X_dp.device)
+                X_baseline_medoid_dp = model.prototype_layer.ig_baseline[ha_med_dp].to(X_dp.device)
 
             rel_err_mean, ig_mean = _completeness_and_ig(X_baseline_mean_dp)
             rel_err_medoid, ig_medoid = _completeness_and_ig(X_baseline_medoid_dp)
@@ -1405,7 +1290,7 @@ def main():
                     q_da = F.normalize(model.embedder(X_da), dim=-1)
                     c_da = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
                     ha_da = (q_da @ c_da.T).argmax(dim=-1)
-                    X_baseline = model.prototype_layer.centroid_x[ha_da].to(X_da.device)  # (N, F)
+                    X_baseline = model.prototype_layer.ig_baseline[ha_da].to(X_da.device)  # (N, F)
                 print(f"\n  [Baseline] medoid (샘플별 소속 그룹의 대표 훈련 샘플)")
             else:
                 X_baseline = X_train.mean(dim=0)              # (F,) 마스킹 시 사용
@@ -1473,7 +1358,7 @@ def main():
                 # 포함하는 구조이므로 이 불일치가 결과를 왜곡할 수 있음).
                 if (not args.mean_baseline):
                     with torch.no_grad():
-                        all_medoids = model.prototype_layer.centroid_x  # (P, F)
+                        all_medoids = model.prototype_layer.ig_baseline  # (P, F)
                         valid_medoid_mask = all_medoids.abs().sum(dim=-1) > 0
                         bg = all_medoids[valid_medoid_mask].cpu().numpy()
                     if len(bg) < 2:
@@ -1633,7 +1518,7 @@ def main():
                     q_ia = F.normalize(model.embedder(X_ia), dim=-1)
                     c_ia = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
                     ha_ia = (q_ia @ c_ia.T).argmax(dim=-1)
-                    X_baseline = model.prototype_layer.centroid_x[ha_ia].to(X_ia.device)  # (N, F)
+                    X_baseline = model.prototype_layer.ig_baseline[ha_ia].to(X_ia.device)  # (N, F)
                 print(f"\n  [Baseline] medoid (샘플별 소속 그룹의 대표 훈련 샘플)")
             else:
                 X_baseline = X_train.mean(dim=0)              # (F,) 복원 시작점
@@ -1696,7 +1581,7 @@ def main():
                 # 포함하는 구조이므로 이 불일치가 결과를 왜곡할 수 있음).
                 if (not args.mean_baseline):
                     with torch.no_grad():
-                        all_medoids = model.prototype_layer.centroid_x  # (P, F)
+                        all_medoids = model.prototype_layer.ig_baseline  # (P, F)
                         valid_medoid_mask = all_medoids.abs().sum(dim=-1) > 0
                         bg = all_medoids[valid_medoid_mask].cpu().numpy()
                     if len(bg) < 2:
@@ -2000,50 +1885,6 @@ def main():
         "seed":         args.seed,
     }, str(state_path))
     print(f"  저장: {state_path}")
-
-    # ── vectorized_fallback 정확성 검증 (학습된 모델 그대로, 재학습 없음) ──
-    # 목적: retrieve()의 cross-group fallback 경로를 벡터화(bmm+gather+
-    # masked topk)로 바꾼 게, 지금 막 학습이 끝난 이 모델의 실제 가중치와
-    # 실제 테스트 데이터에서도 출력을 하나도 안 바꾸는지 확인.
-    # (optimize.py 전체 재학습 비교와는 다른 검증임 — 여기는 재학습 없이
-    # 같은 가중치로 vectorized_fallback만 스위칭해서 순수 forward만 비교)
-    if hasattr(model.memory, "_vectorized_fallback"):
-        print(f"\n{'='*52}")
-        print(f"  vectorized_fallback 정확성 검증")
-        print(f"{'='*52}")
-
-        model.eval()
-        with torch.no_grad():
-            model.memory._vectorized_fallback = False
-            out_false = model(X_test, return_explanations=True)
-
-            model.memory._vectorized_fallback = True
-            out_true = model(X_test, return_explanations=True)
-
-        same_logits = torch.equal(out_false["logits"], out_true["logits"])
-        same_topk   = torch.equal(out_false["topk_idx"], out_true["topk_idx"])
-        same_evw    = torch.equal(out_false["evidence_w"], out_true["evidence_w"])
-
-        print(f"  logits 완전 동일:        {same_logits}")
-        print(f"  topk_idx(이웃) 완전 동일: {same_topk}")
-        print(f"  evidence_w(설명) 완전 동일: {same_evw}")
-
-        if not same_logits:
-            diff = (out_false["logits"] - out_true["logits"]).abs()
-            print(f"    logits 최대 절대오차: {diff.max().item():.2e}")
-        if not same_topk:
-            n_diff = (out_false["topk_idx"] != out_true["topk_idx"]).any(dim=-1).sum().item()
-            print(f"    topk_idx가 다른 샘플 수: {n_diff} / {X_test.shape[0]}")
-        if not same_evw:
-            diff_evw = (out_false["evidence_w"] - out_true["evidence_w"]).abs()
-            print(f"    evidence_w 최대 절대오차: {diff_evw.max().item():.2e}")
-
-        # 학습 종료 후 검증용으로만 forward를 두 번 더 돌렸으므로, 이후
-        # (--explain 등) 로직이 기존 설정(False)으로 계속 진행되도록 복원.
-        model.memory._vectorized_fallback = False
-    else:
-        print("  (참고: 이 libs/tabera.py는 vectorized_fallback을 지원하지 않는 "
-              "버전입니다 — 검증을 건너뜁니다.)")
 
     # ── Feature 기여도 설명 출력 ─────────────────────────
     if args.explain:

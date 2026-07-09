@@ -23,6 +23,7 @@ from typing import Optional, Dict, List
 
 from libs.eval import compute_metric, get_criterion, get_preds_and_probs, is_better
 from libs.tabera import TabERA
+from libs.prototypes import label_all_groups, label_groups_by_target
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,6 +99,9 @@ class TabERAWrapper:
         device: str = "cpu",
         epochs: int = 100,
         patience: int = 20,
+        cat_cols: Optional[List[int]] = None,
+        num_cols: Optional[List[int]] = None,
+        col_names: Optional[List[str]] = None,
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -109,6 +113,14 @@ class TabERAWrapper:
         self._data_id    = "?"      # tqdm 표시용 (optimize.py에서 주입)
         self.ema_history: List[Dict[str, float]] = []
         self.final_ema_stats: Optional[Dict[str, float]] = None
+        # ── 그룹 텍스트 라벨링 (libs/group_labels.py) ────────────
+        # 셋 다 주어져야 라벨링을 수행함. 하나라도 없으면(예: 기존
+        # optimize.py처럼 이 인자들을 안 넘기는 호출부) 조용히 건너뛰고
+        # group_labels는 계속 None으로 남는다 — centroid_x/medoid를
+        # 없앤 것과 달리 이건 선택적 부가 기능이라 하위 호환을 깨지 않음.
+        self.cat_cols  = cat_cols
+        self.num_cols  = num_cols
+        self.col_names = col_names
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -158,6 +170,8 @@ class TabERAWrapper:
         best_val   = None
         best_sample_groups = None
         best_feature_store = None
+        best_group_labels  = None
+        best_target_labels = None
         self.ema_history = []
         self.final_ema_stats = None
         _low_active_streak = 0   # 연속으로 active_ratio<10%인 EMA 체크 횟수 (runaway collapse 감지용)
@@ -229,6 +243,38 @@ class TabERAWrapper:
                             if fs is not None else None
                         )
                         ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
+
+                        # ── 그룹 텍스트 라벨 캐싱 (ema_update() 호출부) ──
+                        # x_ema/sample_groups는 방금 계산됐고, medoid를
+                        # 없앤 대신 이 텍스트 요약이 ①의 그룹 설명을 담당함.
+                        # cat_cols/num_cols/col_names가 전부 주어졌을 때만
+                        # 수행 (없으면 조용히 스킵 — 하위 호환).
+                        if (
+                            self.cat_cols is not None
+                            and self.num_cols is not None
+                            and self.col_names is not None
+                            and x_ema is not None
+                        ):
+                            self.model.prototype_layer.group_labels = label_all_groups(
+                                x_ema.detach().cpu().numpy(),
+                                self.model.prototype_layer.sample_groups,
+                                self.cat_cols,
+                                self.num_cols,
+                                self.col_names,
+                            )
+
+                        # ── 그룹 target(클래스) 분포 캐싱 — ①의 주 콘텐츠 ──
+                        # feature 라벨(위)은 ②(실제 이웃의 raw feature 값)와
+                        # 정보 종류가 겹친다 — ①만이 줄 수 있는 고유 정보는
+                        # "이 그룹이 어떤 target에 해당하는가"다. MemoryBank의
+                        # labels buffer가 sample_groups와 이미 같은 인덱스
+                        # 공간(슬롯 번호)을 쓰므로 바로 대응시킬 수 있다.
+                        y_ema = self.model.memory.labels[:n_mem]
+                        self.model.prototype_layer.target_labels = label_groups_by_target(
+                            y_ema.detach().cpu().numpy(),
+                            self.model.prototype_layer.sample_groups,
+                            self.tasktype,
+                        )
 
                     self.final_ema_stats = dict(ema_stats)
                     self.ema_history.append({
@@ -367,16 +413,18 @@ class TabERAWrapper:
             if is_better(val_v, best_val, self.tasktype):
                 best_val   = val_v
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
-                # [버그 수정] sample_groups(CentroidLayer의 일반 Python 리스트
-                # 속성)와 feature_store._store(nn.Module이 아님)는 위
+                # [버그 수정] sample_groups/group_labels(CentroidLayer의 일반
+                # Python 속성)와 feature_store._store(nn.Module이 아님)는 위
                 # state_dict()에 포함되지 않는다. load_state_dict()로
-                # centroid_emb/centroid_x/memory.keys 등은 "best 검증 epoch"
-                # 시점으로 되돌아가는데, 이 둘만 "마지막 학습 epoch" 시점에
-                # 남아있게 되어 서로 다른 시점의 스냅샷이 섞이는 문제가 있었음
+                # centroid_emb/memory.keys 등은 "best 검증 epoch" 시점으로
+                # 되돌아가는데, 이 셋만 "마지막 학습 epoch" 시점에 남아있게
+                # 되어 서로 다른 시점의 스냅샷이 섞이는 문제가 있었음
                 # (reproduce.py의 dual_space_faithfulness 사전 검증에서
                 # sample_groups 재배정 일치율이 무작위 수준으로 나온 원인).
                 # → best_state와 함께 별도로 스냅샷/복원한다.
                 best_sample_groups = copy.deepcopy(self.model.prototype_layer.sample_groups)
+                best_group_labels  = copy.deepcopy(self.model.prototype_layer.group_labels)
+                best_target_labels = copy.deepcopy(self.model.prototype_layer.target_labels)
                 if self.model.feature_store is not None:
                     best_feature_store = (
                         self.model.feature_store._store.clone(),
@@ -408,6 +456,10 @@ class TabERAWrapper:
             # 시점이 어긋나지 않도록 함.
             if best_sample_groups is not None:
                 self.model.prototype_layer.sample_groups = best_sample_groups
+            if best_group_labels is not None:
+                self.model.prototype_layer.group_labels = best_group_labels
+            if best_target_labels is not None:
+                self.model.prototype_layer.target_labels = best_target_labels
             if best_feature_store is not None:
                 store, ptr, filled = best_feature_store
                 self.model.feature_store._store  = store

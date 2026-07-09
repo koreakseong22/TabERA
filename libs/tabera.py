@@ -789,8 +789,8 @@ class TabERA(nn.Module):
         # 하나 거치게 함. detach_context_grad(gradient 완전 차단)와 달리
         # task_loss의 gradient가 여전히 centroid_emb까지 도달하되, 이
         # 프로젝션 행렬이 "예측에 유리하게 바꾸는 일"의 일부를 대신 떠맡아
-        # centroid_emb 자체가 덜 왜곡되길 기대하는 절충안. raw centroid_emb
-        # 를 직접 쓰는 설명①(hard_assignment, centroid_x medoid, confidence)
+        # centroid_emb 자체가 덜 왜곡되길 기대하는 절충안. raw centroid_emb를
+        # 직접 쓰는 설명①(hard_assignment, 그룹 텍스트 라벨, confidence)
         # 계산에는 전혀 관여하지 않음 — head 직전에만 끼움.
         self.use_context_projection = use_context_projection
         self.context_proj = (

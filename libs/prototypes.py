@@ -6,10 +6,8 @@ CentroidLayer — Dual-Space Prototype Representation
 
 가설 핵심 구현
 ──────────────
-(1) 이중 공간 저장
+(1) 임베딩 공간 centroid
     - centroid_emb  (P, D) : 임베딩 공간 — STE routing + FAISS 마스킹용
-    - centroid_x    (P, F) : 원본 feature 공간 — 역정규화 없이 직접 해석 가능
-    → "Centroid #3: alcohol=10.2, pH=3.3" 형태의 즉각적 설명
 
 (2) Straight-Through Estimator (STE) Hard Routing + FAISS 범위 제한
     - O(N) → O(P + k·log k) 복잡도 개선
@@ -18,21 +16,38 @@ CentroidLayer — Dual-Space Prototype Representation
     - STE: forward=argmax(hard), backward=softmax gradient 통과
     - 근거: VQ-VAE(van den Oord, 2017) 표준 설계 + commitment loss
 
-(3) Medoid 기반 centroid_x 갱신
-    - 매 에폭 후 각 centroid 그룹에서 medoid를 선택하여 centroid_x 갱신
-    - medoid: latent space 기준 centroid_emb[p]에 가장 가까운 실제 훈련 샘플
-    - centroid_x[p] = X_raw[argmax cosine_sim(X_emb_group, centroid_emb[p])]
-    - EMA 평균 대비 장점:
-        · gradient로 최적화된 centroid_emb 방향이 centroid_x에 반영됨
-        · 항상 실제 존재하는 훈련 샘플 → 설명의 신뢰성 보장
-        · "이 그룹의 대표 실제 사례" 로 사용자에게 직접 제시 가능
+(3) 그룹 텍스트 라벨 — ①의 그룹 설명용
+    - ①의 주 콘텐츠: 이 그룹이 어떤 target(클래스)에 해당하는지
+      (label_groups_by_target) — ②/③ 어디에도 없는 ①만의 고유 정보
+    - 보조 정보: 그룹을 가장 잘 특징짓는 feature들의 실제 그룹 평균값
+      (label_all_groups) — 정성적 밴드("매우 높음" 등)가 아니라 원값
+    - 매 epoch ema_update() 직후 supervised.py에서 계산·캐싱
+    - [설계 변경 이력] 이전에는 centroid_x(medoid)를 buffer로 저장해
+      ①에서 대표 데이터 1개를 그대로 보여줬으나, (a) 표본이 적은
+      그룹에서 outlier 1개가 그대로 대표값이 될 위험, (b) "실제 존재
+      하는 샘플을 보여준다"는 medoid의 장점은 이미 ②(MemoryBank 이웃
+      k개 + evidence_w)가 더 강한 근거로 제공하고 있어 역할이 중복됨
+      — 두 이유로 ①에서는 제거하고 텍스트 요약으로 대체함. 처음엔
+      별도 파일(libs/group_labels.py)이었으나, CentroidLayer에만
+      쓰이는 전용 헬퍼라 파일을 분리해 둘 이유가 없어 이 파일로 합침.
+
+(4) ig_baseline — Integrated Gradients(③) 전용 medoid
+    - ①과는 별개 용도. STE hard routing 때문에 IG 적분 경로 위에서
+      baseline이 x와 다른 그룹으로 라우팅되면 F가 불연속을 지나
+      completeness axiom이 깨진다 — 이를 피하려고 x와 같은 그룹으로
+      라우팅되도록 보장된 실제 샘플(=centroid_emb에 가장 가까운 실제
+      훈련 샘플)을 IG baseline으로 쓴다.
+    - ig_baseline[p] = X_raw[argmax cosine_sim(X_emb_group, centroid_emb[p])]
+    - [주의] 이건 IG 문헌의 표준 관행이 아니라 이 아키텍처(STE 불연속)에
+      맞춘 자체 설계임 — 논문에 "표준 기법"이 아니라 "novel contribution"
+      으로 서술할 것.
 
 이론적 근거
 ───────────
 - Dual-Space Prototype Representation (본 가설)
 - Straight-Through Estimator (Bengio et al. 2013)
 - VQ-VAE hard assignment trick (van den Oord et al. 2017)
-- Medoid-based prototype representation (본 구현)
+- IG baseline은 표준 기법이 아닌 본 구현의 자체 설계 (모듈 (4) 참고)
 
 하위 호환성
 ───────────
@@ -42,12 +57,263 @@ PrototypeLayer = CentroidLayer  (alias 유지, 기존 tabr.py 수정 불필요)
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ─────────────────────────────────────────────────────────────
+# 그룹 텍스트 라벨링 헬퍼 (구 libs/group_labels.py)
+# ─────────────────────────────────────────────────────────────
+# CentroidLayer.sample_groups/target_labels/group_labels 캐싱에만
+# 쓰이는 전용 함수들이라, CentroidLayer와 같은 파일에 둔다.
+# supervised.py에서 `from libs.prototypes import label_all_groups,
+# label_groups_by_target`로 가져다 쓴다.
+#
+# 두 부분으로 구성된다:
+# 1) label_groups_by_target()  — ①의 주 콘텐츠. "이 그룹이 어떤
+#    target(클래스)에 해당하는가". ②/③ 어디에도 없는, ①만의 고유 정보.
+# 2) label_all_groups()        — 그 그룹을 가장 잘 특징짓는("두드러진")
+#    feature들의 실제 그룹 평균값(원값, 정성적 밴드 아님).
+#
+# 랭킹 기준: 그룹 간 대비(cross-group distinctiveness)
+# ─────────────────────────────────────────────
+# 목표는 "각 centroid의 서로 구별되는 특징"을 보여주는 것이다. "이 그룹이
+# 전체 데이터셋 대비 얼마나 극단적인가"만 보면, 여러 그룹에 걸쳐 비슷하게
+# 튀는 feature가 계속 1등을 차지해서 서로 다른 centroid들이 같은 feature로
+# 도배되는 문제가 있었다. 대신 "이 그룹의 값이 다른 그룹들의 값 분포에서
+# 얼마나 벗어나는가"(다른 그룹들 대비 robust z-score)로 랭킹한다.
+#
+# numeric은 그룹 median(표본이 작을 때(흔히 1~10개) outlier에 안 휘둘림),
+# categorical은 최빈 카테고리 + 그 비율을 그대로 값으로 보여준다 — "매우
+# 높음/보통" 같은 구간 라벨은 안 쓴다(원값이 이미 직접 해석 가능하고,
+# 구간 경계값에 대한 근거를 따로 만들 필요가 없어짐).
+
+@dataclass
+class FeatureLabel:
+    feature_idx:  int
+    feature_name: str
+    kind:         str    # "numeric" | "categorical"
+    label:        str    # 그룹의 실제 값 (예: "10.4" 또는 "카테고리 2 (65%)")
+    detail: dict          # 사람이 검증/디버그할 때 참고할 원값
+
+
+def _group_stats_numeric(
+    X_train: np.ndarray,                    # (N, F)
+    valid_groups: Sequence[int],
+    sample_groups: Sequence[Sequence[int]],
+    feature_idx: int,
+) -> Dict[int, float]:
+    """그룹별 median (raw 값). {group_idx: group_median}"""
+    col = X_train[:, feature_idx]
+    return {p: float(np.median(col[sample_groups[p]])) for p in valid_groups}
+
+
+def _group_stats_categorical(
+    X_train: np.ndarray,
+    valid_groups: Sequence[int],
+    sample_groups: Sequence[Sequence[int]],
+    feature_idx: int,
+    eps: float = 1e-6,
+) -> Dict[int, dict]:
+    """그룹별 (최빈 카테고리, 그 비율, lift). {group_idx: {...}}"""
+    col = np.rint(X_train[:, feature_idx]).astype(int)
+    out = {}
+    for p in valid_groups:
+        group_vals = col[sample_groups[p]]
+        if len(group_vals) == 0:
+            continue
+        values, counts = np.unique(group_vals, return_counts=True)
+        top_cat = int(values[np.argmax(counts)])
+        group_prop   = float((group_vals == top_cat).mean())
+        overall_prop = float((col == top_cat).mean())
+        out[p] = {
+            "top_category": top_cat,
+            "group_prop":   group_prop,
+            "lift":         group_prop / (overall_prop + eps),
+        }
+    return out
+
+
+def _cross_group_distinctiveness(this_value: float, other_values: Sequence[float]) -> Optional[float]:
+    """
+    other_values(다른 그룹들의 같은 feature 값) 분포에서 this_value가
+    얼마나 벗어나는지 robust z-score로 계산.
+    median/MAD(median absolute deviation) 사용 — 그룹 몇 개가 극단치여도
+    std보다 덜 흔들림. 비교할 다른 그룹이 2개 미만이면(=P가 아주 작은
+    경우) 계산 불가하므로 None 반환 → 호출부에서 fallback.
+    """
+    if len(other_values) < 2:
+        return None
+    others = np.asarray(other_values, dtype=float)
+    med = np.median(others)
+    mad = np.median(np.abs(others - med)) * 1.4826 + 1e-6  # 정규분포 가정 시 std와 동일 스케일
+    return float(abs(this_value - med) / mad)
+
+
+def label_all_groups(
+    X_train: np.ndarray,
+    sample_groups: Sequence[Sequence[int]],
+    cat_cols: Sequence[int],
+    num_cols: Sequence[int],
+    col_names: Sequence[str],
+    top_k: int = 5,
+    min_group_size: int = 2,
+) -> Dict[int, List[FeatureLabel]]:
+    """
+    ema_update() 직후 호출해서 캐싱해두는 용도.
+    반환값: {group_index: [FeatureLabel, ...]}  (top_k개, 그룹 간
+    대비(distinctiveness) 내림차순 — "이 그룹만 유별난" feature가 위로)
+    """
+    valid_groups = [p for p, g in enumerate(sample_groups)
+                     if g is not None and len(g) >= min_group_size]
+    if not valid_groups:
+        return {p: [] for p in range(len(sample_groups))}
+
+    num_stats: Dict[int, Dict[int, float]] = {
+        fi: _group_stats_numeric(X_train, valid_groups, sample_groups, fi)
+        for fi in num_cols
+    }
+    cat_stats: Dict[int, Dict[int, dict]] = {
+        fi: _group_stats_categorical(X_train, valid_groups, sample_groups, fi)
+        for fi in cat_cols
+    }
+
+    result: Dict[int, List[FeatureLabel]] = {p: [] for p in range(len(sample_groups))}
+
+    for p in valid_groups:
+        candidates: List[FeatureLabel] = []
+
+        for fi in num_cols:
+            stats = num_stats[fi]
+            if p not in stats:
+                continue
+            this_val = stats[p]
+            others   = [v for q, v in stats.items() if q != p]
+            dist = _cross_group_distinctiveness(this_val, others)
+            if dist is None:
+                dist = abs(this_val - float(np.median(list(stats.values()))))  # fallback
+
+            candidates.append(FeatureLabel(
+                feature_idx=fi,
+                feature_name=col_names[fi] if fi < len(col_names) else f"f{fi}",
+                kind="numeric",
+                label=f"{this_val:.3g}",
+                detail={"group_value": this_val, "distinctiveness": dist},
+            ))
+
+        for fi in cat_cols:
+            stats = cat_stats[fi]
+            if p not in stats:
+                continue
+            top_cat, group_prop, lift = (stats[p]["top_category"], stats[p]["group_prop"], stats[p]["lift"])
+            this_log = float(np.log2(lift + 1e-6))
+            others_log = [float(np.log2(s["lift"] + 1e-6)) for q, s in stats.items() if q != p]
+            dist = _cross_group_distinctiveness(this_log, others_log)
+            if dist is None:
+                dist = abs(this_log)  # fallback: lift=1(log=0)에서 얼마나 떨어졌는지
+
+            candidates.append(FeatureLabel(
+                feature_idx=fi,
+                feature_name=col_names[fi] if fi < len(col_names) else f"f{fi}",
+                kind="categorical",
+                label=f"카테고리 {top_cat} ({group_prop:.0%})",
+                detail={"top_category": top_cat, "group_prop": group_prop, "lift": lift, "distinctiveness": dist},
+            ))
+
+        candidates.sort(key=lambda fl: fl.detail["distinctiveness"], reverse=True)
+        result[p] = candidates[:top_k]
+
+    return result
+
+
+def format_group_labels(labels: List[FeatureLabel]) -> str:
+    if not labels:
+        return "(그룹 크기가 작아 특징을 요약할 수 없습니다)"
+    lines = [f"  - {fl.feature_name}: {fl.label}" for fl in labels]
+    return "\n".join(lines)
+
+
+def label_groups_by_target(
+    labels: np.ndarray,                      # (N,) MemoryBank 라벨(class index as float, 또는 regression target)
+    sample_groups: Sequence[Sequence[int]],
+    tasktype: str,                            # "multiclass" | "binclass" | "regression"
+    class_names: Optional[Sequence[str]] = None,
+    min_group_size: int = 2,
+    second_class_threshold: float = 0.2,      # 2등 클래스가 이 비율 이상이면 같이 표시
+) -> Dict[int, Optional[dict]]:
+    """
+    각 그룹이 실제로 어떤 target에 해당하는지 요약 — ①의 주 콘텐츠.
+    - classification(multiclass/binclass): 최다 클래스 + 비율. 2등
+      클래스가 second_class_threshold 이상이면 같이 반환(그룹이 두
+      클래스에 걸쳐 있다는 걸 숨기지 않기 위함).
+    - regression: 그룹 target 평균이 전체 분포에서 몇 percentile인지.
+
+    반환값: {group_idx: {...} or None}  (그룹 크기 미달 시 None)
+    """
+    labels = np.asarray(labels)
+    result: Dict[int, Optional[dict]] = {}
+
+    for p, grp in enumerate(sample_groups):
+        if grp is None or len(grp) < min_group_size:
+            result[p] = None
+            continue
+        y_grp = labels[grp]
+
+        if tasktype in ("multiclass", "binclass"):
+            y_int = np.rint(y_grp).astype(int)
+            vals, counts = np.unique(y_int, return_counts=True)
+            order = np.argsort(-counts)
+            top_cls   = int(vals[order[0]])
+            top_prop  = float(counts[order[0]] / len(y_int))
+            top_name  = (class_names[top_cls]
+                         if class_names is not None and top_cls < len(class_names)
+                         else f"Class {top_cls}")
+
+            second = None
+            if len(order) > 1:
+                second_cls  = int(vals[order[1]])
+                second_prop = float(counts[order[1]] / len(y_int))
+                if second_prop >= second_class_threshold:
+                    second_name = (class_names[second_cls]
+                                   if class_names is not None and second_cls < len(class_names)
+                                   else f"Class {second_cls}")
+                    second = {"class": second_cls, "name": second_name, "prop": second_prop}
+
+            result[p] = {
+                "kind": "classification",
+                "top_class": top_cls, "top_class_name": top_name, "top_prop": top_prop,
+                "second": second, "n": len(y_int),
+            }
+        else:  # regression
+            grp_mean   = float(np.mean(y_grp))
+            percentile = float((labels <= grp_mean).mean()) * 100.0
+            result[p] = {
+                "kind": "regression",
+                "group_mean": grp_mean, "percentile": percentile, "n": len(y_grp),
+            }
+
+    return result
+
+
+def format_target_label(info: Optional[dict]) -> str:
+    """label_groups_by_target()의 그룹 하나 결과를 사람이 읽을 텍스트로."""
+    if info is None:
+        return "(그룹 크기가 작아 요약할 수 없습니다)"
+
+    if info["kind"] == "classification":
+        s = f"주로 \"{info['top_class_name']}\" ({info['top_prop']:.0%}, n={info['n']})"
+        if info["second"] is not None:
+            s += f" — \"{info['second']['name']}\"도 {info['second']['prop']:.0%} 포함"
+        return s
+    else:
+        s = (f"target 평균 {info['group_mean']:.3g} "
+             f"(전체 분포 기준 백분위 {info['percentile']:.0f}, n={info['n']})")
+        return s
 
 
 class CentroidLayer(nn.Module):
@@ -88,22 +354,32 @@ class CentroidLayer(nn.Module):
         # ── 온도 (register_buffer: 저장되지만 gradient 없음) ──
         self.register_buffer("current_epoch", torch.tensor(0, dtype=torch.long))
 
-        # ── (1) 이중 공간 centroid ────────────────────────────
-        # 임베딩 공간: 학습 가능 파라미터 (routing + FAISS 마스킹)
+        # ── centroid 임베딩 (학습 가능 파라미터: routing + FAISS 마스킹) ──
         self.centroid_emb = nn.Parameter(torch.empty(n_prototypes, embed_dim))
         nn.init.orthogonal_(self.centroid_emb)
 
-        # 원본 feature 공간: buffer (학습 안 됨, EMA로만 갱신)
+        # ── IG(③) 전용 baseline: buffer (학습 안 됨, ema_update로 갱신) ──
+        # ①의 그룹 설명에는 안 쓰임 (모듈 docstring (3)(4) 참고).
         if n_features > 0:
-            self.register_buffer("centroid_x", torch.zeros(n_prototypes, n_features))
-            self.register_buffer("centroid_x_initialized", torch.tensor(False))
+            self.register_buffer("ig_baseline", torch.zeros(n_prototypes, n_features))
+            self.register_buffer("ig_baseline_initialized", torch.tensor(False))
         else:
-            self.centroid_x = None
-            self.centroid_x_initialized = None
+            self.ig_baseline = None
+            self.ig_baseline_initialized = None
 
         # ── centroid별 샘플 인덱스 그룹 (FAISS 범위 제한용) ──
         # list of lists: sample_groups[p] = [idx, idx, ...]
         self.sample_groups: Optional[List[List[int]]] = None
+
+        # ── centroid별 텍스트 라벨 캐시 (libs/group_labels.py 결과) ──
+        # {p: [FeatureLabel, ...]} — ema_update() 직후 supervised.py에서
+        # 채워짐. ①의 그룹 특징 설명은 이 캐시가 담당한다.
+        self.group_labels: Optional[Dict[int, list]] = None
+
+        # ── centroid별 target(클래스) 분포 캐시 (①의 주 콘텐츠) ──
+        # {p: {"kind": ..., "top_class_name": ..., ...} or None} —
+        # ema_update() 직후 supervised.py에서 label_groups_by_target()로 채움.
+        self.target_labels: Optional[Dict[int, Optional[dict]]] = None
 
         # ── centroid별 평균 레이블 (Rank-Consistency Loss용) ──
         self.register_buffer(
@@ -124,7 +400,7 @@ class CentroidLayer(nn.Module):
     def initialize_from_data(
         self,
         X_emb: torch.Tensor,             # (N, D) 훈련 임베딩
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature
+        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — ig_baseline 초기화용
         y_labels: Optional[torch.Tensor] = None, # (N,) 레이블 (소수 클래스 보장용)
     ) -> None:
         """
@@ -194,9 +470,9 @@ class CentroidLayer(nn.Module):
         idx_t = torch.tensor(selected_idx, device=dev)
         self.centroid_emb.data = X_n[idx_t]
 
-        if X_raw is not None and self.centroid_x is not None:
-            self.centroid_x.data = X_raw[idx_t].float()
-            self.centroid_x_initialized.fill_(True)
+        if X_raw is not None and self.ig_baseline is not None:
+            self.ig_baseline.data = X_raw[idx_t].float()
+            self.ig_baseline_initialized.fill_(True)
         self.sample_groups = [[] for _ in range(self.P)]
 
         # 초기화 품질 로그: centroid 간 평균 코사인 거리
@@ -214,27 +490,30 @@ class CentroidLayer(nn.Module):
     def ema_update(
         self,
         X_emb: torch.Tensor,        # (N, D) 전체 훈련 임베딩 — assignment 계산용
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — centroid_x medoid용
+        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — ig_baseline medoid용
         assignments: Optional[torch.Tensor] = None,  # (N,) hard assignment
     ) -> Dict[str, float]:
         """
-        에폭 종료 후 호출: sample_groups 갱신 + centroid_x medoid 갱신.
+        에폭 종료 후 호출: sample_groups 갱신 + ig_baseline(IG 전용 medoid) 갱신.
 
-        centroid_x 갱신 방식: EMA 평균 → Medoid 교체
-        ──────────────────────────────────────────────
-        기존 EMA 평균은 그룹 샘플들의 원본 feature 평균을 추적하지만,
-        centroid_emb가 gradient로 이동한 방향과 무관하게 갱신된다는 문제가 있음.
+        [주의] ig_baseline은 ①의 그룹 설명에는 안 쓰인다 — ③(Integrated
+        Gradients)의 baseline 전용이다. ①의 그룹 텍스트 라벨(group_labels)은
+        이 함수가 sample_groups를 갱신한 직후, supervised.py의 호출부에서
+        libs/group_labels.py로 별도 계산·캐싱한다.
 
-        Medoid 방식:
-          centroid_x[p] = 그룹 내에서 centroid_emb[p]에
-                          latent space 기준 가장 가까운 실제 훈련 샘플의 원본 feature
+        ig_baseline 갱신 방식: Medoid
+        ─────────────────────────────
+        ig_baseline[p] = 그룹 내에서 centroid_emb[p]에
+                         latent space 기준 가장 가까운 실제 훈련 샘플의 원본 feature
 
-        효과
-        ────
-        - centroid_emb의 gradient 최적화 결과가 centroid_x에 반영됨
-        - centroid_x가 항상 실제 존재하는 훈련 샘플 → 설명의 신뢰성 향상
-        - "이 그룹의 대표 사례" 로 사용자에게 직접 제시 가능
-        - EMA smoothing 불필요 → 에폭마다 현재 상태를 정확히 반영
+        왜 medoid인가 (IG baseline 전용 이유)
+        ────────────────────────────────────
+        STE hard routing 때문에 IG 적분 경로(baseline→x) 위에서 baseline이
+        x와 다른 그룹으로 라우팅되면 forward 함수가 불연속을 지나
+        completeness axiom이 깨진다. medoid는 centroid_emb와의 코사인
+        유사도로 뽑히므로, x와 같은 그룹으로 라우팅되도록 구조적으로
+        보장된다 — 이게 불연속 구간을 최소화하는 이유다. (표준 IG 기법이
+        아니라 이 아키텍처에 맞춘 자체 설계 — 모듈 docstring 참고)
 
         유지되는 기능
         ─────────────
@@ -275,11 +554,11 @@ class CentroidLayer(nn.Module):
         masked_sims = torch.where(assigned_mask, all_sims, torch.tensor(INF, device=all_sims.device))  # (N, P)
         medoid_indices = masked_sims.argmax(dim=0)  # (P,) — 각 centroid의 medoid 샘플 인덱스
 
-        # centroid_x 일괄 업데이트 (medoid가 있는 centroid만)
-        if X_raw is not None and self.centroid_x is not None:
+        # ig_baseline 일괄 업데이트 (medoid가 있는 centroid만)
+        if X_raw is not None and self.ig_baseline is not None:
             for p in range(P):
                 if assigned_mask[:, p].any():
-                    self.centroid_x.data[p] = X_raw[medoid_indices[p]].float()
+                    self.ig_baseline.data[p] = X_raw[medoid_indices[p]].float()
 
         # sample_groups: assignments를 CPU에서 한 번만 변환
         assignments_cpu = assignments.cpu()
@@ -487,75 +766,96 @@ class CentroidLayer(nn.Module):
         self,
         hard_assignment: torch.Tensor,   # (B,)
         routing_probs: torch.Tensor,     # (B, P)
-        norm_mean: Optional[np.ndarray] = None,  # (F,) 역정규화용
-        norm_std:  Optional[np.ndarray] = None,  # (F,) 역정규화용
+        norm_mean: Optional[np.ndarray] = None,  # 더 이상 안 씀 (centroid_x
+                                                  # 역정규화용이었음) — 호출부
+                                                  # 시그니처 호환을 위해 유지
+        norm_std:  Optional[np.ndarray] = None,  # 위와 동일
     ) -> List[dict]:
         """
         샘플별 centroid 배정 설명.
-        norm_mean/norm_std가 주어지면 centroid_x를 역정규화하여
-        원본 feature 값으로 출력합니다.
-        예: alcohol=-0.816 → alcohol=10.24
+
+        ①의 주 콘텐츠는 target_labels(label_groups_by_target() 결과)
+        — "이 그룹은 대체로 어떤 target(클래스)인가". 배정된 그룹뿐
+        아니라 runner-up 그룹들도 각자의 target_info를 같이 반환한다
+        — runner-up도 결국 "이 샘플이 속할 뻔한 다른 그룹"이라, 그
+        그룹이 어떤 target인지도 같이 봐야 맥락이 온전해진다.
+        group_feature_labels는 그 그룹을 다른 그룹들과 가장 뚜렷이
+        구별시키는 feature들의 실제 그룹 평균값(원값) — 보조 정보로
+        같이 반환한다. 캐싱 전(supervised.py 연결 안 된 경우)이면
+        각각 None/빈 리스트.
         """
         pa   = hard_assignment.detach().cpu().numpy()
         pr   = routing_probs.detach().cpu().numpy()
 
-        # centroid_x 역정규화: x_original = x_norm * std + mean
-        if self.centroid_x is not None:
-            cx = self.centroid_x.detach().cpu().numpy()  # (P, F)
-            if norm_mean is not None and norm_std is not None:
-                cx = cx * norm_std + norm_mean  # 역정규화
-        else:
-            cx = None
-
         out  = []
-        ncol = min(len(self.col_names), self.F) if self.F > 0 else 0
 
         for b in range(pa.shape[0]):
             p     = int(pa[b])
             label = self.labels[p]
             conf  = float(pr[b, p])
 
-            runners = sorted(
-                [(self.labels[i], float(pr[b, i]))
-                 for i in range(self.P) if i != p],
-                key=lambda x: -x[1],
+            runner_idx = sorted(
+                [i for i in range(self.P) if i != p],
+                key=lambda i: -float(pr[b, i]),
+            )[:2]
+            runners = [
+                {
+                    "label":       self.labels[i],
+                    "confidence":  float(pr[b, i]),
+                    "target_info": (self.target_labels.get(i)
+                                     if self.target_labels is not None else None),
+                }
+                for i in runner_idx
+            ]
+
+            # ①의 주 콘텐츠: 이 그룹이 어떤 target(클래스)에 해당하는가
+            target_info = (
+                self.target_labels.get(p)
+                if self.target_labels is not None else None
             )
 
-            # 원본 feature 값 (이중 공간의 핵심)
-            centroid_features: Dict[str, float] = {}
-            if cx is not None and ncol > 0:
-                for fi in range(ncol):
-                    centroid_features[self.col_names[fi]] = float(cx[p, fi])
+            # 보조 정보: feature별 "매우 높음/높음/보통/..." 요약
+            group_feature_labels = (
+                self.group_labels.get(p, [])
+                if self.group_labels is not None else []
+            )
 
             out.append({
-                "assigned_group":    label,
-                "centroid_idx":      p,
-                "group_confidence":  conf,
-                "runners_up":        runners[:2],
-                "centroid_features": centroid_features,  # ← 이중 공간 설명
+                "assigned_group":       label,
+                "centroid_idx":         p,
+                "group_confidence":     conf,
+                "runners_up":           runners,
+                "target_info":          target_info,          # ← ①의 주 콘텐츠
+                "group_feature_labels": group_feature_labels,  # ← 보조 정보
             })
         return out
 
     def centroid_summary(self, top_n: int = 3) -> str:
         """
-        전체 centroid의 원본 feature 평균값을 요약 출력.
-        역정규화 없이 직접 해석 가능한 형태.
+        전체 centroid의 그룹 크기 + target 분포 + 두드러진 feature
+        평균값 요약 출력.
+        top_n: 그룹당 보여줄 feature 개수 상한.
         """
         lines = [f"CentroidLayer — {self.P} centroids", "─" * 44]
-        cx = (self.centroid_x.detach().cpu().numpy()
-              if self.centroid_x is not None else None)
-        ncol = min(len(self.col_names), self.F, top_n * 2) if self.F > 0 else 0
 
         for p in range(self.P):
             grp_size = (len(self.sample_groups[p])
                         if self.sample_groups else "?")
             line = f"  [{self.labels[p]}]  n={grp_size}"
-            if cx is not None and ncol > 0:
-                vals = ", ".join(
-                    f"{self.col_names[fi]}={cx[p, fi]:.3f}"
-                    for fi in range(ncol)
-                )
-                line += f"  {vals}"
+
+            # ①의 콘텐츠: target 분포
+            tinfo = self.target_labels.get(p) if self.target_labels else None
+            if tinfo is not None:
+                if tinfo["kind"] == "classification":
+                    line += f"  → {tinfo['top_class_name']}({tinfo['top_prop']:.0%})"
+                else:
+                    line += f"  → target≈{tinfo['group_mean']:.3g}(p{tinfo['percentile']:.0f})"
+
+            # 두드러진 feature의 그룹 평균값
+            labels_p = self.group_labels.get(p) if self.group_labels else None
+            if labels_p:
+                vals = ", ".join(f"{fl.feature_name}={fl.label}" for fl in labels_p[:top_n])
+                line += f"  [{vals}]"
             lines.append(line)
         return "\n".join(lines)
 
