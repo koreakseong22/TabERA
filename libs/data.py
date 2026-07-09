@@ -112,9 +112,16 @@ def load_data(openml_id):
     cat_cols = [valid_cols.index(x) for x in cat_features]
     num_cols = [valid_cols.index(x) for x in valid_cols if not x in cat_features]
     cat_cardinality = [X[c].cat.categories.size for c in cat_features]
+    # [수정] colencoder.classes_[i] = 코드 i가 원래 뭐였는지(원본 카테고리
+    # 문자열). 이전에는 colencoder가 루프 지역 변수라 fit 직후 버려져서,
+    # "Category 0"이 실제로 뭘 뜻하는지 나중에 알 방법이 없었음. 컬럼명
+    # (col_name)을 키로 저장 — invalid_num_cols 필터링은 numeric 컬럼만
+    # 건드리므로 categorical 컬럼명은 이후에도 안 바뀜.
+    cat_category_names = {}
     for col in cat_features:
         colencoder = LabelEncoder()
         X[col] = colencoder.fit_transform(X[col])
+        cat_category_names[col] = [str(c) for c in colencoder.classes_]
     X = X.values
     invalid_num_cols = []
     for col in num_cols:
@@ -129,14 +136,23 @@ def load_data(openml_id):
         X = X[:, keep_mask]
         num_cols = [keep_mask.index(i) for i in num_cols if i not in invalid_num_cols]
         cat_cols = [keep_mask.index(i) for i in cat_cols if i not in invalid_num_cols]
+        # [수정] X를 keep_mask로 걸렀으면, valid_cols(컬럼명 리스트)도
+        # 같은 위치 기준으로 걸러야 최종 X의 컬럼 순서와 이름이 계속
+        # 1:1로 맞는다 — 안 그러면 col_names가 실제와 어긋난 채로 반환됨.
+        valid_cols = [valid_cols[i] for i in keep_mask]
     X = X.astype(np.float32)
 
     y = y.values
     labelencoder = LabelEncoder()
     y = labelencoder.fit_transform(y)
+    # [수정] categorical feature와 같은 문제: 원래 target 라벨 문자열
+    # (예: "good"/"bad")이 정수 코드(0/1)로 바뀐 뒤 매핑이 버려졌음.
+    # classification(binclass/multiclass)에서만 의미 있고, regression은
+    # 호출부(label_groups_by_target)에서 애초에 이 값을 안 씀.
+    target_class_names = [str(c) for c in labelencoder.classes_]
 
     print("full data size", X.shape)
-    return X, y, cat_cols, cat_cardinality, num_cols
+    return X, y, cat_cols, cat_cardinality, num_cols, valid_cols, cat_category_names, target_class_names
 
 
 def one_hot(y):
@@ -169,16 +185,17 @@ def split_data(X, y, tasktype, num_indices=[], seed=0, device='cuda'):
     y_val = torch.from_numpy(y[val_idx]).type(torch.float32).to(device)
     y_test = torch.from_numpy(y[te_idx]).type(torch.float32).to(device)
 
-    (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std = prep_data(
+    (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std, quantile_transformer = prep_data(
         X_train, X_val, X_test, y_train, y_val, y_test, num_indices=num_indices, tasktype=tasktype
     )
 
-    return (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std, quantile_transformer
 
 
 ## following Gorishniy et al., 2021
 def prep_data(X_train, X_val, X_test, y_train, y_val, y_test, num_indices=[], tasktype='multiclass'):
     device = X_train.device
+    quantile_transformer = None
     if len(num_indices) > 0:
         quantile_transformer = QuantileTransformer(output_distribution='uniform', random_state=42)
         X_train[:, num_indices] = torch.as_tensor(
@@ -210,7 +227,11 @@ def prep_data(X_train, X_val, X_test, y_train, y_val, y_test, num_indices=[], ta
         )
     else:
         y_std = 1.
-    return (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std
+    # [수정] 이전에는 quantile_transformer가 fit된 채로 함수 지역변수로
+    # 버려졌음 — numeric feature 표시 시 "0.328"이 실제 몇 단위인지
+    # 역변환(inverse_transform)할 방법이 없어서 [0,1] uniform 값 그대로
+    # 노출되던 원인. 반환해서 TabularDataset이 보관하도록 함.
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test), y_std, quantile_transformer
 
 
 class TabularDataset(torch.utils.data.Dataset):
@@ -219,14 +240,23 @@ class TabularDataset(torch.utils.data.Dataset):
         dataset = TabularDataset(openml_id, tasktype, device=device, seed=seed)
         (X_train, y_train), (X_val, y_val), (X_test, y_test) = dataset._indv_dataset()
         dataset.n_features / dataset.n_classes / dataset.col_names / dataset.y_std
+        dataset.cat_category_names  # {col_name: [원본 카테고리 문자열, ...]}
+                                     # 코드 i ↔ cat_category_names[col][i]
+        dataset.target_class_names # [원본 target 라벨 문자열, ...] (classification만 의미 있음)
+                                     # 코드 i ↔ target_class_names[i]
+        dataset.quantile_transformer # fit된 QuantileTransformer(numeric feature용) —
+                                     # .inverse_transform()으로 [0,1] 값을 실제 단위로 되돌릴 수 있음.
+                                     # num_indices(X_num)가 비어있으면 None.
     형태로 사용.
     """
 
     def __init__(self, openml_id, tasktype, device, seed=1):
-        X, y, self.X_cat, self.X_cat_cardinality, self.X_num = load_data(openml_id)
+        X, y, self.X_cat, self.X_cat_cardinality, self.X_num, raw_col_names, \
+            self.cat_category_names, self.target_class_names = load_data(openml_id)
         self.tasktype = tasktype
 
-        (self.X_train, self.y_train), (self.X_val, self.y_val), (self.X_test, self.y_test), self.y_std = \
+        (self.X_train, self.y_train), (self.X_val, self.y_val), (self.X_test, self.y_test), self.y_std, \
+            self.quantile_transformer = \
             split_data(X, y, self.tasktype, num_indices=self.X_num, seed=seed, device=device)
 
         # multiclass: one-hot((N,C)) → 정수 클래스 인덱스
@@ -246,10 +276,17 @@ class TabularDataset(torch.utils.data.Dataset):
             self.n_classes = None
 
         self.n_features = self.X_train.shape[1]
-        # 원본 컬럼명은 보존되지 않음 (openml categorical_indicator 처리
-        # 과정에서 유실) — 설명① 텍스트 표시("alcohol=10.24" 등)에만
-        # 영향을 주고 학습/정확도에는 전혀 무관.
-        self.col_names = [f"f{i}" for i in range(self.n_features)]
+        # [수정] 이전에는 load_data()가 실제 컬럼명(valid_cols)을 계산해
+        # 놓고도 반환하지 않아서, 여기서 f0/f1/... 같은 자리표시자로
+        # 대체했었음 — 설명①/② 텍스트 표시("checking_status=..." 등)에
+        # 실제 이름 대신 f0/f1이 나오던 원인. 이제 load_data()가 반환하는
+        # 실제 이름을 그대로 쓴다.
+        assert len(raw_col_names) == self.n_features, (
+            f"col_names 길이({len(raw_col_names)})가 n_features({self.n_features})와 "
+            f"다릅니다 — load_data()의 컬럼 필터링 단계 중 하나가 valid_cols와 "
+            f"동기화가 안 됐을 수 있습니다."
+        )
+        self.col_names = raw_col_names
 
         print("input dim: %i, cat: %i, num: %i" % (self.n_features, len(self.X_cat), len(self.X_num)))
         self.batch_size = get_batch_size(len(self.X_train))

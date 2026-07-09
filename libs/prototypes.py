@@ -98,7 +98,7 @@ class FeatureLabel:
     feature_idx:  int
     feature_name: str
     kind:         str    # "numeric" | "categorical"
-    label:        str    # 그룹의 실제 값 (예: "10.4" 또는 "카테고리 2 (65%)")
+    label:        str    # 그룹의 실제 값 (예: "10.4" 또는 "Category 2 (65%)")
     detail: dict          # 사람이 검증/디버그할 때 참고할 원값
 
 
@@ -155,6 +155,35 @@ def _cross_group_distinctiveness(this_value: float, other_values: Sequence[float
     return float(abs(this_value - med) / mad)
 
 
+def inverse_transform_numeric(qt, num_cols: Sequence[int], feature_idx: int, value: float) -> Optional[float]:
+    """
+    numeric feature는 libs/data.py의 prep_data()에서 QuantileTransformer로
+    [0,1] uniform 값으로 바뀐 채 저장된다 — "0.328"이 실제로 몇 단위인지
+    (예: credit_amount가 몇 마르크인지) 알 방법이 없었던 원인. qt(fit된
+    QuantileTransformer)가 주어지면 실제 단위로 역변환한다.
+
+    QuantileTransformer는 각 컬럼을 독립적으로 처리하므로(fit 시 컬럼별로
+    별도 분위수 매핑을 학습함), 다른 컬럼에 아무 값이나 채워 넣어도
+    feature_idx 위치의 역변환 결과에는 영향이 없다 — 그래서 그룹 값 하나만
+    바꿔 넣은 더미 행으로 역변환해도 안전하다(검증됨).
+
+    qt가 None이거나 feature_idx가 num_cols에 없으면 None 반환 →
+    호출부에서 [0,1] 값 그대로 표시하는 걸로 fallback.
+    """
+    if qt is None:
+        return None
+    try:
+        col_pos = list(num_cols).index(feature_idx)
+    except ValueError:
+        return None
+    dummy = np.full((1, len(num_cols)), 0.5)
+    dummy[0, col_pos] = value
+    try:
+        return float(qt.inverse_transform(dummy)[0, col_pos])
+    except Exception:
+        return None
+
+
 def label_all_groups(
     X_train: np.ndarray,
     sample_groups: Sequence[Sequence[int]],
@@ -163,11 +192,24 @@ def label_all_groups(
     col_names: Sequence[str],
     top_k: int = 5,
     min_group_size: int = 2,
+    cat_category_names: Optional[Dict[str, Sequence[str]]] = None,
+    quantile_transformer=None,
 ) -> Dict[int, List[FeatureLabel]]:
     """
     ema_update() 직후 호출해서 캐싱해두는 용도.
     반환값: {group_index: [FeatureLabel, ...]}  (top_k개, 그룹 간
     대비(distinctiveness) 내림차순 — "이 그룹만 유별난" feature가 위로)
+
+    cat_category_names: {col_name: [원본 카테고리 문자열, ...]}가 주어지면
+    (libs/data.py의 load_data()가 반환하는 것), categorical 라벨을
+    "Category 0" 대신 실제 이름("male single" 등)으로 표시한다. 없으면
+    "Category N"으로 fallback (하위 호환 — 이 인자 없이 부르던 기존 코드도
+    그대로 동작).
+
+    quantile_transformer: libs/data.py의 prep_data()가 반환하는 fit된
+    QuantileTransformer가 주어지면, numeric 라벨을 [0,1] uniform 값
+    대신 실제 단위(예: credit_amount=3271)로 역변환해 보여준다. 없으면
+    [0,1] 값 그대로 표시 (하위 호환).
     """
     valid_groups = [p for p, g in enumerate(sample_groups)
                      if g is not None and len(g) >= min_group_size]
@@ -198,12 +240,16 @@ def label_all_groups(
             if dist is None:
                 dist = abs(this_val - float(np.median(list(stats.values()))))  # fallback
 
+            real_val = inverse_transform_numeric(quantile_transformer, num_cols, fi, this_val)
+            display_val = real_val if real_val is not None else this_val
+
             candidates.append(FeatureLabel(
                 feature_idx=fi,
                 feature_name=col_names[fi] if fi < len(col_names) else f"f{fi}",
                 kind="numeric",
-                label=f"{this_val:.3g}",
-                detail={"group_value": this_val, "distinctiveness": dist},
+                label=f"{display_val:.3g}",
+                detail={"group_value_uniform": this_val, "group_value_real": real_val,
+                        "distinctiveness": dist},
             ))
 
         for fi in cat_cols:
@@ -217,11 +263,17 @@ def label_all_groups(
             if dist is None:
                 dist = abs(this_log)  # fallback: lift=1(log=0)에서 얼마나 떨어졌는지
 
+            fname = col_names[fi] if fi < len(col_names) else f"f{fi}"
+            names_for_col = cat_category_names.get(fname) if cat_category_names else None
+            cat_display = (str(names_for_col[top_cat])
+                            if names_for_col is not None and top_cat < len(names_for_col)
+                            else f"Category {top_cat}")
+
             candidates.append(FeatureLabel(
                 feature_idx=fi,
-                feature_name=col_names[fi] if fi < len(col_names) else f"f{fi}",
+                feature_name=fname,
                 kind="categorical",
-                label=f"카테고리 {top_cat} ({group_prop:.0%})",
+                label=f"{cat_display} ({group_prop:.0%})",
                 detail={"top_category": top_cat, "group_prop": group_prop, "lift": lift, "distinctiveness": dist},
             ))
 
@@ -269,24 +321,28 @@ def label_groups_by_target(
             vals, counts = np.unique(y_int, return_counts=True)
             order = np.argsort(-counts)
             top_cls   = int(vals[order[0]])
-            top_prop  = float(counts[order[0]] / len(y_int))
+            top_count = int(counts[order[0]])
+            top_prop  = float(top_count / len(y_int))
             top_name  = (class_names[top_cls]
                          if class_names is not None and top_cls < len(class_names)
                          else f"Class {top_cls}")
 
             second = None
             if len(order) > 1:
-                second_cls  = int(vals[order[1]])
-                second_prop = float(counts[order[1]] / len(y_int))
+                second_cls   = int(vals[order[1]])
+                second_count = int(counts[order[1]])
+                second_prop  = float(second_count / len(y_int))
                 if second_prop >= second_class_threshold:
                     second_name = (class_names[second_cls]
                                    if class_names is not None and second_cls < len(class_names)
                                    else f"Class {second_cls}")
-                    second = {"class": second_cls, "name": second_name, "prop": second_prop}
+                    second = {"class": second_cls, "name": second_name,
+                              "prop": second_prop, "count": second_count}
 
             result[p] = {
                 "kind": "classification",
-                "top_class": top_cls, "top_class_name": top_name, "top_prop": top_prop,
+                "top_class": top_cls, "top_class_name": top_name,
+                "top_prop": top_prop, "top_count": top_count,
                 "second": second, "n": len(y_int),
             }
         else:  # regression
@@ -306,9 +362,10 @@ def format_target_label(info: Optional[dict]) -> str:
         return "(그룹 크기가 작아 요약할 수 없습니다)"
 
     if info["kind"] == "classification":
-        s = f"주로 \"{info['top_class_name']}\" ({info['top_prop']:.0%}, n={info['n']})"
+        s = f"주로 \"{info['top_class_name']}\" {info['top_count']}/{info['n']} ({info['top_prop']:.0%})"
         if info["second"] is not None:
-            s += f" — \"{info['second']['name']}\"도 {info['second']['prop']:.0%} 포함"
+            s += (f" — \"{info['second']['name']}\"도 "
+                  f"{info['second']['count']}/{info['n']} ({info['second']['prop']:.0%}) 포함")
         return s
     else:
         s = (f"target 평균 {info['group_mean']:.3g} "
@@ -847,7 +904,7 @@ class CentroidLayer(nn.Module):
             tinfo = self.target_labels.get(p) if self.target_labels else None
             if tinfo is not None:
                 if tinfo["kind"] == "classification":
-                    line += f"  → {tinfo['top_class_name']}({tinfo['top_prop']:.0%})"
+                    line += f"  → {tinfo['top_class_name']} {tinfo['top_count']}/{tinfo['n']} ({tinfo['top_prop']:.0%})"
                 else:
                     line += f"  → target≈{tinfo['group_mean']:.3g}(p{tinfo['percentile']:.0f})"
 

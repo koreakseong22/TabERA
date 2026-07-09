@@ -102,6 +102,9 @@ class TabERAWrapper:
         cat_cols: Optional[List[int]] = None,
         num_cols: Optional[List[int]] = None,
         col_names: Optional[List[str]] = None,
+        cat_category_names: Optional[Dict[str, List[str]]] = None,
+        target_class_names: Optional[List[str]] = None,
+        quantile_transformer=None,
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -121,6 +124,19 @@ class TabERAWrapper:
         self.cat_cols  = cat_cols
         self.num_cols  = num_cols
         self.col_names = col_names
+        # {col_name: [원본 카테고리 문자열, ...]} — libs/data.py의
+        # load_data()가 반환하는 것. 없어도(None) label_all_groups()가
+        # "Category N" fallback으로 계속 동작하니 하위 호환 안 깨짐.
+        self.cat_category_names = cat_category_names
+        # [원본 target 라벨 문자열, ...] — libs/data.py의 load_data()가
+        # 반환하는 것. "Class 0"/"Class 1" 대신 실제 라벨명("good"/"bad" 등)
+        # 표시에 씀. 없어도(None) label_groups_by_target()가 "Class N"
+        # fallback으로 계속 동작.
+        self.target_class_names = target_class_names
+        # fit된 QuantileTransformer(numeric feature용) — libs/data.py의
+        # prep_data()가 반환하는 것. 있으면 label_all_groups()가 numeric
+        # 값을 [0,1] uniform 대신 실제 단위로 역변환해 보여준다.
+        self.quantile_transformer = quantile_transformer
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -261,6 +277,8 @@ class TabERAWrapper:
                                 self.cat_cols,
                                 self.num_cols,
                                 self.col_names,
+                                cat_category_names=self.cat_category_names,
+                                quantile_transformer=self.quantile_transformer,
                             )
 
                         # ── 그룹 target(클래스) 분포 캐싱 — ①의 주 콘텐츠 ──
@@ -274,6 +292,7 @@ class TabERAWrapper:
                             y_ema.detach().cpu().numpy(),
                             self.model.prototype_layer.sample_groups,
                             self.tasktype,
+                            class_names=self.target_class_names,
                         )
 
                     self.final_ema_stats = dict(ema_stats)

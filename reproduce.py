@@ -21,6 +21,7 @@ from libs.data         import TabularDataset
 from libs.search_space import params_to_model_kwargs
 from libs.supervised   import TabERAWrapper
 from libs.tabera         import TabERA
+from libs.prototypes     import inverse_transform_numeric
 from libs.eval         import calculate_metric
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -31,30 +32,108 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # 설명 출력 (①② architectural + ③ IG post-hoc)
 # ─────────────────────────────────────────────────────────────
 
+def _fmt_class(name: str, count: int, n: int, prop: float) -> str:
+    """하나의 클래스를 "name" count/n (prop%) 형식으로. top/second 어디서
+    부르든 항상 이 하나의 함수만 거치게 해서, 포맷이 서로 어긋나는 걸 막는다
+    (이전에 top은 "(count/n, prop%)", second는 "count/n (prop%)"로 서로
+    다른 괄호 스타일을 쓰던 문제가 있었음 — 데이터셋과 무관하게 항상 이
+    함수 하나로 통일)."""
+    return f"\"{name}\" {count}/{n} ({prop:.0%})"
+
+
 def _format_target_info(tinfo) -> str:
-    """target_info(label_groups_by_target() 결과) 하나를 짧은 텍스트로."""
+    """target_info(label_groups_by_target() result) as a short string."""
     if tinfo is None:
-        return "(target 정보 없음)"
+        return "(no target info)"
     if tinfo["kind"] == "classification":
-        s = f"\"{tinfo['top_class_name']}\" ({tinfo['top_prop']:.0%})"
+        s = _fmt_class(tinfo['top_class_name'], tinfo['top_count'], tinfo['n'], tinfo['top_prop'])
         if tinfo["second"] is not None:
-            s += f", \"{tinfo['second']['name']}\" {tinfo['second']['prop']:.0%}"
+            s += ", " + _fmt_class(tinfo['second']['name'], tinfo['second']['count'],
+                                    tinfo['n'], tinfo['second']['prop'])
         return s
     else:
         return f"target≈{tinfo['group_mean']:.3g}(p{tinfo['percentile']:.0f})"
 
 
-def print_explanation(explanations: list, sample_idx: int, col_names: list) -> None:
+def _select_query_similar_features(
+    query: dict, neighbour: dict, cat_names: set,
+    max_n: int = 4, max_gap: float = 0.15,
+) -> list:
+    """
+    "이 이웃의 값이 원래 크다"가 아니라 "query와 이 이웃이 이 feature에서
+    얼마나 가까운가"로 feature를 고른다 — query도 안 보여주고 이웃 혼자
+    값이 큰 feature만 나열하면 "그래서 왜 비슷한 이웃인지" 설명이 안 됨.
+
+    numeric은 |query-neighbour| (이미 [0,1] 정규화됨), categorical은
+    같으면 0/다르면 1 (Gower distance와 동일한 방식 — LabelEncoder 정수
+    코드에 순서가 없어 그냥 뺄셈하면 안 됨). gap이 작을수록(=가까울수록)
+    상위로 정렬하고, max_gap을 넘는 건 애초에 후보에서 제외한다 — 그래서
+    정말 비슷한 feature가 몇 개 없는 이웃은 개수가 max_n보다 적게 나올
+    수 있다(숫자 채우기용으로 안 비슷한 feature를 억지로 넣지 않음).
+    비슷한 feature가 하나도 없으면(전부 max_gap 초과) 그래도 가장 가까운
+    1개는 보여준다 — 완전히 빈 설명보다는 "그나마 제일 가까운 게 이거"가 낫다.
+
+    반환값: [(name, value, kind), ...] — kind는 "numeric"|"categorical".
+    호출부에서 kind별로 나눠 보여줄 수 있게 dict 대신 list로 반환한다.
+    """
+    diffs = []
+    for k, v in neighbour.items():
+        if k not in query:
+            continue
+        is_cat = k in cat_names
+        gap = (0.0 if query[k] == v else 1.0) if is_cat else abs(query[k] - v)
+        diffs.append((k, v, gap, "categorical" if is_cat else "numeric"))
+    if not diffs:
+        return []
+    diffs.sort(key=lambda x: x[2])
+    selected = [(k, v, kind) for k, v, gap, kind in diffs if gap <= max_gap][:max_n]
+    if not selected:
+        k, v, gap, kind = diffs[0]
+        selected = [(k, v, kind)]
+    return selected
+
+
+def _split_by_kind(labels, get_kind, get_str):
+    """items를 kind별(numeric/categorical)로 나눠 두 개의 문자열 리스트로."""
+    num_strs, cat_strs = [], []
+    for item in labels:
+        (num_strs if get_kind(item) == "numeric" else cat_strs).append(get_str(item))
+    return num_strs, cat_strs
+
+
+def print_explanation(explanations: list, sample_idx: int, col_names: list,
+                       cat_category_names: dict = None,
+                       quantile_transformer=None, num_cols: list = None) -> None:
     e = explanations[sample_idx]
 
     print(f"\n{'━'*52}")
     print(f"  TabERA Explanation — Sample #{sample_idx}")
     print(f"{'━'*52}")
 
-    # ① 프로토타입 그룹 (target 분포 — 이 그룹이 어떤 부류인지)
+    # ① Prototype group (target distribution — which class does this group represent?)
     proto = e["prototype"]
-    print(f"\n  ① 프로토타입 그룹")
-    print(f"     → \"{proto['assigned_group']}\"  (confidence={proto['group_confidence']:.1%})")
+    print(f"\n  ① Prototype Group")
+
+    # 이 그룹의 target(클래스) 분포 — ①의 주 콘텐츠 (label_groups_by_target(),
+    # ema_update() 직후 캐싱됨). ②(실제 이웃의 raw feature 값)와 정보 종류가
+    # 겹치지 않도록, feature 요약이 아니라 "이 그룹이 어떤 부류인가"만 보여준다.
+    # [배치] 배정된 그룹 이름/confidence와 같은 줄에 붙여서, "이 그룹이 뭔지"를
+    # 한눈에 읽을 수 있게 함 (Runner-up은 부가 정보라 그 다음 줄로 내림).
+    tinfo = proto.get("target_info")
+    if tinfo is not None:
+        if tinfo["kind"] == "classification":
+            target_str = _fmt_class(tinfo['top_class_name'], tinfo['top_count'], tinfo['n'], tinfo['top_prop'])
+            if tinfo["second"] is not None:
+                target_str += ", also " + _fmt_class(tinfo['second']['name'], tinfo['second']['count'],
+                                                       tinfo['n'], tinfo['second']['prop'])
+        else:
+            target_str = (f"target mean {tinfo['group_mean']:.3g} "
+                           f"(percentile {tinfo['percentile']:.0f}, n={tinfo['n']})")
+    else:
+        target_str = "(no group target info — target_labels may not have been cached during training)"
+
+    print(f"     → \"{proto['assigned_group']}\"  (confidence={proto['group_confidence']:.1%})  —  {target_str}")
+
     if proto["runners_up"]:
         ru = ", ".join(
             f"\"{r['label']}\"({r['confidence']:.1%}, {_format_target_info(r['target_info'])})"
@@ -62,45 +141,70 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list) -> N
         )
         print(f"     Runner-up: {ru}")
 
-    # 이 그룹의 target(클래스) 분포 — ①의 주 콘텐츠 (libs/group_labels.py
-    # label_groups_by_target(), ema_update() 직후 캐싱됨). ②(실제 이웃의
-    # raw feature 값)와 정보 종류가 겹치지 않도록, feature 요약이 아니라
-    # "이 그룹이 어떤 부류인가"만 보여준다.
-    tinfo = proto.get("target_info")
-    if tinfo is not None:
-        if tinfo["kind"] == "classification":
-            s = f"     이 그룹은: \"{tinfo['top_class_name']}\" ({tinfo['top_prop']:.0%}, n={tinfo['n']})"
-            if tinfo["second"] is not None:
-                s += f"  — \"{tinfo['second']['name']}\"도 {tinfo['second']['prop']:.0%} 포함"
-            print(s)
-        else:
-            print(f"     이 그룹은: target 평균 {tinfo['group_mean']:.3g} "
-                  f"(전체 분포 기준 백분위 {tinfo['percentile']:.0f}, n={tinfo['n']})")
-    else:
-        print(f"     (그룹 target 정보 없음 — 학습 시 target_labels가 캐싱되지 않았을 수 있습니다)")
-
     # 이 그룹을 다른 그룹들과 가장 뚜렷이 구별시키는 feature의 실제
-    # 그룹 평균값(libs/group_labels.py의 label_all_groups, 그룹 간
-    # 대비(distinctiveness) 상위 K개)
+    # 그룹 평균값(label_all_groups, 그룹 간 대비(distinctiveness) 상위 K개).
+    # numeric/categorical을 나눠서 보여줌 — 섞어서 나열하면 스케일이 전혀
+    # 다른 값(원시 비율 vs 카테고리 코드+비율)을 한 줄로 읽어야 해서 헷갈림.
     labels = proto.get("group_feature_labels", [])
     if labels:
-        label_str = ",  ".join(f"{fl.feature_name}={fl.label}" for fl in labels)
-        print(f"     두드러진 특징: {label_str}")
+        num_strs, cat_strs = _split_by_kind(
+            labels, get_kind=lambda fl: fl.kind,
+            get_str=lambda fl: f"{fl.feature_name}={fl.label}",
+        )
+        print(f"     Distinctive features:")
+        if num_strs:
+            print(f"       numeric:     {',  '.join(num_strs)}")
+        if cat_strs:
+            print(f"       categorical: {',  '.join(cat_strs)}")
 
-    # ② 이웃 증거 (Attention weight)
+    # ② Neighbor evidence (Attention weight)
     ev = e["evidence"]
-    print(f"\n  ② 이웃 증거 (Attention)")
+    print(f"\n  ② Neighbor Evidence (Attention)")
     print(f"     dominant={ev['dominant_weight']:.1%},  entropy={ev['entropy']:.3f}")
-    for rank, (idx, w) in enumerate(ev["top_neighbours"]):
-        print(f"     #{rank+1} Neighbour {idx}: {w:.1%}")
 
-    # 이웃의 원본 feature 값 (FeatureStore에서 조회된 경우)
+    # 기여도가 사실상 0인 이웃은 생략 (반올림하면 0.0%로 보이는 것도 포함) —
+    # 예측에 아무 영향을 안 준 이웃까지 보여주는 건 정보가 아니라 소음이다.
+    _WEIGHT_EPS = 1e-3
+    shown = [(rank, idx, w) for rank, (idx, w) in enumerate(ev["top_neighbours"])
+              if w > _WEIGHT_EPS]
+
+    if not shown:
+        print(f"     (no neighbor contributed meaningfully)")
+
     nf = e.get("neighbour_features")
-    if nf:
-        for rank, (idx, w) in enumerate(ev["top_neighbours"][:3]):
-            if rank < len(nf):
-                feat_str = ", ".join(f"{k}={v:.3f}" for k, v in list(nf[idx].items())[:4])
-                print(f"        → {feat_str}")
+    name_to_idx = {name: i for i, name in enumerate(col_names)} if col_names else {}
+
+    def _fmt_cat_value(name: str, code_val: float) -> str:
+        # cat_category_names(libs/data.py의 load_data() 결과)가 있으면
+        # 실제 카테고리 문자열 + 원래 코드 번호를 같이, 없으면 코드만.
+        names_for_col = cat_category_names.get(name) if cat_category_names else None
+        code = int(code_val)
+        if names_for_col is not None and 0 <= code < len(names_for_col):
+            return f"{name}={names_for_col[code]} [{code}]"
+        return f"{name}=Category {code}"
+
+    def _fmt_num_value(name: str, uniform_val: float) -> str:
+        # quantile_transformer(libs/data.py의 prep_data() 결과)가 있으면
+        # [0,1] uniform 값을 실제 단위로 역변환 — ①의 Distinctive features와
+        # 같은 처리를 ②의 이웃 feature 값에도 동일하게 적용.
+        if quantile_transformer is not None and num_cols is not None and name in name_to_idx:
+            real_val = inverse_transform_numeric(quantile_transformer, num_cols, name_to_idx[name], uniform_val)
+            if real_val is not None:
+                return f"{name}={real_val:.3g}"
+        return f"{name}={uniform_val:.3f}"
+
+    for rank, idx, w in shown:
+        print(f"     #{rank+1} Neighbor {idx}: {w:.1%}")
+        if nf and idx < len(nf) and nf[idx]:
+            num_strs, cat_strs = _split_by_kind(
+                nf[idx], get_kind=lambda item: item[2],
+                get_str=lambda item: (_fmt_cat_value(item[0], item[1])
+                                       if item[2] == "categorical" else _fmt_num_value(item[0], item[1])),
+            )
+            if num_strs:
+                print(f"        → numeric:     {', '.join(num_strs)}")
+            if cat_strs:
+                print(f"        → categorical: {', '.join(cat_strs)}")
 
     print(f"{'━'*52}")
 
@@ -413,10 +517,13 @@ def main():
     wrapper = TabERAWrapper(
         model, best_params, tasktype,
         device=str(device), epochs=args.epochs, patience=args.patience,
-        # 그룹 텍스트 라벨링(libs/group_labels.py)에 필요 — ①의 그룹 특징 설명은
-        # 텍스트 요약(medoid 아님)으로 대체됐고, 이 캐시가 그 역할을 함
+        # 그룹 텍스트 라벨링에 필요 — ①의 그룹 특징 설명은 텍스트
+        # 요약(medoid 아님)으로 대체됐고, 이 캐시가 그 역할을 함
         cat_cols=list(dataset.X_cat), num_cols=list(dataset.X_num),
         col_names=dataset.col_names,
+        cat_category_names=dataset.cat_category_names,
+        target_class_names=dataset.target_class_names,
+        quantile_transformer=dataset.quantile_transformer,
     )
     wrapper._data_id = args.openml_id
     wrapper.fit(X_train, y_train, X_val, y_val)
@@ -1889,7 +1996,7 @@ def main():
     # ── Feature 기여도 설명 출력 ─────────────────────────
     if args.explain:
         print(f"\n{'='*52}")
-        print(f"  TabERA 설명 출력 (--explain)")
+        print(f"  TabERA Explanations (--explain)")
         print(f"{'='*52}")
 
         model.eval()
@@ -1904,21 +2011,30 @@ def main():
         # FeatureStore에서 이웃 feature 값 조회하여 설명에 추가
         topk_idx = out.get("topk_idx")
         if model.feature_store is not None and topk_idx is not None:
+            cat_names = {dataset.col_names[i] for i in dataset.X_cat}
+            X_show_cpu = X_show.detach().cpu().numpy()
             # topk_idx: (B, k) → B개 샘플별 k개 이웃 인덱스
             neighbour_feats = model.feature_store.retrieve(topk_idx)  # list[list[dict]]
             for b, exp in enumerate(explanations):
                 if b < len(neighbour_feats):
-                    # 상위 5개 feature만 선택
+                    query_dict = {name: float(X_show_cpu[b, i])
+                                  for i, name in enumerate(dataset.col_names)}
+                    # query와 가장 가까운(=비슷한) feature 위주로 선택 —
+                    # 이웃 혼자 값이 큰 feature가 아니라, "그래서 왜 이
+                    # 이웃과 비슷한지"를 설명하는 feature를 보여준다.
                     exp["neighbour_features"] = [
-                        model.feature_store.top_features(nd, n=5)
+                        _select_query_similar_features(query_dict, nd, cat_names)
                         for nd in neighbour_feats[b]
                     ]
         if not explanations:
-            print("  (설명 없음 — memory bank가 채워지지 않았습니다)")
-            print("  → epochs를 늘리거나 n_trials를 더 실행하세요.")
+            print("  (no explanations — memory bank has not been filled yet)")
+            print("  → try increasing epochs or n_trials.")
         else:
             for i in range(n_show):
-                print_explanation(explanations, i, dataset.col_names)
+                print_explanation(explanations, i, dataset.col_names,
+                                   cat_category_names=dataset.cat_category_names,
+                                   quantile_transformer=dataset.quantile_transformer,
+                                   num_cols=list(dataset.X_num))
 
 
 if __name__ == "__main__":
