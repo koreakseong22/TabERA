@@ -8,11 +8,9 @@ A retrieval-augmented tabular model that produces architectural, example-based e
 
 ## Background
 
-Deep tabular models increasingly match or exceed gradient-boosted trees on many benchmarks, but their predictions are opaque by default. The standard fix is post-hoc attribution (SHAP, LIME, Integrated Gradients) — but these methods only ever answer one kind of question, "which input features mattered," and do so *after the fact*, disconnected from what the model actually computed internally.
+Post-hoc attribution methods (SHAP, LIME, IG) only ever answer "which features mattered," and only after the fact. Retrieval-augmented models (e.g., TabR) suggest a richer alternative: if a model predicts by comparing a query to stored training examples, the retrieval step itself explains "which group this belongs to" and "which examples this prediction is like" — something no post-hoc method can offer for an arbitrary model.
 
-Retrieval-augmented tabular models (e.g., TabR, Gorishniy et al. 2023) suggest a different path: if a model predicts by comparing a query to stored training examples, the retrieval step itself is a second, richer kind of explanation — "which group does this belong to" and "which other data points is this prediction like" — one that no post-hoc method can produce for an arbitrary model, because it requires the architecture to explicitly organize and query training examples at inference time.
-
-TabERA is built around this idea: a centroid-conditioned retrieval architecture where group assignment and neighbor retrieval are load-bearing parts of the forward pass, not add-ons, so the explanations they produce are guaranteed to reflect what the model actually did — with feature-level attribution (via Integrated Gradients) added as a complementary, standard third layer.
+TabERA is built around this idea: group assignment and neighbor retrieval are load-bearing parts of the forward pass, not add-ons, so the explanations they produce are guaranteed to reflect what the model actually did. Feature-level attribution (Integrated Gradients) is added as a complementary, standard third layer.
 
 ---
 
@@ -21,91 +19,91 @@ TabERA is built around this idea: a centroid-conditioned retrieval architecture 
 ![TabERA architecture](docs/TabERA_Figure1.png)
 
 ```
-Query → Embedding → Centroid Routing (macro) → Group-constrained KNN (micro) → Prediction
-                          ↓                              ↓                         ↓
-                    "Which group?"              "Which neighbors?"          "Which features?"
-                    (architectural)              (architectural)             (post-hoc, IG)
+Query → Embedding → Centroid Routing → Group-constrained KNN → Prediction
+                          ↓                     ↓                   ↓
+                    "Which group?"      "Which neighbors?"   "Which features?"
+                    (architectural)      (architectural)       (post-hoc, IG)
 ```
 
-Given `X ∈ ℝ^(N×F)` (D = embedding dim, P = centroids, K = neighbors):
-
-1. **Embed** — `TabularEmbedder` maps `X → query_emb ∈ ℝ^D`.
-2. **Route (→ explanation ①)** — `CentroidLayer` assigns each sample to one of `P` learnable centroids via STE hard-argmax on cosine similarity, producing `hard_assignment`, `context_emb`, and `centroid_x` (the medoid — nearest real training sample, used to make ① human-readable).
-3. **Retrieve & aggregate (→ explanation ②)** — `MemoryBank` performs a K-nearest-neighbor search restricted to the sample's centroid (with cross-group fallback if the group is smaller than K). `AttentionAggregator` converts neighbor similarities into `evidence_w` (TabR-style softmax) and aggregates into `agg_emb`, which feeds the prediction head directly.
+1. **Embed** — `TabularEmbedder` maps `X → query_emb`.
+2. **Route (→ ①)** — `CentroidLayer` assigns each sample to one of `P` centroids via STE hard-argmax, producing `hard_assignment` and `context_emb`. Each centroid also has a `centroid_x` medoid (nearest real training sample), used as the IG baseline in ③ — not shown directly in ① (see below).
+3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the sample's group (cross-group fallback if the group is smaller than K). `AttentionAggregator` turns similarities into `evidence_w` and aggregates into `agg_emb`, fed straight into the prediction head.
 4. **Predict** — `[query_emb ‖ context_emb ‖ agg_emb] → MLP head → ŷ`.
+5. **Attribute (→ ③, post-hoc)** — Integrated Gradients differentiates `ŷ` w.r.t. `X`, independent of steps 2–3.
 
-A third explanation, ③ (feature attribution via Integrated Gradients), is computed afterward by differentiating `ŷ` with respect to `X`, independent of stages 2–3.
-
-**Key design decisions:**
-- **Dual-Space Centroid** — each centroid keeps a learnable `centroid_emb` (routing/retrieval) and a `centroid_x` (real training sample, medoid-updated each epoch), so ① shows an actual data point rather than a synthetic average.
-- **STE Routing** — forward uses discrete argmax for crisp groups; backward substitutes the softmax gradient so `C_emb` stays trainable, active at both train and eval time.
-- **Cross-group Fallback** — expands to the nearest adjacent centroid rather than a global search when a group is small, preserving the semantics of ②. Originally implemented as a per-sample Python loop, which profiling traced to up to 348× slower retrieval on high-fallback-rate datasets (nearly all of it CPU–GPU sync overhead, not real compute); now fully vectorized (`MemoryBank._vectorized_fallback`), verified bit-identical to the original on trained checkpoints across three datasets.
-- **Auxiliary Losses** — `diversity_loss` (spreads centroids apart) and `commitment_loss` (pulls queries to their assigned centroid), together with epoch-wise medoid updates, maintain meaningful group structure across datasets.
+**Design notes:** `diversity_loss`/`commitment_loss` keep centroids well-separated and queries committed; cross-group fallback was originally a per-sample Python loop (up to 348× slower on high-fallback datasets) and is now fully vectorized, verified bit-identical to the original.
 
 ---
 
 ## Explanations
 
-| Level | Module | Type | Explains |
-|---|---|---|---|
-| ① Group context | CentroidLayer (`centroid_x`) | Architectural | "This sample belongs to the high-alcohol, low-pH group" |
-| ② Neighbor evidence | MemoryBank + AttentionAggregator (`evidence_w`) | Architectural | "Neighbor #1 contributes 42%" |
-| ③ Feature attribution | Integrated Gradients | Post-hoc | "`volatile_acidity` has the largest attribution" |
+| Level | Type | Answers |
+|---|---|---|
+| ① Prototype Group | Architectural | What kind of sample is this, and how confidently? |
+| ② Neighbor Evidence | Architectural | Which real training examples drove this prediction? |
+| ③ Feature Attribution | Post-hoc (IG) | Which features moved the prediction, and by how much? |
+
+**① Prototype Group** — assigned group + confidence, runner-up groups (each with their own confidence and target distribution), and what the group *represents*: majority class name + count/share (e.g. `"good" 27/47 (57%)`), plus a second class if it's ≥20%. This target-distribution info is ①'s core content — neither ② nor ③ carries it. Distinctive features are ranked by how unusual this group is *relative to other groups* (robust z-score, median/MAD), not vs. the whole dataset — numeric values inverse-transformed to real units, categorical shown as real category names with in-group share. No medoid is shown as a representative sample here: ② already shows real, prediction-relevant samples on stronger grounds, and a medoid would be fragile for small groups.
+
+**② Neighbor Evidence** — the `k` actual retrieved neighbors and their `evidence_w`, the same values used in the forward pass. Neighbors with ~zero weight are dropped (noise, not signal). Each neighbor's shown features are picked by closeness to the query (smallest gap first — normalized distance for numeric, match/mismatch for categorical), not by the neighbor's own largest values — this is what explains *why* it's similar. Up to 4 features per neighbor, fewer if fewer are actually close (at least 1 always shown). Numeric/categorical shown separately; numeric in real units, categorical as name + original code (`checking_status=no checking [0]`).
+
+**③ Feature Attribution** — IG with a non-standard baseline: the medoid of the sample's own group, not the dataset mean or zero. This is specific to TabERA's STE hard routing: if the baseline routes to a different group than the query, the IG path crosses a forward discontinuity and completeness breaks. The medoid is structurally guaranteed to route to the same group. This does **not** mean better attributions than SHAP (deletion/insertion AUC results below are mixed) — only better completeness convergence. Those are separate claims.
 
 **Sample output:**
 ```
-① Group context      → Centroid_3 (conf. 94.3%): alcohol=10.24, pH=3.31
-② Neighbor evidence   → #0 42.1%: alcohol=10.41, pH=3.28
-③ Feature attribution → volatile_acidity 15.1%
+① Prototype Group     → "Centroid_3" (94.3%) — "good" 27/47 (57%), also "fair" 12/47 (26%)
+                         Distinctive: alcohol=10.24, volatile_acidity=0.31, region=Piedmont (68%)
+② Neighbor Evidence   → #0 42.1%: alcohol=10.41, pH=3.28   #1 31.7%: alcohol=10.19
+③ Feature Attribution → volatile_acidity 15.1%
 ```
 
-①② are guaranteed by construction — `hard_assignment` and `evidence_w` are read directly off the forward pass, so what's reported is exactly what the model used:
+**IG vs. SHAP** (medoid background, deletion/insertion AUC, paired Wilcoxon) — only 3/8 comparisons significant, direction mixed:
 
-| Explanation | Guarantee | Verified by |
+| Dataset | Deletion ↓ (TabERA/SHAP) | Insertion ↑ (TabERA/SHAP) |
 |---|---|---|
-| ① Group context | `hard_assignment` read directly from `routing_probs` | `--ablation dual_space_faithfulness` |
-| ② Neighbor evidence | `evidence_w` is the same tensor used to compute `agg_emb` | `--ablation random_neighbor` |
+| `vehicle` | 0.676/0.623 (n.s.) | 0.736/0.716 (n.s.) |
+| `ada_agnostic` | 0.794/0.784 (SHAP, p=0.01) | 0.854/0.850 (n.s.) |
+| `qsar-biodeg` | 0.724/0.732 (n.s.) | 0.885/0.848 (n.s.) |
+| `wine_quality` | 0.466/0.512 (SHAP, p<0.01) | 0.569/0.516 (TabERA, p<0.001) |
 
-*(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones. This affects which neighbors get retrieved, not speed — the retrieval cost of a high fallback rate was itself a major performance bug, since fixed; see Cross-group Fallback above.)*
+We use IG anyway for cost and structural fit, not superior accuracy: it needs only the gradient TabERA already produces plus one baseline point, and the medoid baseline cuts completeness error from 19–319% to 1.5–17.5% vs. a dataset-mean baseline. ①② remain TabERA's primary contribution regardless.
 
-③ (IG) is post-hoc and measured, not guaranteed — but the case for it isn't attribution quality. Against SHAP (medoid background, deletion/insertion AUC, paired Wilcoxon), only 3 of 8 comparisons reach significance and direction is mixed:
-
-| Dataset | Deletion ↓ (TabERA / SHAP) | Insertion ↑ (TabERA / SHAP) |
-|---|---|---|
-| `vehicle` | 0.676 / 0.623 (n.s.) | 0.736 / 0.716 (n.s.) |
-| `ada_agnostic` | 0.794 / 0.784 (SHAP, p=0.01) | 0.854 / 0.850 (n.s.) |
-| `qsar-biodeg` | 0.724 / 0.732 (n.s.) | 0.885 / 0.848 (n.s., p=0.08) |
-| `wine_quality` | 0.466 / 0.512 (SHAP, p<0.01) | 0.569 / 0.516 (TabERA, p<0.001) |
-
-*(n.s. = not significant, Wilcoxon p≥0.05.)*
-
-We use IG anyway because it fits the architecture: it needs only the gradient TabERA's STE routing already produces and a single baseline point, versus SHAP's per-feature sampling budget and background distribution. That baseline is also already sitting in the architecture — using the centroid medoid (the same one behind ①) instead of the dataset mean cuts IG's completeness error from 19–319% to 1.5–17.5%, since the mean typically falls outside any centroid's region. So the case for IG here is cost and structural fit, not superior accuracy — ①② remain TabERA's primary contribution regardless.
-
-**Cognitive inspiration** (conceptual motivation only): Central Tendency (Posner & Keele, 1968), Schema Theory (Bartlett, 1932), Dual-Process theory (Kahneman, 2011).
+*Cognitive inspiration (conceptual only): Central Tendency (Posner & Keele, 1968), Schema Theory (Bartlett, 1932), Dual-Process theory (Kahneman, 2011).*
 
 ---
 
-## Performance
+## Validation
 
-Prediction quality (HPO-tuned, seed=1 unless noted) on the four datasets used for the faithfulness analysis above:
+`--ablation dual_space_faithfulness` checks whether ①② actually mean what they claim:
+- **Index integrity** — `sample_groups` matches live model state: 100% consistent, reproducibly, across datasets and seeds.
+- **Group separation** — centroids correspond to statistically distinct regions of feature space (ANOVA F-test for numeric, chi-square for categorical, Bonferroni-corrected). Strongly and consistently significant across numeric, categorical, and mixed-type datasets and seeds.
 
-| Dataset | Task | Test Acc | Test AUROC | Test F1 |
-|---|---|---|---|---|
-| `vehicle` (N=846) | 4-class | 0.765 | 0.937 | 0.762 |
-| `ada_agnostic` (N=4,562) | binary | 0.801 | 0.858 | 0.735 |
-| `qsar-biodeg` (N=1,055) | binary | 0.811 | 0.856 | 0.780 |
-| `wine_quality` (N=6,497) | 7-class | 0.586 | 0.757 | 0.284 |
+*(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones. Affects which neighbors get retrieved, not speed.)*
 
-These are single-run illustrative numbers rather than a full leaderboard; `run_tabzilla.ps1` runs the same pipeline across a 36-dataset TabZilla benchmark for a broader comparison against standard tabular baselines.
+---
+
+## CLI reference
+
+- **`--explain`** — prints ①②③ as text.
+- **`--ablation`** — `random_neighbor` (wrong-but-real neighbors, tests retrieval correctness), `neighbor_noise` (fake neighbors, tests whether neighbor info matters at all — read together with `random_neighbor`), `rank_correlation` (IG vs. SHAP vs. Random attribution-rank agreement with actual prediction impact), `dual_space_faithfulness` (validation above), `deletion_auc`/`insertion_auc` (RISE-style faithfulness for ③), `dataset_profile` (quick diagnostic for a new dataset).
+- **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
+
+---
+
+## Known limitations
+
+- ①'s distinctive-feature contrast isn't equally sharp on every dataset.
+- Group sizes can be naturally imbalanced, reflecting the data itself — not a failure mode by itself.
+- `--from_saved_state` on GPU can show sub-decimal inference differences from a fresh run despite identical weights, likely from non-deterministic op scheduling (e.g. cuDNN).
 
 ---
 
 ## Contribution
 
-- **Architecturally-guaranteed explanations (①②)** that no post-hoc method can produce for an arbitrary model — group membership and neighbor evidence are read directly off the forward pass, not estimated afterward.
-- **A structural fix for IG's baseline-selection problem**: reusing the model's own centroid medoid as the Integrated Gradients baseline improves completeness by 8–78× over the conventional dataset-mean baseline, something only a retrieval-augmented architecture can offer.
-- **A principled, low-cost case for gradient-based attribution over sampling-based attribution here**: IG needs only the gradient TabERA's STE routing already produces and one baseline point, performs on par with SHAP empirically, and is cheaper — not a quality trade-off, just the right tool for this architecture.
-- **A documented limitation** of group-constrained retrieval: cross-group fallback rate depends on how `K` compares to the automatically-determined group size (`P = √N_train`), and can dominate on small datasets — a concrete design consideration for anyone adapting this architecture.
+- **Architecturally-guaranteed explanations (①②)** — read directly off the forward pass, not estimated afterward.
+- **A structural fix for IG's baseline problem**, specific to STE hard-routing: the group medoid avoids the cross-group discontinuity a dataset-mean baseline would hit, improving completeness by 8–78×.
+- **A low-cost case for IG over SHAP here**: comparable empirical performance, cheaper compute — a fit argument, not a quality trade-off.
+- **A documented limitation**: cross-group fallback rate depends on `K` vs. group size (`P = √N_train`) and can dominate small datasets.
 
 ---
 
@@ -121,7 +119,7 @@ These are single-run illustrative numbers rather than a full leaderboard; `run_t
 | `libs/data.py` | TabularDataset | OpenML loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
 | `optimize.py` | HPO runner | Auto-sets `n_prototypes = sqrt(N_train)` |
-| `reproduce.py` | Reproducer | Best config, `--explain` (①②③), `--ablation` (faithfulness) |
+| `reproduce.py` | Reproducer | `--explain`, `--ablation`, `--from_saved_state` |
 | `visualize_embeddings.py` | Visualizer | Embedding structure, class pies, KNN closeups |
 
 ---
@@ -142,7 +140,10 @@ python optimize.py --gpu_id 0 --openml_id 11 --n_trials 100 --seed 1
 python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --explain
 
 # Faithfulness / ablations
-python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation rank_correlation
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --ablation dual_space_faithfulness
+
+# Re-inspect explanations without retraining
+python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path> --explain
 
 # TabZilla benchmark (36 datasets)
 .\run_tabzilla.ps1
@@ -194,6 +195,7 @@ TabERA/
 - Bengio et al. (2013). Estimating or Propagating Gradients Through Stochastic Neurons. *arXiv:1308.3432*.
 - Sundararajan et al. (2017). Axiomatic Attribution for Deep Networks. *ICML*.
 - Arthur & Vassilvitskii (2007). k-means++. *SODA*.
+- Petsiuk et al. (2018). RISE: Randomized Input Sampling for Explanation of Black-box Models. *BMVC*.
 - Posner & Keele (1968). On the genesis of abstract ideas. *J. Exp. Psych.* 77(3).
 - Bartlett (1932). *Remembering*. Cambridge University Press.
 - Kahneman (2011). *Thinking, Fast and Slow*. Farrar, Straus and Giroux.
