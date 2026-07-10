@@ -356,6 +356,17 @@ def main():
                         help="설명 출력할 테스트 샘플 수")
     parser.add_argument("--explain",   action="store_true",
                         help="학습 후 feature 기여도 설명 출력")
+    parser.add_argument("--from_saved_state", type=str, default=None,
+                        help=(
+                            "이전 실행이 저장한 *_model_state.pt 경로를 넘기면 "
+                            "재학습을 완전히 건너뛰고 그 상태를 그대로 복원해서 "
+                            "--explain / --ablation만 다시 돌린다. optimize.py의 "
+                            "study 파일도 필요 없음(model_kwargs를 이 파일에서 "
+                            "직접 읽음). --n_explain/--ablation 등 다른 인자는 "
+                            "그대로 같이 쓰면 됨. seed/openml_id는 저장 당시와 "
+                            "일치해야 dataset 분할이 같아짐 — 지금 CLI에 준 값을 "
+                            "그대로 쓰므로 저장했을 때와 동일하게 넘길 것."
+                        ))
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor", "neighbor_noise",
                                  "rank_correlation", "dual_space_faithfulness",
@@ -472,48 +483,76 @@ def main():
     else:
         log_dir = args.savepath
 
-    fname = os.path.join(log_dir, f"data={openml_id}..model=tabera.pkl")
-    if not os.path.exists(fname):
-        _hint_cmd = f"optimize.py --openml_id {openml_id} --seed {args.seed}"
-        raise FileNotFoundError(
-            f"최적화 로그 없음: {fname}\n"
-            f"먼저 {_hint_cmd} 를 실행하세요."
-        )
-    # 출력 파일명 태그
     _save_tag = ("..detach_ctx" if args.detach_context_grad else "") \
               + ("..ctx_proj" if args.context_projection else "")
 
-    study       = joblib.load(fname)
-    best_params = study.best_params
-    print(f"  Best trial #{study.best_trial.number}  val={study.best_value:.4f}")
+    _saved_state = None
+    if args.from_saved_state:
+        # ── --from_saved_state: study 파일 불필요, 저장된 model_kwargs를
+        # 그대로 씀. 재학습을 건너뛰므로 --epochs/--patience는 무시됨.
+        print(f"  [--from_saved_state] {args.from_saved_state} 로드 중 (재학습 생략)")
+        # [수정] PyTorch 2.6부터 torch.load()의 기본값이 weights_only=True로
+        # 바뀌어서, sample_groups/group_labels에 들어있는 커스텀 클래스
+        # (FeatureLabel 등)를 안전 목록에 없다는 이유로 거부한다. 이 파일은
+        # 우리가 방금 위에서 직접 저장한 신뢰 가능한 파일이라(외부에서
+        # 받은 게 아님) weights_only=False로 명시.
+        _saved_state = torch.load(args.from_saved_state, map_location=device, weights_only=False)
+        model_kwargs = _saved_state["model_kwargs"]
+        best_params  = _saved_state.get("best_params", {})
+        if best_params:
+            print(f"  Params(저장된 값): {best_params}")
+        # [하위 호환] 이번 --from_saved_state 지원 이전에 저장된 파일은
+        # model_kwargs에 memory_size가 안 들어있어서(예전엔 TabERA(...)
+        # 호출 시 별도 kwarg로만 넘기고 model_kwargs 딕셔너리 자체에는
+        # 안 합쳐졌음), 새로 모델을 만들면 TabERA 기본값(10000)으로
+        # 만들어져 체크포인트의 실제 크기(n_train)와 안 맞아 로딩이
+        # 깨진다. n_train은 예전 포맷에도 있었으니 그걸로 대체.
+        if "memory_size" not in model_kwargs:
+            fallback_size = _saved_state.get("n_train")
+            if fallback_size is not None:
+                model_kwargs = {**model_kwargs, "memory_size": fallback_size}
+                print(f"  ⚠️  옛날 포맷 파일(memory_size 없음) — n_train={fallback_size}로 대체."
+                      f" sample_groups 등도 없을 수 있으니 아래 경고를 확인하세요.")
+    else:
+        fname = os.path.join(log_dir, f"data={openml_id}..model=tabera.pkl")
+        if not os.path.exists(fname):
+            _hint_cmd = f"optimize.py --openml_id {openml_id} --seed {args.seed}"
+            raise FileNotFoundError(
+                f"최적화 로그 없음: {fname}\n"
+                f"먼저 {_hint_cmd} 를 실행하세요."
+            )
 
-    # optimize.py가 실제 사용한 n_prototypes 그대로 복원
-    best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
-    print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
-    print(f"  Params: {best_params}")
+        study       = joblib.load(fname)
+        best_params = study.best_params
+        print(f"  Best trial #{study.best_trial.number}  val={study.best_value:.4f}")
 
-    # ── 모델 구성 ──────────────────────────────────────────
-    model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
-    model = TabERA(
-        **model_kwargs,
-        column_names=dataset.col_names,
-        # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
-        # HPO 때 찾은 best_params가 이 재현 실행에서 재현되지 않음)
-        memory_size=len(y_train),
-        # 채택된 아키텍처: offset correction 사용, group-constrained
-        # retrieval, context_emb를 head 입력에 포함 (각각
-        # --no_offset_correction/--global_retrieve/--no_context_emb
-        # ablation으로 이미 검증 완료된 결정 — 더 이상 옵션으로 안 둠)
-        use_offset_correction=True,
-        global_retrieve=False,
-        use_context_emb=True,
-        # [진단용] context_emb는 head에 그대로 전달하되 gradient만 끊음
-        detach_context_grad=args.detach_context_grad,
-        # [구조 조정] context_emb를 head 직전 Linear 프로젝션에 통과시킴
-        use_context_projection=args.context_projection,
-    )
+        # optimize.py가 실제 사용한 n_prototypes 그대로 복원
+        best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
+        print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
+        print(f"  Params: {best_params}")
 
-    # ── 학습 ──────────────────────────────────────────────
+        # ── 모델 구성 ──────────────────────────────────────────
+        model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
+        model_kwargs.update(dict(
+            # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
+            # HPO 때 찾은 best_params가 이 재현 실행에서 재현되지 않음)
+            memory_size=len(y_train),
+            # 채택된 아키텍처: offset correction 사용, group-constrained
+            # retrieval, context_emb를 head 입력에 포함 (각각
+            # --no_offset_correction/--global_retrieve/--no_context_emb
+            # ablation으로 이미 검증 완료된 결정 — 더 이상 옵션으로 안 둠)
+            use_offset_correction=True,
+            global_retrieve=False,
+            use_context_emb=True,
+            # [진단용] context_emb는 head에 그대로 전달하되 gradient만 끊음
+            detach_context_grad=args.detach_context_grad,
+            # [구조 조정] context_emb를 head 직전 Linear 프로젝션에 통과시킴
+            use_context_projection=args.context_projection,
+        ))
+
+    model = TabERA(**model_kwargs, column_names=dataset.col_names)
+
+    # ── 학습 (--from_saved_state면 건너뛰고 바로 복원) ───────
     wrapper = TabERAWrapper(
         model, best_params, tasktype,
         device=str(device), epochs=args.epochs, patience=args.patience,
@@ -526,7 +565,29 @@ def main():
         quantile_transformer=dataset.quantile_transformer,
     )
     wrapper._data_id = args.openml_id
-    wrapper.fit(X_train, y_train, X_val, y_val)
+    if _saved_state is not None:
+        # ── 재학습 생략, 저장된 상태 그대로 복원 ──────────────
+        model.load_state_dict(_saved_state["state_dict"])
+        # state_dict에 안 잡히는 것들(plain Python 속성이라 buffer가 아님)
+        # — sample_groups는 group-constrained 검색에 필수라 이게 없으면
+        # retrieve()가 제대로 동작 안 함. group_labels/target_labels는
+        # ①의 텍스트 라벨. feature_store._store는 ②의 원본 feature 값.
+        model.prototype_layer.sample_groups = _saved_state.get("sample_groups")
+        model.prototype_layer.group_labels  = _saved_state.get("group_labels")
+        model.prototype_layer.target_labels = _saved_state.get("target_labels")
+        fs_state = _saved_state.get("feature_store_state")
+        if fs_state is not None and model.feature_store is not None:
+            store, ptr, filled = fs_state
+            model.feature_store._store  = store.to(device)
+            model.feature_store._ptr    = ptr
+            model.feature_store._filled = filled
+        if model.prototype_layer.sample_groups is None:
+            print(f"  ⚠️  저장된 state에 sample_groups가 없습니다 — 이 파일은 이번"
+                  f" --from_saved_state 지원 이전 버전으로 저장된 것 같습니다."
+                  f" group-constrained 검색/①②가 제대로 안 나올 수 있습니다.")
+        print(f"  [--from_saved_state] 복원 완료 (epoch 0부터 재학습 안 함)")
+    else:
+        wrapper.fit(X_train, y_train, X_val, y_val)
 
     # ── 평가 ──────────────────────────────────────────────
     preds_val  = wrapper.predict(X_val)
@@ -1976,14 +2037,31 @@ def main():
 
     print(f"\n  저장: {pred_path}")
 
-    # ── model state 저장 (visualize_embeddings.py --from_state 용) ──
-    # model_kwargs에 use_offset_correction을 명시적으로 넣어둠 — best_params
-    # (Optuna 탐색 대상)에는 없는 값이라, 이걸 안 넣으면 --from_state로
-    # 복원할 때 기본값(True)으로 되돌아가 버려 재현이 어긋남.
+    # ── model state 저장 (--from_saved_state 용) ──────────────
+    # model_kwargs에 이미 use_offset_correction 등 아키텍처 플래그가
+    # 다 병합돼 있음(위에서 model_kwargs.update()로 처리) — best_params
+    # (Optuna 탐색 대상)에는 없는 값이라, 이게 없으면 --from_saved_state로
+    # 복원할 때 기본값으로 되돌아가 버려 재현이 어긋남.
+    #
+    # [수정] state_dict()에 안 잡히는 것들(sample_groups/group_labels/
+    # target_labels — plain Python 속성이라 buffer가 아님, feature_store
+    # — nn.Module이 아니라 model.state_dict()에 안 잡힘)을 여기서도
+    # 놓치고 있었음 — best-checkpoint 스냅샷 때(libs/supervised.py)와
+    # 정확히 같은 문제. 이것들이 없으면 --from_saved_state로 복원해도
+    # ①②가 제대로 안 나옴(특히 sample_groups 없으면 group-constrained
+    # 검색 자체가 깨짐).
     state_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_model_state.pt"
+    fs = model.feature_store
     torch.save({
-        "state_dict":   model.state_dict(),
-        "model_kwargs": {**model_kwargs, "use_offset_correction": True, "global_retrieve": False, "use_context_emb": True, "detach_context_grad": args.detach_context_grad, "use_context_projection": args.context_projection},
+        "state_dict":     model.state_dict(),
+        "model_kwargs":   model_kwargs,
+        "best_params":    best_params,
+        "sample_groups":  model.prototype_layer.sample_groups,
+        "group_labels":   model.prototype_layer.group_labels,
+        "target_labels":  model.prototype_layer.target_labels,
+        "feature_store_state": (
+            (fs._store.detach().cpu(), fs._ptr, fs._filled) if fs is not None else None
+        ),
         "col_names":    dataset.col_names,
         "n_train":      len(X_train),
         "tasktype":     tasktype,
