@@ -25,9 +25,29 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
                     (architectural)      (architectural)       (post-hoc, IG)
 ```
 
-1. **Embed** — `TabularEmbedder` maps `X → query_emb`.
-2. **Route (→ ①)** — `CentroidLayer` assigns each sample to one of `P` centroids via STE hard-argmax, producing `hard_assignment` and `context_emb`. Each centroid also has a `centroid_x` medoid (nearest real training sample), used as the IG baseline in ③ — not shown directly in ① (see below).
-3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the sample's group (cross-group fallback if the group is smaller than K). `AttentionAggregator` turns similarities into `evidence_w` and aggregates into `agg_emb`, fed straight into the prediction head.
+1. **Embed** — `TabularEmbedder` maps `X → query_emb`. Categorical features are
+   one-hot encoded (no learned parameters, no false ordinal structure — a
+   raw integer code has no business implying distance between categories);
+   numeric features go through PLR(lite) — a learned periodic (sin/cos)
+   embedding followed by a Linear+ReLU shared across all numeric columns,
+   following TabR/ModernNCA. Both are vectorized (a single offset-indexed
+   gather, no per-column Python loop).
+2. **Route (→ ①)** — `CentroidLayer` assigns each sample to one of `P`
+   centroids via STE hard-argmax over a *scaled* cosine similarity
+   (`routing_scale` widens the otherwise narrow [-1,1] range so the softmax
+   isn't flat by construction — the same reason ArcFace/CosFace-style losses
+   and cosine-router MoE literature scale logits before softmax), producing
+   `hard_assignment` and `context_emb`. Each centroid also has a `centroid_x`
+   medoid (nearest real training sample), used as the IG baseline in ③ — not
+   shown directly in ① (see below).
+3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the
+   sample's group (cross-group fallback if the group is smaller than K).
+   `AttentionAggregator` turns similarities into `evidence_w` and aggregates
+   into `agg_emb`. Retrieved neighbors' labels are embedded via a learned
+   lookup table for classification (an index is a class, not a scalar) or a
+   linear layer for regression (the label *is* a scalar) — matching how TabR
+   itself distinguishes the two. `agg_emb` feeds straight into the
+   prediction head.
 4. **Predict** — `[query_emb ‖ context_emb ‖ agg_emb] → MLP head → ŷ`.
 5. **Attribute (→ ③, post-hoc)** — Integrated Gradients differentiates `ŷ` w.r.t. `X`, independent of steps 2–3.
 
@@ -87,6 +107,8 @@ We use IG anyway for cost and structural fit, not superior accuracy: it needs on
 - **`--explain`** — prints ①②③ as text.
 - **`--ablation`** — `random_neighbor` (wrong-but-real neighbors, tests retrieval correctness), `neighbor_noise` (fake neighbors, tests whether neighbor info matters at all — read together with `random_neighbor`), `rank_correlation` (IG vs. SHAP vs. Random attribution-rank agreement with actual prediction impact), `dual_space_faithfulness` (validation above), `deletion_auc`/`insertion_auc` (RISE-style faithfulness for ③), `dataset_profile` (quick diagnostic for a new dataset).
 - **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
+- **`--cat_combine {onehot,sum,concat}`** — categorical encoding (default `onehot`). `sum`/`concat` exist for comparison and backward compatibility with earlier checkpoints.
+- **`--num_embedding {plr_lite,linear,ple}`** — numeric encoding (default `plr_lite`). `plr_lite` can be unstable on datasets with very few numeric columns (e.g. 1–5) — `linear`/`ple` are safer fallbacks there.
 
 ---
 
@@ -95,6 +117,7 @@ We use IG anyway for cost and structural fit, not superior accuracy: it needs on
 - ①'s distinctive-feature contrast isn't equally sharp on every dataset.
 - Group sizes can be naturally imbalanced, reflecting the data itself — not a failure mode by itself.
 - `--from_saved_state` on GPU can show sub-decimal inference differences from a fresh run despite identical weights, likely from non-deterministic op scheduling (e.g. cuDNN).
+- `plr_lite` numeric encoding (default) trades some calibration (logloss) for discrimination (accuracy/AUROC) relative to a plain linear projection — a pattern consistent with what the literature it's drawn from also reports. Datasets with very few numeric columns and few binary-classification samples are the most exposed; `--num_embedding linear` is the fallback for those.
 
 ---
 
@@ -111,14 +134,14 @@ We use IG anyway for cost and structural fit, not superior accuracy: it needs on
 
 | File | Component | Role |
 |---|---|---|
-| `libs/prototypes.py` | CentroidLayer | STE routing, KMeans++ init, medoid update — ① |
-| `libs/tabera.py` | TabERA, MemoryBank | Model, group-constrained KNN store — ② |
-| `libs/evidence.py` | AttentionAggregator | `evidence_w`, direct retrieval path — ② |
+| `libs/prototypes.py` | CentroidLayer | STE routing (scaled cosine similarity), KMeans++ init, medoid update — ① |
+| `libs/tabera.py` | TabERA, MemoryBank, TabularEmbedder | Model, feature encoding, group-constrained KNN store — ② |
+| `libs/evidence.py` | AttentionAggregator | `evidence_w`, direct retrieval path, task-aware label encoding — ② |
 | `libs/supervised.py` | TabERAWrapper | Training loop, EMA regrouping, early stopping |
-| `libs/search_space.py` | HPO space | 9 params (Optuna) + auto `n_prototypes` |
+| `libs/search_space.py` | HPO space | Optuna search space + auto `n_prototypes` |
 | `libs/data.py` | TabularDataset | OpenML loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
-| `optimize.py` | HPO runner | Auto-sets `n_prototypes = sqrt(N_train)` |
+| `optimize.py` | HPO runner | Auto-sets `n_prototypes = sqrt(N_train)`, mirrors `reproduce.py`'s architecture |
 | `reproduce.py` | Reproducer | `--explain`, `--ablation`, `--from_saved_state` |
 | `visualize_embeddings.py` | Visualizer | Embedding structure, class pies, KNN closeups |
 
@@ -151,21 +174,33 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 
 ---
 
-## HPO parameters (9 searched)
+## HPO parameters (searched via Optuna)
 
 | Parameter | Range | Role |
 |---|---|---|
 | `embed_dim` | {64, 128, 256} | Embedding dim D |
-| `k` | {8, 16, 32, 64} | KNN neighbors |
-| `embedder_layers` | 1–4 | ResidualMLP depth |
+| `embedder_layers` | {2, 3, 4} | ResidualMLP depth |
 | `dropout` | 0.0–0.5 | — |
 | `loss_diversity` | 5e-2–5e-1 | Centroid spread penalty |
 | `loss_commitment` | 1e-2–1e-1 | Query-centroid commitment |
 | `lr` | 1e-4–1e-2 | — |
 | `weight_decay` | 1e-6–1e-2 | — |
 | `batch_size` | {128, 256, 512} | — |
+| `routing_scale` | 1–20 (log) | Cosine routing logit scale (see Architecture, step 2) |
+| `plr_freq_scale` * | 0.01–100 (log) | PLR(lite) periodic-embedding frequency init scale |
+| `plr_n_frequencies` * | 8–96 | PLR(lite) frequencies per numeric column |
+| `plr_out_dim` * | {4, 8, 16, 32} | PLR(lite) output dim per numeric column |
 
-> `n_prototypes` (P) is **not** searched — auto-set as `P = sqrt(N_train)` (min 4). Ranges P≈12 (`lymph`, N=148) to P≈185 (`nomao`, N=34,465).
+\* only searched when `--num_embedding plr_lite` (the default).
+
+> `k` (KNN neighbors) is fixed at 16, not searched — measured hyperparameter
+> importance (RandomForest on realized HPO trials, 22 datasets) placed it in
+> the lowest tier, consistent with an earlier causal ablation
+> (`--global_retrieve`) showing group-constrained retrieval's exact `k` value
+> doesn't drive performance.
+>
+> `n_prototypes` (P) is **not** searched — auto-set as `P = sqrt(N_train)`
+> (min 4). Ranges P≈12 (`lymph`, N=148) to P≈185 (`nomao`, N=34,465).
 
 ---
 
@@ -174,13 +209,14 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 ```
 TabERA/
 ├── libs/
-│   ├── tabera.py            # Model, MemoryBank — ②
+│   ├── tabera.py            # Model, MemoryBank, TabularEmbedder — ②
 │   ├── prototypes.py        # CentroidLayer — ①
 │   ├── evidence.py          # AttentionAggregator — ②
 │   ├── supervised.py        # Training wrapper
 │   ├── eval.py
 │   ├── search_space.py      # HPO space
 │   └── data.py              # OpenML loader
+├── docs/                    # Design/technical notes
 ├── optim_logs/ / figures/
 ├── optimize.py / reproduce.py / visualize_embeddings.py
 └── requirements.txt
@@ -191,6 +227,12 @@ TabERA/
 ## References
 
 - Gorishniy et al. (2023). TabR: Tabular Deep Learning Meets Nearest Neighbors. *arXiv:2307.14338*.
+- Gorishniy et al. (2022). On Embeddings for Numerical Features in Tabular Deep Learning. *NeurIPS*.
+- Ye et al. (2024). Revisiting Nearest Neighbor for Tabular Data: A Deep Tabular Baseline Two Decades Later (ModernNCA). *arXiv:2407.03257*.
+- Guo & Berkhahn (2016). Entity Embeddings of Categorical Variables. *arXiv:1604.06737*.
+- Snell, Swersky & Zemel (2017). Prototypical Networks for Few-shot Learning. *NeurIPS*.
+- Oreshkin, Rodríguez López & Lacoste (2018). TADAM: Task Dependent Adaptive Metric for Improved Few-Shot Learning. *NeurIPS*.
+- Zhang et al. (2019). AdaCos: Adaptively Scaling Cosine Logits for Effectively Learning Deep Face Representations. *CVPR*.
 - van den Oord et al. (2017). Neural Discrete Representation Learning (VQ-VAE). *NeurIPS*.
 - Bengio et al. (2013). Estimating or Propagating Gradients Through Stochastic Neurons. *arXiv:1308.3432*.
 - Sundararajan et al. (2017). Axiomatic Attribution for Deep Networks. *ICML*.
