@@ -156,7 +156,14 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "n_features":      n_features,
         "embed_dim":       params["embed_dim"],
         "n_prototypes":    params["n_prototypes"],
-        "k":               params["k"],
+        # [버그 수정] k는 get_search_space()에서 trial.suggest_*가 아니라
+        # 고정값(16)으로 dict에 직접 넣는데, Optuna의 study.best_params는
+        # trial.suggest_*()로 "제안된" 파라미터만 기록하고 이렇게 수동으로
+        # 넣은 키는 기록하지 않는다. 즉 optimize.py 실행 중(그 trial의
+        # fresh params 딕셔너리)에는 k=16이 있지만, reproduce.py가 나중에
+        # study.best_params를 다시 읽어올 때는 k가 아예 없어서
+        # KeyError가 남 — .get()으로 같은 고정값(16)을 fallback으로 사용.
+        "k":               params.get("k", 16),
         "embedder_layers": params["embedder_layers"],
         "dropout":         params["dropout"],
         "n_output":        n_output,
