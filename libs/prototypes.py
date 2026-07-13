@@ -31,23 +31,22 @@ CentroidLayer — Dual-Space Prototype Representation
       별도 파일(libs/group_labels.py)이었으나, CentroidLayer에만
       쓰이는 전용 헬퍼라 파일을 분리해 둘 이유가 없어 이 파일로 합침.
 
-(4) ig_baseline — Integrated Gradients(③) 전용 medoid
-    - ①과는 별개 용도. STE hard routing 때문에 IG 적분 경로 위에서
-      baseline이 x와 다른 그룹으로 라우팅되면 F가 불연속을 지나
-      completeness axiom이 깨진다 — 이를 피하려고 x와 같은 그룹으로
-      라우팅되도록 보장된 실제 샘플(=centroid_emb에 가장 가까운 실제
-      훈련 샘플)을 IG baseline으로 쓴다.
-    - ig_baseline[p] = X_raw[argmax cosine_sim(X_emb_group, centroid_emb[p])]
-    - [주의] 이건 IG 문헌의 표준 관행이 아니라 이 아키텍처(STE 불연속)에
-      맞춘 자체 설계임 — 논문에 "표준 기법"이 아니라 "novel contribution"
-      으로 서술할 것.
+[제거됨] ig_baseline — 이전엔 Integrated Gradients(③) 전용 medoid를 여기서
+    관리했음. ③을 SHAP으로 통일하면서 제거됨 — SHAP은 IG처럼 baseline→input
+    연속 경로가 필요 없고(gradient 기반이 아니라 black-box perturbation
+    기반), background로 medoid 1개가 아니라 여러 대표 샘플의 "분포"가
+    필요해 이 buffer의 용도 자체가 없어짐(SHAP background는 reproduce.py
+    에서 X_train 랜덤 샘플링으로 별도 처리).
+    [하위 호환 주의] ig_baseline / ig_baseline_initialized buffer가 state_dict
+    에서 빠짐 — 이전에 저장된 체크포인트를 --from_saved_state로 로드하면
+    strict=True 기준으로는 실패함 (그 checkpoint를 쓸 일이 있다면 로딩 시
+    strict=False 필요).
 
 이론적 근거
 ───────────
 - Dual-Space Prototype Representation (본 가설)
 - Straight-Through Estimator (Bengio et al. 2013)
 - VQ-VAE hard assignment trick (van den Oord et al. 2017)
-- IG baseline은 표준 기법이 아닌 본 구현의 자체 설계 (모듈 (4) 참고)
 
 하위 호환성
 ───────────
@@ -427,14 +426,9 @@ class CentroidLayer(nn.Module):
         self.centroid_emb = nn.Parameter(torch.empty(n_prototypes, embed_dim))
         nn.init.orthogonal_(self.centroid_emb)
 
-        # ── IG(③) 전용 baseline: buffer (학습 안 됨, ema_update로 갱신) ──
-        # ①의 그룹 설명에는 안 쓰임 (모듈 docstring (3)(4) 참고).
-        if n_features > 0:
-            self.register_buffer("ig_baseline", torch.zeros(n_prototypes, n_features))
-            self.register_buffer("ig_baseline_initialized", torch.tensor(False))
-        else:
-            self.ig_baseline = None
-            self.ig_baseline_initialized = None
+        # [제거됨] IG(③) 전용 baseline buffer — ③이 SHAP으로 통일되면서
+        # 더 이상 필요 없어짐 (모듈 docstring 참고). n_features 파라미터
+        # 자체는 다른 용도(생성자 시그니처 하위 호환)로 유지.
 
         # ── centroid별 샘플 인덱스 그룹 (FAISS 범위 제한용) ──
         # list of lists: sample_groups[p] = [idx, idx, ...]
@@ -469,7 +463,7 @@ class CentroidLayer(nn.Module):
     def initialize_from_data(
         self,
         X_emb: torch.Tensor,             # (N, D) 훈련 임베딩
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — ig_baseline 초기화용
+        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — [미사용, 호출부 하위 호환용 시그니처만 유지]
         y_labels: Optional[torch.Tensor] = None, # (N,) 레이블 (소수 클래스 보장용)
     ) -> None:
         """
@@ -539,9 +533,9 @@ class CentroidLayer(nn.Module):
         idx_t = torch.tensor(selected_idx, device=dev)
         self.centroid_emb.data = X_n[idx_t]
 
-        if X_raw is not None and self.ig_baseline is not None:
-            self.ig_baseline.data = X_raw[idx_t].float()
-            self.ig_baseline_initialized.fill_(True)
+        # [제거됨] 이전엔 여기서 ig_baseline(IG medoid)도 같이 초기화했음.
+        # X_raw 파라미터는 supervised.py 호출부 하위 호환을 위해 시그니처는
+        # 유지하되, 더 이상 이 함수 내부에서 쓰이지 않음(③=SHAP 통일).
         self.sample_groups = [[] for _ in range(self.P)]
 
         # 초기화 품질 로그: centroid 간 평균 코사인 거리
@@ -559,30 +553,17 @@ class CentroidLayer(nn.Module):
     def ema_update(
         self,
         X_emb: torch.Tensor,        # (N, D) 전체 훈련 임베딩 — assignment 계산용
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — ig_baseline medoid용
+        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — [미사용, 호출부 하위 호환용 시그니처만 유지]
         assignments: Optional[torch.Tensor] = None,  # (N,) hard assignment
     ) -> Dict[str, float]:
         """
-        에폭 종료 후 호출: sample_groups 갱신 + ig_baseline(IG 전용 medoid) 갱신.
+        에폭 종료 후 호출: sample_groups 갱신.
 
-        [주의] ig_baseline은 ①의 그룹 설명에는 안 쓰인다 — ③(Integrated
-        Gradients)의 baseline 전용이다. ①의 그룹 텍스트 라벨(group_labels)은
-        이 함수가 sample_groups를 갱신한 직후, supervised.py의 호출부에서
-        libs/group_labels.py로 별도 계산·캐싱한다.
-
-        ig_baseline 갱신 방식: Medoid
-        ─────────────────────────────
-        ig_baseline[p] = 그룹 내에서 centroid_emb[p]에
-                         latent space 기준 가장 가까운 실제 훈련 샘플의 원본 feature
-
-        왜 medoid인가 (IG baseline 전용 이유)
-        ────────────────────────────────────
-        STE hard routing 때문에 IG 적분 경로(baseline→x) 위에서 baseline이
-        x와 다른 그룹으로 라우팅되면 forward 함수가 불연속을 지나
-        completeness axiom이 깨진다. medoid는 centroid_emb와의 코사인
-        유사도로 뽑히므로, x와 같은 그룹으로 라우팅되도록 구조적으로
-        보장된다 — 이게 불연속 구간을 최소화하는 이유다. (표준 IG 기법이
-        아니라 이 아키텍처에 맞춘 자체 설계 — 모듈 docstring 참고)
+        [제거됨] 이전엔 여기서 ig_baseline(IG(③) 전용 medoid)도 매 에폭
+        갱신했음 — ③이 SHAP으로 통일되면서 제거됨(모듈 docstring 참고).
+        ①의 그룹 텍스트 라벨(group_labels)은 이 함수가 sample_groups를
+        갱신한 직후, supervised.py의 호출부에서 libs/group_labels.py로
+        별도 계산·캐싱한다 (이 변경과 무관하게 그대로 유지).
 
         유지되는 기능
         ─────────────
@@ -603,33 +584,11 @@ class CentroidLayer(nn.Module):
             c = F.normalize(self.centroid_emb, dim=-1)
             assignments = (q @ c.T).argmax(dim=-1)
 
-        # ── 벡터화된 medoid 계산 ────────────────────────────────
-        # 기존: for p in range(P) → P번 GPU→CPU sync 발생
-        # 개선: 전체를 한 번에 행렬 연산 → GPU에서 한 번에 처리
-        P   = self.P
-        c_norm     = F.normalize(self.centroid_emb.float(), dim=-1)  # (P, D)
-        X_emb_norm = F.normalize(X_emb.float(), dim=-1)              # (N, D)
-
-        # (N, P) similarity matrix — 각 샘플이 각 centroid와 얼마나 가까운가
-        # 한 번의 행렬곱으로 모든 (sample, centroid) similarity 계산
-        all_sims = X_emb_norm @ c_norm.T                             # (N, P)
-
-        # 각 centroid p에 대해: 그 centroid에 배정된 샘플 중 similarity 최대인 샘플 = medoid
-        # assignments가 p인 샘플은 all_sims[:, p]에서 해당 위치만 유효
-        # 배정 안 된 centroid는 -inf로 마스킹
-        INF = torch.finfo(all_sims.dtype).min
-        # assignments를 one-hot처럼 사용: (N, P)에서 배정된 위치만 유효
-        assigned_mask = (assignments.unsqueeze(1) == torch.arange(P, device=assignments.device).unsqueeze(0))  # (N, P)
-        masked_sims = torch.where(assigned_mask, all_sims, torch.tensor(INF, device=all_sims.device))  # (N, P)
-        medoid_indices = masked_sims.argmax(dim=0)  # (P,) — 각 centroid의 medoid 샘플 인덱스
-
-        # ig_baseline 일괄 업데이트 (medoid가 있는 centroid만)
-        if X_raw is not None and self.ig_baseline is not None:
-            for p in range(P):
-                if assigned_mask[:, p].any():
-                    self.ig_baseline.data[p] = X_raw[medoid_indices[p]].float()
-
-        # sample_groups: assignments를 CPU에서 한 번만 변환
+        # [제거됨] 이전엔 여기서 벡터화된 medoid 계산(all_sims/medoid_indices/
+        # assigned_mask)으로 ig_baseline을 갱신했음. ig_baseline이 제거되면서
+        # 이 계산 블록도 함께 제거(다른 곳에서 재사용되지 않음 — sample_groups
+        # 갱신은 아래에서 assignments_cpu 기반의 별도 로직으로 처리됨).
+        P = self.P
         assignments_cpu = assignments.cpu()
         new_groups: List[List[int]] = [[] for _ in range(P)]
         sizes = [0] * P
@@ -754,11 +713,15 @@ class CentroidLayer(nn.Module):
             # [근거]
             # VQ-VAE (van den Oord et al. 2017)와 Bengio et al. 2013의 STE 원 정의는
             # training/eval 구분 없이 forward=hard, backward=soft를 유지한다.
-            # eval에서 STE를 끄면 ∂context_emb/∂query_emb = 0이 되어
-            # IG가 context_emb 경로의 기여를 측정하지 못한다.
-            # eval에서도 STE를 유지하면 forward 값은 hard와 동일하면서
-            # (∵ soft + (hard-soft).detach() = hard, 값 기준)
-            # backward는 soft gradient가 흘러 IG가 context_emb 기여를 반영한다.
+            # eval에서 STE를 끄면 ∂context_emb/∂query_emb = 0이 됨.
+            # [갱신] 이 gradient 경로는 원래 ③(IG)이 eval 모드에서 context_emb
+            # 기여를 측정하려고 필요했던 것인데, ③이 SHAP(gradient 불필요한
+            # black-box 방법)으로 통일되면서 그 필요성 자체는 없어짐. 다만
+            # eval에서도 STE를 유지하는 이 코드는 forward 값 기준으로 hard
+            # argmax와 완전히 동일하므로(∵ soft + (hard-soft).detach() = hard,
+            # 값 기준) 굳이 되돌릴 이유도 없어 그대로 둠 — 순수 gradient
+            # 경로 하나가 이제 아무도 안 쓰는 채로 남아있을 뿐, 예측 결과에는
+            # 영향 없음.
             hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
             routing_probs = soft + (hard_one_hot - soft).detach()      # STE (always)
 

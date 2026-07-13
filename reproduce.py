@@ -29,8 +29,37 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # ─────────────────────────────────────────────────────────────
-# 설명 출력 (①② architectural + ③ IG post-hoc)
+# 설명 출력 (①② architectural + ③ SHAP post-hoc)
 # ─────────────────────────────────────────────────────────────
+
+def _fmt_signed(x: float, decimals: int = 4) -> str:
+    """
+    부호 있는 소수 포맷팅 전용 — 아주 작은 음수(예: -0.00003)가 반올림되면
+    파이썬이 "-0.0000"으로 찍어서, 실제로는 0에 불과한 값이 마치 의미 있는
+    음의 값처럼 오해를 살 수 있다(rank_correlation의 random null 평균
+    corr_rand가 대표적 — 무작위 순위끼리의 기대 상관은 0이라 이런 미세
+    음수가 흔히 나옴). round() 후 +0.0을 더해 음의 0을 양의 0으로
+    정규화한 뒤 포맷한다(IEEE754에서 -0.0 + 0.0 == 0.0).
+    """
+    v = round(x, decimals) + 0.0
+    return f"{v:.{decimals}f}"
+
+
+def _fmt_pval(p: float, n_draws: int) -> str:
+    """
+    Bootstrap/permutation 기반 경험적 p-value 포맷팅 전용.
+
+    n_draws번 무작위 재표본추출 중 관측값을 한 번도 못 넘으면(count=0)
+    p=0.0000으로 그대로 찍기 쉬운데, 이건 "확률이 정확히 0"이라는 뜻이
+    아니라 "n_draws번 중 한 번도 못 봤다"는 관측 해상도의 한계일 뿐이다
+    (실제 p-value는 1/n_draws보다 작다는 것만 알 수 있음 — 0이라는 뜻은
+    아님). rank_correlation의 p_shap_vs_null, interaction_check의
+    p_vs_null 둘 다 이 문제를 갖고 있어 공용 헬퍼로 분리함.
+    """
+    if p <= 0.0:
+        return f"<{1.0 / n_draws:.4g}"
+    return f"{p:.4f}"
+
 
 def _fmt_class(name: str, count: int, n: int, prop: float) -> str:
     """하나의 클래스를 "name" count/n (prop%) 형식으로. top/second 어디서
@@ -210,87 +239,27 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
 
 
 # ─────────────────────────────────────────────────────────────
-# Integrated Gradients (Sundararajan et al. 2017, ICML)
+# [제거됨] Integrated Gradients (Sundararajan et al. 2017, ICML)
 # ─────────────────────────────────────────────────────────────
-def compute_integrated_gradients(
-    model, X, X_baseline, target_fn, n_steps: int = 20,
-    check_convergence: bool = False,
-    use_soft_forward: bool = False,
-):
-    """
-    Parameters
-    ──────────
-    model      : TabERA 모델 (eval 모드)
-    X          : (N, F) 입력 배치
-    X_baseline : (F,) 또는 (N, F) baseline
-    target_fn  : model(x) 출력(dict)을 받아 (N,) 형태의 per-sample 스칼라를
-                 리턴하는 함수.
-    n_steps    : 적분 근사에 사용할 step 수 (기본 20)
-    check_convergence : True면 Completeness axiom 오차를 샘플별로 측정해 출력
-    use_soft_forward : True면 model(x) 대신 model.forward_soft_for_ig(x, target_fn)를 사용.
-
-    Returns
-    ──────────
-    attribution : (N, F) — |IG| (절댓값, 순위 비교용)
-    """
-    if X_baseline.dim() == 1:
-        X_baseline = X_baseline.unsqueeze(0).expand_as(X)
-
-    def _eval_target(x):
-        if use_soft_forward:
-            return model.forward_soft_for_ig(x, target_fn)
-        return target_fn(model(x))
-
-    alphas = torch.linspace(0.0, 1.0, n_steps, device=X.device)
-    grads_accum = torch.zeros_like(X)
-
-    for alpha in alphas:
-        x_interp = (X_baseline + alpha * (X - X_baseline)).clone().detach().requires_grad_(True)
-        target = _eval_target(x_interp)                      # (N,) per-sample
-        grad = torch.autograd.grad(target.sum(), x_interp, retain_graph=False)[0]
-        grads_accum = grads_accum + grad
-
-    avg_grad = grads_accum / n_steps
-    ig_signed = avg_grad * (X - X_baseline)             # (N, F) 부호 보존 (completeness 검증용)
-
-    if check_convergence:
-        with torch.no_grad():
-            f_x        = _eval_target(X)                      # (N,)
-            f_baseline = _eval_target(X_baseline)              # (N,)
-        ig_sum_per_sample  = ig_signed.sum(dim=-1)             # (N,)
-        actual_diff_per_sample = f_x - f_baseline              # (N,)
-
-        abs_error = (ig_sum_per_sample - actual_diff_per_sample).abs()
-        rel_error = abs_error / (actual_diff_per_sample.abs() + 1e-8)
-
-        print(f"    [IG convergence check] n_steps={n_steps}  "
-              f"{'(soft-forward) ' if use_soft_forward else ''}"
-              f"mean|Σ IG_i - (f(x)-f(baseline))| = {abs_error.mean().item():.4f}  "
-              f"(median relative: {rel_error.median().item():.2%}, "
-              f"mean relative: {rel_error.mean().item():.2%})")
-
-    return ig_signed.abs().detach()
-
-
-def make_logit_target_fn(tasktype: str, target_class=None):
-    """
-    compute_integrated_gradients에 넘길 per-sample target_fn 생성.
-    """
-    if tasktype == "regression":
-        return lambda out: out["logits"].squeeze(-1)            # (N,)
-
-    elif tasktype == "multiclass":
-        def _fn(out):
-            logits = out["logits"]                              # (N, C)
-            if target_class is None:
-                tc = logits.argmax(dim=-1)
-            else:
-                tc = torch.as_tensor(target_class, device=logits.device, dtype=torch.long)
-            return logits.gather(1, tc.unsqueeze(1)).squeeze(1)  # (N,)
-        return _fn
-
-    else:  # binclass — 단일 logit, 그 자체가 곧 class=1 방향의 점수
-        return lambda out: out["logits"].squeeze(-1)             # (N,)
+# compute_integrated_gradients / make_logit_target_fn 두 함수를 여기서
+# 제거함. ③(Feature Attribution)을 SHAP으로 통일하기로 확정한 이유:
+#   1. IG는 categorical feature에서 근본적으로 깨짐 — libs/tabera.py의
+#      _encode_categorical()이 x.round().long()으로 정수 캐스팅하는
+#      순간 autograd 그래프가 끊겨, categorical column의 gradient가
+#      항상 정확히 0이 됨(토이 예제로 재현 확인됨). 전부 categorical인
+#      데이터셋(splice 등)에서는 아예 RuntimeError로 크래시.
+#   2. IG는 연속 경로 적분(baseline→input)을 전제하는 방법이라 이산
+#      입력에 원천적으로 안 맞음 — 문헌에서도 "모델이 미분가능해야
+#      하며, 이는 비미분 요소나 workaround 없는 이산 입력에 직접
+#      적용하는 것을 제한한다"고 명시적으로 분류됨(Turing Institute
+#      TEA Techniques 등).
+#   3. SHAP(Shapley value)은 gradient가 아니라 함수를 여러 번 평가하는
+#      black-box perturbation 방법이라 이 문제 자체가 없고, 게다가
+#      efficiency/symmetry/dummy/additivity 네 공리를 만족하는 유일한
+#      배분 규칙이라는 이론적 근거도 있음(Lundberg & Lee 2017).
+# SHAP 계산은 rank_correlation ablation 내부(model_predict 클로저 +
+# shap.KernelExplainer)에서 직접 이뤄짐 — 별도 top-level 함수로 뺄
+# 만큼 여러 곳에서 재사용되지 않아 그대로 inline.
 
 
 # ─────────────────────────────────────────────────────────────
@@ -326,7 +295,7 @@ def main():
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor", "neighbor_noise",
                                  "rank_correlation", "dual_space_faithfulness",
-                                 "deletion_auc", "insertion_auc",
+                                 "interaction_check",
                                  "dataset_profile"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
@@ -342,23 +311,30 @@ def main():
                             "                         (random_neighbor와 함께 봐야 함 —\n"
                             "                         이 둘의 성능 하락 차이가 '틀린 이웃'과\n"
                             "                         '이웃 없음'의 영향을 분리해서 보여줌)\n"
-                            "  rank_correlation      : IG feature 순위 vs 실제 prediction\n"
-                            "                         영향력 순위 Spearman 상관계수\n"
-                            "                         (TabERA vs SHAP vs Random 3자 비교)\n"
+                            "  rank_correlation      : ③(SHAP) feature 순위가 Delta(단순\n"
+                            "                         1차 perturbation) 순위와 어느 정도\n"
+                            "                         정합하는지 보는 실험. [주의] Delta는\n"
+                            "                         ground truth가 아니라 low-fidelity\n"
+                            "                         baseline(feature 상호작용을 못 봄) —\n"
+                            "                         '정합도가 낮다'가 곧 'SHAP이 틀렸다'는\n"
+                            "                         뜻이 아님. random null과 SHAP MC 노이즈\n"
+                            "                         까지 같이 봐야 해석 가능.\n"
                             "  dual_space_faithfulness : sample_groups 인덱스 정합성 +\n"
                             "                         그룹 분리도(F-test/χ²) 검증\n"
-                            "  deletion_auc          : attribution 순위로 feature 누적 마스킹 →\n"
-                            "                         ŷ 곡선의 AUC (낮을수록 좋음)\n"
-                            "  insertion_auc          : baseline에서 시작 → 중요 feature부터 복원 →\n"
-                            "                         ŷ 곡선의 AUC (높을수록 좋음)\n"
-                            "                         Deletion과 짝 (Petsiuk et al. 2018, RISE)\n"
-                            "  dataset_profile        : 새 데이터셋에서 IG/deletion 신뢰도를\n"
-                            "                         빠르게 분류하기 위한 통합 진단. 예측\n"
-                            "                         확신도, fallback 비율, mean/medoid\n"
-                            "                         completeness error, deletion_auc std\n"
-                            "                         (TabERA/SHAP/Random 모두)를 한 번에 출력\n"
-                            "                         하고 A(척도 자체 문제)/B(mean baseline\n"
-                            "                         문제)/C(정상) 중 하나로 자동 분류."
+                            "  interaction_check      : 두 feature를 동시에 perturb했을 때의\n"
+                            "                         변화 vs 개별 perturb 합의 차이로,\n"
+                            "                         '이 데이터셋에 SHAP이 잡아야 할 만큼\n"
+                            "                         유의미한 feature 상호작용이 실제로\n"
+                            "                         있는가'를 rank_correlation과 별개로\n"
+                            "                         직접 확인. rank_correlation에서\n"
+                            "                         SHAP-Delta 불일치가 나왔을 때, 그게\n"
+                            "                         상호작용 때문인지 SHAP 추정 오차\n"
+                            "                         때문인지 구분하는 데 씀.\n"
+                            "  dataset_profile        : 예측 확신도, fallback 비율 등 빠른\n"
+                            "                         데이터셋 진단(예전엔 IG completeness/\n"
+                            "                         deletion_auc 포함했으나 ③=SHAP 통일로\n"
+                            "                         해당 부분은 제거 — rank_correlation이\n"
+                            "                         그 역할을 대신함)."
                         ))
     parser.add_argument("--detach_context_grad", action="store_true",
                         help=(
@@ -413,23 +389,28 @@ def main():
                             "best_params를 쓰는 게 이상적이지만, 없으면 기존 study "
                             "best_params 위에 이 구조만 얹어 1회 재학습(별도 study 불필요)."
                         ))
-    parser.add_argument("--mean_baseline", action="store_true",
+    parser.add_argument("--shap_background", type=int, default=50,
                         help=(
-                            "[ablation 전용] IG baseline으로 centroid medoid 대신 "
-                            "X_train.mean()을 사용. 기본값은 medoid이며, 4개 데이터셋 "
-                            "전부에서 completeness axiom 만족도가 일관되게 크게 개선됨을 "
-                            "확인함 (median relative error 기준: vehicle 146%→17.5%, "
-                            "ada 19.4%→1.5%, qsar 53.4%→1.75%, wine 319%→4.1%). "
-                            "이 플래그는 'baseline 선택이 completeness에 미치는 영향'을 "
-                            "보여주는 ablation 전용이며 메인 결과에는 사용하지 않는다. "
-                            "deletion_auc, insertion_auc에서 공통 사용."
+                            "rank_correlation의 SHAP KernelExplainer background 샘플 수. "
+                            "기본 50. [실측 확인됨] nsamples가 F 대비 부족한 상태에서 이 값만 "
+                            "늘리면 오히려 정합도가 떨어질 수 있음(jasmine, F=144: "
+                            "background 50→200 단독으로 올렸더니 ρ 0.53→0.36으로 악화) — "
+                            "nsamples가 --shap_nsamples(기본 auto)로 충분히 확보된 상태에서만 "
+                            "이 값을 올리는 걸 권장."
                         ))
-    parser.add_argument("--ig_nsteps", type=int, default=50,
+    parser.add_argument("--shap_nsamples", type=int, default=None,
                         help=(
-                            "IG 적분에 사용할 n_steps. 기본 50. deletion_auc, "
-                            "insertion_auc에서 공통으로 사용. medoid baseline(기본값)은 "
-                            "빠르게 수렴하므로, 기본값(50)으로도 충분히 낮은 completeness "
-                            "error를 얻을 수 있음."
+                            "rank_correlation의 SHAP KernelExplainer nsamples(perturbation 표본 "
+                            "수). 기본값 None → SHAP 라이브러리 자체의 'auto' 공식을 그대로 씀 "
+                            "(nsamples = 2*n_features + 2048, shap 공식 문서 기준). [실측 확인됨] "
+                            "이전엔 비용 절감 목적으로 n_features와 무관하게 100으로 고정했었는데, "
+                            "jasmine(F=144)에서 nsamples 100→500만으로도 ρ가 0.53→0.63로 뚜렷이 "
+                            "올랐음 — F 대비 nsamples가 부족하면(KernelSHAP이 내부에서 푸는 가중"
+                            "회귀가 사실상 미지수>관측치인 underdetermined 상태가 되어) 추정치가 "
+                            "체계적으로 편향됨. auto 공식은 이 문제를 원천적으로 피하도록 "
+                            "설계되어 있어(라이브러리 자체가 F에 비례해 표본을 늘림), 임의로 "
+                            "고정값을 주는 것보다 기본값으로 더 적합함. 정수를 명시하면 auto 대신 "
+                            "그 값을 그대로 씀(--shap_repeats로 MC 노이즈 진단 시 등 실험 목적)."
                         ))
     parser.add_argument("--shap_repeats", type=int, default=1,
                         help=(
@@ -673,7 +654,7 @@ def main():
 
         model.eval()
 
-        # ── rank_correlation: IG feature 순위 vs 실제 prediction 영향력 순위 ──
+        # ── rank_correlation: SHAP(③) 순위 vs Delta(1차 신호) 순위 정합성 체크 ──
         if args.ablation == "rank_correlation":
             import shap
             from scipy.stats import spearmanr
@@ -689,8 +670,15 @@ def main():
             X_rc_np    = X_rc.detach().cpu().numpy()
             X_train_np = X_train.detach().cpu().numpy()
 
-            print(f"\n  Rank Correlation Faithfulness (n={n_rc})")
+            print(f"\n  Rank Correlation — SHAP(③) vs Delta(1차 신호) 정합성 체크 (n={n_rc})")
             print(f"  {'─'*60}")
+            print(f"  [주의] 이 실험은 'SHAP이 정확하다'를 증명하는 게 아니라, ")
+            print(f"  'SHAP 순위가 단순 1차 perturbation(Delta) 순위와 어느 정도")
+            print(f"  일치하는가'를 보는 정합성 체크임. Delta는 feature를 하나씩만")
+            print(f"  독립적으로 perturb하는 low-fidelity 방법(Occlusion-1)이라")
+            print(f"  고차 feature 상호작용을 못 봄 — SHAP과 Delta가 불일치할 때,")
+            print(f"  그게 'SHAP이 틀려서'가 아니라 'SHAP이 Delta는 못 보는 상호작용을")
+            print(f"  반영해서'일 수 있음(--ablation interaction_check로 별도 확인 권장).")
 
             with torch.no_grad():
                 logits_orig = model(X_rc)["logits"]           # (N, C) or (N, 1)
@@ -705,7 +693,7 @@ def main():
                     return logits[torch.arange(logits.shape[0], device=logits.device), idx]
                 return logits.squeeze(-1)
 
-            print(f"  [1/4] Delta 순위 계산 중 (feature {n_features}개)...")
+            print(f"  [1/3] Delta 순위 계산 중 (feature {n_features}개)...")
             with torch.no_grad():
                 train_mean   = X_train.mean(dim=0)             # (F,)
                 orig_target  = _pick_target(logits_orig)       # (N,)
@@ -718,256 +706,429 @@ def main():
                     masked_target  = _pick_target(logits_masked)
                     delta_samples[:, f] = (orig_target - masked_target).abs().cpu().numpy()
 
-            delta_arr  = delta_samples.mean(axis=0)            # (F,) 점추정치 (기존과 동일)
+            delta_arr  = delta_samples.mean(axis=0)            # (F,) 점추정치
             delta_rank = np.argsort(np.argsort(-delta_arr))   # 0-based, 낮을수록 중요
 
-            print(f"  [2/4] TabERA IG 순위 계산 중 (Integrated Gradients, 50-step)...")
+            # [SHAP 공식 그대로 사용] --shap_nsamples를 안 주면(None) SHAP
+            # 라이브러리 자체의 'auto' 공식(nsamples = 2*n_features + 2048,
+            # shap 공식 문서 기준)을 그대로 계산해서 씀. 예전엔 비용 절감
+            # 목적으로 n_features와 무관하게 100 고정값을 썼었는데, jasmine
+            # (F=144) 실측에서 nsamples 부족이 SHAP 추정치를 체계적으로
+            # 편향시키는 게 확인됨(100→500만으로 ρ 0.53→0.63) — 임의
+            # 고정값보다 F에 비례해 커지는 auto 공식이 원칙적으로 더 맞고,
+            # 상한(cap)은 일부러 두지 않음: cap을 걸면 결국 예전과 같은
+            # "F가 큰 데이터셋에서 표본이 F 대비 부족해지는" 문제가 다시
+            # 생기기 때문. 비용이 부담되면 --shap_nsamples로 직접 낮은 값을
+            # 줘서 의도적으로 근사 정밀도를 낮추는 쪽을 선택할 것.
+            _shap_nsamples = (
+                args.shap_nsamples if args.shap_nsamples is not None
+                else 2 * n_features + 2048
+            )
+            print(f"  [2/3] SHAP KernelExplainer 실행 중 "
+                  f"(background={args.shap_background}, nsamples={_shap_nsamples}"
+                  f"{' [auto]' if args.shap_nsamples is None else ''})...")
 
-            X_baseline = X_train.mean(dim=0)               # (F,) -- delta 계산과 동일 baseline
-
-            ig_target_fn = make_logit_target_fn(tasktype, target_class=_target_class)
-
-            tabera_imp = compute_integrated_gradients(
-                model, X_rc, X_baseline,
-                target_fn=ig_target_fn,
-                n_steps=50,
-                check_convergence=True,
-            ).cpu().numpy()  # (N, F)
-
-            if True:
-                tabera_mean = tabera_imp.mean(axis=0)          # (F,)
-                tabera_rank = np.argsort(np.argsort(-tabera_mean))
-
-                print(f"  [3/4] SHAP KernelExplainer 실행 중 (background=50, nsamples=100)...")
-
-                def model_predict(x_np):
-                    x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
-                    with torch.no_grad():
-                        logits_np = model(x_t)["logits"].cpu().numpy()
-                    if tasktype == "multiclass":
-                        exp_l = np.exp(logits_np - logits_np.max(-1, keepdims=True))
-                        return exp_l / exp_l.sum(-1, keepdims=True)
-                    elif tasktype == "binary":
-                        return 1 / (1 + np.exp(-logits_np))
-                    else:
-                        return logits_np
-
-                def _run_shap_once(bg_rng: np.random.RandomState):
-                    """SHAP 1회 실행 → (shap_arr, shap_mean, shap_rank)."""
-                    bg_idx      = bg_rng.choice(len(X_train_np), size=50, replace=False)
-                    bg_data     = X_train_np[bg_idx]
-                    explainer   = shap.KernelExplainer(model_predict, bg_data)
-                    shap_values = explainer.shap_values(X_rc_np, nsamples=100)
-
-                    if isinstance(shap_values, list):
-                        arrays = [np.abs(np.array(sv, dtype=float)) for sv in shap_values]
-                        valid = [a for a in arrays if a.ndim == 2 and a.shape[1] == n_features]
-                        if valid and _target_class is not None:
-                            n_valid = len(valid)
-                            shap_arr_ = np.stack([
-                                valid[min(int(_target_class[i]), n_valid - 1)][i]
-                                for i in range(n_rc)
-                            ])                                          # (N, F)
-                        elif valid:
-                            shap_arr_ = np.mean(valid, axis=0)           # (N, F)
-                        else:
-                            shap_arr_ = arrays[0]
-                    else:
-                        shap_values = np.array(shap_values, dtype=float)
-                        if shap_values.ndim == 3:
-                            shape3 = shap_values.shape
-                            sample_axis, feat_axis = None, None
-                            for ax, sz in enumerate(shape3):
-                                if sz == n_rc and sample_axis is None:
-                                    sample_axis = ax
-                            for ax, sz in enumerate(shape3):
-                                if ax != sample_axis and sz == n_features and feat_axis is None:
-                                    feat_axis = ax
-
-                            if sample_axis is not None and feat_axis is not None:
-                                class_axis = [a for a in range(3) if a not in (sample_axis, feat_axis)][0]
-                                shap_moved = np.moveaxis(shap_values, [sample_axis, feat_axis, class_axis], [0, 1, 2])
-                                if _target_class is not None:
-                                    shap_arr_ = np.abs(np.stack([
-                                        shap_moved[i, :, int(_target_class[i])] for i in range(n_rc)
-                                    ]))                                       # (N, F)
-                                else:
-                                    shap_arr_ = np.abs(shap_moved).mean(axis=2)  # (N, F)
-                            else:
-                                shap_arr_ = np.abs(shap_values).mean(axis=-1)
-                                if shap_arr_.shape[0] != n_rc:
-                                    shap_arr_ = shap_arr_.T
-                        else:
-                            shap_arr_ = np.abs(shap_values)             # (N, F)
-
-                    assert shap_arr_.shape[0] == n_rc, (
-                        f"shap_arr의 첫 축이 샘플 수(n_rc={n_rc})와 안 맞습니다: "
-                        f"shap_arr.shape={shap_arr_.shape}. shap_values의 반환 형태가 "
-                        f"예상과 다를 수 있습니다 (shap 버전 확인 필요)."
-                    )
-                    shap_mean_raw_ = np.array(shap_arr_.mean(axis=0), dtype=float)
-                    if shap_mean_raw_.shape[0] != n_features:
-                        shap_mean_raw_ = shap_arr_.mean(axis=0)
-                        if shap_mean_raw_.ndim > 1:
-                            shap_mean_raw_ = shap_mean_raw_.mean(axis=-1)
-                        shap_mean_raw_ = shap_mean_raw_[:n_features]
-                    shap_mean_ = np.array(shap_mean_raw_, dtype=float).flatten()[:n_features]
-                    assert shap_mean_.shape[0] == n_features, f"shap_mean shape {shap_mean_.shape} != {n_features}"
-                    shap_rank_ = np.argsort(np.argsort(-shap_mean_)).astype(int)
-                    return shap_arr_, shap_mean_, shap_rank_
-
-                shap_arr, shap_mean, shap_rank = _run_shap_once(np.random.RandomState(args.seed))
-
-                shap_mc_std = None
-                if args.shap_repeats > 1:
-                    print(f"  [SHAP MC 노이즈 진단] {args.shap_repeats}회 반복 재계산 중"
-                          f"(매번 다른 background)...")
-                    shap_mc_corrs = [spearmanr(shap_rank, delta_rank)[0]]
-                    for _r in range(1, args.shap_repeats):
-                        _, _, shap_rank_r = _run_shap_once(np.random.RandomState(args.seed * 1000 + _r))
-                        corr_r, _ = spearmanr(shap_rank_r, delta_rank)
-                        shap_mc_corrs.append(corr_r)
-                    shap_mc_corrs = np.array(shap_mc_corrs)
-                    shap_mc_std = float(shap_mc_corrs.std())
-                    print(f"    corr_shap (반복 {args.shap_repeats}회): "
-                          f"{shap_mc_corrs.mean():.4f} ± {shap_mc_std:.4f}  "
-                          f"(min={shap_mc_corrs.min():.4f}, max={shap_mc_corrs.max():.4f})")
-                    if shap_mc_std > 0.02:
-                        print(f"    ⚠️  SHAP 자체 노이즈(±{shap_mc_std:.4f})가 꽤 큽니다 — "
-                              f"이전 bootstrap CI 폭의 일부는 샘플 선택이 아니라 이 노이즈")
-                        print(f"       때문일 수 있습니다. nsamples/background를 늘리는 걸 "
-                              f"고려하세요.")
-
-                print(f"  [4/4] Random attribution baseline 계산 중 (1000회 반복)...")
-                rng_rc = np.random.RandomState(args.seed)
-                n_rand_draws = 1000
-                rand_corrs = np.empty(n_rand_draws)
-                for r in range(n_rand_draws):
-                    rand_mean_r = rng_rc.rand(n_features)
-                    rand_rank_r = np.argsort(np.argsort(-rand_mean_r))
-                    rand_corrs[r], _ = spearmanr(rand_rank_r, delta_rank)
-
-                corr_rand      = float(rand_corrs.mean())
-                corr_rand_std  = float(rand_corrs.std())
-
-                tabera_rank = np.array(tabera_rank, dtype=int)
-                delta_rank  = np.array(delta_rank,  dtype=int)
-                shap_rank   = np.array(shap_rank,   dtype=int)
-
-                corr_tabera, p_tabera = spearmanr(tabera_rank, delta_rank)
-                corr_shap,   p_shap   = spearmanr(shap_rank,   delta_rank)
-
-                p_tabera_vs_null = float((rand_corrs >= corr_tabera).mean())
-                p_shap_vs_null   = float((rand_corrs >= corr_shap).mean())
-
-                print(f"\n  {'─'*60}")
-                print(f"  {'Method':<20} {'Spearman ρ':>12}  {'p-value':>12}")
-                print(f"  {'─'*60}")
-                print(f"  {'TabERA (ours)':<20} {corr_tabera:>12.4f}  {p_tabera:>12.4f}")
-                print(f"  {'SHAP':<20} {corr_shap:>12.4f}  {p_shap:>12.4f}")
-                print(f"  {'Random (1000회)':<20} {corr_rand:>12.4f}  {'±' + f'{corr_rand_std:.4f}':>12}")
-                print(f"  {'─'*60}")
-                print(f"  랜덤 귀무분포 대비 경험적 p-value:")
-                print(f"    P(random ρ ≥ TabERA ρ) = {p_tabera_vs_null:.4f}")
-                print(f"    P(random ρ ≥ SHAP ρ)   = {p_shap_vs_null:.4f}")
-
-                print(f"\n  [Bootstrap] TabERA vs SHAP 차이 안정성 검정 (200회 재표본추출)...")
-                n_boot = 200
-                rng_boot = np.random.RandomState(args.seed + 1)
-                boot_diffs = np.empty(n_boot)
-                for b in range(n_boot):
-                    idx_b = rng_boot.randint(0, n_rc, size=n_rc)  # 복원추출
-                    delta_b  = delta_samples[idx_b].mean(axis=0)
-                    tabera_b = tabera_imp[idx_b].mean(axis=0)
-                    shap_b   = shap_arr[idx_b].mean(axis=0)
-
-                    delta_rank_b  = np.argsort(np.argsort(-delta_b))
-                    tabera_rank_b = np.argsort(np.argsort(-tabera_b))
-                    shap_rank_b   = np.argsort(np.argsort(-shap_b))
-
-                    corr_tabera_b, _ = spearmanr(tabera_rank_b, delta_rank_b)
-                    corr_shap_b,   _ = spearmanr(shap_rank_b,   delta_rank_b)
-                    boot_diffs[b] = corr_tabera_b - corr_shap_b
-
-                boot_diff_mean = float(boot_diffs.mean())
-                boot_ci_low, boot_ci_high = np.percentile(boot_diffs, [2.5, 97.5])
-                boot_win_rate = float((boot_diffs > 0).mean())
-
-                print(f"    TabERA ρ - SHAP ρ = {boot_diff_mean:+.4f}  "
-                      f"(95% CI: [{boot_ci_low:+.4f}, {boot_ci_high:+.4f}])")
-                print(f"    재표본 중 TabERA > SHAP 비율: {boot_win_rate:.0%}")
-                if boot_ci_low > 0:
-                    print(f"    → 95% CI가 0을 포함하지 않음: TabERA가 SHAP보다 "
-                          f"안정적으로 낫다고 볼 근거 있음")
-                elif boot_ci_high < 0:
-                    print(f"    → 95% CI가 0을 포함하지 않음: SHAP이 TabERA보다 "
-                          f"안정적으로 낫다고 볼 근거 있음")
+            def model_predict(x_np):
+                # [실측 확인된 OOM 방지] SHAP은 explain 대상 샘플 1개당
+                # nsamples×background(auto 기준으로도 수천 단위)행짜리 합성
+                # 배치를 model()에 한 번에 통째로 넣으려 한다. 학습 때 배치
+                # 크기(보통 128~512)의 수십 배라, group 크기가 큰 데이터셋
+                # (예: SpeedDating, 일부 centroid 그룹 크기 2000+)에서는
+                # MemoryBank.retrieve()의 "정상 경로" 중간 텐서가 이 배치
+                # 크기에 비례해 커져 CUDA OOM으로 죽는 게 실측으로 확인됨
+                # (_outlier_threshold는 학습 중 epoch마다만 GPU 여유 메모리
+                # 기준으로 재보정되고, 추론/ablation 단계에서는 갱신되지
+                # 않아 이 큰 배치에 대응하지 못함). random_neighbor/
+                # neighbor_noise ablation과 동일하게 고정 mini-batch로
+                # 잘라서 순차 forward — 예측값은 배치 분할과 무관하게 동일.
+                _predict_batch = 256
+                x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
+                logits_chunks = []
+                with torch.no_grad():
+                    for start in range(0, x_t.shape[0], _predict_batch):
+                        chunk = x_t[start:start + _predict_batch]
+                        logits_chunks.append(model(chunk)["logits"].cpu())
+                logits_np = torch.cat(logits_chunks, dim=0).numpy()
+                if tasktype == "multiclass":
+                    exp_l = np.exp(logits_np - logits_np.max(-1, keepdims=True))
+                    return exp_l / exp_l.sum(-1, keepdims=True)
+                elif tasktype == "binclass":
+                    return 1 / (1 + np.exp(-logits_np))
                 else:
-                    print(f"    → 95% CI가 0을 포함함: 이 데이터셋에서는 TabERA와 SHAP의")
-                    print(f"      차이가 샘플 구성에 따라 뒤집힐 수 있는 수준 — 점추정치")
-                    print(f"      하나만으로 우열을 단정하면 안 됨")
+                    return logits_np
 
-                print(f"\n  [Delta 상위 5개 feature — 방법별 순위 비교]")
-                top5_delta = np.argsort(delta_arr)[::-1][:5]
-                print(f"  {'Feature':<25} {'Delta순위':>8}  {'TabERA':>8}  {'SHAP':>8}")
-                print(f"  {'─'*55}")
-                for fi in top5_delta:
+            def _run_shap_once(bg_rng: np.random.RandomState):
+                """SHAP 1회 실행 → (shap_arr, shap_mean, shap_rank)."""
+                bg_n        = min(args.shap_background, len(X_train_np))
+                bg_idx      = bg_rng.choice(len(X_train_np), size=bg_n, replace=False)
+                bg_data     = X_train_np[bg_idx]
+                explainer   = shap.KernelExplainer(model_predict, bg_data)
+                shap_values = explainer.shap_values(X_rc_np, nsamples=_shap_nsamples, silent=True)
+
+                if isinstance(shap_values, list):
+                    arrays = [np.abs(np.array(sv, dtype=float)) for sv in shap_values]
+                    valid = [a for a in arrays if a.ndim == 2 and a.shape[1] == n_features]
+                    if valid and _target_class is not None:
+                        n_valid = len(valid)
+                        shap_arr_ = np.stack([
+                            valid[min(int(_target_class[i]), n_valid - 1)][i]
+                            for i in range(n_rc)
+                        ])                                          # (N, F)
+                    elif valid:
+                        shap_arr_ = np.mean(valid, axis=0)           # (N, F)
+                    else:
+                        shap_arr_ = arrays[0]
+                else:
+                    shap_values = np.array(shap_values, dtype=float)
+                    if shap_values.ndim == 3:
+                        shape3 = shap_values.shape
+                        sample_axis, feat_axis = None, None
+                        for ax, sz in enumerate(shape3):
+                            if sz == n_rc and sample_axis is None:
+                                sample_axis = ax
+                        for ax, sz in enumerate(shape3):
+                            if ax != sample_axis and sz == n_features and feat_axis is None:
+                                feat_axis = ax
+
+                        if sample_axis is not None and feat_axis is not None:
+                            class_axis = [a for a in range(3) if a not in (sample_axis, feat_axis)][0]
+                            shap_moved = np.moveaxis(shap_values, [sample_axis, feat_axis, class_axis], [0, 1, 2])
+                            if _target_class is not None:
+                                shap_arr_ = np.abs(np.stack([
+                                    shap_moved[i, :, int(_target_class[i])] for i in range(n_rc)
+                                ]))                                       # (N, F)
+                            else:
+                                shap_arr_ = np.abs(shap_moved).mean(axis=2)  # (N, F)
+                        else:
+                            shap_arr_ = np.abs(shap_values).mean(axis=-1)
+                            if shap_arr_.shape[0] != n_rc:
+                                shap_arr_ = shap_arr_.T
+                    else:
+                        shap_arr_ = np.abs(shap_values)             # (N, F)
+
+                assert shap_arr_.shape[0] == n_rc, (
+                    f"shap_arr의 첫 축이 샘플 수(n_rc={n_rc})와 안 맞습니다: "
+                    f"shap_arr.shape={shap_arr_.shape}. shap_values의 반환 형태가 "
+                    f"예상과 다를 수 있습니다 (shap 버전 확인 필요)."
+                )
+                shap_mean_raw_ = np.array(shap_arr_.mean(axis=0), dtype=float)
+                if shap_mean_raw_.shape[0] != n_features:
+                    shap_mean_raw_ = shap_arr_.mean(axis=0)
+                    if shap_mean_raw_.ndim > 1:
+                        shap_mean_raw_ = shap_mean_raw_.mean(axis=-1)
+                    shap_mean_raw_ = shap_mean_raw_[:n_features]
+                shap_mean_ = np.array(shap_mean_raw_, dtype=float).flatten()[:n_features]
+                assert shap_mean_.shape[0] == n_features, f"shap_mean shape {shap_mean_.shape} != {n_features}"
+                shap_rank_ = np.argsort(np.argsort(-shap_mean_)).astype(int)
+                return shap_arr_, shap_mean_, shap_rank_
+
+            shap_arr, shap_mean, shap_rank = _run_shap_once(np.random.RandomState(args.seed))
+
+            shap_mc_std = None
+            if args.shap_repeats > 1:
+                print(f"  [SHAP MC 노이즈 진단] {args.shap_repeats}회 반복 재계산 중"
+                      f"(매번 다른 background)...")
+                # [해석 우선순위] 이 노이즈부터 확인해야 함 — corr_shap이 corr_rand와
+                # 별 차이 없어 보여도, 그게 'SHAP이 Delta와 안 맞아서'인지 'SHAP 추정
+                # 자체가 이 정도로 흔들려서'인지 이 진단 없이는 구분 불가능함.
+                shap_mc_corrs = [spearmanr(shap_rank, delta_rank)[0]]
+                for _r in range(1, args.shap_repeats):
+                    _, _, shap_rank_r = _run_shap_once(np.random.RandomState(args.seed * 1000 + _r))
+                    corr_r, _ = spearmanr(shap_rank_r, delta_rank)
+                    shap_mc_corrs.append(corr_r)
+                shap_mc_corrs = np.array(shap_mc_corrs)
+                shap_mc_std = float(shap_mc_corrs.std())
+                print(f"    corr_shap (반복 {args.shap_repeats}회): "
+                      f"{shap_mc_corrs.mean():.4f} ± {shap_mc_std:.4f}  "
+                      f"(min={shap_mc_corrs.min():.4f}, max={shap_mc_corrs.max():.4f})")
+                if shap_mc_std > 0.02:
+                    print(f"    ⚠️  SHAP 자체 노이즈(±{shap_mc_std:.4f})가 꽤 큽니다 — "
+                          f"아래 bootstrap CI 폭의 일부는 샘플 선택이 아니라 이 노이즈")
+                    print(f"       때문일 수 있습니다. --shap_nsamples/--shap_background를 "
+                          f"늘리는 걸 고려하세요.")
+
+            print(f"  [3/3] Random attribution baseline 계산 중 (1000회 반복)...")
+            rng_rc = np.random.RandomState(args.seed)
+            n_rand_draws = 1000
+            rand_corrs = np.empty(n_rand_draws)
+            for r in range(n_rand_draws):
+                rand_mean_r = rng_rc.rand(n_features)
+                rand_rank_r = np.argsort(np.argsort(-rand_mean_r))
+                rand_corrs[r], _ = spearmanr(rand_rank_r, delta_rank)
+
+            corr_rand      = float(rand_corrs.mean())
+            corr_rand_std  = float(rand_corrs.std())
+
+            delta_rank = np.array(delta_rank,  dtype=int)
+            shap_rank  = np.array(shap_rank,   dtype=int)
+
+            corr_shap, p_shap = spearmanr(shap_rank, delta_rank)
+            p_shap_vs_null     = float((rand_corrs >= corr_shap).mean())
+
+            print(f"\n  {'─'*60}")
+            print(f"  {'Method':<20} {'Spearman ρ':>12}  {'p-value':>12}")
+            print(f"  {'─'*60}")
+            print(f"  {'SHAP (③)':<20} {corr_shap:>12.4f}  {p_shap:>12.4f}")
+            print(f"  {'Random (1000회)':<20} {_fmt_signed(corr_rand):>12}  {'±' + f'{corr_rand_std:.4f}':>12}")
+            print(f"  {'─'*60}")
+            print(f"  랜덤 귀무분포 대비 경험적 p-value:")
+            print(f"    P(random ρ ≥ SHAP ρ) = {_fmt_pval(p_shap_vs_null, n_rand_draws)}")
+
+            print(f"\n  [Bootstrap] SHAP-Delta 정합도 안정성 검정 (200회 재표본추출)...")
+            n_boot = 200
+            rng_boot = np.random.RandomState(args.seed + 1)
+            boot_corrs = np.empty(n_boot)
+            for b in range(n_boot):
+                idx_b = rng_boot.randint(0, n_rc, size=n_rc)  # 복원추출
+                delta_b = delta_samples[idx_b].mean(axis=0)
+                shap_b  = shap_arr[idx_b].mean(axis=0)
+
+                delta_rank_b = np.argsort(np.argsort(-delta_b))
+                shap_rank_b  = np.argsort(np.argsort(-shap_b))
+                boot_corrs[b], _ = spearmanr(shap_rank_b, delta_rank_b)
+
+            boot_ci_low, boot_ci_high = np.percentile(boot_corrs, [2.5, 97.5])
+
+            print(f"    corr_shap 재표본 분포: mean={boot_corrs.mean():+.4f}  "
+                  f"(95% CI: [{boot_ci_low:+.4f}, {boot_ci_high:+.4f}])")
+            if boot_ci_low > corr_rand + 2 * corr_rand_std:
+                print(f"    → CI가 random 수준을 안정적으로 넘음: SHAP 순위가 Delta와")
+                print(f"      우연 이상으로 정합함")
+            else:
+                print(f"    → CI가 random 수준과 겹칠 수 있음: 이 데이터셋에서 SHAP-Delta")
+                print(f"      정합도를 '우연보다 유의하게 낫다'고 단정하기엔 이름")
+
+            print(f"\n  [Delta 상위 5개 feature — SHAP 순위 비교]")
+            top5_delta = np.argsort(delta_arr)[::-1][:5]
+            print(f"  {'Feature':<25} {'Delta순위':>8}  {'SHAP순위':>8}")
+            print(f"  {'─'*45}")
+            for fi in top5_delta:
+                fn = col_names[fi] if fi < len(col_names) else f"f{fi}"
+                print(
+                    f"  {fn:<25} "
+                    f"  #{int(delta_rank[fi])+1:>4}    "
+                    f"  #{int(shap_rank[fi])+1:>4}"
+                )
+
+            # [추가] 위 표는 Delta 기준 상위만 보여줘서, "SHAP은 상위로 보는데
+            # Delta는 안 중요하게 보는" 반대 방향 불일치는 사각지대였음(예:
+            # 순수 상호작용으로만 작동해서 Delta 개별-perturb로는 안 잡히는
+            # feature). SHAP 상위 5개 중 위 표에 이미 나온 feature는 빼고
+            # 마저 보여줌 — 두 표를 합치면 양방향 불일치를 다 볼 수 있음.
+            top5_delta_set = set(int(fi) for fi in top5_delta)
+            top_shap_sorted = np.argsort(shap_mean)[::-1]
+            top5_shap_only = [fi for fi in top_shap_sorted if int(fi) not in top5_delta_set][:5]
+            if top5_shap_only:
+                print(f"\n  [SHAP 상위 중 위 표에 없던 feature — Delta 순위 비교]")
+                print(f"  {'Feature':<25} {'SHAP순위':>8}  {'Delta순위':>8}")
+                print(f"  {'─'*45}")
+                for fi in top5_shap_only:
+                    fi = int(fi)
                     fn = col_names[fi] if fi < len(col_names) else f"f{fi}"
                     print(
                         f"  {fn:<25} "
-                        f"  #{int(delta_rank[fi])+1:>4}    "
-                        f"  #{int(tabera_rank[fi])+1:>4}    "
-                        f"  #{int(shap_rank[fi])+1:>4}"
+                        f"  #{int(shap_rank[fi])+1:>4}    "
+                        f"  #{int(delta_rank[fi])+1:>4}"
                     )
 
-                print(f"\n  [해석]")
-                if boot_ci_low > 0:
-                    print(f"  ✅ TabERA(ρ={corr_tabera:.3f}) > SHAP(ρ={corr_shap:.3f}) — "
-                          f"bootstrap 95% CI가 0을 안 포함, 안정적으로 우위")
-                elif boot_ci_high < 0:
-                    print(f"  SHAP(ρ={corr_shap:.3f}) > TabERA(ρ={corr_tabera:.3f}) — "
-                          f"bootstrap 95% CI가 0을 안 포함, 안정적으로 우위")
-                else:
-                    print(f"  TabERA(ρ={corr_tabera:.3f}) vs SHAP(ρ={corr_shap:.3f}) — "
-                          f"bootstrap 95% CI가 0을 포함 (동률, 통계적으로 유의한 차이 아님)")
-                print(f"     + explanation이 prediction path 안에 있다는 구조적 차별성은")
-                print(f"       (SHAP은 원래 불가능한 특성) ρ 우열과 무관하게 항상 성립")
+            print(f"\n  [해석]")
+            print(f"  SHAP-Delta Spearman ρ={corr_shap:.3f} (random 기준 {_fmt_signed(corr_rand, 3)}±{corr_rand_std:.3f})")
+            if p_shap_vs_null < 0.05:
+                print(f"  → 우연(random)보다 유의하게 나은 정합도 (p={_fmt_pval(p_shap_vs_null, n_rand_draws)}).")
+                print(f"    다만 이는 'SHAP이 정확하다'는 증명이 아니라, SHAP 순위가")
+                print(f"    단순 1차 신호(Delta)와도 어느 정도 통하는 합리적인 순위라는")
+                print(f"    정도의 정합성 체크임.")
+            else:
+                print(f"  ⚠️  우연(random)과 유의하게 다르다고 말하기 어려움 (p={_fmt_pval(p_shap_vs_null, n_rand_draws)}).")
+                print(f"    SHAP이 틀렸다는 뜻일 수도 있지만, (a) SHAP MC 노이즈가 크거나")
+                print(f"    (b) 이 데이터셋에 Delta로는 못 보는 상호작용이 많아서일 수도")
+                print(f"    있음 — --shap_repeats로 (a)를, --ablation interaction_check로")
+                print(f"    (b)를 먼저 배제한 뒤 재해석할 것.")
+            print(f"     + explanation이 prediction path 안에 있다는 구조적 차별성(①②)은")
+            print(f"       이 ρ 값과 무관하게 항상 성립함 — ③(SHAP)은 그 옆의 보조 장치.")
 
-                if p_tabera_vs_null < 0.05:
-                    print(f"  TabERA는 랜덤(ρ={corr_rand:.3f}±{corr_rand_std:.3f})보다 유의하게 "
-                          f"나음 (p={p_tabera_vs_null:.4f})")
-                else:
-                    print(f"  ⚠️  TabERA가 랜덤(ρ={corr_rand:.3f}±{corr_rand_std:.3f})보다 유의하게 "
-                          f"낫다고 말하기 어려움 (p={p_tabera_vs_null:.4f})")
+            rc_save = {
+                "corr_shap":         corr_shap,
+                "corr_random_mean":  corr_rand,
+                "corr_random_std":   corr_rand_std,
+                "p_shap":            p_shap,
+                "p_shap_vs_null":    p_shap_vs_null,
+                "boot_corr_mean":    float(boot_corrs.mean()),
+                "boot_corr_ci":      [float(boot_ci_low), float(boot_ci_high)],
+                "shap_mc_std":       shap_mc_std,
+                "delta_arr":    delta_arr.tolist(),
+                "shap_mean":    shap_mean.tolist(),
+                "col_names":    col_names,
+                "openml_id":    openml_id,
+                "seed":         args.seed,
+            }
+            rc_path = (
+                Path(log_dir)
+                / f"data={openml_id}..seed{args.seed}_rank_correlation.pkl"
+            )
+            with open(rc_path, "wb") as f:
+                pickle.dump(rc_save, f)
+            print(f"\n  저장: {rc_path}")
 
-                rc_save = {
-                    "corr_tabera":       corr_tabera,
-                    "corr_shap":         corr_shap,
-                    "corr_random_mean":  corr_rand,
-                    "corr_random_std":   corr_rand_std,
-                    "p_tabera":          p_tabera,
-                    "p_shap":            p_shap,
-                    "p_tabera_vs_null":  p_tabera_vs_null,
-                    "p_shap_vs_null":    p_shap_vs_null,
-                    "boot_diff_mean":    boot_diff_mean,
-                    "boot_diff_ci":      [float(boot_ci_low), float(boot_ci_high)],
-                    "boot_win_rate":     boot_win_rate,
-                    "shap_mc_std":       shap_mc_std,
-                    "delta_arr":    delta_arr.tolist(),
-                    "tabera_mean":  tabera_mean.tolist(),
-                    "shap_mean":    shap_mean.tolist(),
-                    "col_names":    col_names,
-                    "openml_id":    openml_id,
-                    "seed":         args.seed,
-                }
-                rc_path = (
-                    Path(log_dir)
-                    / f"data={openml_id}..seed{args.seed}_rank_correlation.pkl"
+        # ── interaction_check: feature 상호작용이 실제로 존재하는지 직접 확인 ──
+        # (SHAP-Delta 불일치가 '상호작용 때문'이라는 주장을 뒷받침하려면, 그 전에
+        # 데이터에 상호작용이 실제로 있는지부터 데이터로 확인해야 함. 여기서는
+        # interaction(i,j) = |perturb(i,j 동시)| - [|perturb(i)| + |perturb(j)|] 로 정의—
+        # 0보다 유의하게 크면 i,j가 예측에 super-additive하게 같이 작동한다는 뜻.)
+        elif args.ablation == "interaction_check":
+            model.eval()
+            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
+            n_features = model.n_features
+
+            n_ic = min(100, X_test.shape[0])
+            _ic_perm = np.random.RandomState(args.seed).permutation(X_test.shape[0])[:n_ic]
+            X_ic = X_test[_ic_perm]
+
+            print(f"\n  Feature Interaction Check (n={n_ic})")
+            print(f"  {'─'*60}")
+            print(f"  '두 feature를 동시에 perturb했을 때의 변화'와 '개별 perturb 변화의")
+            print(f"  합' 사이의 차이로, 상호작용이 실제로 존재하는지 먼저 확인합니다.")
+            print(f"  (SHAP interaction values가 아니라, 모델 구조에 안 얽매이는 직접")
+            print(f"  perturbation 방식 — TabERA처럼 hard-routing 등 불연속을 가진")
+            print(f"  구조에도 안전하게 적용됨.)")
+
+            with torch.no_grad():
+                logits_orig = model(X_ic)["logits"]
+                _target_class = (
+                    logits_orig.argmax(dim=-1).cpu().numpy()
+                    if tasktype == "multiclass" else None
                 )
-                with open(rc_path, "wb") as f:
-                    pickle.dump(rc_save, f)
-                print(f"\n  저장: {rc_path}")
-        # ── dual_space_faithfulness: dual-space centroid 설계 검증 ──────
+
+            def _pick_target_ic(logits: torch.Tensor) -> torch.Tensor:
+                if tasktype == "multiclass":
+                    idx = torch.as_tensor(_target_class, device=logits.device, dtype=torch.long)
+                    return logits[torch.arange(logits.shape[0], device=logits.device), idx]
+                return logits.squeeze(-1)
+
+            with torch.no_grad():
+                train_mean  = X_train.mean(dim=0)
+                orig_target = _pick_target_ic(logits_orig)     # (N,)
+
+                print(f"  [1/3] 개별 Delta 계산 중 (feature {n_features}개)...")
+                delta_1d = np.zeros((n_ic, n_features))
+                for f in range(n_features):
+                    X_m = X_ic.clone()
+                    X_m[:, f] = train_mean[f]
+                    delta_1d[:, f] = (orig_target - _pick_target_ic(model(X_m)["logits"])).abs().cpu().numpy()
+
+            # 상위 K개 Delta-important feature 쌍만 확인 (O(K^2)로 비용 통제)
+            top_k = min(12, n_features)
+            top_feats = np.argsort(-delta_1d.mean(axis=0))[:top_k]
+            n_pairs = top_k * (top_k - 1) // 2
+            print(f"  [2/3] 상위 {top_k}개 feature(O(K^2)={n_pairs}쌍)에 대해 "
+                  f"쌍별 상호작용 계산 중...")
+
+            with torch.no_grad():
+                pair_interactions = []   # [(i, j, mean_abs_interaction), ...]
+                for a in range(top_k):
+                    for b in range(a + 1, top_k):
+                        fi, fj = int(top_feats[a]), int(top_feats[b])
+                        X_pair = X_ic.clone()
+                        X_pair[:, fi] = train_mean[fi]
+                        X_pair[:, fj] = train_mean[fj]
+                        delta_pair = (orig_target - _pick_target_ic(model(X_pair)["logits"])).abs().cpu().numpy()
+                        # super-additive면 양수, sub-additive(중복 신호)면 음수
+                        interaction = delta_pair - (delta_1d[:, fi] + delta_1d[:, fj])
+                        pair_interactions.append((fi, fj, float(np.abs(interaction).mean()),
+                                                   float(interaction.mean())))
+
+            pair_interactions.sort(key=lambda t: -t[2])
+
+            print(f"  [3/3] Random 쌍 대조군 계산 중 (동일 개수, 무작위 feature 쌍)...")
+            rng_ic = np.random.RandomState(args.seed)
+            rand_abs_interactions = []
+            with torch.no_grad():
+                for _ in range(n_pairs):
+                    fi, fj = rng_ic.choice(n_features, size=2, replace=False)
+                    X_pair = X_ic.clone()
+                    X_pair[:, int(fi)] = train_mean[int(fi)]
+                    X_pair[:, int(fj)] = train_mean[int(fj)]
+                    delta_pair = (orig_target - _pick_target_ic(model(X_pair)["logits"])).abs().cpu().numpy()
+                    interaction = delta_pair - (delta_1d[:, int(fi)] + delta_1d[:, int(fj)])
+                    rand_abs_interactions.append(float(np.abs(interaction).mean()))
+
+            top_abs_mean  = float(np.mean([t[2] for t in pair_interactions]))
+            rand_abs_mean = float(np.mean(rand_abs_interactions))
+
+            # [통계적 엄밀성 추가] 기존엔 "top_abs_mean > rand_abs_mean * 1.5"라는
+            # 임의 배수 임계값으로만 판단했음 — rank_correlation처럼 경험적 null
+            # 분포와 p-value로 바꾼다. 다만 random 쌍 자체를 1000번 다시 뽑아
+            # model forward를 또 도는 건 비용이 n_pairs배로 늘어나므로, 이미
+            # 계산해둔 rand_abs_interactions 풀(n_pairs개, 실제 model forward로
+            # 얻은 값)에서 크기 n_pairs로 복원추출(bootstrap)해 "무작위 K쌍의
+            # 평균 |상호작용|"의 null 분포를 근사한다 — rank_correlation의
+            # bootstrap 재표본추출과 같은 원칙(이미 계산된 데이터를 재표본추출해
+            # 추가 forward 비용 없이 분포를 얻음).
+            print(f"  [Null 분포] random 쌍 풀에서 1000회 bootstrap 재표본추출 중...")
+            rand_pool = np.array(rand_abs_interactions)
+            rng_null  = np.random.RandomState(args.seed + 1)
+            n_null_draws = 1000
+            null_means = np.empty(n_null_draws)
+            for r in range(n_null_draws):
+                sample = rng_null.choice(rand_pool, size=len(rand_pool), replace=True)
+                null_means[r] = sample.mean()
+
+            null_mean = float(null_means.mean())
+            null_std  = float(null_means.std())
+            p_vs_null = float((null_means >= top_abs_mean).mean())
+
+            print(f"\n  {'─'*60}")
+            print(f"  Delta-important 상위 {top_k}개 쌍의 |상호작용| 평균: {top_abs_mean:.4f}")
+            print(f"  무작위 feature 쌍의 |상호작용| 평균:              {rand_abs_mean:.4f}")
+            print(f"  Random null 분포 (bootstrap 1000회):              {null_mean:.4f} ± {null_std:.4f}")
+            print(f"  P(random null 평균 ≥ top_abs_mean) = {_fmt_pval(p_vs_null, n_null_draws)}")
+            print(f"  {'─'*60}")
+
+            print(f"\n  [상위 상호작용 5쌍]")
+            print(f"  {'Feature i':<20} {'Feature j':<20} {'|interaction|':>14} {'부호':>6}")
+            print(f"  {'─'*64}")
+            for fi, fj, abs_int, signed_int in pair_interactions[:5]:
+                ni = col_names[fi] if fi < len(col_names) else f"f{fi}"
+                nj = col_names[fj] if fj < len(col_names) else f"f{fj}"
+                sign = "super+" if signed_int > 0 else "sub-"
+                print(f"  {ni:<20} {nj:<20} {abs_int:>14.4f} {sign:>6}")
+
+            print(f"\n  [해석]")
+            if p_vs_null < 0.05:
+                print(f"  ✅ Delta-important feature 쌍에서 상호작용이 무작위 null(p={_fmt_pval(p_vs_null, n_null_draws)})")
+                print(f"    보다 유의하게 큼 ({top_abs_mean:.4f} vs null {null_mean:.4f}±{null_std:.4f}) —")
+                print(f"    이 데이터셋에는 SHAP이 잡아낼 가치가 있는 feature 상호작용이")
+                print(f"    실제로 존재함. rank_correlation에서 SHAP-Delta가 불일치했다면,")
+                print(f"    상호작용 반영 때문일 가능성을 무게 있게 고려할 수 있음.")
+            else:
+                print(f"  ⚠️  Delta-important 쌍의 상호작용이 무작위 null과 유의하게 다르다고")
+                print(f"    말하기 어려움 (p={_fmt_pval(p_vs_null, n_null_draws)}, {top_abs_mean:.4f} vs null "
+                      f"{null_mean:.4f}±{null_std:.4f}). rank_correlation에서 SHAP-Delta 불일치가")
+                print(f"    나온다면, 상호작용보다는 SHAP 추정 자체의 노이즈(--shap_repeats로")
+                print(f"    확인)일 가능성이 더 큼.")
+            print(f"     (주의: 이 null은 random pair 풀 {n_pairs}개의 재표본추출로 근사한 것 —")
+            print(f"      pool 자체가 작으면(top_k가 작은 데이터셋) null 분포도 거칠어질 수 있음.)")
+
+            ic_save = {
+                "top_feats":            [int(f) for f in top_feats],
+                "pair_interactions":    pair_interactions,
+                "top_abs_mean":         top_abs_mean,
+                "rand_abs_mean":        rand_abs_mean,
+                "null_mean":            null_mean,
+                "null_std":             null_std,
+                "p_vs_null":            p_vs_null,
+                "col_names":            col_names,
+                "openml_id":            openml_id,
+                "seed":                 args.seed,
+            }
+            ic_path = (
+                Path(log_dir)
+                / f"data={openml_id}..seed{args.seed}_interaction_check.pkl"
+            )
+            with open(ic_path, "wb") as f:
+                pickle.dump(ic_save, f)
+            print(f"\n  저장: {ic_path}")
+
         elif args.ablation == "dual_space_faithfulness":
             model.eval()
             col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
@@ -1147,37 +1308,39 @@ def main():
                 pickle.dump(dsf_save, f)
             print(f"\n  저장: {dsf_path}")
 
-        # ── dataset_profile: 새 데이터셋 IG/deletion 신뢰도 빠른 분류 ──
+        # ── dataset_profile: 예측 확신도/fallback 비율 빠른 진단 ──
         elif args.ablation == "dataset_profile":
             model.eval()
             n_test = min(100, X_test.shape[0])
             X_dp   = X_test[:n_test].clone()
-            n_features_dp = model.n_features
 
-            print(f"\n  Dataset Profile — IG/Deletion 신뢰도 빠른 진단 (n={n_test})")
+            print(f"\n  Dataset Profile — 빠른 진단 (n={n_test})")
             print(f"  {'='*70}")
+            # [변경 이력] 이전엔 여기서 IG의 mean/medoid baseline completeness
+            # error, deletion_auc 샘플별 분산까지 계산해 A/B/C로 자동 분류했음.
+            # ③이 SHAP으로 통일되면서 그 진단들은 의미가 없어져 제거함 —
+            # SHAP의 faithfulness/노이즈 진단은 --ablation rank_correlation
+            # (특히 --shap_repeats)이 대신 담당한다. 여기 남은 두 진단(예측
+            # 확신도, fallback 비율)은 ③과 무관하게 여전히 유효한 정보라 유지.
 
             with torch.no_grad():
                 logits_dp = model(X_dp)["logits"]
                 if tasktype == "regression":
                     max_prob_dp = None
-                    target_class_dp = None
                 elif tasktype == "multiclass":
                     probs_dp = torch.softmax(logits_dp, dim=-1)
-                    target_class_dp = probs_dp.argmax(dim=-1).cpu().numpy()
                     max_prob_dp = probs_dp.max(dim=-1).values.cpu().numpy()
                 else:
                     probs_dp = torch.sigmoid(logits_dp.squeeze(-1))
-                    target_class_dp = None
                     max_prob_dp = torch.where(probs_dp >= 0.5, probs_dp, 1 - probs_dp).cpu().numpy()
 
             print(f"\n  [1. 예측 확신도]")
             if max_prob_dp is not None:
                 print(f"    mean={max_prob_dp.mean():.4f}  median={np.median(max_prob_dp):.4f}  "
                       f"std={max_prob_dp.std():.4f}")
-                overconfident = np.median(max_prob_dp) > 0.9
-                if overconfident:
-                    print(f"    ⚠️  median > 0.9 — overconfident, deletion/insertion 신호 둔감 위험")
+                if np.median(max_prob_dp) > 0.9:
+                    print(f"    ⚠️  median > 0.9 — overconfident, perturbation 기반 신호(Delta/SHAP) "
+                          f"둔감 위험 (rank_correlation 해석 시 참고)")
 
             cached_sizes_dp = getattr(model.memory, "_cached_group_sizes", None)
             print(f"\n  [2. Fallback 비율]")
@@ -1191,479 +1354,12 @@ def main():
                     avg_group_size_dp = cached_sizes_dp[cached_sizes_dp > 0].float().mean().item()
                 print(f"    k={model.k}, 평균 alive 그룹 크기={avg_group_size_dp:.1f}, "
                       f"fallback 비율={fallback_rate_dp*100:.1f}%")
+                if model.k > avg_group_size_dp:
+                    print(f"    ⚠️  k({model.k}) > 평균 그룹 크기({avg_group_size_dp:.1f}) "
+                          f"— cross-group fallback이 상시 발동할 가능성 높음 (설명②의 "
+                          f"'group-constrained' 클레임이 이 설정에서는 약화될 수 있음)")
             else:
                 print(f"    _cached_group_sizes 없음 — skip")
-
-            print(f"\n  [3. Completeness error: mean vs medoid baseline]")
-            ig_target_fn_dp = make_logit_target_fn(
-                tasktype, target_class=target_class_dp if tasktype == "multiclass" else None,
-            )
-
-            def _completeness_and_ig(X_baseline_this, n_steps=50):
-                if X_baseline_this.dim() == 1:
-                    X_base_this = X_baseline_this.unsqueeze(0).expand_as(X_dp)
-                else:
-                    X_base_this = X_baseline_this
-                alphas = torch.linspace(0.0, 1.0, n_steps, device=X_dp.device)
-                grads_accum = torch.zeros_like(X_dp)
-                for alpha in alphas:
-                    x_interp = (X_base_this + alpha * (X_dp - X_base_this)).clone().detach().requires_grad_(True)
-                    target = ig_target_fn_dp(model(x_interp))
-                    grad = torch.autograd.grad(target.sum(), x_interp, retain_graph=False)[0]
-                    grads_accum = grads_accum + grad
-                avg_grad = grads_accum / n_steps
-                ig_signed = avg_grad * (X_dp - X_base_this)
-                with torch.no_grad():
-                    f_x = ig_target_fn_dp(model(X_dp))
-                    f_b = ig_target_fn_dp(model(X_base_this))
-                abs_err = (ig_signed.sum(dim=-1) - (f_x - f_b)).abs()
-                rel_err = abs_err / ((f_x - f_b).abs() + 1e-8)
-                return rel_err.cpu().numpy(), ig_signed.abs().detach().cpu().numpy()
-
-            X_baseline_mean_dp = X_train.mean(dim=0)
-            with torch.no_grad():
-                q_med_dp = F.normalize(model.embedder(X_dp), dim=-1)
-                c_med_dp = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
-                ha_med_dp = (q_med_dp @ c_med_dp.T).argmax(dim=-1)
-                X_baseline_medoid_dp = model.prototype_layer.ig_baseline[ha_med_dp].to(X_dp.device)
-
-            rel_err_mean, ig_mean = _completeness_and_ig(X_baseline_mean_dp)
-            rel_err_medoid, ig_medoid = _completeness_and_ig(X_baseline_medoid_dp)
-
-            print(f"    mean   : median={np.median(rel_err_mean)*100:.2f}%  mean={rel_err_mean.mean()*100:.2f}%")
-            print(f"    medoid : median={np.median(rel_err_medoid)*100:.2f}%  mean={rel_err_medoid.mean()*100:.2f}%")
-
-            print(f"\n  [4. Deletion AUC 샘플별 분산 (TabERA IG 기준)]")
-
-            def _pred_at_dp(x_batch, sample_idx):
-                with torch.no_grad():
-                    lg = model(x_batch.unsqueeze(0))["logits"]
-                    if tasktype == "regression":
-                        return lg.squeeze(-1).item()
-                    elif tasktype == "multiclass":
-                        return torch.softmax(lg, dim=-1)[0, target_class_dp[sample_idx]].item()
-                    else:
-                        return torch.sigmoid(lg.squeeze(-1))[0].item()
-
-            def _deletion_auc_per_sample(ig_attr, X_baseline_this):
-                baseline_is_per_sample = (X_baseline_this.dim() == 2)
-                aucs = np.zeros(n_test)
-                for n_i in range(n_test):
-                    baseline_n = X_baseline_this[n_i] if baseline_is_per_sample else X_baseline_this
-                    order = np.argsort(-ig_attr[n_i])
-                    masked = X_dp[n_i].clone()
-                    preds = [_pred_at_dp(masked, n_i)]
-                    for f_idx in order:
-                        masked[f_idx] = baseline_n[f_idx]
-                        preds.append(_pred_at_dp(masked, n_i))
-                    try:
-                        auc = np.trapezoid(preds) / n_features_dp
-                    except AttributeError:
-                        auc = np.trapz(preds) / n_features_dp
-                    aucs[n_i] = auc
-                return aucs
-
-            dau_mean   = _deletion_auc_per_sample(ig_mean, X_baseline_mean_dp)
-            dau_medoid = _deletion_auc_per_sample(ig_medoid, X_baseline_medoid_dp)
-
-            print(f"    mean   baseline: median={np.median(dau_mean):.4f}  std={dau_mean.std():.4f}")
-            print(f"    medoid baseline: median={np.median(dau_medoid):.4f}  std={dau_medoid.std():.4f}")
-
-            mean_dau_saturated   = dau_mean.std() < 0.01
-            medoid_dau_saturated = dau_medoid.std() < 0.01
-
-            print(f"\n  {'='*70}")
-            print(f"  [자동 분류]")
-            if mean_dau_saturated and medoid_dau_saturated:
-                print(f"  → 분류 A: deletion_auc 척도 자체가 이 데이터셋에서 둔감함")
-                print(f"    (mean std={dau_mean.std():.4f}, medoid std={dau_medoid.std():.4f} 모두 낮음)")
-                print(f"    권장: deletion/insertion AUC를 메인 결과에서 제외하거나 caveat 명시.")
-                print(f"    rank_correlation ablation으로 이 데이터셋의 IG faithfulness를")
-                print(f"    대체 평가할 수 있는지 별도 확인 권장 (--ablation rank_correlation).")
-                if overconfident:
-                    print(f"    (예측 확신도가 높음 — overconfidence가 원인일 가능성)")
-            elif mean_dau_saturated and not medoid_dau_saturated:
-                print(f"  → 분류 B: mean baseline에서만 문제, medoid에서는 정상")
-                print(f"    (mean std={dau_mean.std():.4f} 낮음, medoid std={dau_medoid.std():.4f} 정상)")
-                print(f"    권장: medoid baseline을 이 데이터셋의 메인 결과로 채택.")
-            else:
-                print(f"  → 분류 C: 정상 (mean std={dau_mean.std():.4f}, "
-                      f"medoid std={dau_medoid.std():.4f} 모두 충분한 분산)")
-                print(f"    권장: mean/medoid 둘 다 사용 가능. medoid의 completeness")
-                print(f"    개선 효과(위 3번)를 참고해 최종 baseline 선택.")
-
-        # ── deletion_auc: attribution 순위로 feature 누적 마스킹 → ŷ AUC ──
-        elif args.ablation == "deletion_auc":
-            model.eval()
-            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
-            n_features = model.n_features
-
-            n_test = min(100, X_test.shape[0])
-            X_da   = X_test[:n_test].clone()
-
-            if (not args.mean_baseline):
-                with torch.no_grad():
-                    q_da = F.normalize(model.embedder(X_da), dim=-1)
-                    c_da = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
-                    ha_da = (q_da @ c_da.T).argmax(dim=-1)
-                    X_baseline = model.prototype_layer.ig_baseline[ha_da].to(X_da.device)  # (N, F)
-                print(f"\n  [Baseline] medoid (샘플별 소속 그룹의 대표 훈련 샘플)")
-            else:
-                X_baseline = X_train.mean(dim=0)              # (F,) 마스킹 시 사용
-                print(f"\n  [Baseline] mean (전체 훈련 데이터 평균)")
-
-            print(f"\n  Deletion AUC Faithfulness (n={n_test})")
-            print(f"  {'─'*60}")
-
-            with torch.no_grad():
-                logits_orig = model(X_da)["logits"]
-                if tasktype == "regression":
-                    pred_orig = logits_orig.squeeze(-1).cpu().numpy()
-                    target_class = None
-                elif tasktype == "multiclass":
-                    pred_orig = torch.softmax(logits_orig, dim=-1).cpu().numpy()
-                    target_class = pred_orig.argmax(axis=-1)
-                    pred_orig = pred_orig[np.arange(n_test), target_class]
-                else:  # binclass
-                    probs = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
-                    target_class = (probs >= 0.5).astype(int)            # (N,) predicted class
-                    pred_orig = np.where(target_class == 1, probs, 1.0 - probs)
-
-            print(f"  [1/3] TabERA IG attribution 계산 중 (n_steps={args.ig_nsteps})...")
-            ig_target_fn = make_logit_target_fn(
-                tasktype,
-                target_class=target_class if tasktype == "multiclass" else None,
-            )
-            tabera_imp = compute_integrated_gradients(
-                model, X_da, X_baseline,
-                target_fn=ig_target_fn,
-                n_steps=args.ig_nsteps,
-                check_convergence=True,
-            ).cpu().numpy()  # (N, F)
-
-            print(f"  [2/3] SHAP attribution 계산 중...")
-            try:
-                import shap
-                from tqdm import tqdm
-
-                def model_predict_fn(x_np):
-                    x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
-                    with torch.no_grad():
-                        lg = model(x_t)["logits"]
-                        if tasktype == "regression":
-                            return lg.squeeze(-1).cpu().numpy()
-                        elif tasktype == "multiclass":
-                            return torch.softmax(lg, dim=-1).cpu().numpy()
-                        else:
-                            return torch.sigmoid(lg.squeeze(-1)).cpu().numpy()
-
-                if (not args.mean_baseline):
-                    with torch.no_grad():
-                        all_medoids = model.prototype_layer.ig_baseline  # (P, F)
-                        valid_medoid_mask = all_medoids.abs().sum(dim=-1) > 0
-                        bg = all_medoids[valid_medoid_mask].cpu().numpy()
-                    if len(bg) < 2:
-                        bg_n   = min(50, len(X_train))
-                        bg_idx = np.random.choice(len(X_train), size=bg_n, replace=False)
-                        bg     = X_train[bg_idx].cpu().numpy()
-                    print(f"  [SHAP background] medoid 기준 ({len(bg)}개 centroid 대표 샘플)")
-                else:
-                    bg_n   = min(50, len(X_train))
-                    bg_idx = np.random.choice(len(X_train), size=bg_n, replace=False)
-                    bg     = X_train[bg_idx].cpu().numpy()
-                    print(f"  [SHAP background] mean 기준 (random {bg_n}개 훈련 샘플)")
-                explainer = shap.KernelExplainer(model_predict_fn, bg, silent=True)
-
-                shap_imp = np.zeros((n_test, n_features))
-                for i in tqdm(range(n_test), ncols=120, leave=False):
-                    sv = explainer.shap_values(X_da[i:i+1].cpu().numpy(), nsamples=100, silent=True)
-                    if isinstance(sv, list):  # multiclass
-                        sv = sv[target_class[i]] if target_class is not None else sv[0]
-                    shap_imp[i] = np.abs(np.array(sv).flatten()[:n_features])
-                shap_available = True
-            except Exception as e:
-                print(f"  [SHAP 실패: {e}] SHAP 없이 진행")
-                shap_imp = None
-                shap_available = False
-
-            print(f"  [3/3] Random baseline 계산 중...")
-            random_imp = np.abs(np.random.randn(n_test, n_features))
-
-            def compute_deletion_auc(attribution):
-                baseline_is_per_sample = (X_baseline.dim() == 2)
-
-                aucs = []
-                for n in range(n_test):
-                    baseline_n = X_baseline[n] if baseline_is_per_sample else X_baseline
-
-                    order = np.argsort(-attribution[n])  # (F,)
-
-                    masked = X_da[n].clone()
-                    preds  = [pred_orig[n]]
-                    for f_idx in order:
-                        masked[f_idx] = baseline_n[f_idx]
-                        with torch.no_grad():
-                            lg = model(masked.unsqueeze(0))["logits"]
-                            if tasktype == "regression":
-                                p = lg.squeeze(-1).item()
-                            elif tasktype == "multiclass":
-                                p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
-                            else:  # binclass — predicted class 방향으로 통일
-                                prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
-                                p = prob1 if target_class[n] == 1 else 1.0 - prob1
-                            preds.append(p)
-                    try:
-                        auc = np.trapezoid(preds) / n_features
-                    except AttributeError:
-                        auc = np.trapz(preds) / n_features
-                    aucs.append(auc)
-                return np.array(aucs)
-
-            print(f"\n  Deletion curve 계산 중...")
-            tabera_aucs = compute_deletion_auc(tabera_imp)
-            shap_aucs   = compute_deletion_auc(shap_imp)   if shap_available else None
-            random_aucs = compute_deletion_auc(random_imp)
-
-            print(f"\n  {'─'*60}")
-            print(f"  {'Method':<25} {'Deletion AUC':>15} {'std':>10}")
-            print(f"  {'─'*60}")
-            print(f"  {'TabERA (ours)':<25} {tabera_aucs.mean():>15.4f} {tabera_aucs.std():>10.4f}")
-            if shap_available:
-                print(f"  {'SHAP':<25} {shap_aucs.mean():>15.4f} {shap_aucs.std():>10.4f}")
-            print(f"  {'Random':<25} {random_aucs.mean():>15.4f} {random_aucs.std():>10.4f}")
-            print(f"  {'─'*60}")
-
-            print(f"\n  [해석]")
-            print(f"  → Deletion AUC가 낮을수록 attribution이 prediction-relevant한")
-            print(f"    feature를 정확히 가리킴 (그것을 먼저 지웠을 때 ŷ가 더 빠르게 변함)")
-            if shap_available:
-                if tabera_aucs.mean() < shap_aucs.mean():
-                    print(f"  ✅ TabERA AUC ({tabera_aucs.mean():.4f}) < SHAP AUC ({shap_aucs.mean():.4f})")
-                else:
-                    print(f"  △ TabERA AUC ({tabera_aucs.mean():.4f}) ≥ SHAP AUC ({shap_aucs.mean():.4f})")
-
-                from scipy.stats import wilcoxon
-                try:
-                    diff = tabera_aucs - shap_aucs
-                    if np.allclose(diff, 0):
-                        print(f"  [Wilcoxon] TabERA와 SHAP 값이 완전히 동일 — 검정 불가")
-                    else:
-                        stat, p_wilcoxon = wilcoxon(tabera_aucs, shap_aucs)
-                        sig = "유의함 (p<0.05)" if p_wilcoxon < 0.05 else "유의하지 않음 (노이즈일 가능성)"
-                        print(f"  [Wilcoxon signed-rank] TabERA vs SHAP: p={p_wilcoxon:.4f}  → {sig}")
-                except Exception as e:
-                    print(f"  [Wilcoxon 실패: {e}]")
-            print(f"  Random baseline: {random_aucs.mean():.4f}")
-
-            da_save = {
-                "tabera_aucs": tabera_aucs.tolist(),
-                "shap_aucs":   shap_aucs.tolist() if shap_available else None,
-                "random_aucs": random_aucs.tolist(),
-                "n_samples":   n_test,
-                "openml_id":   openml_id,
-                "seed":        args.seed,
-            }
-            da_path = (
-                Path(log_dir)
-                / f"data={openml_id}..seed{args.seed}_deletion_auc.pkl"
-            )
-            with open(da_path, "wb") as f:
-                pickle.dump(da_save, f)
-            print(f"\n  저장: {da_path}")
-
-        # ── insertion_auc: baseline에서 시작 → 중요 feature부터 복원 ──
-        elif args.ablation == "insertion_auc":
-            from scipy.stats import spearmanr
-
-            model.eval()
-            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
-            n_features = model.n_features
-
-            n_test = min(100, X_test.shape[0])
-            X_ia   = X_test[:n_test].clone()
-
-            if (not args.mean_baseline):
-                with torch.no_grad():
-                    q_ia = F.normalize(model.embedder(X_ia), dim=-1)
-                    c_ia = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
-                    ha_ia = (q_ia @ c_ia.T).argmax(dim=-1)
-                    X_baseline = model.prototype_layer.ig_baseline[ha_ia].to(X_ia.device)  # (N, F)
-                print(f"\n  [Baseline] medoid (샘플별 소속 그룹의 대표 훈련 샘플)")
-            else:
-                X_baseline = X_train.mean(dim=0)              # (F,) 복원 시작점
-                print(f"\n  [Baseline] mean (전체 훈련 데이터 평균)")
-
-            print(f"\n  Insertion AUC Faithfulness (n={n_test})")
-            print(f"  {'─'*60}")
-
-            with torch.no_grad():
-                logits_orig = model(X_ia)["logits"]
-                if tasktype == "regression":
-                    pred_orig = logits_orig.squeeze(-1).cpu().numpy()
-                    target_class = None
-                elif tasktype == "multiclass":
-                    probs = torch.softmax(logits_orig, dim=-1).cpu().numpy()
-                    target_class = probs.argmax(axis=-1)
-                    pred_orig = probs[np.arange(n_test), target_class]
-                else:  # binclass — predicted class 방향으로 확률 통일
-                    probs = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
-                    target_class = (probs >= 0.5).astype(int)            # (N,)
-                    pred_orig = np.where(target_class == 1, probs, 1.0 - probs)
-
-            print(f"  [1/3] TabERA IG attribution 계산 중 (n_steps={args.ig_nsteps})...")
-            ig_target_fn = make_logit_target_fn(
-                tasktype,
-                target_class=target_class if tasktype == "multiclass" else None,
-            )
-            tabera_imp = compute_integrated_gradients(
-                model, X_ia, X_baseline,
-                target_fn=ig_target_fn,
-                n_steps=args.ig_nsteps,
-                check_convergence=True,
-            ).cpu().numpy()
-
-            print(f"  [2/3] SHAP attribution 계산 중...")
-            try:
-                import shap
-                from tqdm import tqdm
-
-                def model_predict_fn(x_np):
-                    x_t = torch.tensor(x_np, dtype=torch.float32, device=device)
-                    with torch.no_grad():
-                        lg = model(x_t)["logits"]
-                        if tasktype == "regression":
-                            return lg.squeeze(-1).cpu().numpy()
-                        elif tasktype == "multiclass":
-                            return torch.softmax(lg, dim=-1).cpu().numpy()
-                        else:
-                            return torch.sigmoid(lg.squeeze(-1)).cpu().numpy()
-
-                if (not args.mean_baseline):
-                    with torch.no_grad():
-                        all_medoids = model.prototype_layer.ig_baseline  # (P, F)
-                        valid_medoid_mask = all_medoids.abs().sum(dim=-1) > 0
-                        bg = all_medoids[valid_medoid_mask].cpu().numpy()
-                    if len(bg) < 2:
-                        bg_n   = min(50, len(X_train))
-                        bg_idx = np.random.choice(len(X_train), size=bg_n, replace=False)
-                        bg     = X_train[bg_idx].cpu().numpy()
-                    print(f"  [SHAP background] medoid 기준 ({len(bg)}개 centroid 대표 샘플)")
-                else:
-                    bg_n   = min(50, len(X_train))
-                    bg_idx = np.random.choice(len(X_train), size=bg_n, replace=False)
-                    bg     = X_train[bg_idx].cpu().numpy()
-                    print(f"  [SHAP background] mean 기준 (random {bg_n}개 훈련 샘플)")
-                explainer = shap.KernelExplainer(model_predict_fn, bg, silent=True)
-
-                shap_imp = np.zeros((n_test, n_features))
-                for i in tqdm(range(n_test), ncols=120, leave=False):
-                    sv = explainer.shap_values(X_ia[i:i+1].cpu().numpy(), nsamples=100, silent=True)
-                    if isinstance(sv, list):
-                        sv = sv[target_class[i]] if target_class is not None else sv[0]
-                    shap_imp[i] = np.abs(np.array(sv).flatten()[:n_features])
-                shap_available = True
-            except Exception as e:
-                print(f"  [SHAP 실패: {e}] SHAP 없이 진행")
-                shap_imp = None
-                shap_available = False
-
-            print(f"  [3/3] Random baseline 계산 중...")
-            random_imp = np.abs(np.random.randn(n_test, n_features))
-
-            def compute_insertion_auc(attribution):
-                baseline_is_per_sample = (X_baseline.dim() == 2)
-
-                aucs = []
-                for n in range(n_test):
-                    baseline_n = X_baseline[n] if baseline_is_per_sample else X_baseline
-
-                    order = np.argsort(-attribution[n])  # (F,)
-
-                    inserted = baseline_n.clone()
-                    preds    = []
-
-                    with torch.no_grad():
-                        lg = model(inserted.unsqueeze(0))["logits"]
-                        if tasktype == "regression":
-                            p = lg.squeeze(-1).item()
-                        elif tasktype == "multiclass":
-                            p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
-                        else:  # binclass — predicted class 방향으로 통일
-                            prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
-                            p = prob1 if target_class[n] == 1 else 1.0 - prob1
-                        preds.append(p)
-
-                    for f_idx in order:
-                        inserted[f_idx] = X_ia[n, f_idx]
-                        with torch.no_grad():
-                            lg = model(inserted.unsqueeze(0))["logits"]
-                            if tasktype == "regression":
-                                p = lg.squeeze(-1).item()
-                            elif tasktype == "multiclass":
-                                p = torch.softmax(lg, dim=-1)[0, target_class[n]].item()
-                            else:  # binclass — predicted class 방향으로 통일
-                                prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
-                                p = prob1 if target_class[n] == 1 else 1.0 - prob1
-                            preds.append(p)
-
-                    try:
-                        auc = np.trapezoid(preds) / n_features
-                    except AttributeError:
-                        auc = np.trapz(preds) / n_features
-                    aucs.append(auc)
-                return np.array(aucs)
-
-            print(f"\n  Insertion curve 계산 중...")
-            tabera_aucs = compute_insertion_auc(tabera_imp)
-            shap_aucs   = compute_insertion_auc(shap_imp)   if shap_available else None
-            random_aucs = compute_insertion_auc(random_imp)
-
-            print(f"\n  {'─'*60}")
-            print(f"  {'Method':<25} {'Insertion AUC':>15} {'std':>10}")
-            print(f"  {'─'*60}")
-            print(f"  {'TabERA (ours)':<25} {tabera_aucs.mean():>15.4f} {tabera_aucs.std():>10.4f}")
-            if shap_available:
-                print(f"  {'SHAP':<25} {shap_aucs.mean():>15.4f} {shap_aucs.std():>10.4f}")
-            print(f"  {'Random':<25} {random_aucs.mean():>15.4f} {random_aucs.std():>10.4f}")
-            print(f"  {'─'*60}")
-
-            print(f"\n  [해석]")
-            print(f"  → Insertion AUC가 높을수록 attribution이 prediction-relevant한")
-            print(f"    feature를 정확히 가리킴 (그것을 먼저 복원했을 때 ŷ가 더 빠르게 회복)")
-            if shap_available:
-                if tabera_aucs.mean() > shap_aucs.mean():
-                    print(f"  ✅ TabERA AUC ({tabera_aucs.mean():.4f}) > SHAP AUC ({shap_aucs.mean():.4f})")
-                else:
-                    print(f"  △ TabERA AUC ({tabera_aucs.mean():.4f}) ≤ SHAP AUC ({shap_aucs.mean():.4f})")
-
-                from scipy.stats import wilcoxon
-                try:
-                    diff = tabera_aucs - shap_aucs
-                    if np.allclose(diff, 0):
-                        print(f"  [Wilcoxon] TabERA와 SHAP 값이 완전히 동일 — 검정 불가")
-                    else:
-                        stat, p_wilcoxon = wilcoxon(tabera_aucs, shap_aucs)
-                        sig = "유의함 (p<0.05)" if p_wilcoxon < 0.05 else "유의하지 않음 (노이즈일 가능성)"
-                        print(f"  [Wilcoxon signed-rank] TabERA vs SHAP: p={p_wilcoxon:.4f}  → {sig}")
-                except Exception as e:
-                    print(f"  [Wilcoxon 실패: {e}]")
-            print(f"  Random baseline: {random_aucs.mean():.4f}")
-
-            ia_save = {
-                "tabera_aucs": tabera_aucs.tolist(),
-                "shap_aucs":   shap_aucs.tolist() if shap_available else None,
-                "random_aucs": random_aucs.tolist(),
-                "n_samples":   n_test,
-                "openml_id":   openml_id,
-                "seed":        args.seed,
-            }
-            ia_path = (
-                Path(log_dir)
-                / f"data={openml_id}..seed{args.seed}_insertion_auc.pkl"
-            )
-            with open(ia_path, "wb") as f:
-                pickle.dump(ia_save, f)
-            print(f"\n  저장: {ia_path}")
 
         # ── random_neighbor / neighbor_noise: 성능 비교 ─────────────
         else:
