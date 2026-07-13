@@ -41,21 +41,51 @@ class AttentionAggregator(nn.Module):
     """
 
     def __init__(self, embed_dim, k, n_features, n_output, dropout=0.0,
-                 use_offset_correction: bool = True):
+                 use_offset_correction: bool = True,
+                 tasktype: str = "regression", n_classes: Optional[int] = None):
         """
         use_offset_correction : True(기본값)면 TabR 원본 그대로
             value = label_emb + T(query - neighbour).
             False면 T()를 아예 생성하지 않고 value = label_emb만 사용
             (ablation용 — "T()가 실제로 기여하는가"를 재학습으로 검증하기 위함,
             evidence_w/retrieve()의 동작에는 영향 없음).
+
+        tasktype / n_classes : [수정] TabR 원본(yandex-research/tabular-dl-tabr,
+            bin/tabr.py)은 label_encoder를 조건부로 만듦 —
+                nn.Linear(1, d_main) if n_classes is None else nn.Embedding(...)
+            즉 regression(라벨이 진짜 연속형)일 때만 Linear를 쓰고, classification
+            (라벨이 명목형 클래스 인덱스)일 때는 Embedding을 씀. 기존 TabERA
+            구현은 이 분기 없이 항상 nn.Linear(1, embed_dim)을 썼음 — 오늘
+            categorical feature에서 고친 것과 정확히 같은 문제(순서 없는
+            명목형을 raw 정수로 취급)가 이웃 라벨에도 그대로 남아있었음.
+            tasktype="regression"(기본값, 하위 호환)이면 이전과 동일하게
+            nn.Linear(1, embed_dim). "binclass"/"multiclass"면 n_classes가
+            반드시 필요하고 nn.Embedding(n_classes, embed_dim)을 씀.
+
+            [하위 호환 범위] classification 모델의 label_encoder 파라미터
+            구조가 바뀜(Linear(1,D) → Embedding(n_classes,D)) — 기존
+            classification 체크포인트는 --from_saved_state로 로드 불가
+            (regression 체크포인트는 영향 없음, 오늘 categorical embedding
+            변경 때와 동일한 성격의 하위 호환 범위).
         """
         super().__init__()
         self.embed_dim = embed_dim
         self.k = k
         self.use_offset_correction = use_offset_correction
+        self.tasktype = tasktype
 
-        # TabR 원본: label 임베딩
-        self.label_encoder = nn.Linear(1, embed_dim)
+        # TabR 원본: label 임베딩 — regression(연속형)은 Linear,
+        # classification(명목형 클래스)은 Embedding
+        if tasktype in ("binclass", "multiclass"):
+            if n_classes is None or n_classes < 2:
+                raise ValueError(
+                    f"tasktype='{tasktype}'면 n_classes(2 이상)를 반드시 줘야 합니다."
+                )
+            self.n_classes = n_classes
+            self.label_encoder = nn.Embedding(n_classes, embed_dim)
+        else:
+            self.n_classes = None
+            self.label_encoder = nn.Linear(1, embed_dim)
 
         # TabR 원본: T() — query-neighbour 차이 변환 MLP
         # use_offset_correction=False면 아예 생성하지 않음 (파라미터 수
@@ -72,6 +102,18 @@ class AttentionAggregator(nn.Module):
             self.T = None
 
         self.dropout = nn.Dropout(dropout)
+
+    def _encode_labels(self, neighbour_labels: torch.Tensor) -> torch.Tensor:
+        """neighbour_labels (B, k) → label_emb (B, k, D).
+        classification이면 반올림 후 long 캐스팅(부동소수점 오차 대비 —
+        memory.update()가 labels.float()로 저장하므로 클래스 인덱스도
+        float32로 들어와 있음, categorical feature 인코딩과 동일한 이유)
+        해서 Embedding lookup, regression이면 기존처럼 Linear."""
+        if self.tasktype in ("binclass", "multiclass"):
+            idx = neighbour_labels.round().long().clamp(0, self.n_classes - 1)
+            return self.label_encoder(idx)                     # (B, k, D)
+        else:
+            return self.label_encoder(neighbour_labels.unsqueeze(-1).float())  # (B, k, D)
 
     def forward(self, query_emb, nk, neighbour_labels):
         """
@@ -100,9 +142,7 @@ class AttentionAggregator(nn.Module):
 
         # 2. TabR 방식 value = label_emb + T(query - neighbour)
         #    (use_offset_correction=False면 T() 항 없이 label_emb만 사용)
-        label_emb = self.label_encoder(
-            neighbour_labels.unsqueeze(-1).float()
-        )                                                # (B, k, D)
+        label_emb = self._encode_labels(neighbour_labels)      # (B, k, D)
         if self.use_offset_correction:
             values = label_emb + self.T(
                 query_emb.unsqueeze(1) - nk
@@ -148,9 +188,7 @@ class AttentionAggregator(nn.Module):
                 "value_diagnosis는 T() 있는 모델에서만 의미가 있습니다."
             )
 
-        label_emb = self.label_encoder(
-            neighbour_labels.unsqueeze(-1).float()
-        )                                                # (B, k, D)
+        label_emb = self._encode_labels(neighbour_labels)      # (B, k, D)
         offset_term = self.T(query_emb.unsqueeze(1) - nk)  # (B, k, D)
 
         label_norm  = label_emb.norm(dim=-1)              # (B, k)

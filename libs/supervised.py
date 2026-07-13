@@ -191,6 +191,12 @@ class TabERAWrapper:
         self.ema_history = []
         self.final_ema_stats = None
         _low_active_streak = 0   # 연속으로 active_ratio<10%인 EMA 체크 횟수 (runaway collapse 감지용)
+        # [최적화] label_all_groups/label_groups_by_target를 is_better 블록
+        # 안으로 옮기면서 그 재료(x_ema/y_ema)를 epoch 끝까지 들고가야 함 —
+        # n_mem<1인 극초반 epoch이나 prototype_layer가 없는 모델에서는
+        # 아예 안 채워질 수 있어 None으로 미리 선언 (참조 시 NameError 방지).
+        x_ema = None
+        y_ema = None
 
         # [버그 수정] 이전엔 emb_cache로 X_train 전체(N_train개)를 캐시해서
         # ema_update에 넘겼음 → sample_groups가 "X_train 행 번호"로 만들어짐.
@@ -251,6 +257,8 @@ class TabERAWrapper:
                     if n_mem < 1:
                         # 메모리가 아직 하나도 안 채워진 극초반 → 스킵
                         ema_stats = {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
+                        x_ema = None
+                        y_ema = None
                     else:
                         emb_ema = self.model.memory.keys[:n_mem]           # (n_mem, D) — MemoryBank 임베딩
                         fs = self.model.feature_store
@@ -259,41 +267,19 @@ class TabERAWrapper:
                             if fs is not None else None
                         )
                         ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
-
-                        # ── 그룹 텍스트 라벨 캐싱 (ema_update() 호출부) ──
-                        # x_ema/sample_groups는 방금 계산됐고, medoid를
-                        # 없앤 대신 이 텍스트 요약이 ①의 그룹 설명을 담당함.
-                        # cat_cols/num_cols/col_names가 전부 주어졌을 때만
-                        # 수행 (없으면 조용히 스킵 — 하위 호환).
-                        if (
-                            self.cat_cols is not None
-                            and self.num_cols is not None
-                            and self.col_names is not None
-                            and x_ema is not None
-                        ):
-                            self.model.prototype_layer.group_labels = label_all_groups(
-                                x_ema.detach().cpu().numpy(),
-                                self.model.prototype_layer.sample_groups,
-                                self.cat_cols,
-                                self.num_cols,
-                                self.col_names,
-                                cat_category_names=self.cat_category_names,
-                                quantile_transformer=self.quantile_transformer,
-                            )
-
-                        # ── 그룹 target(클래스) 분포 캐싱 — ①의 주 콘텐츠 ──
-                        # feature 라벨(위)은 ②(실제 이웃의 raw feature 값)와
-                        # 정보 종류가 겹친다 — ①만이 줄 수 있는 고유 정보는
-                        # "이 그룹이 어떤 target에 해당하는가"다. MemoryBank의
-                        # labels buffer가 sample_groups와 이미 같은 인덱스
-                        # 공간(슬롯 번호)을 쓰므로 바로 대응시킬 수 있다.
+                        # [최적화] label_all_groups/label_groups_by_target는
+                        # 순수 읽기 전용(설명용 텍스트 캐싱)이라 학습(가중치/
+                        # early stopping 판단)에 전혀 영향을 안 준다. 예전엔
+                        # 매 epoch 계산했는데, 그중 실제로 쓰이는 건 "val이
+                        # 갱신된 epoch"의 값뿐이다(바로 아래 best_* 스냅샷
+                        # 로직이 그 값만 남기고 나머지는 다음 epoch에 덮어써
+                        # 버림). n_mem이 채워진 epoch이면 이번 epoch의 x_ema/
+                        # y_ema를 나중(is_better 블록)에 재사용할 수 있도록
+                        # 여기서는 사람이 읽는 텍스트 계산 자체를 생략하고
+                        # 재료만 남겨둔다 (컬럼 수·centroid 수가 많은 데이터셋
+                        # 에서 이 텍스트 계산 자체가 epoch당 수 초~수십 초까지
+                        # 걸리는 게 실측 확인됨 — nomao: feature 118개, P=166).
                         y_ema = self.model.memory.labels[:n_mem]
-                        self.model.prototype_layer.target_labels = label_groups_by_target(
-                            y_ema.detach().cpu().numpy(),
-                            self.model.prototype_layer.sample_groups,
-                            self.tasktype,
-                            class_names=self.target_class_names,
-                        )
 
                     self.final_ema_stats = dict(ema_stats)
                     self.ema_history.append({
@@ -441,6 +427,38 @@ class TabERAWrapper:
                 # (reproduce.py의 dual_space_faithfulness 사전 검증에서
                 # sample_groups 재배정 일치율이 무작위 수준으로 나온 원인).
                 # → best_state와 함께 별도로 스냅샷/복원한다.
+                #
+                # [최적화] label_all_groups/label_groups_by_target를 여기로
+                # 옮김 — 최종적으로 남는 건 어차피 "이 시점(새 베스트)의" 값
+                # 뿐이므로(다음 epoch에 개선이 없으면 이 값이 계속 최종본으로
+                # 남고, 개선되면 그때 다시 계산돼 덮어씀), 매 epoch 계산하던
+                # 이전 방식과 최종 결과가 100% 동일하면서 개선 없는 epoch의
+                # 계산만 생략된다. x_ema/y_ema는 바로 이번 epoch의 ema_update()
+                # 블록에서 만들어진 것이라 MemoryBank 시점이 정확히 일치함
+                # (학습 다 끝난 뒤 재계산하면 MemoryBank가 그 사이 더 갱신돼
+                # 시점이 어긋날 수 있어 — 그 방식은 채택 안 함).
+                if (
+                    self.cat_cols is not None
+                    and self.num_cols is not None
+                    and self.col_names is not None
+                    and x_ema is not None
+                ):
+                    self.model.prototype_layer.group_labels = label_all_groups(
+                        x_ema.detach().cpu().numpy(),
+                        self.model.prototype_layer.sample_groups,
+                        self.cat_cols,
+                        self.num_cols,
+                        self.col_names,
+                        cat_category_names=self.cat_category_names,
+                        quantile_transformer=self.quantile_transformer,
+                    )
+                if y_ema is not None:
+                    self.model.prototype_layer.target_labels = label_groups_by_target(
+                        y_ema.detach().cpu().numpy(),
+                        self.model.prototype_layer.sample_groups,
+                        self.tasktype,
+                        class_names=self.target_class_names,
+                    )
                 best_sample_groups = copy.deepcopy(self.model.prototype_layer.sample_groups)
                 best_group_labels  = copy.deepcopy(self.model.prototype_layer.group_labels)
                 best_target_labels = copy.deepcopy(self.model.prototype_layer.target_labels)

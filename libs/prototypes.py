@@ -399,6 +399,7 @@ class CentroidLayer(nn.Module):
         ema_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
+        routing_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.P                 = n_prototypes
@@ -407,6 +408,17 @@ class CentroidLayer(nn.Module):
         self.ema_momentum      = ema_momentum
         self.ema_warmup_epochs = ema_warmup_epochs
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
+        # [추가] routing softmax의 scale factor. ArcFace/CosFace/AdaCos/
+        # von Mises-Fisher Loss 등 코사인 유사도 기반 softmax를 쓰는
+        # 문헌에서 공통적으로 지적하는 문제 — cos유사도가 [-1,1]이라는
+        # 좁은 범위에 갇혀 있어 스케일링 없이 그대로 softmax에 넣으면
+        # 분포가 평평(flat)해지고, 그 결과 STE backward의 gradient
+        # 신호가 약해짐. 학습 파라미터가 아니라 고정 배수(기본 1.0 =
+        # 기존과 완전 동일, state_dict도 안 바뀜 — 새 학습 파라미터가
+        # 아니라 plain 속성이라 하위 호환 유지) — HPO로 데이터셋마다
+        # 탐색 가능하게 둠 (AdaCos 논문: 최적 scale이 클래스/그룹 수에
+        # 따라 달라짐 — 고정 상수 하나로는 부족).
+        self.routing_scale     = routing_scale
 
         # ── 온도 (register_buffer: 저장되지만 gradient 없음) ──
         self.register_buffer("current_epoch", torch.tensor(0, dtype=torch.long))
@@ -720,7 +732,7 @@ class CentroidLayer(nn.Module):
         # 코사인 유사도 로짓
         q = F.normalize(query_emb, dim=-1)               # (B, D)
         c = F.normalize(self.centroid_emb, dim=-1)        # (P, D)
-        logits = q @ c.T                                  # (B, P)
+        logits = (q @ c.T) * self.routing_scale           # (B, P) — scale 적용
 
         # ── 전체 softmax (기존 entropy_loss 호환용, M=1에서 STE 적용) ─
         soft = F.softmax(logits, dim=-1)                  # (B, P)

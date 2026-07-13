@@ -58,14 +58,255 @@ class ResidualMLP(nn.Module):
 
 
 class TabularEmbedder(nn.Module):
-    """수치형 특성을 공유 임베딩 공간으로 투영."""
-    def __init__(self, n_features: int, embed_dim: int, n_layers: int = 2, dropout: float = 0.1):
+    """수치형/범주형 특성을 공유 임베딩 공간으로 투영.
+
+    [수정 이력 1] 기존에는 numeric/categorical 구분 없이 전체 feature
+    벡터를 LayerNorm+Linear 하나로 투영했음 — categorical feature가
+    LabelEncoder 정수 코드(순서 없는 명목형)인데도 연속형 스칼라로
+    취급돼, "카테고리 0과 3이 0과 1보다 멀다"는 우연한 인코딩 순서를
+    실제 거리로 잘못 해석하는 문제가 있었음. TabZilla 29개 데이터셋
+    baseline 비교에서 categorical 비중과 AUROC gap(baseline 대비)의
+    상관관계가 견고하게 확인됨(Spearman rho=-0.63, p=0.0003).
+
+    [수정 이력 2 — 속도] categorical 컬럼마다 별도 nn.Embedding + 파이썬
+    for-loop 대신, 카디널리티를 이어붙인 단일 테이블 + offset으로
+    벡터화(nomao에서 4.17배 속도 개선 실측).
+
+    [수정 이력 3 — sum vs concat] Guo & Berkhahn(2016) 원 논문은 concat을
+    쓰는데 처음엔 sum으로 결합했음 — `cat_combine="concat"`으로 전환
+    가능 (컬럼별 embedding을 이어붙인 뒤 최종 Linear로 embed_dim 투영).
+
+    [수정 이력 4 — TabM/ModernNCA 방식] 실제 최신 모델(TabM, ModernNCA,
+    TabR)을 조사해보니 학습형 embedding(sum/concat) 대신 categorical엔
+    **순수 one-hot**(학습 파라미터 없음), numeric엔 **PLE**(Piecewise
+    Linear Encoding, Gorishniy et al. 2022 — quantile 기반 구간별
+    선형 인코딩)를 쓰는 게 오히려 더 흔한 조합이었음. `cat_combine=
+    "onehot"` + `num_embedding="ple"`로 이 조합 재현 가능. TabM(one-hot+
+    PLE-계열)과 ModernNCA(one-hot+PLR)가 사실상 같은 전처리 조합이라
+    하나로 둘 다 테스트됨.
+
+    PLE 공식(Gorishniy et al. 2022): 컬럼별 quantile 기반 구간 경계
+    b_0<...<b_T에 대해 z_t = clamp((x-b_{t-1})/(b_t-b_{t-1}), 0, 1) —
+    x가 구간 t 아래면 0, 위면 1, 안이면 구간 내 상대 위치. 구간 경계는
+    학습 데이터에서 미리 계산해 `num_bin_edges`로 전달받음(카테고리의
+    cat_cardinalities와 같은 패턴).
+
+    [수정 이력 5 — PLR(lite) 채택 확정, 기본값 변경] TabR(Gorishniy et al.
+    2024)/ModernNCA(Ye et al. 2024)가 실제로 쓰는 PLR(lite) — 구간이 아니라
+    학습 가능한 주기(periodic) 함수 + 전체 컬럼이 공유하는 Linear+ReLU.
+    공식 구현(yandex-research/rtdl-num-embeddings)의 수식과 대조 검증 완료:
+    ReLU(Linear(CosSin(2π·Linear(x,bias=False)))), lite는 바깥 Linear만 공유.
+
+    데이터로는 방식마다 승패가 갈렸음(profb 같은 numeric feature가 아주
+    적은 데이터셋에서는 PLR이 오히려 불안정 — auroc가 무작위 수준까지
+    떨어진 사례 있음). 그럼에도 **"TabR/ModernNCA 계보를 잇는 retrieval
+    기반 모델"이라는 정체성을 우선해 `cat_combine="onehot"` +
+    `num_embedding="plr_lite"`를 기본값으로 확정**함 — 특정 데이터셋
+    성능 최적화보다 아키텍처 일관성을 택한 결정. sum/concat/PLE는 여전히
+    옵션으로 남아있어 필요시 비교 가능.
+
+    cat_col_idx=None(기본값)이면 위 옵션들과 무관하게 이전(raw numeric
+    전용) 경로로 100% 동일하게 동작 — raw-encoding 체크포인트 하위 호환.
+    """
+    def __init__(
+        self,
+        n_features: int,
+        embed_dim: int,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        cat_col_idx: Optional[List[int]] = None,
+        num_col_idx: Optional[List[int]] = None,
+        cat_cardinalities: Optional[List[int]] = None,
+        cat_combine: str = "onehot",
+        cat_embed_dim: int = 16,
+        num_embedding: str = "plr_lite",
+        num_bin_edges: Optional[torch.Tensor] = None,
+        plr_n_frequencies: int = 16,
+        plr_freq_scale: float = 0.01,
+        plr_out_dim: int = 8,
+    ):
         super().__init__()
-        self.proj = nn.Sequential(nn.LayerNorm(n_features), nn.Linear(n_features, embed_dim))
+        self.cat_col_idx = list(cat_col_idx) if cat_col_idx else []
+        self.num_col_idx = list(num_col_idx) if num_col_idx is not None else None
+        self.cat_combine = cat_combine
+        self.num_embedding = num_embedding
+        n_num = len(self.num_col_idx) if self.num_col_idx is not None else 0
+
+        if self.cat_col_idx or (n_num > 0 and num_embedding in ("ple", "plr_lite")):
+            if cat_combine not in ("sum", "concat", "onehot", "none"):
+                raise ValueError(f"cat_combine은 'sum'/'concat'/'onehot'/'none'이어야 합니다: {cat_combine}")
+            if num_embedding not in ("linear", "ple", "plr_lite"):
+                raise ValueError(f"num_embedding은 'linear'/'ple'/'plr_lite'여야 합니다: {num_embedding}")
+
+            # ── categorical 처리 준비 ──
+            self.cat_embeddings = None  # 구버전(파이썬 루프) 자리 표시(사용 안 함)
+            self.cat_embed_table = None
+            if self.cat_col_idx:
+                if cat_cardinalities is None or len(cat_cardinalities) != len(self.cat_col_idx):
+                    raise ValueError(
+                        "cat_col_idx가 주어지면 cat_cardinalities도 같은 길이로 "
+                        "줘야 합니다 (컬럼별 categorical 카디널리티)."
+                    )
+                cardinalities = [int(c) for c in cat_cardinalities]
+                offsets = torch.tensor(
+                    [0] + list(torch.cumsum(torch.tensor(cardinalities[:-1]), dim=0).tolist())
+                    if len(cardinalities) > 1 else [0],
+                    dtype=torch.long,
+                )
+                self.register_buffer("_cat_offsets", offsets, persistent=True)
+                self.register_buffer(
+                    "_cat_cardinalities", torch.tensor(cardinalities, dtype=torch.long), persistent=True
+                )
+                total_vocab = sum(cardinalities)
+                if cat_combine == "sum":
+                    self.cat_embed_table = nn.Embedding(total_vocab, embed_dim)
+                elif cat_combine == "concat":
+                    self.cat_embed_table = nn.Embedding(total_vocab, cat_embed_dim)
+                elif cat_combine == "onehot":
+                    self._onehot_total_vocab = total_vocab  # 학습 파라미터 없음
+
+            # ── numeric 처리 준비 ──
+            self.num_proj = None
+            self.ple_n_bins = 0
+            self.plr_out_dim = 0
+            if n_num > 0:
+                if num_embedding == "ple":
+                    if num_bin_edges is None:
+                        raise ValueError(
+                            "num_embedding='ple'면 num_bin_edges(학습 데이터에서 미리 계산한 "
+                            "컬럼별 quantile 구간 경계, shape=(n_num, n_bins+1))를 줘야 합니다."
+                        )
+                    self.register_buffer("ple_edges", num_bin_edges.clone(), persistent=True)
+                    self.ple_n_bins = num_bin_edges.shape[1] - 1
+                elif num_embedding == "plr_lite":
+                    # PLR(lite) — TabR(Gorishniy et al. 2024): periodic embedding
+                    # (컬럼별 학습 가능한 주파수) → 모든 컬럼이 공유하는 Linear
+                    # → ReLU. PLE(구간 기반)와 완전히 다른 메커니즘 — 여기선
+                    # "구간"이 아니라 "주기 함수"로 값을 표현함.
+                    # 주파수(c)는 컬럼별로 따로 학습(자연스러운 스케일이 컬럼마다
+                    # 다르므로), 그 뒤의 Linear+ReLU만 전체 컬럼이 공유 — 이게
+                    # "lite"의 핵심(컬럼마다 별도 Linear를 두는 원래 PLR보다
+                    # 파라미터 훨씬 적음, TabR 논문에서 "성능 손실 없이 가벼워짐"
+                    # 이라고 보고).
+                    self.plr_freq = nn.Parameter(torch.randn(n_num, plr_n_frequencies) * plr_freq_scale)
+                    self.plr_linear = nn.Linear(2 * plr_n_frequencies, plr_out_dim)  # 컬럼 간 공유
+                    self.plr_out_dim = plr_out_dim
+                elif cat_combine == "sum":
+                    self.num_proj = nn.Sequential(nn.LayerNorm(n_num), nn.Linear(n_num, embed_dim))
+                # concat/onehot/none + linear numeric: raw x_num을 그대로 이어붙임 (num_proj=None)
+
+            # ── 최종 결합 방식 결정 ──
+            if cat_combine == "sum" and num_embedding == "linear":
+                # 기존 sum 경로 그대로
+                self.final_proj = None
+            else:
+                # concat/onehot/PLE는 전부 "이어붙인 뒤 최종 Linear" 패턴
+                concat_dim = 0
+                if n_num > 0:
+                    if num_embedding == "ple":
+                        concat_dim += self.ple_n_bins * n_num
+                    elif num_embedding == "plr_lite":
+                        concat_dim += self.plr_out_dim * n_num
+                    else:
+                        concat_dim += n_num
+                if self.cat_col_idx:
+                    if cat_combine == "concat":
+                        concat_dim += len(self.cat_col_idx) * cat_embed_dim
+                    elif cat_combine == "onehot":
+                        concat_dim += self._onehot_total_vocab
+                    elif cat_combine == "sum":
+                        concat_dim += embed_dim  # sum 결과 자체를 하나의 블록으로 이어붙임
+                self.final_proj = nn.Sequential(nn.LayerNorm(concat_dim), nn.Linear(concat_dim, embed_dim))
+        else:
+            self.cat_embed_table = None
+            self.cat_embeddings = None
+            self.final_proj = None
+            self.num_proj = None
+            self.ple_edges = None
+            # [하위 호환 필수] 기존 체크포인트의 state_dict 키가
+            # "embedder.proj.0.weight" 형태로 저장돼 있음 — 속성 이름을
+            # num_proj가 아니라 반드시 proj로 유지해야 --from_saved_state
+            # 로딩이 깨지지 않는다.
+            self.proj = nn.Sequential(nn.LayerNorm(n_features), nn.Linear(n_features, embed_dim))
+
         self.blocks = nn.Sequential(*[ResidualMLP(embed_dim, embed_dim * 2, dropout) for _ in range(n_layers)])
 
+    def _encode_categorical(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """categorical 컬럼들을 cat_combine 방식에 맞게 인코딩. (B, cat_dim) 반환."""
+        if not self.cat_col_idx:
+            return None
+        x_cat = x[:, self.cat_col_idx].round().long()
+        x_cat = torch.clamp(x_cat, min=torch.zeros_like(self._cat_cardinalities),
+                             max=self._cat_cardinalities - 1)
+        x_cat_global = x_cat + self._cat_offsets            # (B, n_cat) — 컬럼별 offset 적용
+
+        if self.cat_combine == "onehot":
+            # 학습 파라미터 없음. offset 덕분에 컬럼별 one-hot 구간이
+            # 서로 안 겹치므로, sum이 곧 "컬럼별 one-hot을 이어붙인 것"과
+            # 수학적으로 동일함 (block-diagonal 구조).
+            onehot = F.one_hot(x_cat_global, num_classes=self._onehot_total_vocab).sum(dim=1)
+            return onehot.float()
+        else:
+            cat_embs = self.cat_embed_table(x_cat_global)    # (B, n_cat, D) — 한 번의 gather
+            if self.cat_combine == "sum":
+                return cat_embs.sum(dim=1)                    # (B, embed_dim)
+            else:  # concat
+                B = x.shape[0]
+                return cat_embs.reshape(B, -1)                # (B, n_cat * cat_embed_dim)
+
+    def _encode_numeric(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """numeric 컬럼들을 num_embedding 방식에 맞게 인코딩."""
+        if self.num_col_idx is None or len(self.num_col_idx) == 0:
+            return None
+        x_num = x[:, self.num_col_idx]
+        if self.num_embedding == "ple":
+            # PLE (Gorishniy et al. 2022): 컬럼별 quantile 구간 경계 기준
+            # z_t = clamp((x-b_{t-1})/(b_t-b_{t-1}), 0, 1) — 파이썬 루프 없이
+            # 전체 컬럼·전체 구간을 한 번에 브로드캐스팅으로 계산.
+            lo = self.ple_edges[:, :-1]                       # (n_num, n_bins)
+            hi = self.ple_edges[:, 1:]                         # (n_num, n_bins)
+            x_expand = x_num.unsqueeze(-1)                     # (B, n_num, 1)
+            frac = (x_expand - lo) / (hi - lo + 1e-8)           # (B, n_num, n_bins)
+            z = torch.clamp(frac, 0.0, 1.0)
+            return z.reshape(x_num.shape[0], -1)                # (B, n_num*n_bins)
+        elif self.num_embedding == "plr_lite":
+            # PLR(lite) (TabR, Gorishniy et al. 2024): periodic embedding
+            # (컬럼별 학습 주파수) → 전체 컬럼이 공유하는 Linear → ReLU.
+            # 파이썬 루프 없음 — nn.Linear가 (B, n_num, 2k) 텐서의 마지막
+            # 차원에 자동으로 브로드캐스팅되므로 "공유 Linear"가 자연스럽게
+            # 구현됨.
+            x_expand = x_num.unsqueeze(-1)                       # (B, n_num, 1)
+            v = 2 * torch.pi * self.plr_freq * x_expand           # (B, n_num, k)
+            periodic = torch.cat([torch.sin(v), torch.cos(v)], dim=-1)  # (B, n_num, 2k)
+            out = F.relu(self.plr_linear(periodic))               # (B, n_num, plr_out_dim) — Linear 공유
+            return out.reshape(x_num.shape[0], -1)                # (B, n_num*plr_out_dim)
+        else:
+            return x_num  # linear 모드는 raw 값 그대로 (num_proj 또는 final_proj가 처리)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.blocks(self.proj(x))
+        if self.final_proj is not None:
+            parts = []
+            num_repr = self._encode_numeric(x)
+            if num_repr is not None:
+                if self.num_proj is not None:
+                    parts.append(self.num_proj(num_repr))
+                else:
+                    parts.append(num_repr)
+            cat_repr = self._encode_categorical(x)
+            if cat_repr is not None:
+                parts.append(cat_repr)
+            combined = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+            return self.blocks(self.final_proj(combined))
+        elif self.cat_embed_table is not None:
+            # 기존 sum(+linear numeric) 경로 — final_proj 없이 바로 embed_dim
+            emb = None
+            if self.num_proj is not None:
+                emb = self.num_proj(x[:, self.num_col_idx])
+            cat_repr = self._encode_categorical(x)
+            emb = cat_repr if emb is None else emb + cat_repr
+            return self.blocks(emb)
+        else:
+            return self.blocks(self.proj(x))
 
 
 class MemoryBank(nn.Module):
@@ -730,6 +971,11 @@ class TabERA(nn.Module):
     dropout           : 전역 드롭아웃
     loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': ..}
     column_names      : 특성 컬럼명 (설명 출력용)
+    cat_col_idx       : categorical 컬럼의 인덱스 목록 (None이면 전체를
+                        수치형으로 취급 — 기존 동작과 동일, 하위 호환)
+    num_col_idx       : numeric 컬럼의 인덱스 목록 (cat_col_idx와 함께 줘야 함)
+    cat_cardinalities : cat_col_idx와 같은 순서의 카디널리티 목록
+                        (nn.Embedding 테이블 크기 결정용)
     """
 
     def __init__(
@@ -747,15 +993,44 @@ class TabERA(nn.Module):
         column_names: Optional[List[str]] = None,
         use_offset_correction: bool = True,
         global_retrieve: bool = False,
+        # [수정] AttentionAggregator의 이웃 라벨 인코딩(label_encoder)이
+        # TabR 원본처럼 classification(nn.Embedding)/regression(nn.Linear)을
+        # 구분하려면 tasktype이 필요함 — 기존엔 n_output만 받아서 binclass
+        # (n_output=1)와 regression(n_output=1)을 구분할 방법이 없었음.
+        # tasktype="regression"(기본값)이면 이전과 100% 동일하게 동작
+        # (하위 호환 — regression 체크포인트는 영향 없음).
+        tasktype: str = "regression",
+        n_classes: Optional[int] = None,
+        routing_scale: float = 1.0,
         use_context_emb: bool = True,
         detach_context_grad: bool = False,
         use_context_projection: bool = False,
         vectorized_fallback: bool = True,
+        cat_col_idx: Optional[List[int]] = None,
+        num_col_idx: Optional[List[int]] = None,
+        cat_cardinalities: Optional[List[int]] = None,
+        cat_combine: str = "onehot",
+        cat_embed_dim: int = 16,
+        num_embedding: str = "plr_lite",
+        num_bin_edges: Optional[torch.Tensor] = None,
+        plr_n_frequencies: int = 16,
+        plr_freq_scale: float = 0.01,
+        plr_out_dim: int = 8,
     ) -> None:
         super().__init__()
         self.k            = k
         self.embed_dim    = embed_dim
         self.n_output     = n_output
+        self.tasktype = tasktype
+        if tasktype in ("binclass", "multiclass"):
+            # multiclass는 n_output이 곧 n_classes. binclass는 n_output=1
+            # 이지만 라벨은 2개 클래스(0/1)라 명시적으로 n_classes를 받거나
+            # 기본값 2를 씀.
+            self._n_classes_for_labels = n_classes if n_classes is not None else (
+                n_output if tasktype == "multiclass" else 2
+            )
+        else:
+            self._n_classes_for_labels = None
         self.n_features   = n_features
         self.loss_weights = loss_weights or {
             "diversity":    0.01,
@@ -799,7 +1074,18 @@ class TabERA(nn.Module):
         )
 
         # ── 임베더 ──────────────────────────────────
-        self.embedder = TabularEmbedder(n_features, embed_dim, embedder_layers, dropout)
+        # cat_col_idx가 주어지면 categorical feature를 nn.Embedding으로
+        # 처리 (① 후보 검증 결과 반영 — 안 주면 이전과 100% 동일 동작,
+        # 기존 체크포인트 하위 호환 유지)
+        self.embedder = TabularEmbedder(
+            n_features, embed_dim, embedder_layers, dropout,
+            cat_col_idx=cat_col_idx, num_col_idx=num_col_idx,
+            cat_cardinalities=cat_cardinalities,
+            cat_combine=cat_combine, cat_embed_dim=cat_embed_dim,
+            num_embedding=num_embedding, num_bin_edges=num_bin_edges,
+            plr_n_frequencies=plr_n_frequencies, plr_freq_scale=plr_freq_scale,
+            plr_out_dim=plr_out_dim,
+        )
 
         # ── CentroidLayer (Dual-Space Prototype) ────────
         self.prototype_layer = CentroidLayer(
@@ -809,10 +1095,14 @@ class TabERA(nn.Module):
             prototype_labels=prototype_labels,
             dropout=dropout,
             col_names=column_names,
+            routing_scale=routing_scale,
         )
 
         # ── TabR 방식 이웃 집계 ──────────────────────────
         # use_offset_correction=False → value=label_emb만 사용 (T() ablation)
+        # [수정] tasktype/n_classes 전달 — classification이면 label_encoder가
+        # nn.Embedding(명목형 클래스에 정확한 표현), regression이면 기존과
+        # 동일한 nn.Linear(연속형 값 그대로).
         self.ot_selector = AttentionAggregator(
             embed_dim=embed_dim,
             k=k,
@@ -820,6 +1110,8 @@ class TabERA(nn.Module):
             n_output=n_output,
             dropout=dropout,
             use_offset_correction=use_offset_correction,
+            tasktype=tasktype,
+            n_classes=self._n_classes_for_labels,
         )
 
         # ── 메모리 뱅크 (검색 전용) ──────────────────

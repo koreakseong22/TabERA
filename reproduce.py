@@ -212,18 +212,6 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
 # ─────────────────────────────────────────────────────────────
 # Integrated Gradients (Sundararajan et al. 2017, ICML)
 # ─────────────────────────────────────────────────────────────
-#
-# [1-step Gradient×Input과의 차이]
-# 1-step: grad(x) * (x - baseline)
-#   → α=1 지점(원본 입력)의 gradient만 사용
-#   → sigmoid/softmax가 saturate된 영역에서 gradient ≈ 0
-#   → Sensitivity, Completeness axiom을 만족하지 못함
-#     (Shrikumar et al. 2016, "Gradient * Input"과 동일한 방법)
-#
-# Multi-step IG: baseline → input 경로를 n_steps개 지점에서 샘플링,
-#   각 지점의 gradient를 평균 → (x - baseline)과 곱함
-#   → fundamental theorem of calculus에 의해 Completeness axiom 만족
-#   → saturation 구간도 경로 적분으로 우회 가능
 def compute_integrated_gradients(
     model, X, X_baseline, target_fn, n_steps: int = 20,
     check_convergence: bool = False,
@@ -236,22 +224,10 @@ def compute_integrated_gradients(
     X          : (N, F) 입력 배치
     X_baseline : (F,) 또는 (N, F) baseline
     target_fn  : model(x) 출력(dict)을 받아 (N,) 형태의 per-sample 스칼라를
-                 리턴하는 함수. 배치를 sum()해서 단일 스칼라로 합치면 안 됨
-                 (개별 샘플의 completeness 검증이 불가능해짐).
-                 예: lambda out: out["logits"].gather(1, target_class.unsqueeze(1)).squeeze(1)
-                     (multiclass, 예측 클래스의 logit)
-                 예: lambda out: out["logits"].squeeze(-1)
-                     (binclass/regression, 단일 출력)
+                 리턴하는 함수.
     n_steps    : 적분 근사에 사용할 step 수 (기본 20)
     check_convergence : True면 Completeness axiom 오차를 샘플별로 측정해 출력
-                 (IG_i(x).sum() ≈ f(x) - f(baseline) 이어야 함 — Riemann sum
-                 근사 오차이므로 n_steps가 부족하면 이 값이 커짐)
-    use_soft_forward : True면 model(x) 대신 model.forward_soft_for_ig(x, target_fn)를
-                 사용. hard_assignment(argmax)로 인한 context_emb 불연속을
-                 제거한 대체 함수 F_soft(x)에 대해 IG를 계산한다.
-                 실제 예측(forward)은 전혀 바뀌지 않음 — 설명 계산 전용.
-                 completeness axiom이 근사가 아니라 엄밀하게 성립해야 하므로
-                 convergence error가 크게 개선될 것으로 기대됨.
+    use_soft_forward : True면 model(x) 대신 model.forward_soft_for_ig(x, target_fn)를 사용.
 
     Returns
     ──────────
@@ -271,10 +247,6 @@ def compute_integrated_gradients(
     for alpha in alphas:
         x_interp = (X_baseline + alpha * (X - X_baseline)).clone().detach().requires_grad_(True)
         target = _eval_target(x_interp)                      # (N,) per-sample
-        # 배치의 각 샘플 출력은 서로 다른 입력에서 나오므로 (배치 내 cross term 없음),
-        # target.sum()의 gradient = 각 샘플 target의 gradient를 합친 것과 동일.
-        # 이렇게 하면 1회 backward로 (N, F) gradient를 모두 얻으면서도
-        # per-sample completeness 검증에 필요한 분리된 의미를 유지함.
         grad = torch.autograd.grad(target.sum(), x_interp, retain_graph=False)[0]
         grads_accum = grads_accum + grad
 
@@ -282,10 +254,6 @@ def compute_integrated_gradients(
     ig_signed = avg_grad * (X - X_baseline)             # (N, F) 부호 보존 (completeness 검증용)
 
     if check_convergence:
-        # Completeness axiom (per-sample): Σ_i IG_i(x) ≈ f(x) - f(baseline)
-        # 오차가 클수록 n_steps가 적분 근사에 부족하다는 신호.
-        # 배치 합산이 아니라 샘플별로 직접 비교해야 상쇄/증폭으로 인한
-        # 진단 오류를 피할 수 있음.
         with torch.no_grad():
             f_x        = _eval_target(X)                      # (N,)
             f_baseline = _eval_target(X_baseline)              # (N,)
@@ -307,18 +275,6 @@ def compute_integrated_gradients(
 def make_logit_target_fn(tasktype: str, target_class=None):
     """
     compute_integrated_gradients에 넘길 per-sample target_fn 생성.
-
-    IG는 "최종 예측"에 대한 feature 기여도를 측정해야 하므로,
-    agg_emb(중간 retrieval 표현)가 아니라 logits을 target으로 삼는다.
-
-    Parameters
-    ──────────
-    tasktype     : "regression" | "multiclass" | 그 외(binclass)
-    target_class : multiclass일 때 각 샘플의 추적 대상 클래스 인덱스, shape (N,)
-                   numpy array 또는 torch tensor. None이면 호출 시점에
-                   model 출력에서 argmax로 자동 결정(단, baseline 평가 시
-                   클래스가 바뀌면 completeness가 깨지므로 고정해서 넘기는
-                   것을 권장).
     """
     if tasktype == "regression":
         return lambda out: out["logits"].squeeze(-1)            # (N,)
@@ -393,7 +349,7 @@ def main():
                             "                         그룹 분리도(F-test/χ²) 검증\n"
                             "  deletion_auc          : attribution 순위로 feature 누적 마스킹 →\n"
                             "                         ŷ 곡선의 AUC (낮을수록 좋음)\n"
-                            "  insertion_auc         : baseline에서 시작 → 중요 feature부터 복원 →\n"
+                            "  insertion_auc          : baseline에서 시작 → 중요 feature부터 복원 →\n"
                             "                         ŷ 곡선의 AUC (높을수록 좋음)\n"
                             "                         Deletion과 짝 (Petsiuk et al. 2018, RISE)\n"
                             "  dataset_profile        : 새 데이터셋에서 IG/deletion 신뢰도를\n"
@@ -413,6 +369,41 @@ def main():
                             "centroid_emb를 두고 서로 다른 방향으로 당기며 충돌하고 있는지' "
                             "검증용."
                         ))
+    parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
+                        help=(
+                            "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
+                            "TabR/ModernNCA 계보를 따름 — 학습 파라미터 없는 순수 one-hot(컬럼별 "
+                            "자리 보장, 정보 섞임 없음). 'sum'은 컬럼별 embedding(embed_dim 폭)을 "
+                            "더함 — 초기 구현, 기존 sum 체크포인트와 하위 호환용으로 남겨둠. "
+                            "'concat'은 Guo & Berkhahn(2016) 원 논문 방식 — 컬럼별로 작은 "
+                            "embedding(--cat_embed_dim)을 만들어 이어붙인 뒤 최종 Linear로 "
+                            "embed_dim에 투영."
+                        ))
+    parser.add_argument("--cat_embed_dim", type=int, default=16,
+                        help="cat_combine=concat일 때 컬럼별 embedding 차원 (기본 16).")
+    parser.add_argument("--num_embedding", type=str, default="plr_lite",
+                        choices=["linear", "ple", "plr_lite"],
+                        help=(
+                            "numeric feature 인코딩 방식. 'plr_lite'(기본값, 채택 확정)는 "
+                            "TabR(Gorishniy et al. 2024)/ModernNCA가 실제로 쓰는 방식 — 학습"
+                            "가능한 주기(periodic) 함수 + 전체 컬럼이 공유하는 Linear+ReLU "
+                            "(공식 구현과 수식 대조 검증됨). 'linear'는 raw 값을 그대로 Linear에 "
+                            "투영 — 기존 동작, 하위 호환용. 'ple'는 Piecewise Linear Encoding "
+                            "(구간/bin 기반, Gorishniy et al. 2022) — plr_lite와 완전히 다른 "
+                            "메커니즘. numeric feature가 매우 적은 데이터셋(예: 1~5개)에서는 "
+                            "plr_lite가 오히려 불안정할 수 있음(실측: profb에서 auroc가 무작위 "
+                            "수준까지 하락) — 그런 경우 --num_embedding linear/ple 고려."
+                        ))
+    parser.add_argument("--num_bins", type=int, default=8,
+                        help="num_embedding=ple일 때 컬럼당 구간(bin) 개수 (기본 8 — 48보다 "
+                             "여러 데이터셋에서 더 나은 calibration 확인 후 기본값 변경).")
+    parser.add_argument("--plr_n_frequencies", type=int, default=16,
+                        help="num_embedding=plr_lite일 때 컬럼별 주기 함수 주파수 개수 (기본 16).")
+    parser.add_argument("--plr_freq_scale", type=float, default=0.01,
+                        help="num_embedding=plr_lite일 때 주파수 초기화 스케일 (기본 0.01, "
+                             "TabR 논문 권장 탐색 범위: LogUniform[0.01, 100.0]).")
+    parser.add_argument("--plr_out_dim", type=int, default=8,
+                        help="num_embedding=plr_lite일 때 컬럼당 최종 출력 차원 (기본 8).")
     parser.add_argument("--context_projection", action="store_true",
                         help=(
                             "[구조 조정] context_emb를 head로 보내기 전 학습 가능한 "
@@ -484,7 +475,11 @@ def main():
         log_dir = args.savepath
 
     _save_tag = ("..detach_ctx" if args.detach_context_grad else "") \
-              + ("..ctx_proj" if args.context_projection else "")
+              + ("..ctx_proj" if args.context_projection else "") \
+              + ("..cat_concat" if args.cat_combine == "concat" else "") \
+              + ("..cat_onehot" if args.cat_combine == "onehot" else "") \
+              + ("..num_ple" if args.num_embedding == "ple" else "") \
+              + ("..num_plr" if args.num_embedding == "plr_lite" else "")
 
     _saved_state = None
     if args.from_saved_state:
@@ -531,6 +526,21 @@ def main():
         print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
         print(f"  Params: {best_params}")
 
+        # ── PLE(Piecewise Linear Encoding) 구간 경계 계산 ───────
+        # 학습 데이터의 quantile로 컬럼별 구간 경계를 미리 계산해서 넘김
+        # (cat_cardinalities와 같은 패턴 — 모델 생성 전에 데이터에서 파생).
+        num_bin_edges = None
+        if args.num_embedding == "ple" and len(dataset.X_num) > 0:
+            X_num_train = X_train[:, dataset.X_num]  # (n_train, n_num)
+            q = torch.linspace(0.0, 1.0, args.num_bins + 1, device=X_num_train.device)
+            # torch.quantile(input, q, dim=0) → (n_bins+1, n_num), transpose해서 (n_num, n_bins+1)
+            num_bin_edges = torch.quantile(X_num_train, q, dim=0).T.contiguous()
+            # 동일 quantile 값이 반복되면(예: 이산적인 numeric 컬럼) 구간 폭이 0이
+            # 될 수 있음 — PLE의 (hi-lo) 분모에 1e-8을 더해 안전하게 처리하지만,
+            # 완전히 동일한 경계가 연속되면 그 구간은 항상 z=0 또는 1로 사실상
+            # 죽은 구간이 됨(오류는 아니지만 표현력 낭비). 필요시 --num_bins를
+            # 줄이거나 나중에 unique-based binning으로 개선 가능.
+
         # ── 모델 구성 ──────────────────────────────────────────
         model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
         model_kwargs.update(dict(
@@ -548,7 +558,54 @@ def main():
             detach_context_grad=args.detach_context_grad,
             # [구조 조정] context_emb를 head 직전 Linear 프로젝션에 통과시킴
             use_context_projection=args.context_projection,
+            # [후보 A 구현 → 채택 확정] categorical feature를 raw 정수 대신
+            # 별도 처리 — TabZilla 29개 baseline 비교에서 cat_ratio와
+            # AUROC gap의 견고한 상관관계(Spearman rho=-0.63, p=0.0003)
+            # 확인 후 적용.
+            cat_col_idx=list(dataset.X_cat),
+            num_col_idx=list(dataset.X_num),
+            cat_cardinalities=list(dataset.X_cat_cardinality),
+            # [채택 확정 — TabR/ModernNCA 계보] categorical=one-hot(학습
+            # 파라미터 없음), numeric=PLR(lite)(주기함수+공유 Linear+ReLU,
+            # Gorishniy et al. 2024). sum/concat/PLE도 데이터셋에 따라
+            # 이겼다 졌다 했지만(특히 numeric feature가 아주 적은 데이터셋
+            # 에서 PLR이 불안정한 사례 있었음 — profb), "TabR/ModernNCA를
+            # 잇는 retrieval 기반 모델"이라는 아키텍처 정체성을 성능
+            # 최적화보다 우선해 이걸로 확정. 필요시 --cat_combine/
+            # --num_embedding으로 다른 방식도 여전히 선택 가능.
+            cat_combine=args.cat_combine,
+            cat_embed_dim=args.cat_embed_dim,
+            num_embedding=args.num_embedding,
+            num_bin_edges=num_bin_edges,
         ))
+        # [수정] plr_freq_scale/plr_n_frequencies/plr_out_dim은 이제
+        # search_space.py가 num_embedding="plr_lite"일 때 trial마다 직접
+        # 탐색한다(Gorishniy et al. 2022 권장 방식 — 이전엔 optimize.py가
+        # 이 값들을 전체 실행에 고정해서, mfeat-fourier/vehicle 같은
+        # numeric-only 데이터셋에서 완전 붕괴 trial이 반복 관찰됨).
+        # best_params가 새 study(이 값들을 이미 탐색한)면 params_to_model_
+        # kwargs()가 이미 model_kwargs에 넣어놨으니 그대로 두고, 구버전
+        # study(이 값들을 모르는)라면 CLI 고정값으로 fallback한다 — 무조건
+        # .update()로 덮어쓰면 Optuna가 찾은 값을 고정값이 지워버리는
+        # 버그가 생기므로 "없을 때만 채움" 방식으로 처리.
+        for _key, _default in [
+            ("plr_n_frequencies", args.plr_n_frequencies if hasattr(args, "plr_n_frequencies") else 16),
+            ("plr_freq_scale",    args.plr_freq_scale if hasattr(args, "plr_freq_scale") else 0.01),
+            ("plr_out_dim",       args.plr_out_dim if hasattr(args, "plr_out_dim") else 8),
+        ]:
+            model_kwargs.setdefault(_key, _default)
+
+    # [필수 수정] AttentionAggregator의 이웃 라벨 인코딩 — classification
+    # (nn.Embedding)/regression(nn.Linear) 구분에 필요. model_kwargs 안에
+    # 넣어야 --from_saved_state로 저장/재로드할 때도 유지됨 (plr_* 값들과
+    # 같은 이유로 setdefault 사용 — 이미 저장된 새 체크포인트를 다시
+    # --from_saved_state로 불러올 때 model_kwargs에 이미 들어있는 값을
+    # 덮어쓰면 안 됨).
+    model_kwargs.setdefault("tasktype", tasktype)
+    model_kwargs.setdefault(
+        "n_classes",
+        output_dim if tasktype == "multiclass" else (2 if tasktype == "binclass" else None),
+    )
 
     model = TabERA(**model_kwargs, column_names=dataset.col_names)
 
@@ -617,19 +674,6 @@ def main():
         model.eval()
 
         # ── rank_correlation: IG feature 순위 vs 실제 prediction 영향력 순위 ──
-        #
-        # [측정 방식]
-        # 1. TabERA Integrated Gradients (50-step) → feature별 중요도 순위
-        # 2. SHAP KernelExplainer → feature별 중요도 순위
-        # 3. Random attribution → baseline
-        # 4. 각 feature를 평균값으로 교체 → prediction 변화량(delta) 순위
-        # 5. 세 attribution의 순위와 delta 순위의 Spearman 상관계수 비교
-        #
-        # [왜 이게 semantic faithfulness 근거가 되는가]
-        # "중요하다고 판단한 feature를 실제로 바꿨을 때
-        #  prediction이 더 많이 바뀐다"는 걸 순위 상관으로 보여줌.
-        # TabERA ≥ SHAP >> Random 이면:
-        # "TabERA explanation이 SHAP만큼 의미있으면서, prediction path 안에 있다"
         if args.ablation == "rank_correlation":
             import shap
             from scipy.stats import spearmanr
@@ -640,9 +684,6 @@ def main():
 
             # 샘플 수 제한 (SHAP KernelExplainer가 느림)
             n_rc       = min(100, X_test.shape[0])
-            # [수정] X_test[:n_rc] (앞에서부터 고정 슬라이스) → 랜덤 샘플로 교체.
-            # 데이터셋이 이미 셔플돼 있다면 차이가 없지만, 그게 보장돼
-            # 있지 않으므로 순서에 의존하지 않게 함. args.seed로 재현 가능.
             _rc_perm   = np.random.RandomState(args.seed).permutation(X_test.shape[0])[:n_rc]
             X_rc       = X_test[_rc_perm]
             X_rc_np    = X_rc.detach().cpu().numpy()
@@ -651,14 +692,6 @@ def main():
             print(f"\n  Rank Correlation Faithfulness (n={n_rc})")
             print(f"  {'─'*60}")
 
-            # ── [정합성 수정] 세 방법(delta/SHAP/IG)이 전부 같은 대상을 재도록
-            # _target_class를 가장 먼저 한 번만 계산해서 공유한다.
-            # [이전 문제] delta와 SHAP은 전체 클래스 평균을, IG는 샘플별
-            # 예측 클래스 하나만 쟀음 — 세 방법이 서로 다른 걸 측정하고
-            # 있었음. deletion_auc 블록은 이미 SHAP을 target_class로만
-            # 골라 썼는데(sv[target_class[i]]), 여기서는 그 패턴이 빠져
-            # 있었음 — 의도된 설계 차이가 아니라 구현 누락으로 판단하여
-            # deletion_auc와 동일한 방식으로 통일함.
             with torch.no_grad():
                 logits_orig = model(X_rc)["logits"]           # (N, C) or (N, 1)
                 _target_class = (
@@ -667,20 +700,11 @@ def main():
                 )
 
             def _pick_target(logits: torch.Tensor) -> torch.Tensor:
-                """(N, C) 또는 (N, 1) logits에서 샘플별 대상 스칼라를 뽑는다.
-                multiclass: 그 샘플의 예측 클래스(_target_class) 하나.
-                binary/regression: 애초에 출력이 1개라 그대로."""
                 if tasktype == "multiclass":
                     idx = torch.as_tensor(_target_class, device=logits.device, dtype=torch.long)
                     return logits[torch.arange(logits.shape[0], device=logits.device), idx]
                 return logits.squeeze(-1)
 
-            # ── Step 1. delta 순위 계산 ─────────────────────────
-            # feature 하나씩 훈련셋 평균으로 교체 → "예측 클래스" logit
-            # 변화량만 측정 (전체 클래스 평균 아님 — IG와 같은 대상)
-            # [샘플별 값을 따로 보관] 나중에 bootstrap으로 TabERA vs SHAP
-            # 차이의 안정성을 검정하려면, feature별 평균(delta_arr)만이
-            # 아니라 (N, F) 전체가 필요함.
             print(f"  [1/4] Delta 순위 계산 중 (feature {n_features}개)...")
             with torch.no_grad():
                 train_mean   = X_train.mean(dim=0)             # (F,)
@@ -697,13 +721,6 @@ def main():
             delta_arr  = delta_samples.mean(axis=0)            # (F,) 점추정치 (기존과 동일)
             delta_rank = np.argsort(np.argsort(-delta_arr))   # 0-based, 낮을수록 중요
 
-            # ── Step 2. TabERA IG 순위 (Integrated Gradients, multi-step) ──
-            #
-            # Sundararajan et al. 2017 (ICML)의 정의를 따라 baseline → input
-            # 경로를 50-step으로 적분 근사. target은 retrieval 중간 표현인
-            # agg_emb가 아니라 최종 logits — "이 feature를 바꾸면 최종 예측이
-            # 얼마나 변하는가"를 delta(perturbation 기반)와 같은 좌표계에서 측정.
-            # -> 모델 구조/학습 변경 없음, eval 모드에서 50회 backward만 사용.
             print(f"  [2/4] TabERA IG 순위 계산 중 (Integrated Gradients, 50-step)...")
 
             X_baseline = X_train.mean(dim=0)               # (F,) -- delta 계산과 동일 baseline
@@ -721,7 +738,6 @@ def main():
                 tabera_mean = tabera_imp.mean(axis=0)          # (F,)
                 tabera_rank = np.argsort(np.argsort(-tabera_mean))
 
-                # ── Step 3. SHAP 순위 ───────────────────────────
                 print(f"  [3/4] SHAP KernelExplainer 실행 중 (background=50, nsamples=100)...")
 
                 def model_predict(x_np):
@@ -737,49 +753,28 @@ def main():
                         return logits_np
 
                 def _run_shap_once(bg_rng: np.random.RandomState):
-                    """SHAP 1회 실행 → (shap_arr, shap_mean, shap_rank).
-                    bg_rng만 다르게 넣으면 매번 다른 background로 재계산되므로,
-                    이 함수를 여러 번 호출해서 SHAP 자체의 몬테카를로 노이즈를
-                    측정할 수 있다 (--shap_repeats)."""
+                    """SHAP 1회 실행 → (shap_arr, shap_mean, shap_rank)."""
                     bg_idx      = bg_rng.choice(len(X_train_np), size=50, replace=False)
                     bg_data     = X_train_np[bg_idx]
                     explainer   = shap.KernelExplainer(model_predict, bg_data)
                     shap_values = explainer.shap_values(X_rc_np, nsamples=100)
 
-                    # shap_values 형태 처리
-                    # multiclass: list[C개의 (N,F)] / binary/regression: (N,F)
-                    # → 목표: shap_arr.shape == (N, F), 그리고 multiclass면
-                    #   샘플별로 "그 샘플의 예측 클래스" 하나만 선택 (delta/IG와
-                    #   같은 대상 — deletion_auc의 sv[target_class[i]] 패턴과 동일)
                     if isinstance(shap_values, list):
                         arrays = [np.abs(np.array(sv, dtype=float)) for sv in shap_values]
                         valid = [a for a in arrays if a.ndim == 2 and a.shape[1] == n_features]
                         if valid and _target_class is not None:
                             n_valid = len(valid)
-                            # 클래스 c의 배열이 valid에서 빠져 있을 수 있으므로 방어적으로 clamp
                             shap_arr_ = np.stack([
                                 valid[min(int(_target_class[i]), n_valid - 1)][i]
                                 for i in range(n_rc)
                             ])                                          # (N, F)
                         elif valid:
-                            # binary/regression은 애초에 클래스가 하나뿐이라
-                            # target_class 선택 자체가 필요 없음 — 기존 방식 유지
                             shap_arr_ = np.mean(valid, axis=0)           # (N, F)
                         else:
-                            # fallback: 첫 번째 배열 사용
                             shap_arr_ = arrays[0]
                     else:
                         shap_values = np.array(shap_values, dtype=float)
                         if shap_values.ndim == 3:
-                            # [버그 수정] 이전 버전은 "어느 축이 F인지"만 찾고
-                            # 나머지 두 축 중 아무거나 평균내버렸는데, 그 "아무거나"가
-                            # 샘플(N) 축인 경우 샘플 자체가 사라져버림 (실측:
-                            # shap이 (N,F,C)를 직접 반환하는 최신 버전에서, remaining
-                            # 축 중 첫 번째가 N이라 N을 평균해버리고 (F,C)만 남아 →
-                            # 이후 transpose 처리에서 (C,F)가 되어 샘플이 통째로
-                            # 사라짐 → bootstrap에서 IndexError로 드러남).
-                            # 이제 n_rc(샘플 수)와 n_features를 모두 알고 있으니,
-                            # 두 축을 각각 명시적으로 찾아 샘플 축을 절대 없애지 않음.
                             shape3 = shap_values.shape
                             sample_axis, feat_axis = None, None
                             for ax, sz in enumerate(shape3):
@@ -791,18 +786,14 @@ def main():
 
                             if sample_axis is not None and feat_axis is not None:
                                 class_axis = [a for a in range(3) if a not in (sample_axis, feat_axis)][0]
-                                # (N, F, C) 순서로 재배열
                                 shap_moved = np.moveaxis(shap_values, [sample_axis, feat_axis, class_axis], [0, 1, 2])
                                 if _target_class is not None:
-                                    # delta/IG와 같은 대상(샘플별 예측 클래스)만 선택
                                     shap_arr_ = np.abs(np.stack([
                                         shap_moved[i, :, int(_target_class[i])] for i in range(n_rc)
                                     ]))                                       # (N, F)
                                 else:
                                     shap_arr_ = np.abs(shap_moved).mean(axis=2)  # (N, F)
                             else:
-                                # 두 축을 못 찾으면(n_rc == n_features 등 드문 충돌)
-                                # 안전하게 클래스 평균으로 폴백 — 최소한 크래시는 방지
                                 shap_arr_ = np.abs(shap_values).mean(axis=-1)
                                 if shap_arr_.shape[0] != n_rc:
                                     shap_arr_ = shap_arr_.T
@@ -825,15 +816,8 @@ def main():
                     shap_rank_ = np.argsort(np.argsort(-shap_mean_)).astype(int)
                     return shap_arr_, shap_mean_, shap_rank_
 
-                # 기본(주) 실행 — 이후 bootstrap 등 전체 파이프라인은 이 결과 사용
                 shap_arr, shap_mean, shap_rank = _run_shap_once(np.random.RandomState(args.seed))
 
-                # ── [진단, opt-in] SHAP 자체의 몬테카를로 노이즈 ──
-                # bootstrap(샘플 재표본)과는 다른 종류의 불확실성: 같은 샘플
-                # 집합이라도 background/nsamples 표본추출 난수에 따라 SHAP
-                # 값 자체가 흔들리는 정도. 기본값(--shap_repeats=1)이면 실행
-                # 안 하고 기존과 동일한 비용. 2 이상이면 매번 다른 background로
-                # SHAP을 다시 계산해 corr_shap의 반복 간 분산을 직접 잼.
                 shap_mc_std = None
                 if args.shap_repeats > 1:
                     print(f"  [SHAP MC 노이즈 진단] {args.shap_repeats}회 반복 재계산 중"
@@ -854,14 +838,6 @@ def main():
                         print(f"       때문일 수 있습니다. nsamples/background를 늘리는 걸 "
                               f"고려하세요.")
 
-                # ── Step 4. Random attribution baseline (1000회 반복) ──
-                # [수정 이전] 랜덤 순위를 딱 한 번만 뽑아서 하나의 ρ만 봤음 —
-                # feature 수가 적을 때(예: vehicle 18개) 순수 랜덤끼리도
-                # 우연히 상관관계가 크게 나올 수 있어(귀무분포 표준오차가
-                # 1/sqrt(F-1) 수준), 단일 추출값을 "baseline"으로 쓰는 건
-                # 통계적으로 불안정함. R=1000회 반복해서 귀무분포 자체를
-                # 만들고, TabERA/SHAP의 관측 ρ가 이 분포에서 얼마나 극단적인
-                # 값인지(경험적 p-value)를 직접 계산함.
                 print(f"  [4/4] Random attribution baseline 계산 중 (1000회 반복)...")
                 rng_rc = np.random.RandomState(args.seed)
                 n_rand_draws = 1000
@@ -874,17 +850,13 @@ def main():
                 corr_rand      = float(rand_corrs.mean())
                 corr_rand_std  = float(rand_corrs.std())
 
-                # 모든 rank 배열 타입 통일 (인덱싱 오류 방지)
                 tabera_rank = np.array(tabera_rank, dtype=int)
                 delta_rank  = np.array(delta_rank,  dtype=int)
                 shap_rank   = np.array(shap_rank,   dtype=int)
 
-                # ── Step 5. Spearman 상관계수 (점추정치) ────────────
                 corr_tabera, p_tabera = spearmanr(tabera_rank, delta_rank)
                 corr_shap,   p_shap   = spearmanr(shap_rank,   delta_rank)
 
-                # 귀무분포(random) 대비 TabERA/SHAP의 경험적 p-value:
-                # "랜덤 순위끼리의 ρ가 관측된 ρ 이상으로 나올 확률"
                 p_tabera_vs_null = float((rand_corrs >= corr_tabera).mean())
                 p_shap_vs_null   = float((rand_corrs >= corr_shap).mean())
 
@@ -899,13 +871,6 @@ def main():
                 print(f"    P(random ρ ≥ TabERA ρ) = {p_tabera_vs_null:.4f}")
                 print(f"    P(random ρ ≥ SHAP ρ)   = {p_shap_vs_null:.4f}")
 
-                # ── Step 6. Bootstrap: TabERA vs SHAP 차이의 안정성 검정 ──
-                # [목적] 지금까지는 "TabERA ρ ≥ SHAP ρ"를 점추정치 하나로만
-                # 판단했음 — 그 차이가 n_rc개 샘플의 특정 조합에서 우연히
-                # 나온 건지, 샘플을 다르게 뽑아도 안정적으로 유지되는지
-                # 알 수 없었음. 이미 계산해둔 샘플별 값(delta_samples,
-                # tabera_imp, shap_arr)을 재표본추출(bootstrap)해서,
-                # "TabERA ρ - SHAP ρ"의 분포와 그게 0보다 큰 비율을 직접 봄.
                 print(f"\n  [Bootstrap] TabERA vs SHAP 차이 안정성 검정 (200회 재표본추출)...")
                 n_boot = 200
                 rng_boot = np.random.RandomState(args.seed + 1)
@@ -975,7 +940,6 @@ def main():
                     print(f"  ⚠️  TabERA가 랜덤(ρ={corr_rand:.3f}±{corr_rand_std:.3f})보다 유의하게 "
                           f"낫다고 말하기 어려움 (p={p_tabera_vs_null:.4f})")
 
-                # 결과 저장
                 rc_save = {
                     "corr_tabera":       corr_tabera,
                     "corr_shap":         corr_shap,
@@ -1023,21 +987,6 @@ def main():
             sample_groups = model.prototype_layer.sample_groups
             X_val_cpu     = X_val_sub.detach().cpu()
 
-            # ── [수정] sample_groups의 실제 인덱스 공간 ────────────────
-            # libs/supervised.py의 학습 루프를 추적한 결과: ema_update()는
-            # X_train 전체가 아니라 model.memory(MemoryBank)의 실제 내용
-            # (model.memory.keys[:n_mem], model.feature_store._store[:n_mem])
-            # 을 받아 sample_groups를 만든다 (supervised.py 162~169행,
-            # 212~228행 주석 — "MemoryBank 인덱스 공간과 항상 일치하도록
-            # 보장"하기 위해 의도적으로 그렇게 바꾼 것). MemoryBank는 크기
-            # min(2*N_train, memory_size)의 FIFO 링버퍼이고, 매 에폭 학습
-            # 순서가 랜덤 셔플(perm)되기 때문에, 링버퍼 슬롯 j번째 내용물이
-            # X_train의 j번째 행과 같다는 보장이 전혀 없다.
-            # → sample_groups[p]의 인덱스는 "X_train 행 번호"가 아니라
-            #   "MemoryBank/FeatureStore 슬롯 번호"이므로, 검증도 반드시
-            #   같은 슬롯 번호로 embedder를 다시 태우는 게 아니라
-            #   model.memory.keys / model.feature_store._store에서 직접
-            #   가져와야 한다.
             n_mem = model.memory.filled.item()
             ref_emb = model.memory.keys[:n_mem].detach().cpu()          # (n_mem, D)
             ref_raw = (
@@ -1045,10 +994,6 @@ def main():
                 if model.feature_store is not None else None
             )                                                            # (n_mem, F)
 
-            # ── categorical/numeric 컬럼 분리 (검증2의 F-test/χ² 분기에 사용) ──
-            # libs/data.py에서 categorical 컬럼은 LabelEncoder 정수 코드로만
-            # 인코딩되고(순서 없는 명목형), numeric 컬럼만 QuantileTransformer로
-            # [0,1] 정규화된다. 검증2에서 이 둘을 각각 다른 검정으로 다룬다.
             cat_cols = list(dataset.X_cat)
             num_cols = list(dataset.X_num)
 
@@ -1062,29 +1007,6 @@ def main():
 
             centroid_emb_cpu = model.prototype_layer.centroid_emb.detach().cpu()  # (P, D)
 
-            # ── [사전 검증, 필수] sample_groups 인덱스 정합성 재확인 ──────
-            # [배경 — 확인된 사실] libs/supervised.py를 추적한 결과, ema_update()는
-            # 매 에폭 X_train 전체가 아니라 MemoryBank/FeatureStore의 실제
-            # 내용(emb_ema = model.memory.keys[:n_mem], x_ema = feature_store
-            # 의 슬롯)을 받아 sample_groups를 만든다(162~228행 주석 참고).
-            # 즉 sample_groups[p]의 인덱스는 애초부터 "MemoryBank 슬롯 번호"
-            # 이지 "X_train 행 번호"가 아니다. 이번 수정 전에는 여기서 X_train
-            # 을 처음부터 다시 embedder에 태워 X_train 행 순서로 비교했으므로,
-            # 두 인덱스 공간(슬롯 번호 vs 행 번호)이 애초에 다른 것을 같다고
-            # 가정하고 검증한 셈 — 이게 7.8%(≈무작위 2.5%) 결과의 원인이다.
-            #
-            # [이번 수정] X_train을 재-embed하지 않고, ema_update가 실제로
-            # 받았던 것과 같은 소스(model.memory.keys / model.feature_store)
-            # 에서 ref_emb/ref_raw를 가져와 같은 슬롯 번호로 비교한다.
-            #
-            # [해석 기준 — 재설정] reproduce.py는 학습이 끝난 뒤 모델을 그대로
-            # eval()에서 평가만 하고, 이 시점 이후 추가 gradient step은 없다.
-            # 즉 마지막 ema_update() 호출과 이 검증 사이에 centroid_emb가
-            # 전혀 움직이지 않으므로, 인덱스가 맞다면 일치율은 100%에 매우
-            # 가까워야 한다(자연스러운 EMA 지연이 성립하려면 그 사이에 추가
-            # 학습 스텝이 있어야 하는데, 여기엔 없음). 따라서 "70~95%면
-            # 지연, 3배 이상이면 안전" 같은 관대한 기준은 이 시점에는 근거가
-            # 없다 — 검증 시점 기준으로는 사실상 100% 아니면 버그다.
             with torch.no_grad():
                 q_check = F.normalize(ref_emb, dim=-1)
                 c_check = F.normalize(centroid_emb_cpu, dim=-1)
@@ -1104,9 +1026,6 @@ def main():
             else:
                 match_rate = match_count / total_count
                 print(f"    재배정 일치율: {match_rate:.1%}  (무작위 기대치: {chance_rate:.1%})")
-                # 100%는 부동소수점 argmax의 동률(tie) 등으로 아주 드물게 못 미칠
-                # 수 있어 약간의 여유(0.99)만 둔다. 그 밑은 "지연"으로 설명되지
-                # 않으므로(위 근거 참고) 전부 인덱스/소스 불일치로 취급한다.
                 index_ok = match_rate >= 0.99
                 if not index_ok:
                     print(f"    ❌ 검증 시점에는 추가 학습이 없어 EMA 지연으로 설명될 수 없습니다 —")
@@ -1119,28 +1038,6 @@ def main():
             if not index_ok:
                 valid_p = []
 
-            # ── 검증 2: between-group feature separation ──────────────
-            # centroid_x들 간 feature 분산 (between) vs 그룹 내 분산 (within).
-            # separation이 높은 feature = centroid가 실제로 그 feature로 그룹을 구분.
-            # 이게 높아야 "이 그룹은 high-alcohol, low-pH 그룹" 설명이 의미있음.
-            #
-            # [재설계] 기존엔 (1) within_var를 그룹별 분산의 비가중 평균으로
-            # 계산해서 표본 1~2개짜리 노이즈 많은 그룹이 큰 그룹과 동일하게
-            # 취급됐고, (2) between_var는 모든 P개 centroid를, within_var는
-            # size>=2인 그룹만 써서 두 항이 서로 다른 그룹 집합 기준이었으며,
-            # (3) 유의성 검정이 전혀 없어 "separation이 몇이면 의미 있는지"
-            # 판단 기준이 없었음. → 표준 one-way ANOVA F-검정으로 교체.
-            #
-            # [추가 수정] F-test는 값이 연속형(등간/비율 척도)이라는 가정을
-            # 깔고 있는데, categorical 컬럼은 libs/data.py에서 LabelEncoder로
-            # 매긴 정수 코드일 뿐 순서가 없는 명목형이다. 이 코드에 그대로
-            # 분산 기반 F-test를 적용하면, "카테고리 0과 3이 0과 1보다
-            # 멀다"는 우연한 인코딩 순서를 실제 분산으로 잘못 해석하게 된다
-            # (검증1에서 L1 거리에 있었던 것과 동일한 문제). numeric 컬럼만
-            # F-test를 쓰고, categorical 컬럼은 "그룹 소속 × 카테고리 값"
-            # 분할표에 대한 카이제곱 독립성 검정으로 교체한다 — 그룹마다
-            # 카테고리 분포가 실제로 다른지(=그 카테고리로 그룹이 구분되는지)
-            # 순서 가정 없이 직접 검정한다.
             print(f"\n  [검증 2] Between-Group Feature Separation")
             print(f"  (numeric: One-way ANOVA F-test / categorical: Chi-square 독립성 검정)")
 
@@ -1154,15 +1051,7 @@ def main():
                 p_arr     = np.full(n_features, np.nan)
                 test_type = np.array(["-"] * n_features, dtype=object)
 
-                # ── numeric 컬럼: 그룹 크기로 가중한 pooled MSW/MSB F-test ──
                 if num_cols:
-                    # [수정] centroid_x(medoid)를 between-group 대표값으로
-                    # 쓰던 걸 실제 그룹 평균으로 교체 — medoid를 아키텍처에서
-                    # 제거하면서 자연히 필요해진 변경이지만, 사실 표준
-                    # one-way ANOVA의 MSB 정의(그룹 평균 기반)에도 이쪽이
-                    # 원래 더 맞다. medoid는 "centroid_emb와 가장 가까운
-                    # 실제 샘플 1개"일 뿐이라 outlier성 특성을 가질 수 있어,
-                    # between-group 대표값으로는 오히려 그룹 평균보다 부정확했다.
                     group_means_num = np.array([
                         ref_raw[sample_groups[p]].numpy()[:, num_cols].mean(axis=0)
                         for p in valid_p
@@ -1190,7 +1079,6 @@ def main():
                         p_arr[fi]     = p_num[j]
                         test_type[fi] = "F"
 
-                # ── categorical 컬럼: 그룹×카테고리 분할표 카이제곱 검정 ──
                 if cat_cols:
                     for fi in cat_cols:
                         cats_per_group = [
@@ -1202,8 +1090,6 @@ def main():
                         for gi, vals in enumerate(cats_per_group):
                             for c in vals:
                                 table[gi, np.searchsorted(all_cats, c)] += 1
-                        # 카이제곱 검정이 성립하려면 카테고리 2종 이상 +
-                        # 모든 행/열 합이 0보다 커야 함
                         if table.shape[1] >= 2 and (table.sum(axis=0) > 0).all() and (table.sum(axis=1) > 0).all():
                             try:
                                 chi2, p, dof, _ = chi2_contingency(table)
@@ -1217,7 +1103,6 @@ def main():
                 bonferroni_alpha = 0.05 / n_features   # 다중비교 보정 (전체 feature 수 기준)
                 n_significant    = int((p_arr[valid_mask] < bonferroni_alpha).sum())
 
-                # 랭킹/표시용: 검정 종류가 달라도 비교 가능하도록 -log10(p)로 통일
                 neglogp = np.full(n_features, -1.0)
                 neglogp[valid_mask] = -np.log10(np.clip(p_arr[valid_mask], 1e-300, 1.0))
                 top_sep_idx = np.argsort(neglogp)[::-1][:5]
@@ -1247,7 +1132,6 @@ def main():
             else:
                 F_stat, p_values, test_type = None, None, None
 
-            # 저장
             dsf_save = {
                 "anova_F_stat":     F_stat.tolist() if F_stat is not None else None,
                 "anova_p_values":   p_values.tolist() if p_values is not None else None,
@@ -1264,19 +1148,6 @@ def main():
             print(f"\n  저장: {dsf_path}")
 
         # ── dataset_profile: 새 데이터셋 IG/deletion 신뢰도 빠른 분류 ──
-        #
-        # [배경] vehicle에서 겪은 시행착오(포화 미확인 → 잘못된 결론 →
-        # 재검증 반복)를 다른 데이터셋에서 되풀이하지 않기 위한 통합 진단.
-        # 예측 확신도, fallback 비율, mean/medoid completeness error,
-        # deletion_auc의 샘플별 분산(TabERA 기준, SHAP/Random은 시간 관계상
-        # --deletion_auc를 별도로 돌려 비교 권장)을 한 번에 출력하고
-        # A/B/C 중 하나로 자동 분류한다.
-        #
-        # A: 척도(deletion_auc) 자체가 이 데이터셋에서 둔감 (overconfidence 등)
-        #    → 이 데이터셋의 deletion/insertion AUC는 메인 결과에서 제외하거나
-        #      caveat과 함께 보고. rank_correlation으로 대체 가능한지 확인.
-        # B: mean baseline에서만 문제, medoid에서는 정상 → medoid를 메인으로 채택
-        # C: 정상 (mean, medoid 모두 deletion_auc 분산 충분) → 그대로 사용
         elif args.ablation == "dataset_profile":
             model.eval()
             n_test = min(100, X_test.shape[0])
@@ -1286,7 +1157,6 @@ def main():
             print(f"\n  Dataset Profile — IG/Deletion 신뢰도 빠른 진단 (n={n_test})")
             print(f"  {'='*70}")
 
-            # ── 1. 예측 확신도 ──────────────────────────────────
             with torch.no_grad():
                 logits_dp = model(X_dp)["logits"]
                 if tasktype == "regression":
@@ -1309,7 +1179,6 @@ def main():
                 if overconfident:
                     print(f"    ⚠️  median > 0.9 — overconfident, deletion/insertion 신호 둔감 위험")
 
-            # ── 2. Fallback 비율 (input 시점) ──────────────────
             cached_sizes_dp = getattr(model.memory, "_cached_group_sizes", None)
             print(f"\n  [2. Fallback 비율]")
             if cached_sizes_dp is not None:
@@ -1325,7 +1194,6 @@ def main():
             else:
                 print(f"    _cached_group_sizes 없음 — skip")
 
-            # ── 3. Mean / Medoid completeness error (50-step, 저비용) ──
             print(f"\n  [3. Completeness error: mean vs medoid baseline]")
             ig_target_fn_dp = make_logit_target_fn(
                 tasktype, target_class=target_class_dp if tasktype == "multiclass" else None,
@@ -1365,7 +1233,6 @@ def main():
             print(f"    mean   : median={np.median(rel_err_mean)*100:.2f}%  mean={rel_err_mean.mean()*100:.2f}%")
             print(f"    medoid : median={np.median(rel_err_medoid)*100:.2f}%  mean={rel_err_medoid.mean()*100:.2f}%")
 
-            # ── 4. Deletion AUC 샘플별 분산 (TabERA IG, mean/medoid 각각) ──
             print(f"\n  [4. Deletion AUC 샘플별 분산 (TabERA IG 기준)]")
 
             def _pred_at_dp(x_batch, sample_idx):
@@ -1405,7 +1272,6 @@ def main():
             mean_dau_saturated   = dau_mean.std() < 0.01
             medoid_dau_saturated = dau_medoid.std() < 0.01
 
-            # ── 5. 자동 분류: A / B / C ─────────────────────────
             print(f"\n  {'='*70}")
             print(f"  [자동 분류]")
             if mean_dau_saturated and medoid_dau_saturated:
@@ -1427,17 +1293,6 @@ def main():
                 print(f"    개선 효과(위 3번)를 참고해 최종 baseline 선택.")
 
         # ── deletion_auc: attribution 순위로 feature 누적 마스킹 → ŷ AUC ──
-        #
-        # [측정 방식]
-        # 1. 각 샘플에 대해 IG / SHAP / Random attribution 순위 계산
-        # 2. 가장 중요한 feature부터 1개씩 누적해서 X̄(평균)로 마스킹
-        # 3. 매 step마다 ŷ 측정 → 곡선 형성
-        # 4. 곡선 아래 면적 (AUC) 계산 — 낮을수록 좋은 attribution
-        #
-        # [rank_correlation과의 차이]
-        # rank_correlation: 순위 일치도만 측정
-        # deletion_auc    : 누적 효과의 크기 측정
-        # (1위 feature가 압도적인 경우와 1~5위가 골고루 영향 주는 경우 구분 가능)
         elif args.ablation == "deletion_auc":
             model.eval()
             col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
@@ -1446,13 +1301,6 @@ def main():
             n_test = min(100, X_test.shape[0])
             X_da   = X_test[:n_test].clone()
 
-            # ── Baseline: medoid(기본) vs mean(--mean_baseline, ablation) ──
-            # medoid baseline은 4개 데이터셋 전부에서 IG의 completeness를
-            # 일관되게 크게 개선함을 확인함 (median relative error 기준:
-            # vehicle 146%→17.5%, ada 19.4%→1.5%, qsar 53.4%→1.75%,
-            # wine 319%→4.1%). deletion/insertion AUC의 feature masking에도
-            # 동일한 baseline을 일관되게 적용해, IG/SHAP/Random 세 방법이
-            # 공정하게 같은 기준으로 비교되도록 함.
             if (not args.mean_baseline):
                 with torch.no_grad():
                     q_da = F.normalize(model.embedder(X_da), dim=-1)
@@ -1467,7 +1315,6 @@ def main():
             print(f"\n  Deletion AUC Faithfulness (n={n_test})")
             print(f"  {'─'*60}")
 
-            # ── Step 1. 원본 prediction (logits) ──────────────
             with torch.no_grad():
                 logits_orig = model(X_da)["logits"]
                 if tasktype == "regression":
@@ -1475,19 +1322,13 @@ def main():
                     target_class = None
                 elif tasktype == "multiclass":
                     pred_orig = torch.softmax(logits_orig, dim=-1).cpu().numpy()
-                    # 다중 클래스: argmax 클래스의 확률 추적
                     target_class = pred_orig.argmax(axis=-1)
                     pred_orig = pred_orig[np.arange(n_test), target_class]
                 else:  # binclass
                     probs = torch.sigmoid(logits_orig.squeeze(-1)).cpu().numpy()
-                    # 모델이 예측한 클래스(0 또는 1) 방향으로 확률 통일
-                    # (그렇지 않으면 class=0으로 예측된 샘플에서 deletion 효과의
-                    #  방향이 반대로 해석됨 — class=1 확률만 추적하면
-                    #  "정답 클래스 확신도"가 아니라 임의 방향의 수치가 됨)
                     target_class = (probs >= 0.5).astype(int)            # (N,) predicted class
                     pred_orig = np.where(target_class == 1, probs, 1.0 - probs)
 
-            # ── Step 2. TabERA IG attribution (Integrated Gradients, multi-step) ──
             print(f"  [1/3] TabERA IG attribution 계산 중 (n_steps={args.ig_nsteps})...")
             ig_target_fn = make_logit_target_fn(
                 tasktype,
@@ -1500,7 +1341,6 @@ def main():
                 check_convergence=True,
             ).cpu().numpy()  # (N, F)
 
-            # ── Step 3. SHAP attribution 순위 ──────────────────
             print(f"  [2/3] SHAP attribution 계산 중...")
             try:
                 import shap
@@ -1517,13 +1357,6 @@ def main():
                         else:
                             return torch.sigmoid(lg.squeeze(-1)).cpu().numpy()
 
-                # ── SHAP background: IG baseline 선택과 정합성 맞춤 ──
-                # IG가 medoid를 baseline으로 쓰면, SHAP의 background도
-                # 같은 기준(centroid medoid들)으로 맞춰야 공정한 비교가 됨.
-                # 그렇지 않으면 "IG는 medoid 대비, SHAP은 전체 평균 근처
-                # random sample 대비"로 서로 다른 기준점에서 평가되는
-                # 문제가 생김 (IG의 attribution 자체가 (x-baseline)을
-                # 포함하는 구조이므로 이 불일치가 결과를 왜곡할 수 있음).
                 if (not args.mean_baseline):
                     with torch.no_grad():
                         all_medoids = model.prototype_layer.ig_baseline  # (P, F)
@@ -1553,28 +1386,18 @@ def main():
                 shap_imp = None
                 shap_available = False
 
-            # ── Step 4. Random baseline ──────────────────────
             print(f"  [3/3] Random baseline 계산 중...")
             random_imp = np.abs(np.random.randn(n_test, n_features))
 
-            # ── Step 5. Deletion AUC 계산 ────────────────────
             def compute_deletion_auc(attribution):
-                """
-                attribution: (N, F) — 각 샘플의 feature 중요도
-                반환: 평균 deletion AUC (낮을수록 좋음)
-                """
-                # X_baseline이 (F,) 1D(mean)면 전체 샘플 공통,
-                # (N,F) 2D(medoid)면 샘플별로 다른 baseline 사용
                 baseline_is_per_sample = (X_baseline.dim() == 2)
 
                 aucs = []
                 for n in range(n_test):
                     baseline_n = X_baseline[n] if baseline_is_per_sample else X_baseline
 
-                    # 순위 (높은 importance 먼저)
                     order = np.argsort(-attribution[n])  # (F,)
 
-                    # 곡선: 마스킹 0개 → F개
                     masked = X_da[n].clone()
                     preds  = [pred_orig[n]]
                     for f_idx in order:
@@ -1589,8 +1412,6 @@ def main():
                                 prob1 = torch.sigmoid(lg.squeeze(-1))[0].item()
                                 p = prob1 if target_class[n] == 1 else 1.0 - prob1
                             preds.append(p)
-                    # 정규화된 AUC (trapezoidal rule)
-                    # numpy 2.0+: np.trapz → np.trapezoid
                     try:
                         auc = np.trapezoid(preds) / n_features
                     except AttributeError:
@@ -1621,11 +1442,6 @@ def main():
                 else:
                     print(f"  △ TabERA AUC ({tabera_aucs.mean():.4f}) ≥ SHAP AUC ({shap_aucs.mean():.4f})")
 
-                # ── Paired Wilcoxon signed-rank test ──────────────
-                # mean/std만으로는 std가 0.2~0.35로 큰 상황에서 TabERA-SHAP
-                # 차이(대개 0.01~0.05)가 통계적으로 유의한지 판단할 수 없음.
-                # 같은 샘플에 대한 TabERA·SHAP 값을 짝지어 비교하는
-                # paired test로 이 차이가 노이즈인지 확인.
                 from scipy.stats import wilcoxon
                 try:
                     diff = tabera_aucs - shap_aucs
@@ -1639,7 +1455,6 @@ def main():
                     print(f"  [Wilcoxon 실패: {e}]")
             print(f"  Random baseline: {random_aucs.mean():.4f}")
 
-            # 저장
             da_save = {
                 "tabera_aucs": tabera_aucs.tolist(),
                 "shap_aucs":   shap_aucs.tolist() if shap_available else None,
@@ -1657,18 +1472,6 @@ def main():
             print(f"\n  저장: {da_path}")
 
         # ── insertion_auc: baseline에서 시작 → 중요 feature부터 복원 ──
-        #
-        # [측정 방식] — Petsiuk et al. 2018 (RISE)
-        # 1. X_baseline (평균) 상태에서 시작 → ŷ_baseline
-        # 2. 각 샘플에 대해 attribution 순위 (가장 중요한 것부터) 계산
-        # 3. 가장 중요한 feature부터 1개씩 원본 값으로 복원
-        # 4. 매 step마다 ŷ 측정 → 곡선 형성
-        # 5. 곡선 아래 면적 (AUC) 계산 — 높을수록 좋은 attribution
-        #
-        # [Deletion과의 짝]
-        # Deletion: 원본 → 중요 feature 제거 → ŷ 빠르게 감소 (낮은 AUC가 좋음)
-        # Insertion: baseline → 중요 feature 추가 → ŷ 빠르게 회복 (높은 AUC가 좋음)
-        # 두 metric은 RISE 논문에서 짝으로 제안된 표준 평가 조합.
         elif args.ablation == "insertion_auc":
             from scipy.stats import spearmanr
 
@@ -1679,8 +1482,6 @@ def main():
             n_test = min(100, X_test.shape[0])
             X_ia   = X_test[:n_test].clone()
 
-            # ── Baseline: medoid(기본) vs mean(--mean_baseline, ablation) ──
-            # deletion_auc와 동일한 근거로 medoid를 기본값으로 사용.
             if (not args.mean_baseline):
                 with torch.no_grad():
                     q_ia = F.normalize(model.embedder(X_ia), dim=-1)
@@ -1695,7 +1496,6 @@ def main():
             print(f"\n  Insertion AUC Faithfulness (n={n_test})")
             print(f"  {'─'*60}")
 
-            # ── Step 1. 원본 prediction (logits) — 최종 target ──
             with torch.no_grad():
                 logits_orig = model(X_ia)["logits"]
                 if tasktype == "regression":
@@ -1710,7 +1510,6 @@ def main():
                     target_class = (probs >= 0.5).astype(int)            # (N,)
                     pred_orig = np.where(target_class == 1, probs, 1.0 - probs)
 
-            # ── Step 2. TabERA IG attribution (Integrated Gradients, multi-step) ──
             print(f"  [1/3] TabERA IG attribution 계산 중 (n_steps={args.ig_nsteps})...")
             ig_target_fn = make_logit_target_fn(
                 tasktype,
@@ -1723,7 +1522,6 @@ def main():
                 check_convergence=True,
             ).cpu().numpy()
 
-            # ── Step 3. SHAP attribution ──────────────────────
             print(f"  [2/3] SHAP attribution 계산 중...")
             try:
                 import shap
@@ -1740,13 +1538,6 @@ def main():
                         else:
                             return torch.sigmoid(lg.squeeze(-1)).cpu().numpy()
 
-                # ── SHAP background: IG baseline 선택과 정합성 맞춤 ──
-                # IG가 medoid를 baseline으로 쓰면, SHAP의 background도
-                # 같은 기준(centroid medoid들)으로 맞춰야 공정한 비교가 됨.
-                # 그렇지 않으면 "IG는 medoid 대비, SHAP은 전체 평균 근처
-                # random sample 대비"로 서로 다른 기준점에서 평가되는
-                # 문제가 생김 (IG의 attribution 자체가 (x-baseline)을
-                # 포함하는 구조이므로 이 불일치가 결과를 왜곡할 수 있음).
                 if (not args.mean_baseline):
                     with torch.no_grad():
                         all_medoids = model.prototype_layer.ig_baseline  # (P, F)
@@ -1776,30 +1567,21 @@ def main():
                 shap_imp = None
                 shap_available = False
 
-            # ── Step 4. Random baseline ──────────────────────
             print(f"  [3/3] Random baseline 계산 중...")
             random_imp = np.abs(np.random.randn(n_test, n_features))
 
-            # ── Step 5. Insertion AUC 계산 ────────────────────
             def compute_insertion_auc(attribution):
-                """
-                attribution: (N, F) — 각 샘플의 feature 중요도
-                반환: 평균 insertion AUC (높을수록 좋음)
-                """
                 baseline_is_per_sample = (X_baseline.dim() == 2)
 
                 aucs = []
                 for n in range(n_test):
                     baseline_n = X_baseline[n] if baseline_is_per_sample else X_baseline
 
-                    # 순위 (높은 importance 먼저)
                     order = np.argsort(-attribution[n])  # (F,)
 
-                    # baseline 상태에서 시작 → 중요 feature부터 1개씩 복원
                     inserted = baseline_n.clone()
                     preds    = []
 
-                    # baseline prediction
                     with torch.no_grad():
                         lg = model(inserted.unsqueeze(0))["logits"]
                         if tasktype == "regression":
@@ -1811,7 +1593,6 @@ def main():
                             p = prob1 if target_class[n] == 1 else 1.0 - prob1
                         preds.append(p)
 
-                    # 중요 feature부터 복원
                     for f_idx in order:
                         inserted[f_idx] = X_ia[n, f_idx]
                         with torch.no_grad():
@@ -1825,7 +1606,6 @@ def main():
                                 p = prob1 if target_class[n] == 1 else 1.0 - prob1
                             preds.append(p)
 
-                    # 정규화된 AUC (trapezoidal rule)
                     try:
                         auc = np.trapezoid(preds) / n_features
                     except AttributeError:
@@ -1869,7 +1649,6 @@ def main():
                     print(f"  [Wilcoxon 실패: {e}]")
             print(f"  Random baseline: {random_aucs.mean():.4f}")
 
-            # 저장
             ia_save = {
                 "tabera_aucs": tabera_aucs.tolist(),
                 "shap_aucs":   shap_aucs.tolist() if shap_available else None,
@@ -1887,11 +1666,6 @@ def main():
             print(f"\n  저장: {ia_path}")
 
         # ── random_neighbor / neighbor_noise: 성능 비교 ─────────────
-        # full model 대비 성능 하락을 측정.
-        # random_neighbor: 틀린(그러나 real) 이웃로 교체 시 하락 → retrieval 정확도의 가치
-        # neighbor_noise : 이웃 정보 자체를 노이즈로 교체 시 하락 → neighbor evidence 자체의 가치
-        # 두 값을 같이 보면: neighbor_noise 하락폭이 random_neighbor보다 커야
-        # "틀린 이웃이라도 real data가 낫다"는 게 일관되게 확인됨
         else:
             with torch.no_grad():
                 abl_logits_list, abl_labels_list = [], []
@@ -1942,13 +1716,6 @@ def main():
                 arrow = "▼" if delta < -0.001 else ("▲" if delta > 0.001 else "─")
                 print(f"  {k_name:<20} {v_full:>12.4f}  {v_abl:>12.4f}  {delta:>+9.4f} {arrow}")
 
-            # ── evidence_w 엔트로피 비교 ──────────────────────────
-            # 목적: neighbor_noise/random_neighbor에서 성능 하락이 왜
-            # 다른지, evidence_w(attention weight)가 얼마나 uniform하게
-            # 퍼졌는지로 설명되는지 확인. nk가 진짜 임베딩이면 유사도가
-            # 뾰족(집중)할 수 있고, nk가 순수 노이즈면 고차원에서 거의
-            # 직교라 유사도가 다 비슷해져 evidence_w가 uniform에 가까워질
-            # 것이라는 가설을 직접 검증.
             evw_stats = {}
             if full_evw is not None and abl_evw is not None:
                 k_dim = full_evw.shape[-1]
@@ -1993,7 +1760,6 @@ def main():
                     print(f"    성능이 덜 떨어진 건 uniform 평균이 이 데이터셋에서")
                     print(f"    우연히 나쁘지 않은 예측이기 때문일 수 있음.")
 
-            # ablation 결과 저장
             abl_save = {
                 "ablation_mode":  args.ablation,
                 "full_metrics":   test_metrics,
@@ -2031,6 +1797,14 @@ def main():
         "use_context_emb": True,
         "detach_context_grad": args.detach_context_grad,
         "use_context_projection": args.context_projection,
+        "cat_embedding": True,  # [후보 A] categorical nn.Embedding 적용 여부 기록
+        "cat_combine": args.cat_combine,
+        "cat_embed_dim": args.cat_embed_dim if args.cat_combine == "concat" else None,
+        "num_embedding": args.num_embedding,
+        "num_bins": args.num_bins if args.num_embedding == "ple" else None,
+        "plr_n_frequencies": args.plr_n_frequencies if args.num_embedding == "plr_lite" else None,
+        "plr_freq_scale": args.plr_freq_scale if args.num_embedding == "plr_lite" else None,
+        "plr_out_dim": args.plr_out_dim if args.num_embedding == "plr_lite" else None,
     }
     with open(meta_path, "wb") as f:
         pickle.dump(meta, f)
@@ -2086,20 +1860,15 @@ def main():
 
         explanations = out.get("explanations", [])
 
-        # FeatureStore에서 이웃 feature 값 조회하여 설명에 추가
         topk_idx = out.get("topk_idx")
         if model.feature_store is not None and topk_idx is not None:
             cat_names = {dataset.col_names[i] for i in dataset.X_cat}
             X_show_cpu = X_show.detach().cpu().numpy()
-            # topk_idx: (B, k) → B개 샘플별 k개 이웃 인덱스
             neighbour_feats = model.feature_store.retrieve(topk_idx)  # list[list[dict]]
             for b, exp in enumerate(explanations):
                 if b < len(neighbour_feats):
                     query_dict = {name: float(X_show_cpu[b, i])
                                   for i, name in enumerate(dataset.col_names)}
-                    # query와 가장 가까운(=비슷한) feature 위주로 선택 —
-                    # 이웃 혼자 값이 큰 feature가 아니라, "그래서 왜 이
-                    # 이웃과 비슷한지"를 설명하는 feature를 보여준다.
                     exp["neighbour_features"] = [
                         _select_query_similar_features(query_dict, nd, cat_names)
                         for nd in neighbour_feats[b]

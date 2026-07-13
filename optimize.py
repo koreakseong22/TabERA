@@ -54,6 +54,31 @@ parser.add_argument("--context_projection", action="store_true",
                         "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
                         "centroid_x/confidence) 계산에는 관여하지 않음."
                     ))
+parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
+                    help=(
+                        "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
+                        "TabR/ModernNCA 계보 — 학습 파라미터 없는 순수 one-hot. 'sum'/"
+                        "'concat'은 이전 실험용 옵션(reproduce.py와 동일)."
+                    ))
+parser.add_argument("--cat_embed_dim", type=int, default=16,
+                    help="cat_combine=concat일 때 컬럼별 embedding 차원 (기본 16).")
+parser.add_argument("--num_embedding", type=str, default="plr_lite",
+                    choices=["linear", "ple", "plr_lite"],
+                    help=(
+                        "numeric feature 인코딩 방식. 'plr_lite'(기본값, 채택 확정)는 "
+                        "TabR/ModernNCA 방식 — 주기함수 + 전체 컬럼 공유 Linear+ReLU. "
+                        "'linear'/'ple'는 이전 실험용 옵션(reproduce.py와 동일)."
+                    ))
+parser.add_argument("--num_bins", type=int, default=8,
+                    help="num_embedding=ple일 때 컬럼당 구간(bin) 개수 (기본 8).")
+# [제거됨] --plr_n_frequencies/--plr_freq_scale/--plr_out_dim
+# num_embedding=plr_lite면 이제 search_space.py의 get_search_space()가
+# trial마다 이 값들을 직접 탐색함(Gorishniy et al. 2022 권장 방식) —
+# 고정 CLI 플래그로 두면 100 trial이 전부 같은 값을 써서 일부 데이터셋
+# (mfeat-fourier, vehicle 등 numeric-only)에서 완전 붕괴 trial이 반복
+# 관찰됨. reproduce.py(최종 1회 학습)에서는 여전히 고정값이 필요하므로
+# 거기엔 이 플래그들이 남아있음 — HPO가 찾은 값은 best_params에 저장되고
+# reproduce.py가 그 study를 재사용할 때 자동으로 반영됨.
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
@@ -93,7 +118,11 @@ if not os.path.exists(savepath):
 _ablation_tag = ("..no_offset" if args.no_offset_correction else "") + \
                 ("..global_retrieve" if args.global_retrieve else "") + \
                 ("..detach_ctx" if args.detach_context_grad else "") + \
-                ("..ctx_proj" if args.context_projection else "")
+                ("..ctx_proj" if args.context_projection else "") + \
+                ("..cat_concat" if args.cat_combine == "concat" else "") + \
+                ("..cat_sum" if args.cat_combine == "sum" else "") + \
+                ("..num_ple" if args.num_embedding == "ple" else "") + \
+                ("..num_linear" if args.num_embedding == "linear" else "")
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
 # ─────────────────────────────────────────────────────────────
@@ -139,6 +168,7 @@ if train:
         print(f"  Diagnostic: task_loss gradient to centroid_emb DETACHED (diversity_loss only)")
     if args.context_projection:
         print(f"  Adjustment: context_emb routed through learned Linear projection before head")
+    print(f"  Encoding: cat_combine={args.cat_combine}, num_embedding={args.num_embedding}")
     print(f"  Save    : {fname}")
     print("=" * 60)
 
@@ -159,6 +189,15 @@ if train:
     n_proto_default = max(4, int(math.sqrt(len(y_train))))
     print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
 
+    # ── PLE(Piecewise Linear Encoding) 구간 경계 계산 (num_embedding=ple일 때만) ──
+    # reproduce.py와 동일 로직 — objective() 밖에서 한 번만 계산 (trial마다
+    # 다시 계산할 이유 없음, 데이터에서 파생되는 값이라 trial 하이퍼파라미터와 무관).
+    num_bin_edges = None
+    if args.num_embedding == "ple" and len(dataset.X_num) > 0:
+        X_num_train = X_train[:, dataset.X_num]
+        q = torch.linspace(0.0, 1.0, args.num_bins + 1, device=X_num_train.device)
+        num_bin_edges = torch.quantile(X_num_train, q, dim=0).T.contiguous()
+
     # ── 자동 가설 생성 (컬럼 평균 기준) ──────────────────
 
     global best_so_far
@@ -168,7 +207,8 @@ if train:
     def objective(trial):
         global best_so_far
         params       = get_search_space(trial, num_features=X_train.size(1),
-                                        data_id=args.openml_id, metric=args.metric)
+                                        data_id=args.openml_id, metric=args.metric,
+                                        num_embedding=args.num_embedding)
         # sqrt(N) 기반 n_prototypes override (가설 ② 복잡도 개선)
         params["n_prototypes"] = n_proto_default
         trial.set_user_attr("n_prototypes_actual", n_proto_default)
@@ -177,6 +217,14 @@ if train:
         model = TabERA(
             **model_kwargs,
             column_names=dataset.col_names,
+            # [필수 수정 — 이전엔 아예 빠져 있었음] AttentionAggregator의
+            # 이웃 라벨 인코딩이 classification(nn.Embedding)/regression
+            # (nn.Linear)을 구분하려면 tasktype이 필요함. TabR 원본
+            # (yandex-research/tabular-dl-tabr)도 이렇게 조건부로 나뉘어
+            # 있음 — 없으면 명목형 클래스 라벨을 raw 정수로 취급하는,
+            # 오늘 categorical feature에서 고친 것과 같은 문제가 생김.
+            tasktype=tasktype,
+            n_classes=(output_dim if tasktype == "multiclass" else (2 if tasktype == "binclass" else None)),
             # [수정] 기존 min(2*N, 10_000) 캡은 N_train > 10,000인 데이터셋에서
             # MemoryBank가 X_train 전체를 담지 못하게 만들어 sample_groups가
             # 실제 그룹의 일부(최대 28%, id=41027 기준)만 반영하게 됨.
@@ -190,6 +238,28 @@ if train:
             global_retrieve=args.global_retrieve,
             detach_context_grad=args.detach_context_grad,
             use_context_projection=args.context_projection,
+            # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
+            # 인코딩. 이게 없으면 cat_col_idx=None이 돼서 cat_combine/
+            # num_embedding 설정과 무관하게 raw-encoding 경로로 빠짐 — HPO가
+            # reproduce.py와 다른 아키텍처를 기준으로 하이퍼파라미터를 찾게
+            # 되는 불일치가 있었음 (reproduce.py는 최종 학습에서 categorical
+            # embedding을 쓰는데, 그 best_params는 이걸 안 쓰던 시절 HPO
+            # 결과였음). 채택 확정된 기본값(onehot+PLR lite)을 HPO도 그대로
+            # 씀 — jasmine 등에서 봤던 "구조 바뀌었는데 하이퍼파라미터는
+            # 헌 것" 문제의 근본 원인.
+            cat_col_idx=list(dataset.X_cat),
+            num_col_idx=list(dataset.X_num),
+            cat_cardinalities=list(dataset.X_cat_cardinality),
+            cat_combine=args.cat_combine,
+            cat_embed_dim=args.cat_embed_dim,
+            num_embedding=args.num_embedding,
+            num_bin_edges=num_bin_edges,
+            # plr_n_frequencies/plr_freq_scale/plr_out_dim은 여기서 안 넘김 —
+            # num_embedding="plr_lite"면 model_kwargs(get_search_space가 trial마다
+            # 탐색한 값, params_to_model_kwargs를 거쳐 옴)에 이미 들어있어서
+            # 여기 또 넘기면 "같은 키워드 인자 중복" 에러가 남. plr_lite가
+            # 아니면 애초에 안 쓰이는 값이라 안 넘겨도 무방(TabERA 기본값이
+            # 대신 채워지지만 어차피 참조 안 됨).
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,
