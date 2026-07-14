@@ -644,6 +644,35 @@ class CentroidLayer(nn.Module):
                         self.dead_streak[p] = 0
                         n_reinit += 1
 
+        # [버그 수정] dead-code reinit이 여러 centroid를 동시에 재배치하면
+        # (jasmine 실측: 한 번의 regroup_update에서 최대 11개, P=48의 20%
+        # 이상), 그 새 위치들이 재초기화 안 된 다른 centroid들의 영역까지
+        # 침범할 수 있다 — 라우팅은 상대적 거리로 정해지므로, centroid
+        # 하나만 옮겨도 그 이웃 centroid들의 담당 영역(Voronoi 경계)이
+        # 같이 바뀐다. 그런데 sample_groups는 reinit *이전* centroid_emb
+        # 기준으로 이미 계산돼 있었고(위 self.sample_groups = new_groups),
+        # 정작 저장되는 건(supervised.py의 best_state) reinit *이후*
+        # centroid_emb이므로, 이 둘이 서로 다른 시점의 스냅샷이 되어버림.
+        # dual_space_faithfulness의 "재배정 일치율"이 무작위 수준(심지어
+        # 그보다 낮게)까지 떨어지는 근본 원인이 이것이었음(재초기화된
+        # centroid 자신의 sample_groups는 원래 비어있어 문제가 안 되지만,
+        # 그 영향을 받는 "다른" centroid들의 sample_groups가 stale해짐).
+        # reinit이 하나라도 있었다면, 최종 centroid_emb 기준으로 assignment를
+        # 다시 계산해 sample_groups/sizes를 덮어써서 항상 서로 일치하게
+        # 만든다 — 비용은 이미 갖고 있는 X_emb에 대한 argmax 한 번 더뿐.
+        if n_reinit > 0:
+            with torch.no_grad():
+                q_final = F.normalize(X_emb.float(), dim=-1)
+                c_final = F.normalize(self.centroid_emb, dim=-1)
+                assignments_final = (q_final @ c_final.T).argmax(dim=-1).cpu()
+            new_groups = [[] for _ in range(P)]
+            sizes = [0] * P
+            for p in range(P):
+                mask_cpu = (assignments_final == p).nonzero(as_tuple=True)[0]
+                new_groups[p] = mask_cpu.tolist()
+                sizes[p] = len(new_groups[p])
+            self.sample_groups = new_groups
+
         # 통계
         n_assigned = sum(1 for s in sizes if s > 0)
 

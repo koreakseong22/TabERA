@@ -1874,6 +1874,61 @@ def main():
             if not index_ok:
                 valid_p = []
 
+            # ── [추가] 스토어 간 슬롯 대응 직접 검증 ──────────────────
+            # [배경] 위 검증은 "sample_groups(캐시)가 지금 라우팅과 맞는가"만
+            # 봄 — MemoryBank와 FeatureStore가 애초에 같은 슬롯에 같은
+            # 샘플을 담고 있는지는 통계적 정황(검증 2가 유의하게 나오면
+            # 간접적으로 그럴듯하다)에만 의존하고 있었음. 이건 직접 증명이
+            # 아니라서, 여기서 직접 재확인한다: memory.keys[i]는 삽입
+            # 시점 embedder(feature_store._store[i])였으므로, 지금
+            # feature_store._store[i]를 다시 embedder에 통과시켜 비교하면
+            # 같은 슬롯인지 바로 알 수 있음.
+            # [주의] 삽입 시점은 train mode(dropout 켜짐), 지금 재계산은
+            # eval mode라 절대 유사도가 1.0에 못 미치는 게 정상 — 그래서
+            # 절대 문턱값 대신, 매칭된 슬롯끼리의 유사도를 일부러 무작위로
+            # 섞은 슬롯끼리의 유사도와 비교한다(이 프로젝트가 계속 써온
+            # null-비교 방식과 동일한 원칙).
+            print(f"\n  [사전 검증 1.5] 스토어 간 슬롯 대응 확인 (MemoryBank ↔ FeatureStore)")
+            if ref_raw is None or n_mem < 2:
+                print(f"    ⚠️  feature_store가 없거나 데이터가 부족해 이 검증을 건너뜁니다.")
+                store_ok = None
+            else:
+                n_check    = min(n_mem, 300)
+                check_idx  = torch.randperm(n_mem)[:n_check]
+                with torch.no_grad():
+                    recomputed = model.embedder(ref_raw[check_idx].to(device)).cpu()
+                recomputed_n = F.normalize(recomputed, dim=-1)
+                stored_n     = F.normalize(ref_emb[check_idx], dim=-1)
+                matched_sim  = (recomputed_n * stored_n).sum(dim=-1)
+                shuffled_idx = torch.randperm(n_check)
+                shuffled_sim = (recomputed_n * stored_n[shuffled_idx]).sum(dim=-1)
+
+                print(f"    매칭된 슬롯끼리 코사인 유사도:      "
+                      f"{matched_sim.mean():.4f} ± {matched_sim.std():.4f}")
+                print(f"    무작위로 섞은 슬롯끼리 코사인 유사도: "
+                      f"{shuffled_sim.mean():.4f} ± {shuffled_sim.std():.4f}")
+                # [수정] 평균+3표준편차(정규분포 가정)는 shuffled_sim이
+                # 치우친/뚱뚱한 꼬리 분포일 때(임베딩 구조가 뚜렷할수록
+                # 무작위로 짝지어도 우연히 같은 군집끼리 묶이는 경우가
+                # 생겨 이렇게 됨) 문턱값이 코사인 유사도의 최댓값(1.0)을
+                # 넘어버려 항상 실패로 나오는 문제가 실측 확인됨(vehicle:
+                # matched=0.968인데도 shuffled_mean+3*std=1.29로 통과 불가).
+                # 정규분포를 가정하지 않는 percentile 비교로 교체 —
+                # margin_percentile penalty 때와 같은 이유.
+                shuffled_p99 = float(np.percentile(shuffled_sim.numpy(), 99))
+                matched_median = float(matched_sim.median())
+                print(f"    셔플 분포의 99th percentile: {shuffled_p99:.4f}  "
+                      f"vs  매칭 중앙값: {matched_median:.4f}")
+                store_ok = matched_median > shuffled_p99
+                if store_ok:
+                    print(f"    ✅ 매칭된 슬롯이 무작위 분포의 상위 1%보다도 확실히 유사함")
+                    print(f"       — 두 스토어의 슬롯이 같은 샘플을 가리키는 것으로 확인됨.")
+                else:
+                    print(f"    ❌ 매칭된 슬롯의 유사도가 무작위로 섞은 분포의 상위 1%")
+                    print(f"       수준을 못 넘습니다 — MemoryBank/FeatureStore 슬롯이")
+                    print(f"       서로 다른 샘플을 가리키고 있을 가능성이 있습니다.")
+                    valid_p = []
+
             print(f"\n  [검증 2] Between-Group Feature Separation")
             print(f"  (numeric: One-way ANOVA F-test / categorical: Chi-square 독립성 검정)")
 
