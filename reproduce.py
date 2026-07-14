@@ -295,7 +295,8 @@ def main():
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor", "neighbor_noise",
                                  "rank_correlation", "dual_space_faithfulness",
-                                 "interaction_check",
+                                 "interaction_check", "centroid_geometry",
+                                 "centroid_representativeness",
                                  "dataset_profile"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
@@ -330,6 +331,23 @@ def main():
                             "                         SHAP-Delta 불일치가 나왔을 때, 그게\n"
                             "                         상호작용 때문인지 SHAP 추정 오차\n"
                             "                         때문인지 구분하는 데 씀.\n"
+                            "  centroid_geometry      : centroid끼리 서로 얼마나 가까운지\n"
+                            "                         (cosine_similarity_matrix()) 확인.\n"
+                            "                         가까운 쌍이 같은 target을 대표하면\n"
+                            "                         (①이 하나의 영역을 여러 centroid로\n"
+                            "                         나눠 대표하는 의도된 설계) 정상,\n"
+                            "                         다른 target을 대표하면 그 경계의\n"
+                            "                         샘플들은 confidence는 낮은데 서사도\n"
+                            "                         갈리는 진짜 애매한 케이스일 수 있음.\n"
+                            "  centroid_representativeness : centroid_geometry가 못 보는 축 —\n"
+                            "                         '이 centroid가 자기한테 배정된 실제\n"
+                            "                         샘플들을 얼마나 잘 대표하는가'를 크기가\n"
+                            "                         아니라 순도(purity)·응집도(cohesion)\n"
+                            "                         기준으로 정렬해서 봄. 큰 centroid도 순도가\n"
+                            "                         높으면 정상(밀집 지역), 작은 centroid도\n"
+                            "                         순도 100%면 정당한 outlier 그룹 — 문제는\n"
+                            "                         '크지만 순도가 baseline(전역 최다 클래스\n"
+                            "                         비율)과 다를 바 없는' centroid.\n"
                             "  dataset_profile        : 예측 확신도, fallback 비율 등 빠른\n"
                             "                         데이터셋 진단(예전엔 IG completeness/\n"
                             "                         deletion_auc 포함했으나 ③=SHAP 통일로\n"
@@ -1128,6 +1146,384 @@ def main():
             with open(ic_path, "wb") as f:
                 pickle.dump(ic_save, f)
             print(f"\n  저장: {ic_path}")
+
+        # ── centroid_geometry: cosine_similarity_matrix()를 실제로 노출 ──
+        # (지금까지 정의만 되고 아무 데서도 안 쓰이던 진단 메서드)
+        #
+        # [설계 의도 반영] centroid끼리 가까운 것 자체는 버그가 아닐 수
+        # 있음 — 하나의 매니폴드/자연 군집을 여러 centroid가 나눠서
+        # 대표하도록(다중 커버리지) 의도적으로 설계된 것이라는 전제가
+        # 있음. 그래서 이 진단은 "가까운 쌍 = 나쁨"으로 단정하지 않고,
+        # 가까운 쌍을 찾은 뒤 그 둘의 target 구성(어떤 클래스/값을
+        # 대표하는가)이 서로 같은지 다른지로 한 번 더 나눠서 본다:
+        #   - 가깝고 target도 비슷함 → 의도한 대로 같은 영역을 일관되게
+        #     나눠 대표하는 것(다중 커버리지, 정상)
+        #   - 가깝지만 target이 다름 → 같은 embedding 위치에서 서로 다른
+        #     이야기를 하는 centroid들이 경합 중이라는 뜻 — 그 경계에
+        #     있는 쿼리의 confidence가 낮게 나오는 게 여기서 비롯될 수
+        #     있고, 이 경우가 실제로 살펴볼 가치가 있는 케이스.
+        elif args.ablation == "centroid_geometry":
+            model.eval()
+            P = model.prototype_layer.P
+            sim_matrix = model.prototype_layer.cosine_similarity_matrix()  # (P, P), CPU
+
+            print(f"\n  Centroid Geometry — cosine_similarity_matrix() 진단 (P={P})")
+            print(f"  {'─'*60}")
+            print(f"  centroid끼리 가까운 것 자체는 버그가 아닐 수 있음(하나의 매니폴드를")
+            print(f"  여러 centroid가 나눠 대표하도록 설계됨) — 여기서는 '가까운 쌍'을 찾은 뒤,")
+            print(f"  그 쌍의 target(대표 클래스/값) 구성이 같은지 다른지로 한 번 더 나눠서 봄.")
+
+            sim_np = sim_matrix.numpy()
+            off_diag_mask = ~np.eye(P, dtype=bool)
+            off_diag_vals = sim_np[off_diag_mask]
+
+            print(f"\n  [Off-diagonal 유사도 분포] (자기 자신 제외, {len(off_diag_vals)}개 쌍)")
+            print(f"    mean={off_diag_vals.mean():.4f}  std={off_diag_vals.std():.4f}  "
+                  f"median={np.median(off_diag_vals):.4f}  max={off_diag_vals.max():.4f}")
+
+            # 상위 top_n_pairs개 가장 가까운 쌍 (i<j로 중복 제거)
+            top_n_pairs = min(10, P * (P - 1) // 2)
+            iu = np.triu_indices(P, k=1)
+            pair_sims = sim_np[iu]
+            top_idx = np.argsort(-pair_sims)[:top_n_pairs]
+
+            target_labels = model.prototype_layer.target_labels
+            labels_list    = model.prototype_layer.labels
+
+            print(f"\n  [가장 가까운 centroid 쌍 top {top_n_pairs}]")
+            print(f"  {'Pair':<20} {'cos_sim':>8}  {'같은 target?':<14}  {'세부'}")
+            print(f"  {'─'*90}")
+
+            same_target_count = 0
+            diff_target_count = 0
+            unknown_count      = 0
+
+            for idx in top_idx:
+                i, j = int(iu[0][idx]), int(iu[1][idx])
+                s = float(pair_sims[idx])
+                pair_name = f"{labels_list[i]}-{labels_list[j]}"
+
+                ti = target_labels.get(i) if target_labels is not None else None
+                tj = target_labels.get(j) if target_labels is not None else None
+
+                if ti is None or tj is None:
+                    verdict = "?(그룹 too small)"
+                    detail  = ""
+                    unknown_count += 1
+                elif ti["kind"] == "classification":
+                    if ti["top_class"] == tj["top_class"]:
+                        verdict = "같음"
+                        same_target_count += 1
+                        detail = (f"둘 다 '{ti['top_class_name']}' "
+                                  f"({ti['top_prop']:.0%} vs {tj['top_prop']:.0%})")
+                    else:
+                        verdict = "⚠️ 다름"
+                        diff_target_count += 1
+                        detail = (f"'{ti['top_class_name']}'({ti['top_prop']:.0%}) vs "
+                                  f"'{tj['top_class_name']}'({tj['top_prop']:.0%})")
+                else:  # regression
+                    pdiff = abs(ti["percentile"] - tj["percentile"])
+                    if pdiff < 20.0:
+                        verdict = "비슷함"
+                        same_target_count += 1
+                    else:
+                        verdict = "⚠️ 다름"
+                        diff_target_count += 1
+                    detail = (f"percentile {ti['percentile']:.0f} vs {tj['percentile']:.0f} "
+                              f"(Δ{pdiff:.0f})")
+
+                print(f"  {pair_name:<20} {s:>8.4f}  {verdict:<14}  {detail}")
+
+            print(f"\n  [요약] 가까운 top {top_n_pairs}쌍 중: "
+                  f"같은/비슷한 target {same_target_count}쌍, "
+                  f"⚠️ 다른 target {diff_target_count}쌍, "
+                  f"판단불가 {unknown_count}쌍")
+
+            print(f"\n  [해석]")
+            if diff_target_count == 0:
+                print(f"  ✅ 가까운 centroid 쌍은 전부 같은/비슷한 target을 대표함 — ")
+                print(f"    의도한 대로 하나의 영역을 여러 centroid가 일관되게 나눠 대표하는")
+                print(f"    '다중 커버리지'로 보임. 이 경우 confidence가 낮게 나오는 건 버그가")
+                print(f"    아니라, 애초에 여러 centroid가 같은 이야기를 하도록 설계된 결과일")
+                print(f"    가능성이 큼.")
+            else:
+                print(f"  ⚠️  가까운 centroid 쌍 중 {diff_target_count}개가 서로 다른 target을")
+                print(f"    대표함 — 이 쌍들 근처에 있는 쿼리는 'confidence는 낮은데 서사도")
+                print(f"    갈리는' 진짜 애매한 케이스일 수 있음. 위 표에서 ⚠️ 표시된 쌍을 눈여겨")
+                print(f"    볼 것 (예: credit-g의 Centroid_25-Centroid_23이 여기 있는지 직접 확인).")
+
+            # ── Query-Centroid 유사도: centroid끼리의 유사도와 나란히 비교 ──
+            # centroid-centroid 유사도가 이미 압축돼 있다면(위 off-diagonal
+            # 분포), 그게 이 embed_dim 공간 자체의 특성(고차원에서 cosine
+            # similarity가 0 근처로 몰리는 현상)인지, 아니면 정말 query 쪽만
+            # 특별히 애매한 것인지는 query-centroid 유사도를 직접 봐야
+            # 구분됨. "가장 확실한 매칭"조차 이 공간에서 어디까지 올라가는지
+            # 확인하는 게 핵심.
+            print(f"\n  {'='*60}")
+            print(f"  [Query-Centroid 유사도] — 위 centroid-centroid 유사도와 비교용")
+            print(f"  {'='*60}")
+
+            n_qc = X_test.shape[0]  # 전체 테스트셋 (비용이 forward 1회뿐이라 샘플링 불필요)
+            _qc_batch = 256
+            top1_sims  = []
+            margins    = []  # top1 - top2 (라우팅이 얼마나 여유있게 갈렸는지)
+            with torch.no_grad():
+                c_norm_qc = F.normalize(model.prototype_layer.centroid_emb, dim=-1)  # (P, D)
+                for start in range(0, n_qc, _qc_batch):
+                    X_batch = X_test[start:start + _qc_batch]
+                    q_norm_qc = F.normalize(model.embedder(X_batch), dim=-1)          # (b, D)
+                    sim_qc = q_norm_qc @ c_norm_qc.T                                   # (b, P)
+                    top2 = sim_qc.topk(min(2, P), dim=-1).values                       # (b, ≤2)
+                    top1_sims.append(top2[:, 0].cpu())
+                    if top2.shape[1] > 1:
+                        margins.append((top2[:, 0] - top2[:, 1]).cpu())
+
+            top1_sims = torch.cat(top1_sims).numpy()
+            margins   = torch.cat(margins).numpy() if margins else np.array([])
+
+            print(f"\n  [Top-1 query-centroid 유사도 분포] (n={n_qc}, raw cosine, scale/temperature 적용 전)")
+            print(f"    mean={top1_sims.mean():.4f}  std={top1_sims.std():.4f}  "
+                  f"median={np.median(top1_sims):.4f}")
+            print(f"    min={top1_sims.min():.4f}  max={top1_sims.max():.4f}")
+
+            print(f"\n  [Top1-Top2 margin 분포] (라우팅이 2등과 얼마나 벌어져 있는지)")
+            print(f"    mean={margins.mean():.4f}  std={margins.std():.4f}  "
+                  f"median={np.median(margins):.4f}  min={margins.min():.4f}")
+            narrow_margin_ratio = float((margins < 0.01).mean())
+            print(f"    margin<0.01인 샘플 비율: {narrow_margin_ratio:.1%} "
+                  f"(1등·2등이 사실상 구분 안 되는 쿼리)")
+
+            print(f"\n  {'─'*60}")
+            print(f"  [Null 베이스라인] 완전 무작위(학습 전혀 안 된) centroid/query 벡터를")
+            print(f"  같은 D/P/N 조건으로 50회 시뮬레이션 — '이 정도 구조는 학습 없이도")
+            print(f"  나오는가'를 z-score로 직접 검정. (3배 임계값 같은 임의 배수 대신")
+            print(f"  이 방식을 씀 — 실측으로 그 배수 판정이 SpeedDating에서 틀렸던 걸 확인함.)")
+
+            D = model.prototype_layer.centroid_emb.shape[1]
+            n_null_trials = 50
+            null_top1_medians = np.empty(n_null_trials)
+            null_margin_means = np.empty(n_null_trials)
+            for _t in range(n_null_trials):
+                _g = torch.Generator().manual_seed(args.seed * 1000 + _t)
+                _q_null = F.normalize(torch.randn(n_qc, D, generator=_g), dim=-1)
+                _c_null = F.normalize(torch.randn(P, D, generator=_g), dim=-1)
+                _sim_null = _q_null @ _c_null.T
+                _top2_null = _sim_null.topk(min(2, P), dim=-1).values
+                null_top1_medians[_t] = _top2_null[:, 0].median().item()
+                if _top2_null.shape[1] > 1:
+                    null_margin_means[_t] = (_top2_null[:, 0] - _top2_null[:, 1]).mean().item()
+                else:
+                    null_margin_means[_t] = float("nan")
+
+            null_top1_mean, null_top1_std = float(null_top1_medians.mean()), float(null_top1_medians.std())
+            null_margin_mean, null_margin_std = float(np.nanmean(null_margin_means)), float(np.nanstd(null_margin_means))
+
+            z_top1   = (float(np.median(top1_sims)) - null_top1_mean) / (null_top1_std + 1e-8)
+            z_margin = (float(margins.mean()) - null_margin_mean) / (null_margin_std + 1e-8)
+
+            print(f"\n  {'':<28} {'null(50회)':>16}  {'실측':>10}  {'z-score':>8}")
+            print(f"  {'top1 유사도 median':<28} {null_top1_mean:>9.4f}±{null_top1_std:<5.4f}  "
+                  f"{np.median(top1_sims):>10.4f}  {z_top1:>8.2f}")
+            print(f"  {'margin(top1-top2) mean':<28} {null_margin_mean:>9.4f}±{null_margin_std:<5.4f}  "
+                  f"{margins.mean():>10.4f}  {z_margin:>8.2f}")
+
+            print(f"\n  [해석]")
+            if z_margin < -2.0:
+                print(f"  🔴 margin이 무작위 null보다 유의하게 '더 좁습니다'(z={z_margin:.2f}) —")
+                print(f"    이건 단순히 '학습이 구조를 못 만들었다'가 아니라, 학습 과정이")
+                print(f"    top1·top2를 오히려 무작위보다 더 가깝게 만들고 있다는 뜻입니다.")
+                print(f"    routing_scale이 낮으면(현재 {model.prototype_layer.routing_scale:.2f})")
+                print(f"    STE backward의 soft 분포가 flat해서, gradient가 query를 여러")
+                print(f"    centroid 방향의 blend 쪽으로 당기는 것으로 추정됨(가설, 확정 아님) —")
+                print(f"    routing_scale이 큰 다른 데이터셋에서는 이 현상이 없었음(z≫0).")
+                print(f"    ⚠️ 이건 reproduce.py(추론 전용)에서 post-hoc으로 못 고칩니다 —")
+                print(f"    이미 학습된 embedding을 다시 정렬시키려면 재학습이 필요합니다.")
+            elif z_top1 < 2.0 and z_margin < 2.0:
+                print(f"  ⚠️  top1 유사도·margin 둘 다 무작위 null과 통계적으로 구분되지")
+                print(f"    않습니다(z_top1={z_top1:.2f}, z_margin={z_margin:.2f}) — 이 데이터셋의")
+                print(f"    centroid 라우팅이 학습을 통해 유의미한 구조를 갖췄다고 보기")
+                print(f"    어렵습니다. ①의 confidence·runner-up 정보가 '진짜 기하학적")
+                print(f"    신호'라기보다 노이즈에 가까울 수 있음.")
+            else:
+                print(f"  ✅ 무작위 null보다 유의하게 큼(z_top1={z_top1:.2f}, z_margin={z_margin:.2f}) —")
+                print(f"    이 데이터셋의 centroid 라우팅은 학습을 통해 실제로 유의미한 구조를")
+                print(f"    갖췄다고 볼 수 있음. 이 공간 안에서 confidence가 낮게 나오는 샘플은")
+                print(f"    '노이즈'가 아니라 상대적으로 정말 애매한 축에 속하는 케이스로 봐도 됨.")
+
+            cg_save = {
+                "sim_matrix":         sim_np.tolist(),
+                "off_diag_mean":      float(off_diag_vals.mean()),
+                "off_diag_std":       float(off_diag_vals.std()),
+                "top_pairs":          [(int(iu[0][idx]), int(iu[1][idx]), float(pair_sims[idx]))
+                                          for idx in top_idx],
+                "same_target_count":  same_target_count,
+                "diff_target_count":  diff_target_count,
+                "qc_top1_mean":       float(top1_sims.mean()),
+                "qc_top1_median":     float(np.median(top1_sims)),
+                "qc_top1_max":        float(top1_sims.max()),
+                "qc_margin_mean":     float(margins.mean()) if len(margins) else None,
+                "qc_margin_narrow_ratio": narrow_margin_ratio,
+                "null_top1_mean":     null_top1_mean,
+                "null_top1_std":      null_top1_std,
+                "null_margin_mean":   null_margin_mean,
+                "null_margin_std":    null_margin_std,
+                "z_top1":             float(z_top1),
+                "z_margin":           float(z_margin),
+                "openml_id":          openml_id,
+                "seed":               args.seed,
+            }
+            cg_path = (
+                Path(log_dir)
+                / f"data={openml_id}..seed{args.seed}_centroid_geometry.pkl"
+            )
+            with open(cg_path, "wb") as f:
+                pickle.dump(cg_save, f)
+            print(f"\n  저장: {cg_path}")
+
+        # ── centroid_representativeness: 크기가 아니라 대표성(purity·cohesion) ──
+        # [배경] centroid_geometry는 "가까운 centroid 쌍이 서로 다른 target을
+        # 대표하는가"를 봤는데, 이건 쌍(pair) 단위 진단이라 "이 centroid
+        # 하나가 자기 그룹을 얼마나 잘 대표하는가"는 안 봄. 크기가 크다고
+        # 나쁜 게 아니고(데이터가 밀집된 영역이면 자연스럽게 큼), 작다고
+        # 나쁜 것도 아님(outlier 영역이면 작은 게 정상) — 유일하게 문제인
+        # 경우는 "크든 작든, 그 그룹 내부가 실제로 하나의 이야기로
+        # 수렴하지 않는" 경우. 그래서 크기 대신 순도(purity, 그룹 내
+        # 최다 target 비율)와 응집도(cohesion, 그룹 내 실제 샘플들이
+        # 자기 centroid 주변에 얼마나 모여있는지)로 정렬해서 본다.
+        elif args.ablation == "centroid_representativeness":
+            model.eval()
+            P = model.prototype_layer.P
+            sample_groups = model.prototype_layer.sample_groups
+            target_labels = model.prototype_layer.target_labels
+            class_names = getattr(dataset, "target_class_names", None)
+
+            print(f"\n  Centroid Representativeness (P={P})")
+            print(f"  {'─'*60}")
+            print(f"  크기가 아니라 대표성을 봄 — 크더라도 순도가 높으면 정상(밀집")
+            print(f"  지역), 작더라도 순도가 100%면 정당한 outlier 그룹. 순도가")
+            print(f"  baseline(전역 최다 target 비율)과 다를 바 없는 centroid만 문제.")
+
+            y_train_np = y_train.detach().cpu().numpy()
+
+            if tasktype in ("multiclass", "binclass"):
+                y_int = np.rint(y_train_np).astype(int)
+                vals, counts = np.unique(y_int, return_counts=True)
+                global_majority_prop = float(counts.max() / counts.sum())
+                global_majority_cls  = int(vals[counts.argmax()])
+                global_majority_name = (
+                    class_names[global_majority_cls]
+                    if class_names is not None and global_majority_cls < len(class_names)
+                    else f"Class {global_majority_cls}"
+                )
+                print(f"\n  [전역 baseline] 최다 target '{global_majority_name}' = "
+                      f"{global_majority_prop:.1%} (n_classes={len(vals)})")
+                print(f"  → 순도가 이 값보다 안 높으면, centroid가 굳이 있을 필요 없이")
+                print(f"    '그냥 전체 다수결로 찍는 것'과 다를 바 없다는 뜻.")
+            else:
+                global_std = float(y_train_np.std())
+                print(f"\n  [전역 baseline] y_train std = {global_std:.4f}")
+                print(f"  → 그룹 내 std가 이 값과 다를 바 없으면, centroid가 굳이 있을")
+                print(f"    필요 없이 '전체 평균'과 다를 바 없다는 뜻.")
+
+            print(f"\n  [1/2] cohesion 계산 중 (train set 전체 embedding, feature {model.n_features}개)...")
+            with torch.no_grad():
+                c_norm = F.normalize(model.prototype_layer.centroid_emb, dim=-1)  # (P, D)
+                q_chunks = []
+                _batch = 256
+                for start in range(0, X_train.shape[0], _batch):
+                    q_chunks.append(
+                        F.normalize(model.embedder(X_train[start:start + _batch]), dim=-1).cpu()
+                    )
+                q_all = torch.cat(q_chunks)  # (N_train, D), CPU
+            c_norm_cpu = c_norm.cpu()
+
+            print(f"  [2/2] centroid별 purity·cohesion 집계 중...")
+            rows = []  # (p, size, purity_or_None, gap_or_None, cohesion, label_str)
+            for p in range(P):
+                grp = sample_groups[p] if sample_groups is not None else None
+                size = len(grp) if grp else 0
+                if size == 0:
+                    continue
+
+                idx_t   = torch.as_tensor(grp, dtype=torch.long)
+                q_grp   = q_all[idx_t]                               # (size, D)
+                cohesion = float((q_grp @ c_norm_cpu[p]).mean())
+
+                tl = target_labels.get(p) if target_labels is not None else None
+                if tl is None:
+                    rows.append((p, size, None, None, cohesion, "N/A(그룹<2)"))
+                    continue
+
+                if tl["kind"] == "classification":
+                    purity = tl["top_prop"]
+                    gap    = purity - global_majority_prop
+                    label_str = f"{tl['top_class_name']} {purity:.0%}"
+                else:
+                    y_grp     = y_train_np[grp]
+                    group_std = float(np.std(y_grp))
+                    purity    = 1.0 - (group_std / (global_std + 1e-8))
+                    gap       = purity  # baseline은 정의상 0
+                    label_str = f"mean={tl['group_mean']:.3g}, 집중도={purity:.0%}"
+
+                rows.append((p, size, purity, gap, cohesion, label_str))
+
+            # cohesion의 전체(centroid 간) percentile — 다른 centroid 대비 상대 순위
+            cohesion_vals = np.array([r[4] for r in rows])
+            cohesion_ranks = {
+                r[0]: float((cohesion_vals < r[4]).mean()) for r in rows
+            }
+
+            rows_known   = sorted([r for r in rows if r[2] is not None], key=lambda r: r[2])
+            rows_unknown = [r for r in rows if r[2] is None]
+
+            print(f"\n  {'Centroid':<12} {'크기':>5}  {'대표':<20} {'gap vs baseline':>16}  "
+                  f"{'cohesion':>9}  {'cohesion 순위':>12}")
+            print(f"  {'─'*90}")
+            for p, size, purity, gap, cohesion, label_str in rows_known:
+                gap_str = f"{gap:+.1%}" if gap is not None else "-"
+                crank = cohesion_ranks[p]
+                flag = " ⚠️" if gap is not None and gap <= 0 else ""
+                print(f"  Centroid_{p:<4} {size:>5}  {label_str:<20} {gap_str:>16}  "
+                      f"{cohesion:>9.4f}  {crank:>11.0%}{flag}")
+            for p, size, purity, gap, cohesion, label_str in rows_unknown:
+                crank = cohesion_ranks[p]
+                print(f"  Centroid_{p:<4} {size:>5}  {label_str:<20} {'-':>16}  "
+                      f"{cohesion:>9.4f}  {crank:>11.0%}")
+
+            n_below_baseline = sum(1 for r in rows_known if r[3] is not None and r[3] <= 0)
+            print(f"\n  [요약] {len(rows_known)}개 그룹 평가 가능 중 {n_below_baseline}개가 baseline")
+            print(f"  이하(⚠️ 표시) — '있으나 마나 한' centroid 후보. {len(rows_unknown)}개는")
+            print(f"  그룹이 너무 작아(<2) 판단 불가.")
+
+            print(f"\n  [해석]")
+            print(f"  이 표는 purity 오름차순(대표성 낮은 것부터)이라, 위쪽에 있는")
+            print(f"  centroid일수록 자기 그룹을 잘 못 대표함. cohesion 순위가 같이")
+            print(f"  낮으면(예: 하위 20% 안) '경계가 애매한 것'을 넘어 '애초에 이")
+            print(f"  centroid 주변에 실제로 모인 게 없다'는 더 근본적인 신호일 수 있음")
+            print(f"  — purity는 낮은데 cohesion은 높다면 '여러 target이 섞여있지만")
+            print(f"  그 섞인 형태 자체는 일관됨'이라 해석이 다름. 100% 순도·응집도를")
+            print(f"  기대할 필요는 없음 — baseline 대비 나은지가 실질적인 기준.")
+
+            rep_save = {
+                "rows": [
+                    {"centroid": p, "size": size, "purity": purity, "gap": gap,
+                     "cohesion": cohesion, "cohesion_percentile": cohesion_ranks[p],
+                     "label": label_str}
+                    for p, size, purity, gap, cohesion, label_str in rows
+                ],
+                "global_majority_prop": (global_majority_prop
+                                          if tasktype in ("multiclass", "binclass") else None),
+                "global_std": (global_std if tasktype == "regression" else None),
+                "openml_id": openml_id,
+                "seed": args.seed,
+            }
+            rep_path = (
+                Path(log_dir)
+                / f"data={openml_id}..seed{args.seed}_centroid_representativeness.pkl"
+            )
+            with open(rep_path, "wb") as f:
+                pickle.dump(rep_save, f)
+            print(f"\n  저장: {rep_path}")
 
         elif args.ablation == "dual_space_faithfulness":
             model.eval()
