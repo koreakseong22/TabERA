@@ -39,7 +39,15 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
    (`routing_scale` widens the otherwise narrow [-1,1] range so the softmax
    isn't flat by construction — the same reason ArcFace/CosFace-style losses
    and cosine-router MoE literature scale logits before softmax), producing
-   `hard_assignment` and `context_emb`.
+   `hard_assignment` and `context_emb`. Centroids are trained with VQ-VAE's
+   full dual loss (`commitment_loss` pulls queries toward their centroid,
+   `codebook_loss` pulls centroids toward their queries — both operate on
+   L2-normalized vectors, matching what routing itself uses), kept at unit
+   norm via a CosFace-style reprojection after every optimizer step, and
+   protected from permanent dead centroids by a Jukebox/SoundStream-style
+   reset (a centroid with no assignments for several consecutive epochs is
+   reinitialized to a real embedding). See `docs/centroid-stability.md` for
+   the full mechanism and validation.
 3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the
    sample's group (cross-group fallback if the group is smaller than K).
    `AttentionAggregator` turns similarities into `evidence_w` and aggregates
@@ -56,7 +64,7 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
    exactly the two things TabERA's STE hard-routing and one-hot categorical
    encoding would break for a gradient-based method (see *Why SHAP*).
 
-**Design notes:** `diversity_loss`/`commitment_loss` keep centroids well-separated and queries committed; cross-group fallback was originally a per-sample Python loop (up to 348× slower on high-fallback datasets) and is now fully vectorized, verified bit-identical to the original.
+**Design notes:** `diversity_loss` keeps centroids well-separated; `commitment_loss`/`codebook_loss` keep queries and centroids mutually anchored (§ above); cross-group fallback is fully vectorized (a single offset-indexed gather, no per-sample Python loop), which matters most on datasets where fallback rate is high.
 
 ---
 
@@ -125,17 +133,15 @@ are correlated (a known critique — e.g. Aas et al., 2019).
 
 Its cost also scales with feature count — by design: `KernelExplainer`'s
 default `nsamples='auto'` is `2*F + 2048`, growing with `F` because the
-number of feature coalitions worth sampling grows with `F` too. An earlier
-version of this repo capped `nsamples` at a fixed value to control cost on
-wide datasets, but that turned out to be the wrong trade-off: on a 144-feature
-dataset, fixing `nsamples=100` (far below what `F` calls for) produced
-systematically *biased* SHAP-Delta rank correlation (Spearman ρ=0.53), not
-just noisier — raising `nsamples` to 500 alone moved it to ρ=0.63, well past
-what repeated-run Monte Carlo noise (±0.05) could explain. TabERA follows the
-library's own `auto` formula by default rather than a fixed cap, since a
-fixed sample count that ignores `F` reintroduces exactly this bias on wide
-datasets; `--shap_nsamples` remains available to override this manually if
-you deliberately want a cheaper, lower-precision run.
+number of feature coalitions worth sampling grows with `F` too. TabERA
+follows this library formula rather than a fixed sample count, because a
+fixed count that ignores `F` underdetermines the KernelSHAP regression on
+wide datasets and produces systematically *biased* attributions, not just
+noisier ones (on a 144-feature dataset, `nsamples=100` yields a
+SHAP-Delta Spearman ρ of 0.53; `nsamples=500` alone moves it to 0.63 —
+well past what Monte Carlo noise across repeated runs, ±0.05, could
+explain). `--shap_nsamples` remains available to override this manually
+if a cheaper, lower-precision run is preferred.
 
 *Cognitive inspiration (conceptual only): Central Tendency (Posner & Keele, 1968), Schema Theory (Bartlett, 1932), Dual-Process theory (Kahneman, 2011).*
 
@@ -162,16 +168,32 @@ does perturbing two features together move the prediction more than the sum
 of perturbing them separately?) before attributing any SHAP–Delta disagreement
 to "SHAP is capturing interaction."
 
+For ①'s underlying centroid layer specifically, two more ablations check
+health from different angles rather than assuming trained structure is
+automatically meaningful:
+- `--ablation centroid_geometry` — is centroid routing distinguishable from
+  a random, untrained one at all (50-trial null simulation, see
+  `docs/centroid-stability.md`)? Also used automatically inside HPO: a
+  percentile-based penalty (no fixed threshold) nudges Optuna away from
+  hyperparameter regions that converge to random-or-worse geometry, without
+  constraining the search space itself.
+- `--ablation centroid_representativeness` — does each individual centroid
+  actually represent the members assigned to it (purity vs. a global-
+  majority baseline, cohesion vs. the run's other centroids), independent
+  of group size?
+
 ---
 
 ## CLI reference
 
 - **`--explain`** — prints ①②③ as text.
-- **`--ablation`** — `random_neighbor` (wrong-but-real neighbors, tests retrieval correctness), `neighbor_noise` (fake neighbors, tests whether neighbor info matters at all — read together with `random_neighbor`), `rank_correlation` (SHAP-vs-Delta rank consistency check, see *Validation*), `interaction_check` (direct test for feature interaction, to interpret `rank_correlation` disagreements correctly), `dual_space_faithfulness` (validation above), `dataset_profile` (quick diagnostic for a new dataset — prediction confidence, fallback rate).
+- **`--ablation`** — `random_neighbor` (wrong-but-real neighbors, tests retrieval correctness), `neighbor_noise` (fake neighbors, tests whether neighbor info matters at all — read together with `random_neighbor`), `rank_correlation` (SHAP-vs-Delta rank consistency check, see *Validation*), `interaction_check` (direct test for feature interaction, to interpret `rank_correlation` disagreements correctly), `dual_space_faithfulness` (validation above), `centroid_geometry` (is routing distinguishable from random? see *Validation* and `docs/centroid-stability.md`), `centroid_representativeness` (does each centroid represent its own members, independent of size?), `dataset_profile` (quick diagnostic for a new dataset — prediction confidence, fallback rate).
 - **`--shap_background` / `--shap_nsamples`** — SHAP `KernelExplainer` background-sample count and perturbation count for `rank_correlation`. `--shap_nsamples` defaults to the library's own `auto` formula (`2*F + 2048`) rather than a fixed value — see *Why SHAP* for why a fixed cap turned out to bias attributions on wide datasets. `--shap_background` defaults to 50; raising it only helps once `nsamples` is adequate (raising background alone, with `nsamples` still too low for `F`, made agreement worse in testing, not better). `--shap_repeats` reruns SHAP multiple times with different backgrounds to report its own Monte-Carlo noise, separate from sampling noise across explained examples.
 - **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
 - **`--cat_combine {onehot,sum,concat}`** — categorical encoding (default `onehot`). `sum`/`concat` exist for comparison and backward compatibility with earlier checkpoints.
 - **`--num_embedding {plr_lite,linear,ple}`** — numeric encoding (default `plr_lite`). `plr_lite` can be unstable on datasets with very few numeric columns (e.g. 1–5) — `linear`/`ple` are safer fallbacks there.
+- **`--regroup_log_every <N>`** — how often (in epochs) to print the `[Regroup]` routing-health line during training (default 10). Lower it (e.g. 1–2) to inspect whether `active_ratio`/dead-code-reset activity is actually settling by the end of training, not just at coarse checkpoints.
+- **`--loss_codebook_override <float>` / `--dropout_override <float>`** — controlled-ablation overrides: retrain with every other hyperparameter held at `best_params`, only this one value changed. Output filenames get a distinguishing tag (`..lcb<v>`, `..do<v>`) so runs don't overwrite each other. No effect combined with `--from_saved_state` (that path skips retraining entirely).
 
 ---
 
@@ -182,6 +204,7 @@ to "SHAP is capturing interaction."
 - `--from_saved_state` on GPU can show sub-decimal inference differences from a fresh run despite identical weights, likely from non-deterministic op scheduling (e.g. cuDNN).
 - `plr_lite` numeric encoding (default) trades some calibration (logloss) for discrimination (accuracy/AUROC) relative to a plain linear projection — a pattern consistent with what the literature it's drawn from also reports. Datasets with very few numeric columns and few binary-classification samples are the most exposed; `--num_embedding linear` is the fallback for those.
 - ③'s SHAP estimates inherit `KernelExplainer`'s own limitations: a feature-independence assumption during background perturbation (can be misleading on strongly correlated features) and a cost that scales with feature count, both discussed in *Why SHAP*. These are properties of the method, not of TabERA's use of it, but they bound how much weight ③'s attributions should be given relative to ①②'s architectural guarantees.
+- On at least one dataset (credit-g, N_train=800), centroid routing shows persistent instability across training (`active_ratio` oscillating, dead-code reset never tapering off by the end of a run) that isn't explained by `dropout`, `routing_scale`, or accuracy cost — ruled out via controlled ablation — and doesn't reproduce on other datasets tested with the same mechanism (e.g. mfeat-zernike converges cleanly). Root cause open; see `docs/centroid-stability.md` §8.
 
 ---
 
@@ -190,6 +213,7 @@ to "SHAP is capturing interaction."
 - **Architecturally-guaranteed explanations (①②)** — read directly off the forward pass, not estimated afterward.
 - **A clean separation of what's load-bearing from what's swappable**: ①② are architectural and central to the paper's claim; ③ is a standard post-hoc layer that could be any axiomatically-grounded attribution method — SHAP is used here for its categorical/numeric-agnostic behavior and Shapley's uniqueness guarantees, not because the paper's core claim depends on that specific choice.
 - **A direct empirical check for feature interaction** (`--ablation interaction_check`), rather than assuming SHAP's theoretical interaction-handling automatically applies to a given dataset.
+- **Null-simulation-based diagnostics for the centroid layer itself** (`centroid_geometry`, `centroid_representativeness`) — checking routing structure and per-centroid representativeness against empirical baselines rather than assuming trained structure is automatically meaningful, plus a training-time mechanism (dual commitment/codebook loss, CosFace-style reprojection, dead-code reset) that measurably improves it without a manual floor on any hyperparameter (`docs/centroid-stability.md`).
 - **A documented limitation**: cross-group fallback rate depends on `K` vs. group size (`P = √N_train`) and can dominate small datasets.
 
 ---
@@ -198,10 +222,10 @@ to "SHAP is capturing interaction."
 
 | File | Component | Role |
 |---|---|---|
-| `libs/prototypes.py` | CentroidLayer | STE routing (scaled cosine similarity), KMeans++ init, EMA sample-group regrouping — ① |
+| `libs/prototypes.py` | CentroidLayer | STE routing (scaled cosine similarity), KMeans++ init, dual commitment/codebook loss, dead-code reset, periodic sample-group regrouping — ① |
 | `libs/tabera.py` | TabERA, MemoryBank, TabularEmbedder | Model, feature encoding, group-constrained KNN store — ② |
 | `libs/evidence.py` | AttentionAggregator | `evidence_w`, direct retrieval path, task-aware label encoding — ② |
-| `libs/supervised.py` | TabERAWrapper | Training loop, EMA regrouping, early stopping |
+| `libs/supervised.py` | TabERAWrapper | Training loop, sample-group regrouping, early stopping |
 | `libs/search_space.py` | HPO space | Optuna search space + auto `n_prototypes` |
 | `libs/data.py` | TabularDataset | OpenML loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
@@ -246,7 +270,8 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 | `embedder_layers` | {2, 3, 4} | ResidualMLP depth |
 | `dropout` | 0.0–0.5 | — |
 | `loss_diversity` | 5e-2–5e-1 | Centroid spread penalty |
-| `loss_commitment` | 1e-2–1e-1 | Query-centroid commitment |
+| `loss_commitment` | 1e-2–1e-1 | Query→centroid pull (VQ commitment loss) |
+| `loss_codebook` | 1e-2–1e-1 | Centroid→query pull (VQ codebook loss, same scale as `loss_commitment` — see `docs/centroid-stability.md`) |
 | `lr` | 1e-4–1e-2 | — |
 | `weight_decay` | 1e-6–1e-2 | — |
 | `batch_size` | {128, 256, 512} | — |
@@ -265,6 +290,12 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 >
 > `n_prototypes` (P) is **not** searched — auto-set as `P = sqrt(N_train)`
 > (min 4). Ranges P≈12 (`lymph`, N=148) to P≈185 (`nomao`, N=34,465).
+>
+> The Optuna objective isn't raw accuracy/RMSE — it's scaled by a
+> centroid-geometry penalty (0–5%, continuous, no fixed threshold) that
+> discourages hyperparameter regions converging to random-or-worse routing
+> structure, without constraining any search range directly. See
+> `docs/centroid-stability.md` §2.
 
 ---
 
@@ -280,7 +311,7 @@ TabERA/
 │   ├── eval.py
 │   ├── search_space.py      # HPO space
 │   └── data.py              # OpenML loader
-├── docs/                    # Design/technical notes
+├── docs/                    # Design/technical notes (see centroid-stability.md)
 ├── optim_logs/ / figures/
 ├── optimize.py / reproduce.py / visualize_embeddings.py
 └── requirements.txt
@@ -298,6 +329,11 @@ TabERA/
 - Oreshkin, Rodríguez López & Lacoste (2018). TADAM: Task Dependent Adaptive Metric for Improved Few-Shot Learning. *NeurIPS*.
 - Zhang et al. (2019). AdaCos: Adaptively Scaling Cosine Logits for Effectively Learning Deep Face Representations. *CVPR*.
 - van den Oord et al. (2017). Neural Discrete Representation Learning (VQ-VAE). *NeurIPS*.
+- Wang et al. (2018). CosFace: Large Margin Cosine Loss for Deep Face Recognition. *CVPR*. — norm-fixing/reprojection convention adopted for `centroid_emb`, see `docs/centroid-stability.md` §4.
+- Deng et al. (2019). ArcFace: Additive Angular Margin Loss for Deep Face Recognition. *CVPR*.
+- Dhariwal et al. (2020). Jukebox: A Generative Model for Music. *arXiv:2005.00341*. — dead-code "random restart" reset convention.
+- Zeghidour et al. (2021). SoundStream: An End-to-End Neural Audio Codec. *arXiv:2107.03312*. — dead-code reset convention.
+- Lu et al. (2026). Beyond Stationarity: Rethinking Codebook Collapse in Vector Quantization. *arXiv:2602.18896*. — controlled evidence that collapse persists even under ideal initialization, motivating dead-code reset as an ongoing (not just at-init) mechanism.
 - Bengio et al. (2013). Estimating or Propagating Gradients Through Stochastic Neurons. *arXiv:1308.3432*.
 - Lundberg & Lee (2017). A Unified Approach to Interpreting Model Predictions (SHAP). *NeurIPS*.
 - Sundararajan et al. (2017). Axiomatic Attribution for Deep Networks (Integrated Gradients). *ICML*. — cited for why IG was ruled out for ③, see *Why SHAP*.
