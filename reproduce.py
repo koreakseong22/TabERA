@@ -1319,7 +1319,7 @@ def main():
                 print(f"  ⚠️  가까운 centroid 쌍 중 {diff_target_count}개가 서로 다른 target을")
                 print(f"    대표함 — 이 쌍들 근처에 있는 쿼리는 'confidence는 낮은데 서사도")
                 print(f"    갈리는' 진짜 애매한 케이스일 수 있음. 위 표에서 ⚠️ 표시된 쌍을 눈여겨")
-                print(f"    볼 것 (예: credit-g의 Centroid_25-Centroid_23이 여기 있는지 직접 확인).")
+                print(f"    볼 것 — 위 표에 나열된 ⚠️ 쌍들이 그 후보입니다.")
 
             # ── Query-Centroid 유사도: centroid끼리의 유사도와 나란히 비교 ──
             # centroid-centroid 유사도가 이미 압축돼 있다면(위 off-diagonal
@@ -1401,12 +1401,16 @@ def main():
                 print(f"  🔴 margin이 무작위 null보다 유의하게 '더 좁습니다'(z={z_margin:.2f}) —")
                 print(f"    이건 단순히 '학습이 구조를 못 만들었다'가 아니라, 학습 과정이")
                 print(f"    top1·top2를 오히려 무작위보다 더 가깝게 만들고 있다는 뜻입니다.")
-                print(f"    routing_scale이 낮으면(현재 {model.prototype_layer.routing_scale:.2f})")
-                print(f"    STE backward의 soft 분포가 flat해서, gradient가 query를 여러")
-                print(f"    centroid 방향의 blend 쪽으로 당기는 것으로 추정됨(가설, 확정 아님) —")
-                print(f"    routing_scale이 큰 다른 데이터셋에서는 이 현상이 없었음(z≫0).")
+                print(f"    (참고: 이번 실행의 routing_scale={model.prototype_layer.routing_scale:.2f}.")
+                print(f"    routing_scale이 낮을 때 이 현상이 나온 사례가 있었지만, routing_scale이")
+                print(f"    낮지 않은 데이터셋에서도 같은 현상이 재현된 바 있어 — 원인을 이것")
+                print(f"    하나로 단정할 근거는 없습니다. 원인 미확정 — dropout, loss_diversity/")
+                print(f"    commitment/codebook 배합 등 다른 요인이 섞여 있을 수 있습니다.)")
                 print(f"    ⚠️ 이건 reproduce.py(추론 전용)에서 post-hoc으로 못 고칩니다 —")
                 print(f"    이미 학습된 embedding을 다시 정렬시키려면 재학습이 필요합니다.")
+                print(f"    --ablation centroid_representativeness로 그룹별 대표성까지 같이")
+                print(f"    보거나, --regroup_log_every로 학습 과정 자체가 수렴했는지부터")
+                print(f"    확인해보는 걸 권합니다.")
             elif z_top1 < 2.0 and z_margin < 2.0:
                 print(f"  ⚠️  top1 유사도·margin 둘 다 무작위 null과 통계적으로 구분되지")
                 print(f"    않습니다(z_top1={z_top1:.2f}, z_margin={z_margin:.2f}) — 이 데이터셋의")
@@ -1560,9 +1564,16 @@ def main():
                       f"{cohesion:>9.4f}  {crank:>11.0%}")
 
             n_below_baseline = sum(1 for r in rows_known if r[3] is not None and r[3] <= 0)
-            print(f"\n  [요약] {len(rows_known)}개 그룹 평가 가능 중 {n_below_baseline}개가 baseline")
+            eval_ratio = len(rows_known) / P if P > 0 else 0.0
+            print(f"\n  [요약] {len(rows_known)}/{P}개 centroid({eval_ratio:.0%})가 평가 가능 — "
+                  f"그중 {n_below_baseline}개가 baseline")
             print(f"  이하(⚠️ 표시) — '있으나 마나 한' centroid 후보. {len(rows_unknown)}개는")
             print(f"  그룹이 너무 작아(<2) 판단 불가.")
+            if eval_ratio < 0.5:
+                print(f"  ⚠️  평가 가능 비율 자체가 절반 미만입니다 — 대부분의 centroid가")
+                print(f"    너무 작아 판단 불가 상태라는 뜻이고, '⚠️ 0개'만으로 안심할 수")
+                print(f"    없는 상황입니다. 아래 요약과 별개로 이 비율 자체를 문제로")
+                print(f"    보는 게 맞을 수 있습니다.")
 
             print(f"\n  [해석]")
             print(f"  이 표는 purity 오름차순(대표성 낮은 것부터)이라, 위쪽에 있는")
@@ -1583,6 +1594,8 @@ def main():
                 "global_majority_prop": (global_majority_prop
                                           if tasktype in ("multiclass", "binclass") else None),
                 "global_std": (global_std if tasktype == "regression" else None),
+                "eval_ratio": eval_ratio,
+                "n_below_baseline": n_below_baseline,
                 "openml_id": openml_id,
                 "seed": args.seed,
             }
