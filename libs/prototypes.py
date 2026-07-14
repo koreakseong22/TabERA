@@ -693,7 +693,7 @@ class CentroidLayer(nn.Module):
         c = F.normalize(self.centroid_emb, dim=-1)        # (P, D)
         logits = (q @ c.T) * self.routing_scale           # (B, P) — scale 적용
 
-        # ── 전체 softmax (기존 entropy_loss 호환용, M=1에서 STE 적용) ─
+        # ── 전체 softmax (STE backward gradient용, M=1에서 STE 적용) ─
         soft = F.softmax(logits, dim=-1)                  # (B, P)
 
         # ── Top-M soft routing (핵심 변경) ──────────────
@@ -704,7 +704,7 @@ class CentroidLayer(nn.Module):
         hard_assignment = topM_idx[:, 0]                  # (B,)
 
         # ── routing_probs 분기 ──────────────────────────
-        # M=1: 기존 STE 동작 유지 (entropy_loss 호환)
+        # M=1: 기존 STE 동작 유지 (backward gradient가 soft를 거쳐 흐르게 함)
         # M>1: 일반 softmax (hierarchical 경로에서는 STE 의미 없음)
         if top_m_eff == 1:
             # STE: forward는 hard (argmax), backward는 soft gradient
@@ -732,7 +732,8 @@ class CentroidLayer(nn.Module):
             context_emb = self.dropout(routing_probs @ self.centroid_emb)
         else:
             # Hierarchical 경로
-            # routing_probs는 entropy_loss용 (soft 그대로, gradient 흐름)
+            # routing_probs는 forward() 반환값(diagnose/설명 등 호출부에서
+            # 전체 분포를 참조할 수 있게) — soft 그대로, gradient 흐름
             routing_probs = soft
 
             # topM_weights: top-M에 대한 softmax (differentiable!)
@@ -762,21 +763,14 @@ class CentroidLayer(nn.Module):
         loss = (sim.pow(2) * mask).sum() / (self.P * (self.P - 1))
         return loss.clamp(max=1e4)  # nan 방지
 
-    def entropy_loss(self, routing_probs: torch.Tensor) -> torch.Tensor:
-        """
-        Codebook utilization 향상 — 배정 분포의 entropy 최대화.
-
-        근거: VQ-VAE-2 (Razavi et al., NeurIPS 2019)
-        배치 내 평균 routing 분포의 entropy를 최대화하여
-        모든 centroid가 고르게 사용되도록 유도.
-
-        routing_probs: (B, P) — STE output (soft 값 보유, gradient 연결됨)
-        soft collapse 시 avg_probs 편중 → entropy 낮음 → loss 높음
-        → gradient가 centroid_emb를 분산 방향으로 당김
-        """
-        avg_probs = routing_probs.mean(dim=0)              # (P,) 배치 평균
-        entropy   = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
-        return -entropy  # entropy 최대화 → loss 최소화
+    # [제거됨] entropy_loss — 정의만 되어 있고 tabera.py의 aux_loss 조합
+    # (diversity + commitment)에 실제로는 한 번도 연결된 적 없는 죽은
+    # 코드였음. 참고로 이 손실은 "배치 평균 라우팅 분포"의 entropy를
+    # 최대화하는 것(codebook utilization/dead-centroid 방지, VQ-VAE-2
+    # 방식)이라 "샘플 하나하나의 라우팅을 confident하게 만드는" 것과는
+    # 다른 목적이었음 — 그 목적(샘플별 confidence)을 위해서는 이것과
+    # 다른 손실(샘플별 entropy 최소화, entropy minimization 계열)이
+    # 필요하며, 별도 검토 없이 지금 다시 넣지 않기로 함.
 
     def cosine_similarity_matrix(self) -> torch.Tensor:
         """진단용: centroid 간 cosine similarity 행렬 반환 (P, P)."""
