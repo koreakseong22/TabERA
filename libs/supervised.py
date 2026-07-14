@@ -16,6 +16,7 @@ import math
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 import numpy as np
 from tqdm import tqdm
@@ -116,6 +117,10 @@ class TabERAWrapper:
         self._data_id    = "?"      # tqdm 표시용 (optimize.py에서 주입)
         self.ema_history: List[Dict[str, float]] = []
         self.final_ema_stats: Optional[Dict[str, float]] = None
+        # fit() 완료 후 채워짐 — z_top1/z_margin 등 (compute_metric처럼
+        # optimize.py의 objective가 val_v 외에 추가로 참조할 수 있는 값).
+        # prototype_layer가 없는 모델이거나 계산 실패 시 None으로 남음.
+        self.centroid_geometry_diag: Optional[Dict[str, float]] = None
         # ── 그룹 텍스트 라벨링 (libs/group_labels.py) ────────────
         # 셋 다 주어져야 라벨링을 수행함. 하나라도 없으면(예: 기존
         # optimize.py처럼 이 인자들을 안 넘기는 호출부) 조용히 건너뛰고
@@ -503,6 +508,110 @@ class TabERAWrapper:
                 self.model.feature_store._ptr    = ptr
                 self.model.feature_store._filled = filled
         self._best_state = best_state
+
+        # ── centroid margin z-score 진단 (best epoch 복원된 모델 기준) ──
+        # reproduce.py --ablation centroid_geometry와 동일 로직. 매 HPO
+        # trial마다 자동 계산해 self.centroid_geometry_diag에 저장 —
+        # optimize.py의 objective가 val_v(정확도/logloss)와 함께 이 값을
+        # (예: routing_scale이 너무 낮아 z_margin이 무작위보다도 낮게 나온
+        # trial에 페널티를 주는 방식으로) 반영할지는 optimize.py 쪽에서
+        # 결정한다 — search space(routing_scale 탐색 범위) 자체는 안 건드림.
+        self.centroid_geometry_diag = self._compute_centroid_margin_zscore(X_val)
+
+    def _compute_centroid_margin_zscore(
+        self, X_val: torch.Tensor, n_null_trials: int = 50,
+    ) -> Optional[Dict[str, float]]:
+        """
+        top1-top2 query-centroid cosine similarity margin이 완전 무작위
+        (학습 전혀 안 된) centroid/query 벡터로 만든 null 베이스라인과
+        비교해 얼마나 유의하게 다른지 z-score로 진단.
+
+        [배경] routing_scale은 forward(예측)에는 영향이 없지만(STE라서
+        hard_assignment는 양수 스케일에 불변), 학습 중 STE backward
+        gradient의 뾰족함에는 직접 영향을 준다 — routing_scale이 낮으면
+        gradient가 여러 centroid 방향으로 뭉근하게 blend되어, 학습이
+        끝나도 query가 centroid 주변에 뚜렷하게 뭉치지 못하고 심하면
+        margin이 무작위보다도 더 좁아지는 현상이 실측 확인됨(credit-g,
+        routing_scale=1.49: z_margin=-3.40 — 무작위보다 유의하게 나쁨).
+        반대로 routing_scale이 큰 데이터셋(socmob 19.8, SpeedDating
+        13.77)은 z_margin이 +18~+22로 무작위보다 압도적으로 큼.
+
+        Returns
+        ───────
+        None이면 prototype_layer가 없거나(ablation 등) P<2라 계산 불가.
+        dict: {z_top1, z_margin, top1_median, margin_mean,
+               null_top1_mean, null_margin_mean}
+        """
+        if not (hasattr(self.model, "prototype_layer")
+                and self.model.prototype_layer is not None):
+            return None
+
+        P = self.model.prototype_layer.P
+        if P < 2:
+            return None
+        D = self.model.prototype_layer.centroid_emb.shape[1]
+        n_val = X_val.shape[0]
+
+        self.model.eval()
+        with torch.no_grad():
+            c_norm = F.normalize(self.model.prototype_layer.centroid_emb, dim=-1)
+            top1_sims_list, margins_list = [], []
+            _batch = 256
+            for start in range(0, n_val, _batch):
+                q_norm = F.normalize(
+                    self.model.embedder(X_val[start:start + _batch]), dim=-1
+                )
+                sim  = q_norm @ c_norm.T
+                top2 = sim.topk(min(2, P), dim=-1).values
+                top1_sims_list.append(top2[:, 0].cpu())
+                if top2.shape[1] > 1:
+                    margins_list.append((top2[:, 0] - top2[:, 1]).cpu())
+
+        if not margins_list:
+            return None
+        top1_sims = torch.cat(top1_sims_list).numpy()
+        margins   = torch.cat(margins_list).numpy()
+
+        # null 베이스라인 — 완전 무작위 벡터, 동일 D/P/n_val 조건, CPU에서
+        # (모델과 무관한 순수 텐서 연산이라 GPU 동기화 비용 없이 저렴함)
+        null_top1_medians = np.empty(n_null_trials)
+        null_margin_means = np.empty(n_null_trials)
+        for t in range(n_null_trials):
+            g = torch.Generator().manual_seed(t)
+            q_null = F.normalize(torch.randn(n_val, D, generator=g), dim=-1)
+            c_null = F.normalize(torch.randn(P, D, generator=g), dim=-1)
+            sim_null  = q_null @ c_null.T
+            top2_null = sim_null.topk(min(2, P), dim=-1).values
+            null_top1_medians[t] = top2_null[:, 0].median().item()
+            null_margin_means[t] = (
+                (top2_null[:, 0] - top2_null[:, 1]).mean().item()
+                if top2_null.shape[1] > 1 else float("nan")
+            )
+
+        null_top1_mean,   null_top1_std   = float(null_top1_medians.mean()), float(null_top1_medians.std())
+        null_margin_mean, null_margin_std = float(np.nanmean(null_margin_means)), float(np.nanstd(null_margin_means))
+
+        z_top1   = (float(np.median(top1_sims)) - null_top1_mean) / (null_top1_std + 1e-8)
+        z_margin = (float(margins.mean()) - null_margin_mean) / (null_margin_std + 1e-8)
+
+        # [percentile — z-score와 별개로 직접 계산] z-score는 정규분포
+        # 근사가 깔려있고, "얼마나 유의하면 봐줄지" 임계값(예: z=2.0)을
+        # 어디에 둘지가 결국 다시 임의적인 선택이 됨. 이미 50개 null 샘플을
+        # 실제로 갖고 있으니, 정규분포 가정도 임계값도 없이 "실측 margin이
+        # 이 50개 중 몇 %보다 나은가"를 직접 셀 수 있음 — HPO penalty(아래
+        # optimize.py)는 이 percentile을 그대로 연속값으로 써서, "몇 z
+        # 이상이면 괜찮다"는 문턱값 자체를 없앤다.
+        margin_percentile = float((null_margin_means < margins.mean()).mean())
+
+        return {
+            "z_top1":            z_top1,
+            "z_margin":          z_margin,
+            "margin_percentile": margin_percentile,
+            "top1_median":       float(np.median(top1_sims)),
+            "margin_mean":       float(margins.mean()),
+            "null_top1_mean":    null_top1_mean,
+            "null_margin_mean":  null_margin_mean,
+        }
 
     # ── predict ─────────────────────────────────────────────
 

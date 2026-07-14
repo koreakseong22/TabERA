@@ -301,6 +301,56 @@ if train:
         # 최적화 목표: regression → rmse_val 최소화 / classification → acc_val 최대화
         result = val_metrics["rmse_val"] if tasktype == "regression" else val_metrics["acc_val"]
 
+        # ── centroid margin 진단 반영 (percentile 기반, 문턱값 없음) ──
+        # [배경] routing_scale은 forward(예측)에는 영향이 없지만(STE라서
+        # hard_assignment는 양수 스케일에 불변), 학습 중 STE backward
+        # gradient의 뾰족함에는 직접 영향을 준다. 실측 결과(credit-g:
+        # routing_scale=1.49, margin_percentile≈0% vs socmob: 19.8,
+        # ≈100% / SpeedDating: 13.77, ≈100%) — routing_scale이 낮게 나온
+        # trial일수록 학습된 centroid 라우팅 구조가 무작위 수준(또는 그보다
+        # 나쁨)에 머물 수 있음이 확인됨.
+        #
+        # [설계 원칙] search_space.py의 routing_scale 탐색 범위(1.0~20.0)는
+        # 그대로 둔다 — 하한을 강제하지 않고, Optuna가 정확도와 함께 이
+        # 부작용까지 스스로 학습해서 피하도록 objective만 조정한다.
+        #
+        # [z-score 문턱값 대신 percentile을 직접 쓰는 이유] 처음엔
+        # "z_margin < -2.0(또는 2.0)이면 penalty"처럼 z-score에 문턱값을
+        # 두는 방식을 썼는데:
+        #   1. z-score는 정규분포 근사가 깔려 있고, "몇 z 이상이면 봐줄지"
+        #      자체가 다시 임의의 선택이 됨 — 처음 -2.0(actively bad만
+        #      잡음)으로 뒀다가 mfeat-zernike(z_margin=-0.15, "무작위와
+        #      구분 안 됨"인데 -2.0보다는 커서 penalty가 전혀 안 걸림)
+        #      에서 구멍이 확인돼 2.0으로 올렸는데, 그 2.0도 근거는
+        #      "reproduce.py 진단 라벨(사람이 읽는 용도로 고른 2-시그마
+        #      관행)을 그대로 재사용한 것"뿐이라 여전히 매직넘버였음.
+        #   2. penalty 자체는 어차피 연속값(badness에 비례)이라, "유의미
+        #      하다고 확신할 수 있는가"라는 이진 판단(z 문턱값이 필요한
+        #      이유)이 애초에 필요 없음 — "이게 무작위보다 나은가"라는
+        #      순위 정보만 있으면 됨.
+        # 그래서 이미 계산해둔 50개 null 샘플 대비 실측 margin의 순위를
+        # 직접 백분위(margin_percentile, supervised.py에서 계산)로 써서
+        # penalty를 100% 연속으로 만든다 — percentile=100%(모든 무작위
+        # 시도보다 나음)면 penalty=0, 50%(딱 무작위 평균만큼)면 penalty=
+        # cap의 절반, 0%(무작위보다 항상 나쁨)면 penalty=cap. 어떤 z를
+        # 기준으로 "봐줄지" 결정하는 문턱값이 코드 어디에도 없음.
+        # penalty_cap(0.05)은 credit-g/mfeat-zernike/jasmine 실측 기준
+        # 잡은 값 — 더 많은 데이터셋의 margin_percentile이 아래 user_attr에
+        # 계속 쌓이므로, 나중에 이 상한 자체도 데이터로 재조정 가능.
+        diag = wrapper.centroid_geometry_diag
+        if diag is not None:
+            trial.set_user_attr("centroid_z_top1",            diag["z_top1"])
+            trial.set_user_attr("centroid_z_margin",           diag["z_margin"])
+            trial.set_user_attr("centroid_margin_percentile",  diag["margin_percentile"])
+            penalty_cap  = 0.05
+            penalty_frac = penalty_cap * (1.0 - diag["margin_percentile"])
+            if penalty_frac > 0.0:
+                if tasktype == "regression":
+                    result = result * (1.0 + penalty_frac)   # rmse는 클수록 나쁨 → 키움
+                else:
+                    result = result * (1.0 - penalty_frac)   # acc는 클수록 좋음 → 줄임
+                trial.set_user_attr("centroid_penalty_frac", penalty_frac)
+
         # [메모리 정리] trial마다 새 모델/옵티마이저를 만드는데, PyTorch가
         # 이전 trial에서 쓴 GPU 메모리를 내부 캐시로 들고 있으면 다음 trial의
         # collapse 안전장치(supervised.py)가 "여유 메모리 0"으로 오판할 수
