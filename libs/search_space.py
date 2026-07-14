@@ -29,6 +29,7 @@ def suggest_initial_trial() -> dict:
         "dropout":          0.1,
         "loss_diversity":   0.10,   # 새 하한(5e-2) 안에서 안정적인 초기값
         "loss_commitment":  0.05,
+        "loss_codebook":    0.05,   # commitment와 같은 스케일로 시작 (신규)
         "lr":               3e-4,
         "weight_decay":     1e-5,
         "batch_size":       256,
@@ -101,6 +102,16 @@ def get_search_space(
         #       현상 확인. 두 loss가 같은 order of magnitude에서 탐색되도록 하한 통일.
         "loss_commitment": trial.suggest_float("loss_commitment", 1e-2, 1e-1, log=True),
 
+        # [추가] loss_codebook — codebook_loss(commitment_loss의 반대 방향,
+        # centroid를 배정된 쿼리 쪽으로 당김) 가중치. VQ-VAE 원 논문은 이
+        # 항이 없으면 centroid가 "자기 그룹의 대표"가 되도록 당겨주는 직접
+        # 신호가 아예 없다는 게 실측으로 확인됨(credit-g centroid_geometry
+        # 진단에서 cohesion이 낮은 centroid들이 다수 발견됨). commitment_loss와
+        # 같은 스케일(1e-2~1e-1)로 시작 — 둘 다 같은 ‖query-centroid‖²를
+        # 미는 손실이라 크기가 크게 벌어지면 한쪽만 지배적이 될 위험이 있음
+        # (loss_diversity/loss_commitment 하한을 통일했던 것과 같은 이유).
+        "loss_codebook":   trial.suggest_float("loss_codebook",   1e-2, 1e-1, log=True),
+
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
@@ -170,6 +181,11 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "loss_weights": {
             "diversity":   params["loss_diversity"],
             "commitment":  params["loss_commitment"],
+            # .get() — codebook_loss 추가 이전에 저장된 구버전 study의
+            # best_params에는 이 키가 없음 (그런 경우 codebook_loss 자체가
+            # 없던 이전 동작과 동일하게 0.0 사용 — tabera.py의 aux_loss
+            # 조합에서도 동일한 fallback을 씀).
+            "codebook":    params.get("loss_codebook", 0.0),
         },
         # .get() — 이 파라미터 추가 이전에 저장된 구버전 study의 best_params
         # 에는 이 키가 없을 수 있음 (그런 경우 기존과 동일한 1.0 사용).

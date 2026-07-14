@@ -106,6 +106,7 @@ class TabERAWrapper:
         cat_category_names: Optional[Dict[str, List[str]]] = None,
         target_class_names: Optional[List[str]] = None,
         quantile_transformer=None,
+        regroup_log_every: int = 10,   # [Regroup] 로그 출력 주기(epoch). 진단 목적으로 좁힐 수 있게.
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -113,10 +114,11 @@ class TabERAWrapper:
         self.device   = device
         self.epochs   = epochs
         self.patience = patience
+        self.regroup_log_every = max(1, regroup_log_every)
         self._best_state = None
         self._data_id    = "?"      # tqdm 표시용 (optimize.py에서 주입)
-        self.ema_history: List[Dict[str, float]] = []
-        self.final_ema_stats: Optional[Dict[str, float]] = None
+        self.regroup_history: List[Dict[str, float]] = []
+        self.final_regroup_stats: Optional[Dict[str, float]] = None
         # fit() 완료 후 채워짐 — z_top1/z_margin 등 (compute_metric처럼
         # optimize.py의 objective가 val_v 외에 추가로 참조할 수 있는 값).
         # prototype_layer가 없는 모델이거나 계산 실패 시 None으로 남음.
@@ -153,6 +155,17 @@ class TabERAWrapper:
         y_val: torch.Tensor,
     ) -> None:
         criterion  = get_criterion(self.tasktype)  # weight_matrix GPU 이동
+
+        # [정정] centroid_emb를 weight_decay에서 빼는 대신, ArcFace/CosFace
+        # 표준을 그대로 따른다 — "정규화해서 쓰는 파라미터는 weight_decay를
+        # 빼는 게 아니라, 매 스텝 후 norm=1로 강제 재투영"하는 방식(CosFace:
+        # "norm(W)를 반드시 불변으로 고정"). 이러면 weight_decay를 평범하게
+        # 켜둬도(ArcFace/CosFace 논문들의 실제 학습 세팅과 동일) centroid_emb
+        # 방향이 흔들리지 않는다 — weight_decay 제외는 지도학습(ArcFace)이
+        # 하지 않는 방식이었고, 저희 라우팅도 어차피 F.normalize(centroid_emb)
+        # 만 쓰므로 원본 파라미터 자체를 늘 단위벡터로 유지하는 쪽이 일관적.
+        # 재투영은 fit() 아래 학습 루프의 optimizer.step() 직후에서 수행.
+        centroid_param = self.model.prototype_layer.centroid_emb
 
         # [최적화] AdamW.step()이 프로파일에서 retrieve() 전체보다 더 큰
         # 단일 비용으로 확인됨 (파라미터 텐서별로 개별 커널을 발사하기 때문).
@@ -193,21 +206,28 @@ class TabERAWrapper:
         best_feature_store = None
         best_group_labels  = None
         best_target_labels = None
-        self.ema_history = []
-        self.final_ema_stats = None
-        _low_active_streak = 0   # 연속으로 active_ratio<10%인 EMA 체크 횟수 (runaway collapse 감지용)
+        self.regroup_history = []
+        self.final_regroup_stats = None
+        # [추가, penalty 미반영 순수 로깅용] 학습 전체에 걸친 라우팅 안정성
+        # 진단 — "상관관계부터 확인하고 penalty는 나중에" 원칙에 따라
+        # 일단 기록만 한다. reinit_total: 전체 reinit 발생 횟수(적을수록
+        # 안정). active_ratio_history: 매 regroup_update의 active_ratio를
+        # 전부 모아뒀다가 std를 계산(요동 정도 — 최종 스냅샷만 보는
+        # centroid_geometry_diag가 못 보는 "과정 전체의 불안정성"을 보완).
+        _reinit_total = 0
+        _active_ratio_history: List[float] = []
         # [최적화] label_all_groups/label_groups_by_target를 is_better 블록
-        # 안으로 옮기면서 그 재료(x_ema/y_ema)를 epoch 끝까지 들고가야 함 —
+        # 안으로 옮기면서 그 재료(x_regroup/y_regroup)를 epoch 끝까지 들고가야 함 —
         # n_mem<1인 극초반 epoch이나 prototype_layer가 없는 모델에서는
         # 아예 안 채워질 수 있어 None으로 미리 선언 (참조 시 NameError 방지).
-        x_ema = None
-        y_ema = None
+        x_regroup = None
+        y_regroup = None
 
         # [버그 수정] 이전엔 emb_cache로 X_train 전체(N_train개)를 캐시해서
-        # ema_update에 넘겼음 → sample_groups가 "X_train 행 번호"로 만들어짐.
+        # regroup_update에 넘겼음 → sample_groups가 "X_train 행 번호"로 만들어짐.
         # 그런데 MemoryBank는 별도의 링버퍼(크기 min(2*N_train, 10000))라서
         # 두 인덱스 공간이 어긋남 (N_train > memory_size인 경우 특히 심각 —
-        # retrieve()에서 clamp로 인덱스가 뭉개짐). 아래에서 ema_update에
+        # retrieve()에서 clamp로 인덱스가 뭉개짐). 아래에서 regroup_update에
         # MemoryBank/FeatureStore의 실제 내용을 직접 넘기도록 수정 →
         # sample_groups가 처음부터 MemoryBank 인덱스 공간을 가리키게 됨.
         # 이에 따라 emb_cache/hook(구 PATCH ⑥)은 더 이상 필요 없어 제거.
@@ -245,6 +265,12 @@ class TabERAWrapper:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
+                # [CosFace 표준] centroid_emb를 매 step 후 단위벡터로 강제
+                # 재투영 — weight_decay가 켜져 있어도 방향만 남고 크기는
+                # 항상 1로 리셋되므로, 크기 붕괴로 인한 라우팅 불안정이
+                # 원천적으로 발생하지 않음.
+                with torch.no_grad():
+                    centroid_param.data = F.normalize(centroid_param.data, dim=-1)
 
                 tr_loss_gpu += loss.detach()          # .item() 없이 GPU에 누적 (동기화 제거)
                 n_batch += 1
@@ -252,8 +278,8 @@ class TabERAWrapper:
             scheduler.step()
             self.model.anneal(self.params.get("anneal_factor", 0.97))
 
-            # ── (3) EMA centroid 업데이트 ───────────────────────
-            if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'ema_update'):
+            # ── (3) sample_groups 재계산(regroup_update) ───────────────
+            if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'regroup_update'):
                 with torch.no_grad():
                     # [버그 수정] X_train 전체 대신 MemoryBank에 실제로 들어있는
                     # 내용(최대 memory_size개)만 클러스터링 → sample_groups가
@@ -261,39 +287,45 @@ class TabERAWrapper:
                     n_mem = self.model.memory.filled.item()
                     if n_mem < 1:
                         # 메모리가 아직 하나도 안 채워진 극초반 → 스킵
-                        ema_stats = {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
-                        x_ema = None
-                        y_ema = None
+                        regroup_stats = {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
+                        x_regroup = None
+                        y_regroup = None
                     else:
-                        emb_ema = self.model.memory.keys[:n_mem]           # (n_mem, D) — MemoryBank 임베딩
+                        emb_regroup = self.model.memory.keys[:n_mem]           # (n_mem, D) — MemoryBank 임베딩
                         fs = self.model.feature_store
-                        x_ema = (
+                        x_regroup = (
                             fs._store[:n_mem].to(self.device)              # (n_mem, F) — 원본 feature
                             if fs is not None else None
                         )
-                        ema_stats = self.model.prototype_layer.ema_update(emb_ema, x_ema)
+                        regroup_stats = self.model.prototype_layer.regroup_update(emb_regroup, x_regroup)
                         # [최적화] label_all_groups/label_groups_by_target는
                         # 순수 읽기 전용(설명용 텍스트 캐싱)이라 학습(가중치/
                         # early stopping 판단)에 전혀 영향을 안 준다. 예전엔
                         # 매 epoch 계산했는데, 그중 실제로 쓰이는 건 "val이
                         # 갱신된 epoch"의 값뿐이다(바로 아래 best_* 스냅샷
                         # 로직이 그 값만 남기고 나머지는 다음 epoch에 덮어써
-                        # 버림). n_mem이 채워진 epoch이면 이번 epoch의 x_ema/
-                        # y_ema를 나중(is_better 블록)에 재사용할 수 있도록
+                        # 버림). n_mem이 채워진 epoch이면 이번 epoch의 x_regroup/
+                        # y_regroup를 나중(is_better 블록)에 재사용할 수 있도록
                         # 여기서는 사람이 읽는 텍스트 계산 자체를 생략하고
                         # 재료만 남겨둔다 (컬럼 수·centroid 수가 많은 데이터셋
                         # 에서 이 텍스트 계산 자체가 epoch당 수 초~수십 초까지
                         # 걸리는 게 실측 확인됨 — nomao: feature 118개, P=166).
-                        y_ema = self.model.memory.labels[:n_mem]
+                        y_regroup = self.model.memory.labels[:n_mem]
 
-                    self.final_ema_stats = dict(ema_stats)
-                    self.ema_history.append({
+                    # [추가] 안정성 진단용 누적 — warmup으로 스킵된 epoch도
+                    # active_ratio=0.0을 그대로 기록(실제로 아직 활성화 전인
+                    # 상태이므로 std 계산에서 왜곡 요인이 아니라 사실 그대로).
+                    _reinit_total += regroup_stats.get("reinit_count", 0)
+                    _active_ratio_history.append(regroup_stats.get("active_ratio", 0.0))
+
+                    self.final_regroup_stats = dict(regroup_stats)
+                    self.regroup_history.append({
                         "epoch": float(epoch),
-                        "active_ratio": float(ema_stats.get("active_ratio", 0.0)),
-                        "active_centroids": float(ema_stats.get("active_centroids", 0.0)),
-                        "pruned_this_epoch": float(ema_stats.get("pruned_this_epoch", 0.0)),
-                        "min_cluster_size": float(ema_stats.get("min_cluster_size", 0.0)),
-                        "max_cluster_size": float(ema_stats.get("max_cluster_size", 0.0)),
+                        "active_ratio": float(regroup_stats.get("active_ratio", 0.0)),
+                        "active_centroids": float(regroup_stats.get("active_centroids", 0.0)),
+                        "pruned_this_epoch": float(regroup_stats.get("pruned_this_epoch", 0.0)),
+                        "min_cluster_size": float(regroup_stats.get("min_cluster_size", 0.0)),
+                        "max_cluster_size": float(regroup_stats.get("max_cluster_size", 0.0)),
                     })
 
                     # ── retrieve()의 하이브리드 임계값을 실제 GPU 여유 메모리
@@ -324,7 +356,7 @@ class TabERAWrapper:
                     # trial마다 64~256으로 다름. "N_train 대비 비율" 같은
                     # 고정 임계값은 D를 반영 못 해 또 다른 임의의 숫자가 될
                     # 뿐이라, 대신 실제 남은 GPU 메모리와 직접 비교한다.
-                    max_cluster_now = ema_stats.get("max_cluster_size", 0)
+                    max_cluster_now = regroup_stats.get("max_cluster_size", 0)
                     if (torch.cuda.is_available()
                             and str(self.device).startswith("cuda")
                             and max_cluster_now > 0):
@@ -363,29 +395,18 @@ class TabERAWrapper:
                         except Exception:
                             pass  # 메모리 조회 실패 시 이 안전장치만 건너뜀 (학습은 계속)
 
-                    # ── 안전장치 2: active_ratio 지속 저하 감지 ──────────
-                    # 단발성 dip(일시적으로 낮았다가 회복되는 경우)은 봐주고,
-                    # "연속으로 계속 나쁜 상태가 유지"될 때만 중단한다.
-                    # 매 에폭 체크(로그 출력 주기 10epoch과는 별개) — 추세가
-                    # 뚜렷해지는 즉시 반응하기 위함. 그냥 낮은 값 한 번이
-                    # 아니라 2회 연속(=최소 2 에폭 연속, 보통 10epoch 단위
-                    # 로그 사이에도 매 에폭 계산되므로 실제로는 곧바로 반응)
-                    # 유지될 때만 중단하여, 회복 가능한 dip을 살려둔다.
-                    # (이것도 cache_sample_groups() 이전에 체크 — 어차피
-                    # 중단할 거면 불필요한 텐서 할당을 피함)
-                    active_ratio_now = ema_stats.get("active_ratio", 1.0)
-                    if active_ratio_now < 0.1:
-                        _low_active_streak += 1
-                    else:
-                        _low_active_streak = 0   # 회복하면 카운터 리셋
-
-                    if _low_active_streak >= 5:
-                        tqdm.write(
-                            f"  [STOP] Runaway centroid collapse at epoch {epoch} "
-                            f"(active={active_ratio_now:.0%}, {_low_active_streak}epoch 연속 "
-                            f"10% 미만). Early exit."
-                        )
-                        break
+                    # [제거됨] 안전장치 2(active_ratio 5epoch 연속 저하 시
+                    # 조기종료)는 dead-code 재초기화(regroup_update의
+                    # dead_reinit_patience) 도입으로 제거함 — 이제 낮은
+                    # active_ratio는 방치되는 게 아니라 적극적으로 복구를
+                    # 시도하는 대상이라, "회복 불가능한 상태"를 조기에
+                    # 판별해 시간을 아끼려던 이 장치의 존재 이유 자체가
+                    # 약해짐. 게다가 이 장치의 임계값(5epoch 연속)이
+                    # dead_reinit_patience(기본 5)와 정확히 같아서, 재초기화가
+                    # 막 개입하려는 타이밍에 먼저 학습을 끊어버리는 경쟁
+                    # 상황이 실측으로 확인됨. 안전장치 1(OOM 방지)은 그대로
+                    # 유지 — 그건 collapse 여부와 무관하게 실제 메모리
+                    # 크래시를 막는 별개의 안전장치.
 
                     self.model.memory.cache_sample_groups(
                         self.model.prototype_layer.sample_groups,
@@ -393,12 +414,14 @@ class TabERAWrapper:
                         centroid_emb=self.model.prototype_layer.centroid_emb,
                     )
 
-                    if epoch % 10 == 0:
+                    if epoch % self.regroup_log_every == 0:
+                        _reinit = regroup_stats.get('reinit_count', 0)
                         pbar.write(
-                            f"  [EMA] active={ema_stats['active_ratio']*100:.0f}%  "
-                            f"alive={ema_stats.get('active_centroids', 0)}  "
-                            f"min={ema_stats['min_cluster_size']}  "
-                            f"max={ema_stats['max_cluster_size']}"
+                            f"  [Regroup] active={regroup_stats['active_ratio']*100:.0f}%  "
+                            f"alive={regroup_stats.get('active_centroids', 0)}  "
+                            f"min={regroup_stats['min_cluster_size']}  "
+                            f"max={regroup_stats['max_cluster_size']}"
+                            + (f"  reinit={_reinit}" if _reinit > 0 else "")
                         )
 
             avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
@@ -438,7 +461,7 @@ class TabERAWrapper:
                 # 뿐이므로(다음 epoch에 개선이 없으면 이 값이 계속 최종본으로
                 # 남고, 개선되면 그때 다시 계산돼 덮어씀), 매 epoch 계산하던
                 # 이전 방식과 최종 결과가 100% 동일하면서 개선 없는 epoch의
-                # 계산만 생략된다. x_ema/y_ema는 바로 이번 epoch의 ema_update()
+                # 계산만 생략된다. x_regroup/y_regroup는 바로 이번 epoch의 regroup_update()
                 # 블록에서 만들어진 것이라 MemoryBank 시점이 정확히 일치함
                 # (학습 다 끝난 뒤 재계산하면 MemoryBank가 그 사이 더 갱신돼
                 # 시점이 어긋날 수 있어 — 그 방식은 채택 안 함).
@@ -446,10 +469,10 @@ class TabERAWrapper:
                     self.cat_cols is not None
                     and self.num_cols is not None
                     and self.col_names is not None
-                    and x_ema is not None
+                    and x_regroup is not None
                 ):
                     self.model.prototype_layer.group_labels = label_all_groups(
-                        x_ema.detach().cpu().numpy(),
+                        x_regroup.detach().cpu().numpy(),
                         self.model.prototype_layer.sample_groups,
                         self.cat_cols,
                         self.num_cols,
@@ -457,9 +480,9 @@ class TabERAWrapper:
                         cat_category_names=self.cat_category_names,
                         quantile_transformer=self.quantile_transformer,
                     )
-                if y_ema is not None:
+                if y_regroup is not None:
                     self.model.prototype_layer.target_labels = label_groups_by_target(
-                        y_ema.detach().cpu().numpy(),
+                        y_regroup.detach().cpu().numpy(),
                         self.model.prototype_layer.sample_groups,
                         self.tasktype,
                         class_names=self.target_class_names,
@@ -517,6 +540,22 @@ class TabERAWrapper:
         # trial에 페널티를 주는 방식으로) 반영할지는 optimize.py 쪽에서
         # 결정한다 — search space(routing_scale 탐색 범위) 자체는 안 건드림.
         self.centroid_geometry_diag = self._compute_centroid_margin_zscore(X_val)
+
+        # [추가, penalty 미반영] 학습 과정 전체의 라우팅 안정성 지표.
+        # centroid_geometry_diag(위)는 best epoch 하나의 스냅샷만 보므로,
+        # "그 스냅샷 하나는 좋았지만 학습 내내 계속 흔들리다 우연히 멈춘"
+        # trial(credit-g trial #47 실측 사례)을 못 잡아낸다. 이 두 값이
+        # 실제로 나쁜 결과(불안정한 재현성, 낮은 test 성능 등)와 상관관계가
+        # 있는지 먼저 여러 trial에 걸쳐 확인한 뒤, 유의미하면 그때 penalty에
+        # 반영할지 결정한다(바로 반영하지 않는 이유) — z_margin penalty
+        # 임계값을 검증 없이 정했다가 두 번 다시 만졌던 전례를 반복하지
+        # 않기 위함.
+        if self.centroid_geometry_diag is not None:
+            n_epochs_seen = max(1, len(_active_ratio_history))
+            self.centroid_geometry_diag["reinit_per_epoch"] = _reinit_total / n_epochs_seen
+            self.centroid_geometry_diag["active_ratio_std"] = (
+                float(np.std(_active_ratio_history)) if len(_active_ratio_history) > 1 else 0.0
+            )
 
     def _compute_centroid_margin_zscore(
         self, X_val: torch.Tensor, n_null_trials: int = 50,

@@ -21,7 +21,7 @@ CentroidLayer — Dual-Space Prototype Representation
       (label_groups_by_target) — ②/③ 어디에도 없는 ①만의 고유 정보
     - 보조 정보: 그룹을 가장 잘 특징짓는 feature들의 실제 그룹 평균값
       (label_all_groups) — 정성적 밴드("매우 높음" 등)가 아니라 원값
-    - 매 epoch ema_update() 직후 supervised.py에서 계산·캐싱
+    - 매 epoch regroup_update() 직후 supervised.py에서 계산·캐싱
     - [설계 변경 이력] 이전에는 centroid_x(medoid)를 buffer로 저장해
       ①에서 대표 데이터 1개를 그대로 보여줬으나, (a) 표본이 적은
       그룹에서 outlier 1개가 그대로 대표값이 될 위험, (b) "실제 존재
@@ -195,7 +195,7 @@ def label_all_groups(
     quantile_transformer=None,
 ) -> Dict[int, List[FeatureLabel]]:
     """
-    ema_update() 직후 호출해서 캐싱해두는 용도.
+    regroup_update() 직후 호출해서 캐싱해두는 용도.
     반환값: {group_index: [FeatureLabel, ...]}  (top_k개, 그룹 간
     대비(distinctiveness) 내림차순 — "이 그룹만 유별난" feature가 위로)
 
@@ -382,8 +382,11 @@ class CentroidLayer(nn.Module):
     embed_dim         : 임베딩 차원 D
     n_features        : 원본 feature 수 F (이중 공간 저장용)
     prototype_labels  : centroid 의미론적 이름 (없으면 "Centroid_i" 자동 생성)
-    ema_momentum      : EMA 업데이트 모멘텀 (0.9~0.99 권장)
-    ema_warmup_epochs : 이 에폭 이후부터 EMA 활성화 (기본 0 = 즉시)
+    regroup_warmup_epochs : 이 에폭 이후부터 그룹 재계산(regroup_update) 활성화 (기본 0 = 즉시)
+    dead_reinit_patience : 이 횟수만큼 연속으로 regroup_update에서 배정을 하나도
+                          못 받으면(연속 dead) 그 centroid를 실제 embedding
+                          (무작위 샘플 + 작은 가우시안 노이즈)으로 재초기화한다
+                          (Jukebox/SoundStream 스타일 dead-code reset). 0이면 비활성화.
     dropout           : 컨텍스트 벡터 드롭아웃
     col_names         : 원본 feature 컬럼명 (설명 출력용)
     """
@@ -394,8 +397,8 @@ class CentroidLayer(nn.Module):
         embed_dim: int,
         n_features: int = 0,
         prototype_labels: Optional[List[str]] = None,
-        ema_momentum: float = 0.95,
-        ema_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
+        regroup_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
+        dead_reinit_patience: int = 5,    # 5회 연속 dead면 재초기화
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
         routing_scale: float = 1.0,
@@ -404,8 +407,8 @@ class CentroidLayer(nn.Module):
         self.P                 = n_prototypes
         self.D                 = embed_dim
         self.F                 = n_features
-        self.ema_momentum      = ema_momentum
-        self.ema_warmup_epochs = ema_warmup_epochs
+        self.regroup_warmup_epochs = regroup_warmup_epochs
+        self.dead_reinit_patience  = dead_reinit_patience
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
         # [추가] routing softmax의 scale factor. ArcFace/CosFace/AdaCos/
         # von Mises-Fisher Loss 등 코사인 유사도 기반 softmax를 쓰는
@@ -421,6 +424,8 @@ class CentroidLayer(nn.Module):
 
         # ── 온도 (register_buffer: 저장되지만 gradient 없음) ──
         self.register_buffer("current_epoch", torch.tensor(0, dtype=torch.long))
+        # dead-code reset용: centroid별 "연속으로 배정 0이었던 regroup_update 횟수"
+        self.register_buffer("dead_streak", torch.zeros(n_prototypes, dtype=torch.long))
 
         # ── centroid 임베딩 (학습 가능 파라미터: routing + FAISS 마스킹) ──
         self.centroid_emb = nn.Parameter(torch.empty(n_prototypes, embed_dim))
@@ -435,13 +440,13 @@ class CentroidLayer(nn.Module):
         self.sample_groups: Optional[List[List[int]]] = None
 
         # ── centroid별 텍스트 라벨 캐시 (libs/group_labels.py 결과) ──
-        # {p: [FeatureLabel, ...]} — ema_update() 직후 supervised.py에서
+        # {p: [FeatureLabel, ...]} — regroup_update() 직후 supervised.py에서
         # 채워짐. ①의 그룹 특징 설명은 이 캐시가 담당한다.
         self.group_labels: Optional[Dict[int, list]] = None
 
         # ── centroid별 target(클래스) 분포 캐시 (①의 주 콘텐츠) ──
         # {p: {"kind": ..., "top_class_name": ..., ...} or None} —
-        # ema_update() 직후 supervised.py에서 label_groups_by_target()로 채움.
+        # regroup_update() 직후 supervised.py에서 label_groups_by_target()로 채움.
         self.target_labels: Optional[Dict[int, Optional[dict]]] = None
 
         # ── centroid별 평균 레이블 (Rank-Consistency Loss용) ──
@@ -546,11 +551,11 @@ class CentroidLayer(nn.Module):
               f"from {N} samples. avg_inter_dist={avg_dist:.3f}")
 
     # ─────────────────────────────────────────────────────────
-    # (3) EMA 업데이트 (에폭 종료 후 호출)
+    # (3) sample_groups 재계산 (regroup_update, 에폭 종료 후 호출)
     # ─────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def ema_update(
+    def regroup_update(
         self,
         X_emb: torch.Tensor,        # (N, D) 전체 훈련 임베딩 — assignment 계산용
         X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — [미사용, 호출부 하위 호환용 시그니처만 유지]
@@ -570,12 +575,21 @@ class CentroidLayer(nn.Module):
         - sample_groups 갱신: KNN 검색 범위 제한 (필수)
         - dead centroid 감지: collapse 조기 종료 (필수)
 
+        [추가] dead-code 재초기화
+        ─────────────────────────
+        dead_reinit_patience회 연속 배정 0인 centroid를 실제 embedding
+        (+ 작은 노이즈)으로 재초기화 — Jukebox(Dhariwal et al. 2020)/
+        SoundStream(Zeghidour et al. 2021) 스타일. k-means++ 초기화가
+        "출발선"만 보장하는 것과 달리, 학습 중 encoder drift로 인해
+        나중에 죽는 centroid까지 계속 구제한다.
+
         Returns
         ───────
-        stats: {"active_ratio": float, "min_cluster_size": int, "max_cluster_size": int}
+        stats: {"active_ratio": float, "min_cluster_size": int,
+                "max_cluster_size": int, "reinit_count": int}
         """
         epoch = self.current_epoch.item()
-        if epoch < self.ema_warmup_epochs:
+        if epoch < self.regroup_warmup_epochs:
             return {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
 
         if assignments is None:
@@ -600,6 +614,36 @@ class CentroidLayer(nn.Module):
         self.sample_groups = new_groups
         self.current_epoch += 1
 
+        # ── dead-code 재초기화 (Jukebox/SoundStream 스타일) ────────
+        # [배경] k-means++ 시딩은 "출발선"에서만 도움을 줄 뿐, 학습 중
+        # encoder가 계속 움직이면서(drift) 한때 살아있던 centroid도 배정을
+        # 잃고 죽을 수 있다는 게 NSVQ 논문 통제실험(완벽한 초기화에서
+        # 출발해도 collapse가 재발함)으로 확인됨 — 초기화와는 별개로
+        # 학습 내내 필요한 안전장치. dead_reinit_patience회 연속으로
+        # 배정을 하나도 못 받은 centroid를, 이번 epoch 실제 embedding
+        # 중 무작위로 하나 골라 작은 가우시안 노이즈를 더해 재배치한다
+        # (문헌 표현 그대로: "randomly sampled encoder outputs plus
+        # small Gaussian noise"). centroid_emb는 항상 단위벡터로 유지
+        # 되므로(supervised.py의 매 optimizer step 후 재투영) 재초기화
+        # 결과도 정규화해서 그 불변조건을 깨지 않게 한다.
+        n_reinit = 0
+        if self.dead_reinit_patience > 0:
+            with torch.no_grad():
+                for p in range(P):
+                    if sizes[p] == 0:
+                        self.dead_streak[p] += 1
+                    else:
+                        self.dead_streak[p] = 0
+
+                    if self.dead_streak[p].item() >= self.dead_reinit_patience:
+                        src_idx = torch.randint(0, X_emb.shape[0], (1,)).item()
+                        anchor  = X_emb[src_idx].float()
+                        noise   = torch.randn_like(anchor) * 0.01 * anchor.norm().clamp(min=1e-6)
+                        new_vec = F.normalize(anchor + noise, dim=-1)
+                        self.centroid_emb.data[p] = new_vec.to(self.centroid_emb.dtype)
+                        self.dead_streak[p] = 0
+                        n_reinit += 1
+
         # 통계
         n_assigned = sum(1 for s in sizes if s > 0)
 
@@ -607,6 +651,7 @@ class CentroidLayer(nn.Module):
             "active_ratio":     n_assigned / self.P,
             "active_centroids": int(n_assigned),
             "pruned_this_epoch": 0,
+            "reinit_count":     n_reinit,
             "min_cluster_size": int(min(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
             "max_cluster_size": int(max(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
         }
@@ -780,9 +825,55 @@ class CentroidLayer(nn.Module):
     def commitment_loss(
         self, query_emb: torch.Tensor, hard_assignment: torch.Tensor
     ) -> torch.Tensor:
-        """쿼리를 배정된 centroid 방향으로."""
+        """
+        쿼리를 배정된 centroid 방향으로.
+
+        [수정] raw 벡터가 아니라 정규화된 벡터끼리 MSE를 계산한다.
+        라우팅(hard_assignment를 정하는 코사인 유사도)은 방향에만
+        의존하는데(query_emb/centroid_emb를 F.normalize()한 뒤 내적),
+        이전 구현은 정규화 안 된 raw 벡터로 MSE를 계산해 크기(norm) 차이
+        에도 반응했다 — centroid_emb는 초기화 시점부터 단위 벡터인 반면
+        (initialize_from_data의 X_n = F.normalize(...)) query_emb(임베더
+        raw 출력)는 그럴 이유가 없어, 라우팅과 무관한 "크기 맞추기"에
+        gradient가 낭비될 수 있었다. 정규화된 벡터의 MSE는 2-2·cos_sim과
+        동치라(‖â-b̂‖² = 2-2â·b̂, 단위벡터끼리) 이 수정은 사실상 라우팅과
+        동일한 기준(코사인 유사도)을 손실로도 쓰는 것과 같다.
+        """
         assigned = self.centroid_emb[hard_assignment]
-        return F.mse_loss(query_emb, assigned.detach())
+        q_norm = F.normalize(query_emb, dim=-1)
+        c_norm = F.normalize(assigned, dim=-1)
+        return F.mse_loss(q_norm, c_norm.detach())
+
+    def codebook_loss(
+        self, query_emb: torch.Tensor, hard_assignment: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        centroid를 배정된 쿼리들 방향으로 (commitment_loss의 반대 방향).
+
+        VQ-VAE(van den Oord et al., 2017) 원 손실의 나머지 절반 — 원 논문은
+        codebook loss(‖sg[query]-centroid‖², 이 함수)와 commitment loss
+        (‖query-sg[centroid]‖², 위 commitment_loss)를 항상 같이 쓴다.
+        이 구현은 그동안 commitment 쪽만 있었음 — centroid_emb를 실제로
+        "자기 그룹의 대표"로 만드는 유일한 직접 신호가 없었다(diversity_loss는
+        밀어내기만, task_loss는 간접적이고 대표성과 무관한 방향).
+
+        닫힌 형태 최적해는 배정된 query들의 평균 — Lloyd's iteration의
+        "centroid = 배정된 점들의 평균" 갱신과 동일한 목표를, 이산 argmax
+        선택 아래서도 gradient로 달성한다.
+
+        query_emb 쪽을 detach하는 이유: commitment_loss(반대쪽 detach)와
+        같은 대상(‖query-centroid‖²)을 서로 다른 변수 쪽에서 미는 것이라
+        방향이 대립하지 않음 — 다만 둘 다 detach 없이 대칭으로 두면 매
+        스텝 서로를 향해 동시에 움직여 진동/불안정해질 수 있어(self-supervised
+        학습의 target network류와 같은 이유로) 한쪽씩 번갈아 고정한다.
+
+        [수정] commitment_loss와 동일한 이유로 정규화된 벡터끼리 MSE —
+        라우팅(코사인 유사도, 방향만)과 같은 기준을 최적화하도록 통일.
+        """
+        assigned = self.centroid_emb[hard_assignment]
+        c_norm = F.normalize(assigned, dim=-1)
+        q_norm = F.normalize(query_emb, dim=-1)
+        return F.mse_loss(c_norm, q_norm.detach())
 
     # ─────────────────────────────────────────────────────────
     # 설명 헬퍼 (기존 tabr.py 호환 + 원본 feature 값 추가)

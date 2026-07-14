@@ -3,7 +3,7 @@ libs/tabera.py
 ============
 TabERA — Dual-Space Prototype Explainable TabR Model.
 
-  CentroidLayer        : Dual-Space Prototype + STE Routing + EMA
+  CentroidLayer        : Dual-Space Prototype + STE Routing + 주기적 Regroup
   AttentionAggregator  : TabR 방식 similarity 기반 이웃 집계
   MemoryBank           : Cross-group fallback (인접 centroid 확장 검색)
 
@@ -419,7 +419,7 @@ class MemoryBank(nn.Module):
     ) -> None:
         """
         sample_groups를 GPU 텐서로 미리 변환·캐시.
-        EMA 업데이트 후 에폭당 1번만 호출 → retrieve 내부 변환 비용 제거.
+        regroup_update 후 에폭당 1번만 호출 → retrieve 내부 변환 비용 제거.
         패딩: 가장 큰 그룹 크기에 맞춰 -1로 채움.
 
         [Cross-group fallback]
@@ -969,7 +969,7 @@ class TabERA(nn.Module):
     memory_size       : 메모리 뱅크 최대 크기
     embedder_layers   : TabularEmbedder ResidualMLP 수
     dropout           : 전역 드롭아웃
-    loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': ..}
+    loss_weights      : 보조 손실 가중치 {'diversity': .., 'commitment': .., 'codebook': ..(선택, 없으면 0)}
     column_names      : 특성 컬럼명 (설명 출력용)
     cat_col_idx       : categorical 컬럼의 인덱스 목록 (None이면 전체를
                         수치형으로 취급 — 기존 동작과 동일, 하위 호환)
@@ -1051,13 +1051,14 @@ class TabERA(nn.Module):
         # 기여하는가"만 깨끗하게 격리해서 재기 위함. T()처럼 꺼지면
         # 파라미터 자체가 안 생김(head 입력 차원이 줄어듦).
         self.use_context_emb = use_context_emb
-        # [진단용] centroid_emb는 diversity_loss(흩어뜨림)와 task_loss
-        # (head를 거친 예측 손실, context_emb 경유)라는 서로 다른 목적의
-        # gradient를 동시에 받음 (commitment_loss는 이미 assigned.detach()라
-        # centroid_emb를 안 건드림 — 확인됨). 이 두 목적이 충돌해 centroid_emb가
-        # 어느 쪽에도 최적이 아닌 타협점에 머물 가능성을 검증하기 위해,
-        # True면 head로 가는 context_emb만 detach — forward 값은 그대로
-        # 전달되지만 task_loss가 centroid_emb로 역전파되지 않음
+        # [진단용] centroid_emb는 diversity_loss(흩어뜨림)·codebook_loss
+        # (배정된 쿼리 쪽으로 당김)·task_loss(head를 거친 예측 손실,
+        # context_emb 경유)라는 서로 다른 목적의 gradient를 동시에 받음
+        # (commitment_loss는 정규화된 centroid 쪽을 detach하므로
+        # centroid_emb를 안 건드림 — 확인됨). 이 목적들이 충돌해
+        # centroid_emb가 어느 쪽에도 최적이 아닌 타협점에 머물 가능성을
+        # 검증하기 위해, True면 head로 가는 context_emb만 detach — forward
+        # 값은 그대로 전달되지만 task_loss가 centroid_emb로 역전파되지 않음
         # (centroid_emb는 diversity_loss만으로 학습됨).
         self.detach_context_grad = detach_context_grad
         # [구조 조정] context_emb를 head로 보내기 전 학습 가능한 Linear를
@@ -1244,6 +1245,11 @@ class TabERA(nn.Module):
             aux_loss = (
                 self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
                 + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
+                # [추가] codebook_loss — commitment_loss와 방향만 반대인 짝.
+                # .get()으로 하위 호환: 옛 체크포인트의 loss_weights에는
+                # "codebook" 키가 없어 --from_saved_state 로드 시 이 항은
+                # 0으로 처리됨(codebook_loss 자체가 아예 없던 상태와 동일).
+                + self.loss_weights.get("codebook", 0.0) * self.prototype_layer.codebook_loss(query_emb, hard_assignment)
             )
 
         out = {

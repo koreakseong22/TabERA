@@ -342,6 +342,18 @@ if train:
             trial.set_user_attr("centroid_z_top1",            diag["z_top1"])
             trial.set_user_attr("centroid_z_margin",           diag["z_margin"])
             trial.set_user_attr("centroid_margin_percentile",  diag["margin_percentile"])
+            # [순수 로깅, penalty 미반영] "결과(최종 스냅샷)"가 아니라 "과정
+            # 전체의 안정성"을 보는 지표 — credit-g trial #47(margin_percentile=
+            # 1.0인데 학습 내내 reinit이 안 멈췄던 사례)처럼, 최종 스냅샷만
+            # 보는 위 세 지표로는 안 잡히는 케이스가 있다는 게 실측 확인됨.
+            # 다만 이 두 지표가 실제로 나쁜 결과(재현성, test 성능)와
+            # 상관관계가 있는지 여러 trial에 걸쳐 먼저 확인한 뒤에 penalty
+            # 반영 여부를 결정한다 — study.trials_dataframe()에서 이 두
+            # 컬럼과 test 성능/margin_percentile 간 상관관계를 분석할 것.
+            if "reinit_per_epoch" in diag:
+                trial.set_user_attr("centroid_reinit_per_epoch", diag["reinit_per_epoch"])
+            if "active_ratio_std" in diag:
+                trial.set_user_attr("centroid_active_ratio_std", diag["active_ratio_std"])
             penalty_cap  = 0.05
             penalty_frac = penalty_cap * (1.0 - diag["margin_percentile"])
             if penalty_frac > 0.0:

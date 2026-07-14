@@ -144,7 +144,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     print(f"\n  ① Prototype Group")
 
     # 이 그룹의 target(클래스) 분포 — ①의 주 콘텐츠 (label_groups_by_target(),
-    # ema_update() 직후 캐싱됨). ②(실제 이웃의 raw feature 값)와 정보 종류가
+    # regroup_update() 직후 캐싱됨). ②(실제 이웃의 raw feature 값)와 정보 종류가
     # 겹치지 않도록, feature 요약이 아니라 "이 그룹이 어떤 부류인가"만 보여준다.
     # [배치] 배정된 그룹 이름/confidence와 같은 줄에 붙여서, "이 그룹이 뭔지"를
     # 한눈에 읽을 수 있게 함 (Runner-up은 부가 정보라 그 다음 줄로 내림).
@@ -296,7 +296,7 @@ def main():
                         choices=["none", "random_neighbor", "neighbor_noise",
                                  "rank_correlation", "dual_space_faithfulness",
                                  "interaction_check", "centroid_geometry",
-                                 "centroid_representativeness",
+                                 "centroid_representativeness", "evidence_compensation",
                                  "dataset_profile"],
                         help=(
                             "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
@@ -348,6 +348,13 @@ def main():
                             "                         순도 100%면 정당한 outlier 그룹 — 문제는\n"
                             "                         '크지만 순도가 baseline(전역 최다 클래스\n"
                             "                         비율)과 다를 바 없는' centroid.\n"
+                            "  evidence_compensation  : centroid_representativeness의 'purity\n"
+                            "                         낮음+cohesion 높음'(①이 흐릿한) centroid\n"
+                            "                         소속 샘플들만 모아서, ②(dominant weight/\n"
+                            "                         entropy)가 다른 샘플들보다 유의하게 더\n"
+                            "                         결정적인지 Mann-Whitney U 검정. '①이\n"
+                            "                         흐릿한 곳을 ②가 메워준다'는 ①②를 나눠\n"
+                            "                         설계한 근거를 직접 검증.\n"
                             "  dataset_profile        : 예측 확신도, fallback 비율 등 빠른\n"
                             "                         데이터셋 진단(예전엔 IG completeness/\n"
                             "                         deletion_auc 포함했으나 ③=SHAP 통일로\n"
@@ -406,6 +413,37 @@ def main():
                             "--context_projection으로 학습한 study가 있으면 그 "
                             "best_params를 쓰는 게 이상적이지만, 없으면 기존 study "
                             "best_params 위에 이 구조만 얹어 1회 재학습(별도 study 불필요)."
+                        ))
+    parser.add_argument("--loss_codebook_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 loss_codebook 값을 이 값으로 "
+                            "덮어쓰고 나머지 하이퍼파라미터는 그대로 재학습. codebook_loss "
+                            "도입 전후 val_acc/centroid_geometry(z_margin)/"
+                            "centroid_representativeness(purity) 변화가 codebook_loss "
+                            "자체 때문인지, 아니면 HPO가 다른 조합에 정착한 우연 때문인지 "
+                            "(탐색 차원이 하나 늘어난 것 포함) 갈라내려는 용도. 예:\n"
+                            "  --loss_codebook_override 0.0   → codebook_loss 끄고 재학습\n"
+                            "  --loss_codebook_override 0.044 → best_params가 찾은 값 그대로\n"
+                            "(둘을 같은 seed로 각각 돌려서 나머지 파라미터 동일 조건에서 "
+                            "비교). --from_saved_state와 같이 쓰면 재학습을 안 하므로 "
+                            "아무 효과가 없다 — 경고만 찍고 무시됨."
+                        ))
+    parser.add_argument("--regroup_log_every", type=int, default=10,
+                        help=(
+                            "[진단용] [Regroup] 로그를 몇 epoch마다 찍을지. 기본 10(기존과 "
+                            "동일). trial의 active_ratio/reinit 추이를 더 촘촘히 보고 싶을 "
+                            "때(예: 10epoch 간격으로는 마지막 구간에서 실제로 안정됐는지 "
+                            "판단이 안 될 때) 1~2로 낮춰서 재실행. --from_saved_state와 "
+                            "같이 쓰면 재학습 자체를 안 하므로 아무 효과가 없다."
+                        ))
+    parser.add_argument("--dropout_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 dropout 값을 이 값으로 덮어쓰고 "
+                            "나머지는 그대로 재학습. dropout이 TabularEmbedder(ResidualMLP) "
+                            "내부에 있어 query_emb 자체를 매 forward마다 흔드는데, 이게 "
+                            "라우팅 churn(연속적인 centroid dead/reinit)의 원인 중 하나인지 "
+                            "확인하려는 용도. --loss_codebook_override와 같은 패턴 — "
+                            "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
                         ))
     parser.add_argument("--shap_background", type=int, default=50,
                         help=(
@@ -478,7 +516,9 @@ def main():
               + ("..cat_concat" if args.cat_combine == "concat" else "") \
               + ("..cat_onehot" if args.cat_combine == "onehot" else "") \
               + ("..num_ple" if args.num_embedding == "ple" else "") \
-              + ("..num_plr" if args.num_embedding == "plr_lite" else "")
+              + ("..num_plr" if args.num_embedding == "plr_lite" else "") \
+              + (f"..lcb{args.loss_codebook_override:g}" if args.loss_codebook_override is not None else "") \
+              + (f"..do{args.dropout_override:g}" if args.dropout_override is not None else "")
 
     _saved_state = None
     if args.from_saved_state:
@@ -507,6 +547,12 @@ def main():
                 model_kwargs = {**model_kwargs, "memory_size": fallback_size}
                 print(f"  ⚠️  옛날 포맷 파일(memory_size 없음) — n_train={fallback_size}로 대체."
                       f" sample_groups 등도 없을 수 있으니 아래 경고를 확인하세요.")
+        if args.loss_codebook_override is not None:
+            print(f"  ⚠️  --loss_codebook_override는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.dropout_override is not None:
+            print(f"  ⚠️  --dropout_override는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
     else:
         fname = os.path.join(log_dir, f"data={openml_id}..model=tabera.pkl")
         if not os.path.exists(fname):
@@ -542,6 +588,28 @@ def main():
 
         # ── 모델 구성 ──────────────────────────────────────────
         model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
+        if args.loss_codebook_override is not None:
+            # [통제 실험용] best_params가 찾은 loss_codebook 값(있다면)을
+            # 무시하고 이 값으로 강제 — 나머지 하이퍼파라미터는 best_params
+            # 그대로라, 이 값 하나만 바꿔가며 재학습해서 codebook_loss
+            # 자체의 효과와 "HPO가 다른 조합에 우연히 정착한 것"을 분리
+            # 검증할 수 있음.
+            _old_codebook_w = model_kwargs.get("loss_weights", {}).get("codebook", 0.0)
+            model_kwargs.setdefault("loss_weights", {})["codebook"] = args.loss_codebook_override
+            best_params["loss_codebook"] = args.loss_codebook_override  # 저장/재출력 시 실제 학습값과 일치하도록
+            print(f"  [--loss_codebook_override] loss_weights['codebook']: "
+                  f"{_old_codebook_w:.4g} → {args.loss_codebook_override:.4g} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.dropout_override is not None:
+            # [통제 실험용] dropout은 TabularEmbedder(ResidualMLP) 내부에서
+            # query_emb 자체를 매 forward마다 흔드는 유일한 확률적 요소라,
+            # 라우팅 churn(연속 dead/reinit)의 원인 후보로 지목됨 — 검증
+            # 안 된 가설이라 나머지는 그대로 두고 이 값 하나만 바꿔 재학습.
+            _old_dropout = model_kwargs.get("dropout")
+            model_kwargs["dropout"] = args.dropout_override
+            best_params["dropout"] = args.dropout_override  # 저장/재출력 시 실제 학습값과 일치하도록
+            print(f"  [--dropout_override] dropout: {_old_dropout} → {args.dropout_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
         model_kwargs.update(dict(
             # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
             # HPO 때 찾은 best_params가 이 재현 실행에서 재현되지 않음)
@@ -619,6 +687,7 @@ def main():
         cat_category_names=dataset.cat_category_names,
         target_class_names=dataset.target_class_names,
         quantile_transformer=dataset.quantile_transformer,
+        regroup_log_every=args.regroup_log_every,
     )
     wrapper._data_id = args.openml_id
     if _saved_state is not None:
@@ -1525,6 +1594,203 @@ def main():
                 pickle.dump(rep_save, f)
             print(f"\n  저장: {rep_path}")
 
+        # ── evidence_compensation: "①이 흐릿한 곳을 ②가 메워주는가" 직접 검증 ──
+        # [배경] centroid_representativeness에서 purity가 낮아도(baseline
+        # 이하) cohesion은 높은 centroid(예: credit-g의 Centroid_27, 26)가
+        # 발견됨 — embedding은 일관되게 뭉쳐있는데 그 안의 target은 거의
+        # 반반으로 섞인 경우. ①(그룹)만 보면 "애매하다"고 하지만, ②는
+        # 실제 이웃 개별 샘플을 보여주는 방식이라 이 coarse-graining
+        # 문제가 덜할 수 있음 — 이걸 실측으로 확인한다.
+        elif args.ablation == "evidence_compensation":
+            from scipy.stats import mannwhitneyu
+
+            model.eval()
+            P = model.prototype_layer.P
+            sample_groups = model.prototype_layer.sample_groups
+            target_labels = model.prototype_layer.target_labels
+
+            print(f"\n  Evidence Compensation — '①이 흐릿한 곳을 ②가 메워주는가' (P={P})")
+            print(f"  {'─'*60}")
+            print(f"  centroid_representativeness와 같은 기준(purity vs baseline,")
+            print(f"  cohesion은 이 run의 중앙값 기준 이분)으로 centroid를 3종으로 나눔:")
+            print(f"    type A(진짜 문제)  : purity<=baseline, cohesion<=중앙값")
+            print(f"    type B(①만 흐릿함) : purity<=baseline, cohesion>중앙값  ← 여기가 관심 대상")
+            print(f"    normal            : purity>baseline")
+
+            y_train_np = y_train.detach().cpu().numpy()
+            if tasktype in ("multiclass", "binclass"):
+                y_int = np.rint(y_train_np).astype(int)
+                vals, counts = np.unique(y_int, return_counts=True)
+                global_majority_prop = float(counts.max() / counts.sum())
+            else:
+                global_std = float(y_train_np.std())
+
+            print(f"\n  [1/3] centroid별 purity·cohesion 재계산 중...")
+            with torch.no_grad():
+                c_norm = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
+                q_chunks = []
+                _batch = 256
+                for start in range(0, X_train.shape[0], _batch):
+                    q_chunks.append(
+                        F.normalize(model.embedder(X_train[start:start + _batch]), dim=-1).cpu()
+                    )
+                q_all = torch.cat(q_chunks)
+            c_norm_cpu = c_norm.cpu()
+
+            gaps = {}
+            cohesions = {}
+            for p in range(P):
+                grp = sample_groups[p] if sample_groups is not None else None
+                size = len(grp) if grp else 0
+                if size == 0:
+                    continue
+                idx_t = torch.as_tensor(grp, dtype=torch.long)
+                cohesions[p] = float((q_all[idx_t] @ c_norm_cpu[p]).mean())
+
+                tl = target_labels.get(p) if target_labels is not None else None
+                if tl is None:
+                    continue
+                if tl["kind"] == "classification":
+                    gaps[p] = tl["top_prop"] - global_majority_prop
+                else:
+                    y_grp = y_train_np[grp]
+                    group_std = float(np.std(y_grp))
+                    gaps[p] = (1.0 - group_std / (global_std + 1e-8))  # baseline=0
+
+            cohesion_vals = np.array(list(cohesions.values()))
+            cohesion_median = float(np.median(cohesion_vals)) if len(cohesion_vals) else 0.0
+
+            type_of = {}  # centroid_idx -> 'A' | 'B' | 'normal' | None(판단불가)
+            for p in range(P):
+                if p not in cohesions:
+                    continue
+                if p not in gaps:
+                    type_of[p] = None   # 그룹 너무 작아 purity 판단 불가
+                    continue
+                if gaps[p] > 0:
+                    type_of[p] = "normal"
+                elif cohesions[p] > cohesion_median:
+                    type_of[p] = "B"
+                else:
+                    type_of[p] = "A"
+
+            n_a = sum(1 for v in type_of.values() if v == "A")
+            n_b = sum(1 for v in type_of.values() if v == "B")
+            n_normal = sum(1 for v in type_of.values() if v == "normal")
+            print(f"  centroid 분류: type A={n_a}개, type B={n_b}개, normal={n_normal}개")
+
+            if n_b == 0:
+                print(f"\n  ⚠️  type B centroid가 하나도 없어 이 진단을 진행할 수 없습니다")
+                print(f"    (이 데이터셋/모델에서는 'purity 낮지만 cohesion 높은' centroid가")
+                print(f"    발견되지 않음 — centroid_representativeness로 먼저 확인해볼 것).")
+            else:
+                print(f"\n  [2/3] test set forward — ②(evidence_w) 수집 중...")
+                n_test = X_test.shape[0]
+                dominant_list, entropy_list, hard_group_list = [], [], []
+                with torch.no_grad():
+                    for start in range(0, n_test, 256):
+                        X_batch = X_test[start:start + 256]
+                        out_batch = model(X_batch)
+                        evw = out_batch.get("evidence_w")
+                        hg  = out_batch.get("hard_group")
+                        if evw is None or hg is None:
+                            continue
+                        dom = evw.max(dim=-1).values
+                        ent = -(evw * torch.log(evw + 1e-8)).sum(dim=-1)
+                        dominant_list.append(dom.cpu())
+                        entropy_list.append(ent.cpu())
+                        hard_group_list.append(hg.cpu())
+
+                if not dominant_list:
+                    print(f"  ⚠️  evidence_w를 얻을 수 없습니다(fallback 등으로 이웃이 없는 경우일 수 있음).")
+                else:
+                    dominant  = torch.cat(dominant_list).numpy()
+                    entropy   = torch.cat(entropy_list).numpy()
+                    hard_group = torch.cat(hard_group_list).numpy()
+
+                    sample_type = np.array([type_of.get(int(g), None) for g in hard_group])
+
+                    mask_b      = sample_type == "B"
+                    mask_a      = sample_type == "A"
+                    mask_rest_b = ~mask_b  # type B 아닌 전부(A+normal+판단불가)
+                    mask_rest_a = ~mask_a  # type A 아닌 전부(B+normal+판단불가) — 대조군용
+
+                    print(f"\n  [3/3] Mann-Whitney U 검정 중 (test n={n_test})...")
+                    print(f"\n  {'그룹':<12} {'n':>5}  {'dominant_weight':>16}  {'entropy':>10}")
+                    print(f"  {'─'*50}")
+                    for name, mask in [("type B", mask_b), ("type A", mask_a),
+                                        ("나머지(전체)", np.ones_like(mask_b, dtype=bool))]:
+                        if mask.sum() == 0:
+                            print(f"  {name:<12} {'0':>5}  {'-':>16}  {'-':>10}")
+                            continue
+                        print(f"  {name:<12} {int(mask.sum()):>5}  "
+                              f"{dominant[mask].mean():>16.4f}  {entropy[mask].mean():>10.4f}")
+
+                    print(f"\n  [type B vs 나머지] — 핵심 비교")
+                    if mask_b.sum() >= 3 and mask_rest_b.sum() >= 3:
+                        u_dom, p_dom = mannwhitneyu(dominant[mask_b], dominant[mask_rest_b],
+                                                     alternative="greater")
+                        u_ent, p_ent = mannwhitneyu(entropy[mask_b], entropy[mask_rest_b],
+                                                     alternative="less")
+                        print(f"    dominant_weight: type B가 더 큼? Mann-Whitney p={p_dom:.4f}")
+                        print(f"    entropy:         type B가 더 작음(뾰족함)? Mann-Whitney p={p_ent:.4f}")
+                    else:
+                        p_dom = p_ent = None
+                        print(f"    표본 부족(type B n={mask_b.sum()}) — 검정 생략")
+
+                    print(f"\n  [type A vs 나머지] — 대조군 (여기서는 유의하지 않아야 A/B 구분이 의미있음)")
+                    if mask_a.sum() >= 3 and mask_rest_a.sum() >= 3:
+                        u_dom_a, p_dom_a = mannwhitneyu(dominant[mask_a], dominant[mask_rest_a],
+                                                         alternative="greater")
+                        u_ent_a, p_ent_a = mannwhitneyu(entropy[mask_a], entropy[mask_rest_a],
+                                                         alternative="less")
+                        print(f"    dominant_weight: type A가 더 큼? Mann-Whitney p={p_dom_a:.4f}")
+                        print(f"    entropy:         type A가 더 작음(뾰족함)? Mann-Whitney p={p_ent_a:.4f}")
+                    else:
+                        p_dom_a = p_ent_a = None
+                        print(f"    표본 부족(type A n={mask_a.sum()}) — 검정 생략")
+
+                    print(f"\n  [해석]")
+                    b_significant = (p_dom is not None and p_dom < 0.05) or \
+                                     (p_ent is not None and p_ent < 0.05)
+                    a_significant = (p_dom_a is not None and p_dom_a < 0.05) or \
+                                     (p_ent_a is not None and p_ent_a < 0.05)
+                    if b_significant and not a_significant:
+                        print(f"  ✅ type B는 ②가 유의하게 더 결정적이고, type A는 그렇지 않음 —")
+                        print(f"    '①이 흐릿한 곳(순도는 낮지만 일관된 곳)을 ②가 실제로 메워준다'는")
+                        print(f"    가설이 뒷받침됨. ①②를 나눠 설계한 근거가 이 데이터셋에서 실측으로")
+                        print(f"    확인된 것으로 볼 수 있음.")
+                    elif b_significant and a_significant:
+                        print(f"  ⚠️  type A·B 둘 다 ②가 유의하게 결정적임 — ②가 '①이 흐릿한 곳만")
+                        print(f"    선택적으로' 메워준다기보다, 그냥 전반적으로 ①보다 결정적인")
+                        print(f"    경향이 있을 수 있음(①②의 역할 분담이 이 특정 형태로는 뚜렷이")
+                        print(f"    드러나지 않음). 다른 데이터셋에서도 이 패턴이 반복되는지 볼 것.")
+                    else:
+                        print(f"  type B에서 ②가 유의하게 더 결정적이라고 하기 어려움. 표본이 적거나")
+                        print(f"    (n_b={mask_b.sum()}), 이 데이터셋에서는 ①이 흐릿한 곳에서 ②도")
+                        print(f"    같이 흐릿할 수 있음 — 데이터셋마다 다를 수 있는 부분이라 여러")
+                        print(f"    데이터셋에서 반복 확인이 필요함.")
+
+                    ec_save = {
+                        "type_of":        {int(k): v for k, v in type_of.items()},
+                        "n_a": n_a, "n_b": n_b, "n_normal": n_normal,
+                        "dominant_mean_B": float(dominant[mask_b].mean()) if mask_b.sum() else None,
+                        "dominant_mean_A": float(dominant[mask_a].mean()) if mask_a.sum() else None,
+                        "dominant_mean_rest": float(dominant.mean()),
+                        "entropy_mean_B": float(entropy[mask_b].mean()) if mask_b.sum() else None,
+                        "entropy_mean_A": float(entropy[mask_a].mean()) if mask_a.sum() else None,
+                        "p_dom_B": p_dom, "p_ent_B": p_ent,
+                        "p_dom_A": p_dom_a, "p_ent_A": p_ent_a,
+                        "openml_id": openml_id, "seed": args.seed,
+                    }
+                    ec_path = (
+                        Path(log_dir)
+                        / f"data={openml_id}..seed{args.seed}_evidence_compensation.pkl"
+                    )
+                    with open(ec_path, "wb") as f:
+                        pickle.dump(ec_save, f)
+                    print(f"\n  저장: {ec_path}")
+
         elif args.ablation == "dual_space_faithfulness":
             model.eval()
             col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
@@ -1585,7 +1851,7 @@ def main():
                 print(f"    재배정 일치율: {match_rate:.1%}  (무작위 기대치: {chance_rate:.1%})")
                 index_ok = match_rate >= 0.99
                 if not index_ok:
-                    print(f"    ❌ 검증 시점에는 추가 학습이 없어 EMA 지연으로 설명될 수 없습니다 —")
+                    print(f"    ❌ 검증 시점에는 추가 학습이 없어 regroup 지연으로 설명될 수 없습니다 —")
                     print(f"       sample_groups가 가리키는 소스(MemoryBank/FeatureStore)와 지금")
                     print(f"       비교에 쓴 소스가 여전히 어긋나 있을 가능성이 높습니다.")
                     print(f"       아래 검증 2 결과는 재확인 전까지 신뢰할 수 없습니다.")
