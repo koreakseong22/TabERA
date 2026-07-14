@@ -65,19 +65,34 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 
 def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict:
+    # [수정] search_space.py의 params_to_model_kwargs와 동기화.
+    # 이 파일이 순환 import 방지를 위해 그 함수를 따로 복사해 쓰고 있는데,
+    # search_space.py 쪽만 여러 번 바뀌는 동안(k 고정, loss_codebook 추가,
+    # entropy_loss 제거) 이 복사본이 안 따라가서 실제로 문제가 됐음:
+    #   - params["k"]: k는 고정값이라 Optuna best_params에 아예 없어 KeyError
+    #   - routing_scale: 아예 안 넘겨서, 이 파일이 --from_saved_state 없이
+    #     wrapper.fit()으로 처음부터 재학습하는데도 HPO가 찾은 값이 아니라
+    #     기본값(1.0)으로 조용히 학습되고 있었음(크래시 없이 다른 모델을
+    #     시각화하는 셈이라 더 위험했음)
+    #   - loss_entropy: entropy_loss 자체가 이미 죽은 코드라 제거됐는데
+    #     이 파일만 그 개념을 계속 참조하고 있었음
+    # search_space.py를 다시 바꿀 때 이 함수도 같이 맞춰야 한다는 걸
+    # 잊지 않도록 이 주석을 남겨둠 — 근본적으로는 순환 import 문제를
+    # 풀어서 하나의 source of truth로 합치는 게 맞음.
     return {
         "n_features":      n_features,
         "embed_dim":       params["embed_dim"],
         "n_prototypes":    params["n_prototypes"],
-        "k":               params["k"],
+        "k":               params.get("k", 16),
         "embedder_layers": params["embedder_layers"],
         "dropout":         params["dropout"],
         "n_output":        n_output,
         "loss_weights": {
             "diversity":   params["loss_diversity"],
             "commitment":  params["loss_commitment"],
-            "entropy":     params["loss_entropy"],
+            "codebook":    params.get("loss_codebook", 0.0),
         },
+        "routing_scale":   params.get("routing_scale", 1.0),
     }
 
 
@@ -102,7 +117,7 @@ BG_COLOR    = "#f8f8f6"
 def extract_embeddings(model, X_all, y_all, device, chunk=512):
     model.eval()
     model = model.to(device)
-    all_emb, all_assign, all_prob, all_ew, all_topk = [], [], [], [], []
+    all_emb, all_assign, all_prob, all_ew, all_topk, all_x = [], [], [], [], [], []
 
     for start in range(0, len(X_all), chunk):
         xb  = X_all[start:start+chunk].to(device)
@@ -113,18 +128,36 @@ def extract_embeddings(model, X_all, y_all, device, chunk=512):
         all_prob.append(out["routing"].cpu().numpy())
         all_ew.append(out["evidence_w"].cpu().numpy())
         all_topk.append(out["topk_idx"].cpu().numpy())
+        all_x.append(xb.cpu().numpy())
+
+    hard_assign = np.concatenate(all_assign, axis=0)
+    X_concat    = np.concatenate(all_x,      axis=0)
+    P = model.prototype_layer.P
+
+    # [수정] model.prototype_layer.centroid_x — SHAP 마이그레이션 때
+    # ig_baseline(IG(③) 전용 medoid)을 제거하면서 같이 없어진 속성인데,
+    # 이 파일만 그 이후로도 계속 참조하고 있어 AttributeError가 났음.
+    # ig_baseline은 "IG가 gradient를 계산할 유효한 입력점"이어야 해서
+    # medoid(실제 존재하는 점)여야 했지만, 여기 centroid_x는 순수하게
+    # annotation(그룹 근처에 대표 feature 값을 텍스트로 표시)용이라
+    # medoid를 다시 구현할 필요 없이 그룹별 raw feature 평균으로 충분함
+    # — 이 함수가 이미 갖고 있는 hard_assign/X_all로 직접 계산.
+    centroid_x = np.full((P, X_concat.shape[1]), np.nan, dtype=np.float64)
+    for p in range(P):
+        mask = hard_assign == p
+        if mask.any():
+            centroid_x[p] = X_concat[mask].mean(axis=0)
 
     return dict(
         emb          = np.concatenate(all_emb,    axis=0),
-        hard_assign  = np.concatenate(all_assign, axis=0),
+        hard_assign  = hard_assign,
         routing_prob = np.concatenate(all_prob,   axis=0),
         evidence_w   = np.concatenate(all_ew,     axis=0),
         topk_idx     = np.concatenate(all_topk,   axis=0),
         y            = y_all.cpu().numpy().astype(int),
         centroid_emb = model.prototype_layer.centroid_emb.detach().cpu().numpy(),
-        centroid_x   = (model.prototype_layer.centroid_x.cpu().numpy()
-                        if model.prototype_layer.centroid_x is not None else None),
-        P            = model.prototype_layer.P,
+        centroid_x   = centroid_x,
+        P            = P,
         k            = model.k,
     )
 
@@ -635,9 +668,9 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
     ax.scatter(C2d[ci,0], C2d[ci,1],
                s=260, marker="^", c=col_g,
                edgecolors="white", linewidths=1.6, zorder=8)
-    if centroid_x is not None and col_names:
+    if centroid_x is not None and col_names and not np.isnan(centroid_x[ci]).all():
         cx_feat = centroid_x[ci]
-        top2    = np.argsort(np.abs(cx_feat))[::-1][:2]
+        top2    = np.argsort(np.where(np.isnan(cx_feat), -np.inf, np.abs(cx_feat)))[::-1][:2]
         feat_str = "\n".join(
             f"{col_names[i]}: {cx_feat[i]:.3f}" for i in top2)
         ax.annotate(
@@ -929,7 +962,6 @@ def main():
         best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
         print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
 
-        best_params.setdefault("loss_entropy",    0.01)
         best_params.setdefault("loss_diversity",  0.01)
         best_params.setdefault("loss_commitment", 0.01)
         best_params.setdefault("n_heads",         4)
@@ -1032,4 +1064,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
