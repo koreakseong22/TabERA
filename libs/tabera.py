@@ -121,6 +121,13 @@ class TabularEmbedder(nn.Module):
         cat_embed_dim: int = 16,
         num_embedding: str = "plr_lite",
         num_bin_edges: Optional[torch.Tensor] = None,
+        ple_d_embedding: int = 12,   # [추가] PiecewiseLinearEmbeddings의 feature별 embedding
+                                      # 차원. rtdl_num_embeddings 공식 문서 권장 시작값
+                                      # (activation=False 기준 d_embedding=12) — Optuna 탐색
+                                      # 대상에 넣지 않고 고정. "컴팩트한 탐색 공간"이 목표인
+                                      # 이 작업 취지상, PLR 3종처럼 검증 없이 탐색 차원을
+                                      # 늘리는 실수를 반복하지 않기 위함 — 필요성이 실측되면
+                                      # 그때 탐색 대상 추가 검토.
         plr_n_frequencies: int = 16,
         plr_freq_scale: float = 0.01,
         plr_out_dim: int = 8,
@@ -168,6 +175,7 @@ class TabularEmbedder(nn.Module):
             # ── numeric 처리 준비 ──
             self.num_proj = None
             self.ple_n_bins = 0
+            self.ple_d_embedding = 0
             self.plr_out_dim = 0
             if n_num > 0:
                 if num_embedding == "ple":
@@ -178,6 +186,26 @@ class TabularEmbedder(nn.Module):
                         )
                     self.register_buffer("ple_edges", num_bin_edges.clone(), persistent=True)
                     self.ple_n_bins = num_bin_edges.shape[1] - 1
+                    # [수정 — TabM 정합성] 기존엔 raw bin 벡터(z)를 그대로
+                    # concat→final_proj(전체 feature 공유 Linear)에 넘겼음 —
+                    # 이건 rtdl_num_embeddings의 PiecewiseLinearEncoding이지,
+                    # TabM이 기본값으로 권장하는 PiecewiseLinearEmbeddings
+                    # (activation=False)가 아님. 후자는 "Linear(PLE(x_i))"를
+                    # feature마다 독립적으로 적용한다 — 즉 feature i, bin t마다
+                    # 별도로 학습되는 (n_bins, d_embedding) 가중치가 있어야 함.
+                    # 여기서 그 가중치를 직접 만들고, forward에서 z와 가중합
+                    # (einsum)해서 feature별 embedding을 얻는다.
+                    # [주의] TabM 논문(subsection A.3)의 "version B" 초기화는
+                    # 약간 다른 디테일이 있을 수 있음 — 여기서는 nn.Linear
+                    # 표준 초기화(Kaiming uniform 계열)에 준하는 일반적인
+                    # 방식을 씀. bit-exact 재현이 필요하면 TabM 공식 구현체
+                    # (rtdl_num_embeddings.PiecewiseLinearEmbeddings) 소스를
+                    # 직접 대조해야 함.
+                    self.ple_d_embedding = ple_d_embedding
+                    self.ple_emb_weight = nn.Parameter(torch.empty(n_num, self.ple_n_bins, ple_d_embedding))
+                    self.ple_emb_bias   = nn.Parameter(torch.zeros(n_num, ple_d_embedding))
+                    bound = 1.0 / (self.ple_n_bins ** 0.5)
+                    nn.init.uniform_(self.ple_emb_weight, -bound, bound)
                 elif num_embedding == "plr_lite":
                     # PLR(lite) — TabR(Gorishniy et al. 2024): periodic embedding
                     # (컬럼별 학습 가능한 주파수) → 모든 컬럼이 공유하는 Linear
@@ -204,7 +232,7 @@ class TabularEmbedder(nn.Module):
                 concat_dim = 0
                 if n_num > 0:
                     if num_embedding == "ple":
-                        concat_dim += self.ple_n_bins * n_num
+                        concat_dim += self.ple_d_embedding * n_num
                     elif num_embedding == "plr_lite":
                         concat_dim += self.plr_out_dim * n_num
                     else:
@@ -260,15 +288,20 @@ class TabularEmbedder(nn.Module):
             return None
         x_num = x[:, self.num_col_idx]
         if self.num_embedding == "ple":
-            # PLE (Gorishniy et al. 2022): 컬럼별 quantile 구간 경계 기준
-            # z_t = clamp((x-b_{t-1})/(b_t-b_{t-1}), 0, 1) — 파이썬 루프 없이
-            # 전체 컬럼·전체 구간을 한 번에 브로드캐스팅으로 계산.
+            # PiecewiseLinearEmbeddings(activation=False) — TabM(Gorishniy et
+            # al. 2024)이 기본값으로 권장하는 버전. bin 경계로 raw encoding
+            # z를 만드는 것까지는 기존과 동일하지만, 그 z를 그대로 내보내는
+            # 대신 feature별 학습 가중치(ple_emb_weight)와 가중합해서 각
+            # feature마다 (ple_d_embedding,)짜리 벡터를 만든다 — "Linear(PLE
+            # (x_i))"를 feature마다 독립적으로 적용하는 것과 동일.
             lo = self.ple_edges[:, :-1]                       # (n_num, n_bins)
             hi = self.ple_edges[:, 1:]                         # (n_num, n_bins)
             x_expand = x_num.unsqueeze(-1)                     # (B, n_num, 1)
             frac = (x_expand - lo) / (hi - lo + 1e-8)           # (B, n_num, n_bins)
-            z = torch.clamp(frac, 0.0, 1.0)
-            return z.reshape(x_num.shape[0], -1)                # (B, n_num*n_bins)
+            z = torch.clamp(frac, 0.0, 1.0)                     # (B, n_num, n_bins)
+            # (B, n_num, n_bins) x (n_num, n_bins, d) → (B, n_num, d)
+            emb = torch.einsum("bnk,nkd->bnd", z, self.ple_emb_weight) + self.ple_emb_bias
+            return emb.reshape(x_num.shape[0], -1)              # (B, n_num*ple_d_embedding)
         elif self.num_embedding == "plr_lite":
             # PLR(lite) (TabR, Gorishniy et al. 2024): periodic embedding
             # (컬럼별 학습 주파수) → 전체 컬럼이 공유하는 Linear → ReLU.
@@ -335,6 +368,14 @@ class MemoryBank(nn.Module):
         # ── 정규화 캐시: retrieve() 내부의 반복 F.normalize 제거용 ──────
         # update() 시 O(B)로 증분 갱신, retrieve()에서는 그대로 gather만 함.
         self.register_buffer("_keys_norm", torch.zeros(max_size, embed_dim))
+        # [추가 — 설명가능성/재현성] 슬롯 i가 X_train의 몇 번째 행인지 저장.
+        # FeatureStore.sample_ids와 비교하면 "MemoryBank 슬롯과 FeatureStore
+        # 슬롯이 같은 샘플을 가리키는가"를 통계적 근사(사전검증 1.5의 기존
+        # percentile 비교) 없이 정확한 등식으로 확정할 수 있음. -1은
+        # "아직 채워지지 않은 슬롯" 표시(정상적인 X_train 행 번호는 항상
+        # 0 이상이므로 구분됨). state_dict()에 buffer로 잡히므로 best_state
+        # 스냅샷/복원(libs/supervised.py) 시 자동으로 같이 따라감.
+        self.register_buffer("sample_ids", torch.full((max_size,), -1, dtype=torch.long))
 
         # [출처 명확화] retrieve()가 "그룹 하나가 이례적으로 커서 나머지
         # 모두를 그 폭에 맞춰 패딩하는 게 낭비인지"를 판단하는 임계값.
@@ -398,7 +439,7 @@ class MemoryBank(nn.Module):
         self._outlier_threshold = new_threshold
 
     @torch.no_grad()
-    def update(self, keys, labels):
+    def update(self, keys, labels, sample_ids=None):
         B   = keys.shape[0]
         ptr = self.ptr.item()
         end = min(ptr + B, self.max_size)
@@ -407,6 +448,11 @@ class MemoryBank(nn.Module):
         self.labels[ptr:end] = labels[:n].float().detach()
         # 정규화도 여기서 O(B)로 한 번만 계산 (retrieve 매 배치 재계산 제거)
         self._keys_norm[ptr:end] = F.normalize(keys[:n].detach(), dim=-1)
+        # [추가] sample_ids가 없으면(하위 호환 — 예전 호출부) -1로 남겨둠.
+        # 새 학습 루프(libs/supervised.py)는 항상 X_train 행 번호(perm 슬라이스)를
+        # 넘기도록 수정됨.
+        if sample_ids is not None:
+            self.sample_ids[ptr:end] = sample_ids[:n].detach().to(self.sample_ids.device)
         self.ptr    = torch.tensor(end % self.max_size, dtype=torch.long)
         self.filled = torch.tensor(min(self.filled.item() + n, self.max_size), dtype=torch.long)
 
@@ -898,7 +944,15 @@ class FeatureStore:
     설계 원칙
     ─────────
     - MemoryBank의 ptr과 동기화 (같은 순서로 저장)
-    - 원본 X(역정규화 완료값) 저장
+    - forward()가 embedder(X)에 넘기는 것과 동일한 X를 그대로 저장
+      [정정] 이전 문서엔 "역정규화 완료값"이라 적혀 있었으나, 실제
+      forward()의 `self._feature_store.update(X)` 호출은 embedder(X)에
+      쓰인 것과 같은 텐서 X를 그대로 넘긴다 — 별도 역정규화 과정 없음.
+      즉 _store[i]를 다시 embedder()에 통과시키면(refresh_memory_keys)
+      추가 전처리 없이 그 자체로 재현 가능한 값이 나옴. 사람이 읽는
+      원 스케일 표시(예: credit_amount=3050)는 저장 시점이 아니라
+      출력 시점(print_explanation의 quantile_transformer 역변환)에
+      이루어짐.
     - nn.Module이 아님 → gradient 없음, 순수 numpy/tensor 저장소
     - retrieve(top_k_indices) → X 값 dict 반환
     """
@@ -915,13 +969,21 @@ class FeatureStore:
         self._store  = torch.zeros(max_size, n_features)
         self._ptr    = 0
         self._filled = 0
+        # [추가 — 설명가능성/재현성] MemoryBank.sample_ids와 짝을 이루는
+        # X_train 행 번호. nn.Module이 아니라 buffer로는 못 잡으니, 저장/
+        # 복원 시 feature_store_state 튜플에 같이 실어 날라야 함
+        # (reproduce.py checkpoint 저장/--from_saved_state 복원,
+        # libs/supervised.py의 best_feature_store 스냅샷 세 군데 모두).
+        self._sample_ids = torch.full((max_size,), -1, dtype=torch.long)
 
     @torch.no_grad()
-    def update(self, X_raw: torch.Tensor) -> None:
+    def update(self, X_raw: torch.Tensor, sample_ids: Optional[torch.Tensor] = None) -> None:
         B   = X_raw.shape[0]
         end = min(self._ptr + B, self.max_size)
         n   = end - self._ptr
         self._store[self._ptr:end] = X_raw[:n].detach().cpu().float()
+        if sample_ids is not None:
+            self._sample_ids[self._ptr:end] = sample_ids[:n].detach().cpu()
         self._ptr    = end % self.max_size
         self._filled = min(self._filled + n, self.max_size)
 
@@ -1013,6 +1075,8 @@ class TabERA(nn.Module):
         cat_embed_dim: int = 16,
         num_embedding: str = "plr_lite",
         num_bin_edges: Optional[torch.Tensor] = None,
+        ple_d_embedding: int = 12,   # [추가] TabularEmbedder와 동일 — 고정 기본값,
+                                      # Optuna 탐색 대상 아님 (rtdl_num_embeddings 권장값).
         plr_n_frequencies: int = 16,
         plr_freq_scale: float = 0.01,
         plr_out_dim: int = 8,
@@ -1084,6 +1148,7 @@ class TabERA(nn.Module):
             cat_cardinalities=cat_cardinalities,
             cat_combine=cat_combine, cat_embed_dim=cat_embed_dim,
             num_embedding=num_embedding, num_bin_edges=num_bin_edges,
+            ple_d_embedding=ple_d_embedding,
             plr_n_frequencies=plr_n_frequencies, plr_freq_scale=plr_freq_scale,
             plr_out_dim=plr_out_dim,
         )
@@ -1154,6 +1219,8 @@ class TabERA(nn.Module):
         self,
         X: torch.Tensor,                          # (B, F)
         labels: Optional[torch.Tensor] = None,    # (B,) 학습 시 메모리 업데이트용
+        sample_ids: Optional[torch.Tensor] = None, # (B,) 학습 시 X_train 행 번호 — MemoryBank/
+                                                    # FeatureStore 슬롯 대응을 확정적으로 증명하기 위함
         return_explanations: bool = False,
         ablation_mode: str = "none",              # ablation 모드 (학습 시 "none" 유지)
     ) -> Dict[str, torch.Tensor]:
@@ -1235,9 +1302,9 @@ class TabERA(nn.Module):
 
         # 5. 메모리 업데이트 (학습 시)
         if self.training and labels is not None:
-            self.memory.update(query_emb.detach(), labels.float())
+            self.memory.update(query_emb.detach(), labels.float(), sample_ids)
             if self._feature_store is not None:
-                self._feature_store.update(X)
+                self._feature_store.update(X, sample_ids)
 
         # 6. 보조 손실
         aux_loss = torch.tensor(0.0, device=X.device)
@@ -1288,6 +1355,73 @@ class TabERA(nn.Module):
     @property
     def feature_store(self) -> Optional[FeatureStore]:
         return self._feature_store
+
+    @torch.no_grad()
+    def refresh_memory_keys(self, batch_size: int = 1024) -> Optional[Dict[str, float]]:
+        """학습 종료 후(best_state/feature_store 복원 직후) 1회 호출.
+
+        feature_store에 저장된 raw feature를 지금(frozen) 가중치로 다시
+        embedder에 통과시켜 memory.keys/_keys_norm을 덮어쓴다. 그 결과
+        memory.keys[i]는 "학습 도중 특정 시점의 dropout mask + 그 시점의
+        가중치로 계산된 1회성 스냅샷"이 아니라 "현재 가중치에서 raw
+        feature의 순수 결정론적 함수"가 된다.
+
+        [설계 근거] 원본 TabR(libs/tabr.py)의 candidate 처리 방식과 같은
+        원칙 — TabR도 candidate embedding을 영구 저장하지 않고, epoch마다
+        `self.model.cached_candidate_k = self._encode(...)`로 통째로 다시
+        인코딩하며, predict()에서는 self.model.eval() 이후 candidate를
+        처음부터 다시 계산한다. 즉 "추론/설명 단계에는 학습 노이즈가
+        새어나가지 않는다"는 원본 설계를 TabERA의 저장 구조(ring buffer +
+        group cache)에 맞게 적용한 것.
+
+        [학습 중엔 호출 안 함 — 의도적] 학습 스텝마다 이걸 부르지 않는
+        이유: (1) 매 스텝 embedder를 한 번 더 통과시키는 건 학습 전체
+        기간(E epoch) 동안 E×N_train번의 추가 forward가 필요해 비쌈,
+        이 방식은 학습 전체에 걸쳐 N_train번(최선의 경우 그보다 적게,
+        best가 갱신될 때만) 한 번만 계산하면 됨. (2) TabR도 학습 중엔
+        현재 배치의 noisy key를 candidate에 섞어 쓰므로(`candidate_k =
+        torch.cat([k, cached_candidate_k])`), 학습 중 retrieval 대상에
+        약간의 노이즈가 섞이는 것 자체는 TabR 계열에서 드문 일이 아님.
+
+        Returns
+        ───────
+        None이면 feature_store가 없어 건너뜀. 있으면 진단용 dict
+        {"n_refreshed": int} — 몇 개 슬롯을 갱신했는지.
+        """
+        if self._feature_store is None:
+            return None
+
+        n_mem  = int(self.memory.filled.item())
+        n_feat = self._feature_store._filled
+        # [방어적 확인] 두 저장소는 forward()에서 항상 같은 호출, 같은
+        # 배치로 붙어서 update되므로 filled가 같아야 하는 구조적 불변조건.
+        # 어긋나면 memory와 feature_store가 서로 다른 시점(예: best_state는
+        # 복원됐는데 feature_store는 최신 상태로 남은 경우)을 가리키고
+        # 있다는 뜻이라, 조용히 잘못된 슬롯을 짝짓는 대신 바로 알아채도록
+        # assert로 막는다 — 리뷰에서 지적된 "memory/feature_store 복원
+        # 순서" 문제를 코드가 스스로 검증하게 하는 안전장치.
+        assert n_mem == n_feat, (
+            f"refresh_memory_keys(): memory.filled({n_mem}) != "
+            f"feature_store._filled({n_feat}) — memory와 feature_store가 "
+            f"서로 다른 시점으로 복원된 상태일 수 있습니다. best_state/"
+            f"feature_store 복원이 refresh_memory_keys() 호출보다 먼저 "
+            f"끝났는지 확인하세요."
+        )
+        if n_mem == 0:
+            return {"n_refreshed": 0}
+
+        was_training = self.training
+        self.eval()
+        device = self.memory.keys.device
+        for start in range(0, n_mem, batch_size):
+            end = min(start + batch_size, n_mem)
+            raw   = self._feature_store._store[start:end].to(device)
+            clean = self.embedder(raw)
+            self.memory.keys[start:end]      = clean
+            self.memory._keys_norm[start:end] = F.normalize(clean, dim=-1)
+        if was_training:
+            self.train()
+        return {"n_refreshed": n_mem}
 
     # [제거됨] forward_soft_for_ig / get_fixed_neighbors_for_ig /
     # forward_fixed_neighbors_for_ig — 전부 IG의 completeness axiom을

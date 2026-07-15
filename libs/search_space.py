@@ -10,12 +10,80 @@ params_to_model_kwargs: params → TabHERA 생성자 인자
 """
 
 from __future__ import annotations
+import math
 import optuna
+
+
+# ─────────────────────────────────────────────────────────────
+# AdaCos fixed-scale 공식 (Zhang et al. 2019, CVPR)
+# ─────────────────────────────────────────────────────────────
+
+def adacos_fixed_scale(n_prototypes: int) -> float:
+    """centroid routing softmax의 scale factor를 탐색 대신 공식으로 계산.
+
+    [배경] 기존엔 routing_scale을 Optuna가 [1.0, 20.0] 구간에서 데이터셋
+    마다 탐색했음(get_search_space 옛 버전 참고). 그런데 이미 그 탐색
+    범위를 정할 때 AdaCos 논문(Zhang et al. 2019)의 fixed-scale 공식
+    s = √2·log(C-1)을 실제 n_prototypes(P=√N_train) 범위에 대입해본 적이
+    있고, 그 결과가 이 프로젝트가 다루는 전체 데이터셋 규모(P=7~322)에서
+    s=2.5~8.2로 좁게 수렴한다는 게 이미 확인돼 있었음(search_space.py
+    routing_scale 탐색 범위 상한을 20으로 좁힌 근거이기도 함).
+
+    즉 이 파라미터는 "데이터셋마다 안 다른 파라미터"가 아니라 "데이터셋
+    마다 다르지만 n_prototypes로부터 원리적으로 계산 가능한 값"이라는
+    뜻 — k/n_prototypes처럼 "안 중요해서 고정"이 아니라, "중요하지만
+    탐색이 아니라 계산으로 풀 수 있어서 탐색 공간에서 제외"하는 종류의
+    컴팩트화. Optuna가 매번 헛수고로 이 축을 훑는 대신, 그 예산을
+    lr/dropout처럼 진짜 데이터셋마다 다른 파라미터에 더 배분하기 위함.
+
+    [주의] AdaCos 원 논문은 얼굴 인식 태스크의 클래스 수(C)를 기준으로
+    한 공식이라, "centroid 수(P)를 C 대신 넣는다"는 이 프로젝트의
+    치환 자체는 검증된 이론이 아니라 유비(analogy)에 기반한 실용적
+    근사임 — 성능이 유지되는지 A/B로 반드시 확인해야 함.
+    """
+    # P<=2면 log(P-1)<=0이 되어 scale이 0 이하로 나올 수 있음 — cosine
+    # softmax의 최소한의 뾰족함은 보장하도록 1.0 하한을 둠(기존 탐색
+    # 범위 하한과 동일).
+    return max(1.0, math.sqrt(2) * math.log(max(n_prototypes - 1, 1)))
 
 
 # ─────────────────────────────────────────────────────────────
 # 초기 trial 기본값 (MultiTab suggest_initial_trial 패턴)
 # ─────────────────────────────────────────────────────────────
+
+def study_pkl_tag(
+    no_offset_correction: bool = False,
+    global_retrieve: bool = False,
+    detach_context_grad: bool = False,
+    context_projection: bool = False,
+    cat_combine: str = "onehot",
+    num_embedding: str = "ple",
+) -> str:
+    """optimize.py가 저장하는 study .pkl 파일명의 태그 부분을 만든다.
+
+    [배경] optimize.py는 이 태그로 study 파일을 저장하는데, reproduce.py는
+    그 파일을 다시 읽어올 때 자기만의 별도 태그 로직(_save_tag, 자기
+    출력 파일용이라 구성 항목이 다름 — 예: cat_combine="onehot"이 기본값
+    인데도 태그를 붙이고, num_embedding="plr_lite"에도 태그를 붙이는 등)을
+    썼음. 두 로직이 따로 존재하면서 한쪽만 바뀌면(이번엔 --num_embedding
+    기본값을 plr_lite→ple로 바꾼 것) 조용히 어긋나는 사고가 실제로 남 —
+    optimize.py가 "data=41143..num_ple..model=tabera.pkl"로 저장했는데,
+    reproduce.py는 태그 없이 "data=41143..model=tabera.pkl"을 찾다가
+    FileNotFoundError.
+
+    두 파일이 이 함수 하나를 공유하게 해서, 앞으로 태그 구성 항목이
+    늘어나도(예: 새 ablation 플래그 추가) 한 곳만 고치면 항상 일치하도록
+    한다.
+    """
+    return ("..no_offset" if no_offset_correction else "") \
+        + ("..global_retrieve" if global_retrieve else "") \
+        + ("..detach_ctx" if detach_context_grad else "") \
+        + ("..ctx_proj" if context_projection else "") \
+        + ("..cat_concat" if cat_combine == "concat" else "") \
+        + ("..cat_sum" if cat_combine == "sum" else "") \
+        + ("..num_ple" if num_embedding == "ple" else "") \
+        + ("..num_linear" if num_embedding == "linear" else "")
+
 
 def suggest_initial_trial() -> dict:
     """
@@ -47,7 +115,10 @@ def get_search_space(
     num_features: int = 0,   # MultiTab 호환 인자 (현재 미사용)
     data_id: int = 0,        # MultiTab 호환 인자 (현재 미사용)
     metric: str = "l2",      # TabR Retriever 거리 지표
-    num_embedding: str = "linear",  # "plr_lite"면 PLR 관련 하이퍼파라미터도 탐색
+    num_embedding: str = "ple",  # [수정] 공식 채택값(2026-07)과 일관되게 변경.
+                                   # optimize.py는 항상 args.num_embedding을 명시적으로
+                                   # 넘기므로 실제 파이프라인 동작엔 영향 없음 — 이 함수를
+                                   # 직접 호출하는 경우(테스트/노트북 등)를 위한 방어적 기본값.
 ) -> dict:
     """
     Optuna Trial로부터 TabHERA 하이퍼파라미터를 샘플링합니다.
@@ -122,22 +193,19 @@ def get_search_space(
         # ── TabR Retriever 거리 지표 (확장용) ──────────
         "metric":          metric,
 
-        # [추가] centroid routing softmax의 scale factor. ArcFace/CosFace/
-        # AdaCos/von Mises-Fisher Loss 등 코사인 유사도 기반 softmax 문헌에서
-        # 공통 지적: cos 유사도가 [-1,1]이라는 좁은 범위라 스케일링 없이
-        # softmax에 넣으면 분포가 평평해지고 STE backward gradient가 약해짐
-        # (실측: P=10, scale=1.0일 때 1등 확률 평균 0.142 — 거의 무작위
-        # 수준인 0.1에 가까움).
-        #
-        # [범위 재검증] 처음엔 [1,50]으로 뒀는데, AdaCos 논문(Zhang et al.
-        # 2019)의 fixed-scale 공식 s≈√2·log(C-1)을 실제 n_prototypes(P=
-        # sqrt(N_train)) 범위에 대입해보니: 현재 다루는 소형 데이터셋(P=7~65)
-        # 은 s=2.5~5.9, 향후 다룰 대형 데이터셋(electricity/nomao 등, P=166~
-        # 322)까지 포함해도 s=7.2~8.2를 넘지 않음 — 즉 이론적으로 타당한
-        # 구간은 전부 ~1~8 안에 있는데 상한을 50으로 두면 로그스케일 확률
-        # 질량의 절반 가까이가 그 이론 구간 밖에 낭비됨. 상한을 20으로
-        # 줄여 여유(이론 최대값의 ~2.5배)는 남기되 탐색 효율을 높임.
-        "routing_scale":   trial.suggest_float("routing_scale", 1.0, 20.0, log=True),
+        # [수정 — 컴팩트화] routing_scale을 더 이상 여기서 탐색하지 않음.
+        # 기존엔 trial.suggest_float("routing_scale", 1.0, 20.0, log=True)
+        # 였는데, 이 축 하나가 AdaCos fixed-scale 공식(adacos_fixed_scale,
+        # 이 파일 상단)으로 n_prototypes만 알면 계산 가능하다는 게 이미
+        # 이 프로젝트 자체 분석(탐색 범위를 20으로 좁힌 근거)으로 확인돼
+        # 있었음. 실제 계산은 params_to_model_kwargs()에서 n_prototypes를
+        # 이용해 수행 — 여기서 굳이 trial 정보 없이도 계산 가능하므로
+        # get_search_space() 시그니처(n_prototypes 미보유)를 안 건드림.
+        # [하위 호환] 구버전 study의 best_params에는 trial.suggest_float로
+        # 기록된 routing_scale이 그대로 남아있으므로, 그 study를 다시
+        # 불러오면(reproduce.py) 이 새 공식이 아니라 기존 탐색값을 그대로
+        # 사용함(params_to_model_kwargs의 .get() fallback 참고) — 재현성
+        # 보존.
     }
 
     if num_embedding == "plr_lite":
@@ -187,9 +255,13 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
             # 조합에서도 동일한 fallback을 씀).
             "codebook":    params.get("loss_codebook", 0.0),
         },
-        # .get() — 이 파라미터 추가 이전에 저장된 구버전 study의 best_params
-        # 에는 이 키가 없을 수 있음 (그런 경우 기존과 동일한 1.0 사용).
-        "routing_scale":   params.get("routing_scale", 1.0),
+        # [수정] routing_scale이 없는 경우(신규 study — get_search_space가
+        # 더 이상 trial.suggest_float로 이 키를 채우지 않음)엔 AdaCos
+        # fixed-scale 공식으로 계산. 반대로 구버전 study의 best_params에
+        # 이 키가 이미 있으면(예전엔 tuning 대상이었으므로) 그 값을 그대로
+        # 씀 — 재현성 보존(기존 체크포인트/study의 결과가 이 변경으로
+        # 조용히 달라지지 않게 함).
+        "routing_scale":   params.get("routing_scale", adacos_fixed_scale(params["n_prototypes"])),
     }
     # PLR(lite) 하이퍼파라미터 — get_search_space가 num_embedding="plr_lite"일
     # 때만 params에 넣어주므로, 있을 때만 그대로 전달 (없으면 TabERA 기본값

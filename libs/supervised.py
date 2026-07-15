@@ -107,6 +107,15 @@ class TabERAWrapper:
         target_class_names: Optional[List[str]] = None,
         quantile_transformer=None,
         regroup_log_every: int = 10,   # [Regroup] 로그 출력 주기(epoch). 진단 목적으로 좁힐 수 있게.
+        refresh_on_best: bool = False,
+        # [추가] best_state 복원 직후 model.refresh_memory_keys()를 호출할지.
+        # 기본 False — 기존 Optuna study/best_params는 이 플래그와 무관하게
+        # 전혀 오염되지 않음(변경 전 재현 그대로 유지). True로 켜면
+        # memory.keys가 raw feature의 결정론적 함수가 되지만, dropout 노이즈가
+        # retrieval 강건성에 기여하고 있었다면 val/test 성능이 달라질 수
+        # 있음 — 그래서 재고 데이터셋에서 A/B 비교부터 하고 기본값 전환을
+        # 결정하는 걸 권장 (bare 플래그로 시작, HPO search space엔 아직
+        # 안 넣음).
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -144,8 +153,74 @@ class TabERAWrapper:
         # prep_data()가 반환하는 것. 있으면 label_all_groups()가 numeric
         # 값을 [0,1] uniform 대신 실제 단위로 역변환해 보여준다.
         self.quantile_transformer = quantile_transformer
+        self.refresh_on_best = refresh_on_best
 
     # ── fit ─────────────────────────────────────────────────
+
+    def _resync_groups_after_refresh(self) -> Optional[Dict[str, float]]:
+        """refresh_memory_keys() 직후 호출. sample_groups(centroid별 그룹
+        캐시)는 학습 중 그 시점의 memory.keys(noisy)를 기준으로 계산돼
+        있는데, refresh_memory_keys()는 memory.keys를 완전히 다른 값
+        (clean embedding)으로 갈아치우면서 sample_groups는 그대로 둔다 —
+        그러면 두 저장소가 서로 다른 시점의 스냅샷이 되어버림
+        (dual_space_faithfulness의 "사전 검증 1" 재배정 일치율이 무너지는
+        원인 — libs/prototypes.py의 regroup_update() 안에 있는 dead-code
+        reinit 버그 수정 주석과 정확히 같은 종류의 문제).
+
+        regroup_update()는 X_raw를 안 쓰고(하위 호환용 시그니처만 유지),
+        dead-centroid reinit이 일어나도 그 직후 최종 centroid_emb 기준
+        으로 assignment를 다시 계산해 sample_groups를 덮어쓰므로, 이걸
+        clean 임베딩으로 한 번 더 불러주면 (sample_groups, centroid_emb,
+        memory.keys) 셋이 항상 서로 일치하는 상태로 돌아온다.
+
+        [참고] regroup_update()가 내부적으로 current_epoch을 1 증가시키고,
+        dead_streak 상태에 따라 일부 centroid를 재초기화할 수 있다 —
+        학습 중과 동일한 안전장치가 그대로 적용되는 것이라 원칙적으로는
+        문제없지만, 그 결과 최종 centroid_emb가 저장된 best_state의 값과
+        (재초기화된 소수의 centroid에 한해) 미세하게 달라질 수 있다는
+        점은 알아둘 필요가 있음.
+        """
+        if not (hasattr(self.model, 'prototype_layer')
+                and hasattr(self.model.prototype_layer, 'regroup_update')):
+            return None
+
+        with torch.no_grad():
+            n_mem = self.model.memory.filled.item()
+            if n_mem < 1:
+                return None
+            emb_regroup = self.model.memory.keys[:n_mem]   # 방금 refresh된 clean 값
+            regroup_stats = self.model.prototype_layer.regroup_update(emb_regroup)
+
+            # retrieve()가 참조하는 GPU 그룹 캐시도 같이 갱신 — 안 하면
+            # sample_groups(방금 갱신됨)와 cache_sample_groups()가 예전에
+            # 만들어둔 캐시(옛 그룹 기준)가 또 어긋남.
+            self.model.memory.cache_sample_groups(
+                self.model.prototype_layer.sample_groups,
+                device=torch.device(self.device),
+                centroid_emb=self.model.prototype_layer.centroid_emb,
+            )
+
+            # ①의 텍스트 라벨(group_labels/target_labels)도 옛 그룹 기준
+            # 캐시라 stale함 — 새 sample_groups로 다시 계산.
+            fs = self.model.feature_store
+            if (fs is not None and self.cat_cols is not None
+                    and self.num_cols is not None and self.col_names is not None):
+                x_regroup = fs._store[:n_mem].to(self.device)
+                self.model.prototype_layer.group_labels = label_all_groups(
+                    x_regroup.detach().cpu().numpy(),
+                    self.model.prototype_layer.sample_groups,
+                    self.cat_cols, self.num_cols, self.col_names,
+                    cat_category_names=self.cat_category_names,
+                    quantile_transformer=self.quantile_transformer,
+                )
+            y_regroup = self.model.memory.labels[:n_mem]
+            self.model.prototype_layer.target_labels = label_groups_by_target(
+                y_regroup.detach().cpu().numpy(),
+                self.model.prototype_layer.sample_groups,
+                self.tasktype,
+                class_names=self.target_class_names,
+            )
+        return regroup_stats
 
     def fit(
         self,
@@ -253,7 +328,11 @@ class TabERAWrapper:
 
                 optimizer.zero_grad()
 
-                out = self.model(xb, labels=yb)
+                # [추가] idx가 그대로 X_train 행 번호 — MemoryBank/FeatureStore가
+                # 이 배치를 저장할 때 같은 값을 sample_ids로 같이 넣어두면,
+                # 두 저장소의 슬롯 대응을 사후에 통계가 아니라 정확한 등식으로
+                # 검증할 수 있다 (reproduce.py --ablation dual_space_faithfulness).
+                out = self.model(xb, labels=yb, sample_ids=idx)
                 lg  = out["logits"]
 
                 if self.tasktype in ("regression", "binclass"):
@@ -495,6 +574,7 @@ class TabERAWrapper:
                         self.model.feature_store._store.clone(),
                         self.model.feature_store._ptr,
                         self.model.feature_store._filled,
+                        self.model.feature_store._sample_ids.clone(),
                     )
                 else:
                     best_feature_store = None
@@ -519,6 +599,10 @@ class TabERAWrapper:
             # [버그 수정] state_dict에 없는 sample_groups/feature_store도
             # 같은 best epoch 시점으로 함께 복원 — centroid_emb/memory.keys와
             # 시점이 어긋나지 않도록 함.
+            # [참고] memory.keys/labels/ptr/filled/sample_ids는 모두
+            # nn.Module buffer라 위 load_state_dict() 한 줄로 이미 best
+            # epoch 시점으로 복원됨 — feature_store(아래)와 항상 같은
+            # 시점이 되도록, 그 다음 순서로 feature_store를 복원한다.
             if best_sample_groups is not None:
                 self.model.prototype_layer.sample_groups = best_sample_groups
             if best_group_labels is not None:
@@ -526,10 +610,25 @@ class TabERAWrapper:
             if best_target_labels is not None:
                 self.model.prototype_layer.target_labels = best_target_labels
             if best_feature_store is not None:
-                store, ptr, filled = best_feature_store
-                self.model.feature_store._store  = store
-                self.model.feature_store._ptr    = ptr
-                self.model.feature_store._filled = filled
+                store, ptr, filled, sample_ids = best_feature_store
+                self.model.feature_store._store       = store
+                self.model.feature_store._ptr         = ptr
+                self.model.feature_store._filled      = filled
+                self.model.feature_store._sample_ids  = sample_ids
+            # [추가] memory(위에서 이미 복원됨)와 feature_store(방금 복원됨)가
+            # 모두 같은 best epoch 시점이 된 뒤에만 refresh를 실행한다 —
+            # 순서가 바뀌면 refresh_memory_keys() 내부 assert(filled 일치)가
+            # 즉시 잡아낸다.
+            if self.refresh_on_best:
+                refresh_stats = self.model.refresh_memory_keys()
+                if refresh_stats is not None:
+                    tqdm.write(f"  [refresh_on_best] memory.keys {refresh_stats['n_refreshed']}개 "
+                               f"슬롯을 frozen weight로 재계산 완료")
+                    regroup_stats = self._resync_groups_after_refresh()
+                    if regroup_stats is not None:
+                        tqdm.write(f"  [refresh_on_best] clean 임베딩 기준으로 sample_groups 재동기화 "
+                                   f"완료 (active={regroup_stats.get('active_ratio', 0)*100:.0f}%, "
+                                   f"reinit={regroup_stats.get('reinit_count', 0)})")
         self._best_state = best_state
 
         # ── centroid margin z-score 진단 (best epoch 복원된 모델 기준) ──

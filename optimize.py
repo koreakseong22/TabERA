@@ -62,12 +62,20 @@ parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum",
                     ))
 parser.add_argument("--cat_embed_dim", type=int, default=16,
                     help="cat_combine=concat일 때 컬럼별 embedding 차원 (기본 16).")
-parser.add_argument("--num_embedding", type=str, default="plr_lite",
+parser.add_argument("--num_embedding", type=str, default="ple",
                     choices=["linear", "ple", "plr_lite"],
                     help=(
-                        "numeric feature 인코딩 방식. 'plr_lite'(기본값, 채택 확정)는 "
-                        "TabR/ModernNCA 방식 — 주기함수 + 전체 컬럼 공유 Linear+ReLU. "
-                        "'linear'/'ple'는 이전 실험용 옵션(reproduce.py와 동일)."
+                        "numeric feature 인코딩 방식. 'ple'(기본값, 채택 확정 — 2026-07 갱신)은 "
+                        "PiecewiseLinearEmbeddings(activation=False) — TabM(Gorishniy et al. 2024) "
+                        "기본값과 동일 구조. 4개 데이터셋(profb/vehicle/credit-g/jasmine) 실측 근거: "
+                        "PLR 대비 val 붕괴(무작위 수준 trial)가 0건으로 감소(PLR은 vehicle 2건, "
+                        "credit-g 1건 발생) + routing_scale/PLR 3종 제거로 HPO 탐색 공간이 13→9차원 "
+                        "으로 축소됨. 다만 top5-test 성능은 데이터셋마다 갈렸고(4개 중 1개만 PLE "
+                        "우세, 나머지는 PLR 우세 — 명확한 성능 우위는 아님), centroid "
+                        "margin_percentile은 4개 데이터셋 전부에서 PLE가 더 낮게 나옴(원인 미상, "
+                        "추가 조사 필요) — 즉 '성능이 더 좋아서'가 아니라 '재앙적 실패를 없애고 "
+                        "탐색을 단순화하기 위해' 채택한 것임을 분명히 해둠. 'plr_lite'는 이전 "
+                        "기본값(TabR/ModernNCA 계보) — 필요시 여전히 선택 가능."
                     ))
 parser.add_argument("--num_bins", type=int, default=8,
                     help="num_embedding=ple일 때 컬럼당 구간(bin) 개수 (기본 8).")
@@ -86,7 +94,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과
 import optuna, torch, json, joblib, datetime, math, gc
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
-from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs
+from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
 import warnings
@@ -115,14 +123,14 @@ else:
 if not os.path.exists(savepath):
     os.makedirs(savepath)
 
-_ablation_tag = ("..no_offset" if args.no_offset_correction else "") + \
-                ("..global_retrieve" if args.global_retrieve else "") + \
-                ("..detach_ctx" if args.detach_context_grad else "") + \
-                ("..ctx_proj" if args.context_projection else "") + \
-                ("..cat_concat" if args.cat_combine == "concat" else "") + \
-                ("..cat_sum" if args.cat_combine == "sum" else "") + \
-                ("..num_ple" if args.num_embedding == "ple" else "") + \
-                ("..num_linear" if args.num_embedding == "linear" else "")
+_ablation_tag = study_pkl_tag(
+    no_offset_correction=args.no_offset_correction,
+    global_retrieve=args.global_retrieve,
+    detach_context_grad=args.detach_context_grad,
+    context_projection=args.context_projection,
+    cat_combine=args.cat_combine,
+    num_embedding=args.num_embedding,
+)
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
 # ─────────────────────────────────────────────────────────────

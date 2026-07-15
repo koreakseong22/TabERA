@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from pathlib import Path
 
 from libs.data         import TabularDataset
-from libs.search_space import params_to_model_kwargs
+from libs.search_space import params_to_model_kwargs, study_pkl_tag
 from libs.supervised   import TabERAWrapper
 from libs.tabera         import TabERA
 from libs.prototypes     import inverse_transform_numeric
@@ -382,18 +382,24 @@ def main():
                         ))
     parser.add_argument("--cat_embed_dim", type=int, default=16,
                         help="cat_combine=concat일 때 컬럼별 embedding 차원 (기본 16).")
-    parser.add_argument("--num_embedding", type=str, default="plr_lite",
+    parser.add_argument("--num_embedding", type=str, default="ple",
                         choices=["linear", "ple", "plr_lite"],
                         help=(
-                            "numeric feature 인코딩 방식. 'plr_lite'(기본값, 채택 확정)는 "
-                            "TabR(Gorishniy et al. 2024)/ModernNCA가 실제로 쓰는 방식 — 학습"
-                            "가능한 주기(periodic) 함수 + 전체 컬럼이 공유하는 Linear+ReLU "
-                            "(공식 구현과 수식 대조 검증됨). 'linear'는 raw 값을 그대로 Linear에 "
-                            "투영 — 기존 동작, 하위 호환용. 'ple'는 Piecewise Linear Encoding "
-                            "(구간/bin 기반, Gorishniy et al. 2022) — plr_lite와 완전히 다른 "
-                            "메커니즘. numeric feature가 매우 적은 데이터셋(예: 1~5개)에서는 "
-                            "plr_lite가 오히려 불안정할 수 있음(실측: profb에서 auroc가 무작위 "
-                            "수준까지 하락) — 그런 경우 --num_embedding linear/ple 고려."
+                            "numeric feature 인코딩 방식. 'ple'(기본값, 채택 확정 — 2026-07 갱신)은 "
+                            "PiecewiseLinearEmbeddings(activation=False, Gorishniy et al. 2022) — "
+                            "TabM(Gorishniy et al. 2024)이 기본값으로 권장하는 것과 동일 구조 "
+                            "(feature별 학습 가능한 (n_bins, d_embedding) 가중치로 bin 인코딩을 "
+                            "가중합 — 예전엔 이 가중치 없이 raw bin 벡터를 그대로 내보내는 "
+                            "PiecewiseLinearEncoding이었음, TabM 기본값과 달랐던 걸 이번에 맞춤). "
+                            "4개 데이터셋(profb/vehicle/credit-g/jasmine) 실측 근거: PLR 대비 val "
+                            "붕괴(무작위 수준 trial)가 0건으로 감소(PLR은 vehicle 2건, credit-g 1건 "
+                            "발생) + routing_scale/PLR 3종이 탐색 공간에서 빠져 HPO가 13→9차원으로 "
+                            "축소됨. 다만 top5-test 성능은 데이터셋마다 갈렸고(4개 중 1개만 PLE "
+                            "우세), centroid margin_percentile은 4개 전부 PLE가 더 낮게 나옴(원인 "
+                            "미상) — '성능 우위'가 아니라 '재앙적 실패 방지 + 탐색 단순화'가 채택"
+                            "근거임을 분명히 해둠. 'plr_lite'는 이전 기본값(TabR/ModernNCA 계보, "
+                            "학습 가능한 주기함수 + 공유 Linear+ReLU) — 필요시 여전히 선택 가능. "
+                            "'linear'는 raw 값을 그대로 Linear에 투영 — 기존 동작, 하위 호환용."
                         ))
     parser.add_argument("--num_bins", type=int, default=8,
                         help="num_embedding=ple일 때 컬럼당 구간(bin) 개수 (기본 8 — 48보다 "
@@ -444,6 +450,21 @@ def main():
                             "라우팅 churn(연속적인 centroid dead/reinit)의 원인 중 하나인지 "
                             "확인하려는 용도. --loss_codebook_override와 같은 패턴 — "
                             "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
+                        ))
+    parser.add_argument("--refresh_on_best", action="store_true",
+                        help=(
+                            "[설명가능성/재현성] best_state(및 feature_store) 복원 직후, "
+                            "memory.keys를 raw feature(feature_store._store)로부터 현재 "
+                            "(frozen) 가중치로 다시 인코딩해 덮어쓴다. 학습 중 저장된 값은 "
+                            "특정 시점의 dropout mask로 계산된 1회성 스냅샷이라 raw feature의 "
+                            "결정론적 함수가 아니었는데, 이 플래그를 켜면 memory.keys[i] == "
+                            "embedder(feature_store._store[i])가 (부동소수점 오차 수준까지) "
+                            "성립하게 됨 — --ablation dual_space_faithfulness의 사전검증 1.5가 "
+                            "percentile 비교 대신 정확한 근접도(≈1.0)로 판정 가능해짐. 기본값 "
+                            "False — 켜지 않으면 기존 동작과 100% 동일(HPO best_params도 안전). "
+                            "--from_saved_state와 같이 쓰면, 저장된 checkpoint가 이미 refresh된 "
+                            "상태가 아닐 경우에만 여기서 다시 refresh를 수행한다(방법2 fallback — "
+                            "저장 당시 --refresh_on_best를 켰다면 이미 clean해서 사실상 no-op)."
                         ))
     parser.add_argument("--shap_background", type=int, default=50,
                         help=(
@@ -554,9 +575,35 @@ def main():
             print(f"  ⚠️  --dropout_override는 재학습 시에만 의미가 있습니다 — "
                   f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
     else:
-        fname = os.path.join(log_dir, f"data={openml_id}..model=tabera.pkl")
+        # [수정] optimize.py가 실제로 저장한 파일명과 일치시키기 위해
+        # study_pkl_tag()를 그대로 재사용 — 예전엔 여기서 태그 없이
+        # "data={id}..model=tabera.pkl"로 고정해뒀는데, optimize.py의
+        # --num_embedding 기본값이 ple로 바뀌면서 실제 저장 파일명엔
+        # "..num_ple"이 붙어 조용히 어긋나는 사고가 났음(FileNotFoundError).
+        # no_offset_correction/global_retrieve는 reproduce.py에 CLI 플래그
+        # 자체가 없음(이미 "채택 확정"돼 하드코딩된 값 — 아래 meta 저장부의
+        # use_offset_correction=True/global_retrieve=False와 동일) — 그래서
+        # 여기도 같은 고정값(False, False)으로 명시.
+        _study_tag = study_pkl_tag(
+            no_offset_correction=False,
+            global_retrieve=False,
+            detach_context_grad=args.detach_context_grad,
+            context_projection=args.context_projection,
+            cat_combine=args.cat_combine,
+            num_embedding=args.num_embedding,
+        )
+        fname = os.path.join(log_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
         if not os.path.exists(fname):
-            _hint_cmd = f"optimize.py --openml_id {openml_id} --seed {args.seed}"
+            _hint_flags = ""
+            if args.num_embedding != "ple":
+                _hint_flags += f" --num_embedding {args.num_embedding}"
+            if args.cat_combine != "onehot":
+                _hint_flags += f" --cat_combine {args.cat_combine}"
+            if args.detach_context_grad:
+                _hint_flags += " --detach_context_grad"
+            if args.context_projection:
+                _hint_flags += " --context_projection"
+            _hint_cmd = f"optimize.py --openml_id {openml_id} --seed {args.seed}{_hint_flags}"
             raise FileNotFoundError(
                 f"최적화 로그 없음: {fname}\n"
                 f"먼저 {_hint_cmd} 를 실행하세요."
@@ -688,6 +735,7 @@ def main():
         target_class_names=dataset.target_class_names,
         quantile_transformer=dataset.quantile_transformer,
         regroup_log_every=args.regroup_log_every,
+        refresh_on_best=args.refresh_on_best,
     )
     wrapper._data_id = args.openml_id
     if _saved_state is not None:
@@ -702,14 +750,39 @@ def main():
         model.prototype_layer.target_labels = _saved_state.get("target_labels")
         fs_state = _saved_state.get("feature_store_state")
         if fs_state is not None and model.feature_store is not None:
-            store, ptr, filled = fs_state
-            model.feature_store._store  = store.to(device)
-            model.feature_store._ptr    = ptr
-            model.feature_store._filled = filled
+            # [하위 호환] 예전 체크포인트는 (store, ptr, filled) 3-tuple —
+            # sample_ids가 없으면 전부 -1(미확인)로 채움. 이 경우
+            # dual_space_faithfulness의 ID 비교는 "확인 불가"로 표시됨.
+            if len(fs_state) == 4:
+                store, ptr, filled, sample_ids = fs_state
+            else:
+                store, ptr, filled = fs_state
+                sample_ids = torch.full((model.feature_store.max_size,), -1, dtype=torch.long)
+                print(f"  ⚠️  저장된 feature_store_state에 sample_ids가 없습니다 — "
+                      f"이전 버전 체크포인트로 보입니다. ID 기반 검증은 건너뜁니다.")
+            model.feature_store._store       = store.to(device)
+            model.feature_store._ptr         = ptr
+            model.feature_store._filled      = filled
+            model.feature_store._sample_ids  = sample_ids.to(device)
         if model.prototype_layer.sample_groups is None:
             print(f"  ⚠️  저장된 state에 sample_groups가 없습니다 — 이 파일은 이번"
                   f" --from_saved_state 지원 이전 버전으로 저장된 것 같습니다."
                   f" group-constrained 검색/①②가 제대로 안 나올 수 있습니다.")
+        # [방법2 fallback] 저장 당시 --refresh_on_best가 꺼져 있었거나(기본값)
+        # 이전 버전 체크포인트라 memory.keys가 여전히 noisy할 수 있음 —
+        # 이번 실행에서 --refresh_on_best를 켰다면 로드 직후 여기서 한 번
+        # 실행. 저장 당시 이미 refresh된 상태였다면 keys를 다시 같은 값으로
+        # 덮어쓸 뿐이라 안전(no-op에 가까움).
+        if args.refresh_on_best:
+            refresh_stats = model.refresh_memory_keys()
+            if refresh_stats is not None:
+                print(f"  [--refresh_on_best] memory.keys {refresh_stats['n_refreshed']}개 "
+                      f"슬롯을 frozen weight로 재계산 완료")
+                regroup_stats = wrapper._resync_groups_after_refresh()
+                if regroup_stats is not None:
+                    print(f"  [--refresh_on_best] clean 임베딩 기준으로 sample_groups 재동기화 "
+                          f"완료 (active={regroup_stats.get('active_ratio', 0)*100:.0f}%, "
+                          f"reinit={regroup_stats.get('reinit_count', 0)})")
         print(f"  [--from_saved_state] 복원 완료 (epoch 0부터 재학습 안 함)")
     else:
         wrapper.fit(X_train, y_train, X_val, y_val)
@@ -1877,57 +1950,93 @@ def main():
             # ── [추가] 스토어 간 슬롯 대응 직접 검증 ──────────────────
             # [배경] 위 검증은 "sample_groups(캐시)가 지금 라우팅과 맞는가"만
             # 봄 — MemoryBank와 FeatureStore가 애초에 같은 슬롯에 같은
-            # 샘플을 담고 있는지는 통계적 정황(검증 2가 유의하게 나오면
-            # 간접적으로 그럴듯하다)에만 의존하고 있었음. 이건 직접 증명이
-            # 아니라서, 여기서 직접 재확인한다: memory.keys[i]는 삽입
-            # 시점 embedder(feature_store._store[i])였으므로, 지금
-            # feature_store._store[i]를 다시 embedder에 통과시켜 비교하면
-            # 같은 슬롯인지 바로 알 수 있음.
-            # [주의] 삽입 시점은 train mode(dropout 켜짐), 지금 재계산은
-            # eval mode라 절대 유사도가 1.0에 못 미치는 게 정상 — 그래서
-            # 절대 문턱값 대신, 매칭된 슬롯끼리의 유사도를 일부러 무작위로
-            # 섞은 슬롯끼리의 유사도와 비교한다(이 프로젝트가 계속 써온
-            # null-비교 방식과 동일한 원칙).
+            # 샘플을 담고 있는지는 통계적 정황에만 의존하고 있었음.
+            #
+            # [갱신] sample_ids(MemoryBank.sample_ids / FeatureStore._sample_ids)
+            # 도입 이후에는 이걸 percentile 비교가 아니라 정확한 등식으로
+            # 확정할 수 있음. sample_ids가 아직 채워지지 않은 구버전
+            # 체크포인트(전부 -1)라면, 예전 방식(무작위 셔플 대비 percentile)
+            # 으로 자동 fallback.
             print(f"\n  [사전 검증 1.5] 스토어 간 슬롯 대응 확인 (MemoryBank ↔ FeatureStore)")
             if ref_raw is None or n_mem < 2:
                 print(f"    ⚠️  feature_store가 없거나 데이터가 부족해 이 검증을 건너뜁니다.")
                 store_ok = None
             else:
-                n_check    = min(n_mem, 300)
-                check_idx  = torch.randperm(n_mem)[:n_check]
-                with torch.no_grad():
-                    recomputed = model.embedder(ref_raw[check_idx].to(device)).cpu()
-                recomputed_n = F.normalize(recomputed, dim=-1)
-                stored_n     = F.normalize(ref_emb[check_idx], dim=-1)
-                matched_sim  = (recomputed_n * stored_n).sum(dim=-1)
-                shuffled_idx = torch.randperm(n_check)
-                shuffled_sim = (recomputed_n * stored_n[shuffled_idx]).sum(dim=-1)
+                mem_ids  = model.memory.sample_ids[:n_mem].detach().cpu()
+                feat_ids = model.feature_store._sample_ids[:n_mem].detach().cpu()
+                has_ids  = bool((mem_ids >= 0).any()) and bool((feat_ids >= 0).any())
 
-                print(f"    매칭된 슬롯끼리 코사인 유사도:      "
-                      f"{matched_sim.mean():.4f} ± {matched_sim.std():.4f}")
-                print(f"    무작위로 섞은 슬롯끼리 코사인 유사도: "
-                      f"{shuffled_sim.mean():.4f} ± {shuffled_sim.std():.4f}")
-                # [수정] 평균+3표준편차(정규분포 가정)는 shuffled_sim이
-                # 치우친/뚱뚱한 꼬리 분포일 때(임베딩 구조가 뚜렷할수록
-                # 무작위로 짝지어도 우연히 같은 군집끼리 묶이는 경우가
-                # 생겨 이렇게 됨) 문턱값이 코사인 유사도의 최댓값(1.0)을
-                # 넘어버려 항상 실패로 나오는 문제가 실측 확인됨(vehicle:
-                # matched=0.968인데도 shuffled_mean+3*std=1.29로 통과 불가).
-                # 정규분포를 가정하지 않는 percentile 비교로 교체 —
-                # margin_percentile penalty 때와 같은 이유.
-                shuffled_p99 = float(np.percentile(shuffled_sim.numpy(), 99))
-                matched_median = float(matched_sim.median())
-                print(f"    셔플 분포의 99th percentile: {shuffled_p99:.4f}  "
-                      f"vs  매칭 중앙값: {matched_median:.4f}")
-                store_ok = matched_median > shuffled_p99
-                if store_ok:
-                    print(f"    ✅ 매칭된 슬롯이 무작위 분포의 상위 1%보다도 확실히 유사함")
-                    print(f"       — 두 스토어의 슬롯이 같은 샘플을 가리키는 것으로 확인됨.")
+                if has_ids:
+                    # ── 1.5-a: 인덱스 대응 — 통계 아니라 정확한 등식 ──────
+                    id_match = (mem_ids == feat_ids)
+                    id_match_rate = float(id_match.float().mean())
+                    print(f"    [1.5-a] sample_id 일치율: {id_match_rate:.1%}  "
+                          f"(100%가 아니면 즉시 확정적 버그 — 통계적 여지 없음)")
+                    id_ok = id_match_rate >= 0.999  # 부동소수점 아닌 정수 비교라 사실상 100% 기대
+                    if id_ok:
+                        print(f"    ✅ 두 스토어의 슬롯이 같은 샘플을 가리키는 것으로 확정됨.")
+                    else:
+                        print(f"    ❌ sample_id가 어긋나는 슬롯이 있습니다 — "
+                              f"MemoryBank/FeatureStore가 서로 다른 시점 또는 순서로 "
+                              f"복원됐을 가능성이 높습니다 (예: best_state/feature_store "
+                              f"복원 순서 확인).")
+
+                    # ── 1.5-b: 값 재현성 — refresh_on_best 여부에 따라
+                    # 기대치가 다름. refresh했다면 부동소수점 오차 수준(≈1.0)
+                    # 까지 기대할 수 있고, 안 했다면(기본값) 여전히 dropout
+                    # 노이즈가 섞여 있어 1.0보다 뚜렷이 낮은 게 정상.
+                    n_check   = min(n_mem, 300)
+                    check_idx = torch.randperm(n_mem)[:n_check]
+                    with torch.no_grad():
+                        recomputed = model.embedder(ref_raw[check_idx].to(device)).cpu()
+                    recomputed_n = F.normalize(recomputed, dim=-1)
+                    stored_n     = F.normalize(ref_emb[check_idx], dim=-1)
+                    matched_sim  = (recomputed_n * stored_n).sum(dim=-1)
+                    print(f"    [1.5-b] 재계산 코사인 유사도: "
+                          f"mean={matched_sim.mean():.6f}  min={matched_sim.min():.6f}")
+                    if getattr(args, "refresh_on_best", False):
+                        # refresh 이후엔 거의 정확히 1.0이어야 함 — 부동소수점
+                        # 오차(비결정적 GPU 커널 포함) 감안해 0.999를 기준으로.
+                        value_ok = float(matched_sim.min()) > 0.999
+                        print(f"       (--refresh_on_best 켜짐 → ≈1.0 기대) "
+                              f"{'✅ 재현됨' if value_ok else '❌ 기대에 못 미침 — refresh 로직 확인 필요'}")
+                    else:
+                        print(f"       (--refresh_on_best 꺼짐 → dropout 노이즈로 1.0보다 "
+                              f"뚜렷이 낮은 게 정상. 재현성이 필요하면 --refresh_on_best로 재학습)")
+                    store_ok = id_ok
+                    if not id_ok:
+                        valid_p = []
                 else:
-                    print(f"    ❌ 매칭된 슬롯의 유사도가 무작위로 섞은 분포의 상위 1%")
-                    print(f"       수준을 못 넘습니다 — MemoryBank/FeatureStore 슬롯이")
-                    print(f"       서로 다른 샘플을 가리키고 있을 가능성이 있습니다.")
-                    valid_p = []
+                    # ── 하위 호환: sample_ids 없는 구버전 체크포인트 → 기존 percentile 방식
+                    print(f"    ⚠️  sample_ids가 없는 체크포인트입니다 — 기존 percentile 기반")
+                    print(f"       방식으로 대신 확인합니다(확정적 증명 아님, 통계적 근사).")
+                    n_check    = min(n_mem, 300)
+                    check_idx  = torch.randperm(n_mem)[:n_check]
+                    with torch.no_grad():
+                        recomputed = model.embedder(ref_raw[check_idx].to(device)).cpu()
+                    recomputed_n = F.normalize(recomputed, dim=-1)
+                    stored_n     = F.normalize(ref_emb[check_idx], dim=-1)
+                    matched_sim  = (recomputed_n * stored_n).sum(dim=-1)
+                    shuffled_idx = torch.randperm(n_check)
+                    shuffled_sim = (recomputed_n * stored_n[shuffled_idx]).sum(dim=-1)
+
+                    print(f"    매칭된 슬롯끼리 코사인 유사도:      "
+                          f"{matched_sim.mean():.4f} ± {matched_sim.std():.4f}")
+                    print(f"    무작위로 섞은 슬롯끼리 코사인 유사도: "
+                          f"{shuffled_sim.mean():.4f} ± {shuffled_sim.std():.4f}")
+                    shuffled_p99 = float(np.percentile(shuffled_sim.numpy(), 99))
+                    matched_median = float(matched_sim.median())
+                    print(f"    셔플 분포의 99th percentile: {shuffled_p99:.4f}  "
+                          f"vs  매칭 중앙값: {matched_median:.4f}")
+                    store_ok = matched_median > shuffled_p99
+                    if store_ok:
+                        print(f"    ✅ 매칭된 슬롯이 무작위 분포의 상위 1%보다도 확실히 유사함")
+                        print(f"       — 두 스토어의 슬롯이 같은 샘플을 가리키는 것으로 확인됨.")
+                    else:
+                        print(f"    ❌ 매칭된 슬롯의 유사도가 무작위로 섞은 분포의 상위 1%")
+                        print(f"       수준을 못 넘습니다 — MemoryBank/FeatureStore 슬롯이")
+                        print(f"       서로 다른 샘플을 가리키고 있을 가능성이 있습니다.")
+                        valid_p = []
 
             print(f"\n  [검증 2] Between-Group Feature Separation")
             print(f"  (numeric: One-way ANOVA F-test / categorical: Chi-square 독립성 검정)")
@@ -2260,7 +2369,8 @@ def main():
         "group_labels":   model.prototype_layer.group_labels,
         "target_labels":  model.prototype_layer.target_labels,
         "feature_store_state": (
-            (fs._store.detach().cpu(), fs._ptr, fs._filled) if fs is not None else None
+            (fs._store.detach().cpu(), fs._ptr, fs._filled, fs._sample_ids.detach().cpu())
+            if fs is not None else None
         ),
         "col_names":    dataset.col_names,
         "n_train":      len(X_train),
