@@ -1080,6 +1080,18 @@ class TabERA(nn.Module):
         plr_n_frequencies: int = 16,
         plr_freq_scale: float = 0.01,
         plr_out_dim: int = 8,
+        regroup_warmup_epochs: int = 0,   # [추가] CentroidLayer로 배선 — 지금까지는
+                                            # 이 값이 TabERA 생성자에 아예 없어서
+                                            # CentroidLayer 자체 기본값(0=즉시 활성화)이
+                                            # 무조건 쓰이고 있었음. 학습 초반 STE+
+                                            # dead-centroid reinit이 불안정한 시기에
+                                            # regroup을 미루면 그 노이즈가 줄어드는지
+                                            # 확인하기 위해 조정 가능하게 함.
+        dead_reinit_patience: int = 5,     # [추가] 마찬가지로 지금까지 CentroidLayer로
+                                            # 배선이 안 돼서 항상 기본값(5)만 쓰였음.
+                                            # 검증 안 된 값이라 스윕 가능하게 노출.
+        dead_reinit_noise_scale: float = 0.01,  # [추가] 재초기화 시 노이즈 상대 크기,
+                                            # 마찬가지로 검증 안 된 값이라 노출.
     ) -> None:
         super().__init__()
         self.k            = k
@@ -1162,6 +1174,9 @@ class TabERA(nn.Module):
             dropout=dropout,
             col_names=column_names,
             routing_scale=routing_scale,
+            regroup_warmup_epochs=regroup_warmup_epochs,
+            dead_reinit_patience=dead_reinit_patience,
+            dead_reinit_noise_scale=dead_reinit_noise_scale,
         )
 
         # ── TabR 방식 이웃 집계 ──────────────────────────

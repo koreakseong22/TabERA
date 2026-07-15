@@ -398,7 +398,18 @@ class CentroidLayer(nn.Module):
         n_features: int = 0,
         prototype_labels: Optional[List[str]] = None,
         regroup_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
-        dead_reinit_patience: int = 5,    # 5회 연속 dead면 재초기화
+        dead_reinit_patience: int = 5,    # 5회 연속 dead면 재초기화 — [주의] 문헌
+                                            # (Jukebox/SoundStream/NSVQ)이 실제로 쓰는
+                                            # 기준은 "연속 N epoch"이 아니라 "사용률이
+                                            # threshold 아래로 떨어지면"이라 이 파라미터화
+                                            # 자체가 문헌과 다름. 5라는 값도 검증된 적
+                                            # 없음(과거 별개 안전장치의 임계값과 우연히
+                                            # 같았을 뿐) — 스윕 대상으로 취급할 것.
+        dead_reinit_noise_scale: float = 0.01,   # [추가] 재초기화 시 anchor 벡터에
+                                            # 더하는 가우시안 노이즈의 상대 크기
+                                            # (noise_std = 이 값 × anchor.norm()).
+                                            # 문헌은 "small Gaussian noise"라고만 하지
+                                            # 구체적 수치를 안 줌 — 0.01도 검증 안 된 값.
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
         routing_scale: float = 1.0,
@@ -409,6 +420,7 @@ class CentroidLayer(nn.Module):
         self.F                 = n_features
         self.regroup_warmup_epochs = regroup_warmup_epochs
         self.dead_reinit_patience  = dead_reinit_patience
+        self.dead_reinit_noise_scale = dead_reinit_noise_scale
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
         # [추가] routing softmax의 scale factor. ArcFace/CosFace/AdaCos/
         # von Mises-Fisher Loss 등 코사인 유사도 기반 softmax를 쓰는
@@ -589,11 +601,23 @@ class CentroidLayer(nn.Module):
                 "max_cluster_size": int, "reinit_count": int}
         """
         epoch = self.current_epoch.item()
-        if epoch < self.regroup_warmup_epochs:
-            return {"active_ratio": 0.0, "min_cluster_size": 0, "max_cluster_size": 0}
+        # [버그 수정] current_epoch 증가를 warmup 체크 "직후"로 옮김 — 원래는
+        # 이 함수 맨 아래(warmup을 통과해야만 도달하는 지점)에서만 증가시켜서,
+        # epoch < warmup이면 조기 반환되어 current_epoch이 절대 못 늘어나는
+        # 순환 참조가 있었음(증가하려면 warmup을 통과해야 하고, warmup을
+        # 통과하려면 먼저 증가해야 함) — regroup_warmup_epochs>0이면 매 호출마다
+        # 무조건 조기 반환되어 사실상 영원히 켜지지 않는 상태였음(실측: vehicle
+        # 에서 warmup=5/10 둘 다 학습 끝까지 active=0%, sample_groups 전부 빈
+        # 상태로 확인됨). 이제 이 호출이 몇 번째 호출인지와 무관하게 매번
+        # current_epoch을 먼저 증가시킨 뒤 warmup 여부를 판단 — 조기 반환
+        # 되더라도 카운터는 정상적으로 흘러가서 warmup 기간이 실제로 끝난다.
+        self.current_epoch += 1
+        in_warmup = epoch < self.regroup_warmup_epochs
 
         if assignments is None:
-            # 현재 centroid 기준으로 재배정
+            # 현재 centroid 기준으로 재배정 — warmup 중에도 매번 새로 계산.
+            # dead-centroid 판정(아래)이 "이번 epoch에 배정을 하나라도
+            # 받았는가"를 warmup 여부와 무관하게 실시간으로 봐야 하기 때문.
             q = F.normalize(X_emb.float(), dim=-1)
             c = F.normalize(self.centroid_emb, dim=-1)
             assignments = (q @ c.T).argmax(dim=-1)
@@ -611,8 +635,15 @@ class CentroidLayer(nn.Module):
             new_groups[p] = mask_cpu.tolist()
             sizes[p] = len(new_groups[p])
 
-        self.sample_groups = new_groups
-        self.current_epoch += 1
+        # [수정] sample_groups(=KNN 검색 범위로 실제 쓰이는 캐시) 발행만
+        # warmup 동안 미룬다 — 예전엔 이 함수 전체가 조기 반환돼서 아래
+        # dead-centroid reinit까지 같이 꺼져 있었는데(사용자 지적), reinit은
+        # "학습 초반 불안정을 완화"하려는 warmup의 목적과 반대로 오히려
+        # 계속 돌아가야 하는 안전장치라 분리함. 실측(vehicle, rwe20)에서
+        # reinit이 warmup 끝나는 순간 한 번에 몰려서(26개 중 20개) 터지는
+        # 현상이 바로 이 결합 때문이었음.
+        if not in_warmup:
+            self.sample_groups = new_groups
 
         # ── dead-code 재초기화 (Jukebox/SoundStream 스타일) ────────
         # [배경] k-means++ 시딩은 "출발선"에서만 도움을 줄 뿐, 학습 중
@@ -626,6 +657,11 @@ class CentroidLayer(nn.Module):
         # small Gaussian noise"). centroid_emb는 항상 단위벡터로 유지
         # 되므로(supervised.py의 매 optimizer step 후 재투영) 재초기화
         # 결과도 정규화해서 그 불변조건을 깨지 않게 한다.
+        # [수정] warmup 여부와 무관하게 항상 실행 — dead_streak 누적을
+        # 학습 시작부터 추적해야 "진짜로 오래 죽어있던" centroid를 놓치지
+        # 않는다. warmup 중에 죽기 시작한 centroid를 warmup이 끝날 때까지
+        # 방치했다가 뒤늦게 한꺼번에 감지하면, 그 순간 여러 centroid가
+        # 동시에 재배치되어 오히려 불안정을 몰아주는 문제가 있었음(실측).
         n_reinit = 0
         if self.dead_reinit_patience > 0:
             with torch.no_grad():
@@ -638,7 +674,7 @@ class CentroidLayer(nn.Module):
                     if self.dead_streak[p].item() >= self.dead_reinit_patience:
                         src_idx = torch.randint(0, X_emb.shape[0], (1,)).item()
                         anchor  = X_emb[src_idx].float()
-                        noise   = torch.randn_like(anchor) * 0.01 * anchor.norm().clamp(min=1e-6)
+                        noise   = torch.randn_like(anchor) * self.dead_reinit_noise_scale * anchor.norm().clamp(min=1e-6)
                         new_vec = F.normalize(anchor + noise, dim=-1)
                         self.centroid_emb.data[p] = new_vec.to(self.centroid_emb.dtype)
                         self.dead_streak[p] = 0
@@ -660,7 +696,10 @@ class CentroidLayer(nn.Module):
         # reinit이 하나라도 있었다면, 최종 centroid_emb 기준으로 assignment를
         # 다시 계산해 sample_groups/sizes를 덮어써서 항상 서로 일치하게
         # 만든다 — 비용은 이미 갖고 있는 X_emb에 대한 argmax 한 번 더뿐.
-        if n_reinit > 0:
+        # [수정] 이 재계산·재발행도 sample_groups 발행 자체와 마찬가지로
+        # warmup 중에는 건너뜀 — 이번 호출에서 sample_groups를 아직 발행
+        # 안 했으므로(위 in_warmup 분기) 다시 계산해서 덮어쓸 대상이 없다.
+        if n_reinit > 0 and not in_warmup:
             with torch.no_grad():
                 q_final = F.normalize(X_emb.float(), dim=-1)
                 c_final = F.normalize(self.centroid_emb, dim=-1)
@@ -672,6 +711,13 @@ class CentroidLayer(nn.Module):
                 new_groups[p] = mask_cpu.tolist()
                 sizes[p] = len(new_groups[p])
             self.sample_groups = new_groups
+
+        if in_warmup:
+            # sample_groups는 발행 안 했지만 reinit_count는 warmup 중에도
+            # 실제로 일어난 값을 그대로 보고 — 로그로 "warmup 중 몇 개가
+            # 이미 구제됐는지" 볼 수 있게 한다.
+            return {"active_ratio": 0.0, "min_cluster_size": 0,
+                    "max_cluster_size": 0, "reinit_count": n_reinit}
 
         # 통계
         n_assigned = sum(1 for s in sizes if s > 0)

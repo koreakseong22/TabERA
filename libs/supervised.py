@@ -521,8 +521,26 @@ class TabERAWrapper:
                 val_m  = compute_metric(val_logits, y_val[_val_perm], self.tasktype)
             val_v = list(val_m.values())[0]
 
+            # [버그 수정] regroup_warmup_epochs 도입 후 발견된 문제 — warmup
+            # 중엔 sample_groups가 아직 한 번도 발행 안 된 상태([[],[],...])라,
+            # 이 시점 val이 우연히 좋게 나오면(retrieve()가 그룹 제약 없이
+            # 사실상 global 검색처럼 동작해서 오히려 잘 나올 수 있음) 그
+            # "그룹 없는" 스냅샷이 best_state로 뽑혀버린다. 그러면 이후
+            # epoch에서 sample_groups가 정상적으로 채워져도 이미 best가
+            # 아니라 반영이 안 되고, patience 안에 그 val을 못 넘기면 그대로
+            # 조기 종료되어 최종 모델이 영원히 빈 sample_groups로 굳는다
+            # (실측: vehicle rwe5에서 epoch 33 조기 종료, "검증 가능한
+            # 그룹이 없어 일치율 계산 불가"). regroup_update()가 이번 epoch
+            # 안에서 이미 호출됐으므로(위), current_epoch이 warmup을
+            # 지났는지로 "이번 epoch에 sample_groups가 실제로 발행됐는가"를
+            # 판단해 best_state 후보에서 제외한다.
+            _past_regroup_warmup = (
+                self.model.prototype_layer.current_epoch.item()
+                >= self.model.prototype_layer.regroup_warmup_epochs
+            )
+
             # best 모델 저장
-            if is_better(val_v, best_val, self.tasktype):
+            if is_better(val_v, best_val, self.tasktype) and _past_regroup_warmup:
                 best_val   = val_v
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
                 # [버그 수정] sample_groups/group_labels(CentroidLayer의 일반
@@ -593,6 +611,20 @@ class TabERAWrapper:
                 break
 
         pbar.close()
+
+        if best_state is None:
+            # [추가] regroup_warmup_epochs가 너무 길어서(또는 patience가
+            # 너무 짧아서) warmup을 한 번도 못 지나고 조기 종료된 경우 —
+            # best_state가 끝까지 채워지지 않는다. 이 경우 모델은 학습
+            # 마지막 시점 가중치를 그대로 쓰게 되는데, sample_groups가
+            # 여전히 비어있을 수 있어 explanation/group-constrained
+            # retrieval이 정상 동작 안 할 수 있음을 알림.
+            tqdm.write(
+                f"  ⚠️  best_state가 한 번도 갱신되지 않았습니다 — "
+                f"regroup_warmup_epochs({self.model.prototype_layer.regroup_warmup_epochs})가 "
+                f"조기 종료 시점보다 길었을 가능성이 있습니다. warmup을 줄이거나 "
+                f"patience를 늘려서 재시도하세요."
+            )
 
         if best_state:
             self.model.load_state_dict(best_state)

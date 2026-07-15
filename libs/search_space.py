@@ -147,7 +147,23 @@ def get_search_space(
         # 12차원 탐색 공간에서 안 중요한 차원을 고정해 trial 예산을 lr/
         # plr_freq_scale 같은 실제 중요한 차원에 더 배분.
         "k":               16,
-        # [수정] embedder_layers 후보 [1,2,3,4] → [2,3,4]로 축소.
+        # [원복 — 2026-07] embedder_layers를 [2,4] → [1,4]로 되돌림.
+        # 좁혔던 근거({1:2, 2:1, 3:9, 4:10} 분포, 아래 원래 주석)가 이후
+        # 재검토 결과 두 가지 문제가 있었음:
+        # (1) 그 뒤로 수집된 study들은 이미 [2,4]로 좁혀진 상태에서 돌았기
+        #     때문에, "1을 아무도 안 고른다"는 재확인 자체가 불가능한
+        #     순환논리였음(애초에 선택지에 없었으므로).
+        #     RandomForest 중요도 분석에서도 embedder_layers가 최하위로
+        #     나왔는데, 이것도 같은 이유(범위 제한→분산 감소→중요도
+        #     과소평가, restriction of range) 로 신뢰할 수 없음.
+        # (2) 1을 선호했던 2개 데이터셋(51 heart-h, 41143 jasmine) 중
+        #     jasmine은 이후 PLE 인코더 채택 검증 과정에서 PLR 대비 test
+        #     성능이 낮게 나왔는데, 이 데이터셋이 정확히 layers=1 선호
+        #     이력이 있는 곳이라 — 그 결과가 인코더 문제가 아니라 이미
+        #     막혀있던 layers=1 선택지 때문일 가능성을 배제 못 함.
+        # 편향 없이 재확인하기 전까지는 원래 범위로 복원.
+        "embedder_layers": trial.suggest_int("embedder_layers", 1, 4),
+        # [원래 주석, 참고용] embedder_layers 후보 [1,2,3,4] → [2,3,4]로 축소.
         # 근거: 같은 22개 데이터셋 best trial의 embedder_layers 분포가
         # {1:2, 2:1, 3:9, 4:10}으로 3~4에 압도적으로 쏠림(19/22). 1을 완전히
         # 빼지 않고 2~4로 좁힌 건, 1을 선호한 2개 데이터셋(51 heart-h,
@@ -156,7 +172,6 @@ def get_search_space(
         # 상관관계 없어(rho=0.15~0.20, p>0.37) 안전하게 좁힐 근거가 부족해
         # 그대로 유지. batch_size도 이후 electricity/nomao(대형 데이터셋)를
         # 다룰 예정이라 미리 좁히지 않고 그대로 둠.
-        "embedder_layers": trial.suggest_int("embedder_layers", 2, 4),
         "dropout":         trial.suggest_float("dropout", 0.0, 0.5, step=0.05),
 
         # ── 보조 손실 가중치 ────────────────────────────
@@ -186,7 +201,23 @@ def get_search_space(
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
-        "batch_size":      trial.suggest_categorical("batch_size", [128, 256, 512]),
+        # [수정 — 컴팩트화, 2026-07] batch_size를 탐색 대상에서 제외, 고정값
+        # 256 사용. 근거: (1) RandomForest 중요도 분석(18개 데이터셋)에서
+        # batch_size importance=0.037로 9개 중 7~8위, embed_dim/embedder_layers
+        # 다음으로 낮음. (2) 데이터셋 크기별 최적값을 직접 스윕(profb/credit-g/
+        # vehicle/jasmine, {64,128,256,512})해본 결과 신뢰할 만한 크기-batch_size
+        # 관계를 못 찾음 — vehicle은 bs256→0.847, bs512→0.671로 인접 값 사이에서
+        # 조차 낙폭이 컸는데, 이건 STE+dead-centroid reinit이 학습 초반의 작은
+        # 차이를 증폭시키는 이 아키텍처 고유의 노이즈(regroup_warmup_epochs
+        # 도입 배경과 동일)에 묻힌 것으로 보임 — 즉 batch_size의 순수한 효과가
+        # 노이즈보다 작아서 Optuna가 탐색해봤자 노이즈에 맞추는 것에 가까움.
+        # 256은 TabR 계보 문헌에서 소규모 데이터셋(N_train ~수백~수천)에 흔히
+        # 쓰이는 값이자 suggest_initial_trial()의 기존 기본값과도 일치.
+        # [주의 — 잠정값] 이건 "batch_size가 중요하지 않다"는 확정이 아니라
+        # "지금은 노이즈 때문에 신호를 못 본다"는 상태임. regroup_warmup_epochs로
+        # 노이즈를 줄인 뒤, 또는 electricity/nomao 같은 대형 데이터셋을 다룰
+        # 때 이 결정을 다시 검토해야 함.
+        "batch_size":      256,
         # "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
         # "n_heads":         trial.suggest_categorical("n_heads", [1, 2, 4, 8]),
 

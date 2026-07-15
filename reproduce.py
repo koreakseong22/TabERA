@@ -451,6 +451,51 @@ def main():
                             "확인하려는 용도. --loss_codebook_override와 같은 패턴 — "
                             "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
                         ))
+    parser.add_argument("--batch_size_override", type=int, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 batch_size 값을 이 값으로 덮어쓰고 "
+                            "나머지는 그대로 재학습. batch_size를 HPO 탐색 대상에서 빼고 "
+                            "데이터셋 크기에 따른 고정값으로 대체할 근거(TabR 계보의 표준 "
+                            "관행)를 마련하기 위한 실측용 — 같은 best_params에 batch_size만 "
+                            "바꿔가며 여러 값(예: 64/128/256/512)을 스윕해서 val 성능이 얼마나 "
+                            "민감한지, 데이터셋 크기와 어떤 관계가 있는지 확인한다. "
+                            "--dropout_override/--loss_codebook_override와 같은 패턴 — "
+                            "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과. "
+                            "model_kwargs가 아니라 best_params(=TabERAWrapper.params)에만 "
+                            "반영됨 — batch_size는 학습 루프에서만 쓰이고 모델 구조와는 무관."
+                        ))
+    parser.add_argument("--regroup_warmup_epochs_override", type=int, default=None,
+                        help=(
+                            "[통제 실험용] CentroidLayer.regroup_warmup_epochs를 이 값으로 "
+                            "설정하고 재학습(기본은 0=즉시 활성화 — 지금까지 실제로 쓰인 값). "
+                            "학습 초반 STE+dead-centroid reinit이 불안정한 시기에 regroup을 "
+                            "미루면 학습 전체의 라우팅 안정성(active_ratio_std, "
+                            "reinit_per_epoch)과 최종 성능이 어떻게 바뀌는지 확인하는 용도. "
+                            "--dropout_override와 같은 패턴 — model_kwargs에 반영(모델 구조 "
+                            "파라미터이므로 --from_saved_state와는 같이 못 씀, 이미 만들어진 "
+                            "모델의 CentroidLayer 설정은 재학습 없이 못 바꿈)."
+                        ))
+    parser.add_argument("--dead_reinit_patience_override", type=int, default=None,
+                        help=(
+                            "[통제 실험용] CentroidLayer.dead_reinit_patience를 이 값으로 "
+                            "설정하고 재학습(기본 5 — 검증 안 된 값, Jukebox/NSVQ 등 원 논문은 "
+                            "'연속 N epoch'이 아니라 '사용률이 threshold 아래로 떨어지면'이라는 "
+                            "다른 기준을 씀). 값을 늘리면 죽은 centroid가 재초기화(=gradient "
+                            "없이 파라미터를 무작위로 덮어쓰는 이벤트)되기까지 더 오래 방치되는 "
+                            "대신, 그 무작위 개입 자체의 빈도가 줄어듦 — reinit 빈도와 학습 "
+                            "안정성(active_ratio_std) 사이의 트레이드오프를 재기 위한 용도. "
+                            "model_kwargs에 반영 — --from_saved_state와는 같이 못 씀."
+                        ))
+    parser.add_argument("--dead_reinit_noise_scale_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] CentroidLayer.dead_reinit_noise_scale을 이 값으로 "
+                            "설정하고 재학습(기본 0.01 — 검증 안 된 값. 재초기화 시 anchor "
+                            "벡터에 더하는 가우시안 노이즈의 표준편차 = 이 값 × anchor.norm()). "
+                            "원 논문은 'small Gaussian noise'라고만 하고 구체적 크기를 안 줌 — "
+                            "이 값이 재초기화 직후 그 centroid가 원래 anchor와 얼마나 다른 "
+                            "위치에 놓이는지를 결정. 0으로 주면 노이즈 없이 anchor를 그대로 "
+                            "복제. model_kwargs에 반영 — --from_saved_state와는 같이 못 씀."
+                        ))
     parser.add_argument("--refresh_on_best", action="store_true",
                         help=(
                             "[설명가능성/재현성] best_state(및 feature_store) 복원 직후, "
@@ -539,7 +584,11 @@ def main():
               + ("..num_ple" if args.num_embedding == "ple" else "") \
               + ("..num_plr" if args.num_embedding == "plr_lite" else "") \
               + (f"..lcb{args.loss_codebook_override:g}" if args.loss_codebook_override is not None else "") \
-              + (f"..do{args.dropout_override:g}" if args.dropout_override is not None else "")
+              + (f"..do{args.dropout_override:g}" if args.dropout_override is not None else "") \
+              + (f"..bs{args.batch_size_override}" if args.batch_size_override is not None else "") \
+              + (f"..rwe{args.regroup_warmup_epochs_override}" if args.regroup_warmup_epochs_override is not None else "") \
+              + (f"..drp{args.dead_reinit_patience_override}" if args.dead_reinit_patience_override is not None else "") \
+              + (f"..drn{args.dead_reinit_noise_scale_override:g}" if args.dead_reinit_noise_scale_override is not None else "")
 
     _saved_state = None
     if args.from_saved_state:
@@ -570,6 +619,18 @@ def main():
                       f" sample_groups 등도 없을 수 있으니 아래 경고를 확인하세요.")
         if args.loss_codebook_override is not None:
             print(f"  ⚠️  --loss_codebook_override는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.batch_size_override is not None:
+            print(f"  ⚠️  --batch_size_override는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.regroup_warmup_epochs_override is not None:
+            print(f"  ⚠️  --regroup_warmup_epochs_override는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.dead_reinit_patience_override is not None:
+            print(f"  ⚠️  --dead_reinit_patience_override는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.dead_reinit_noise_scale_override is not None:
+            print(f"  ⚠️  --dead_reinit_noise_scale_override는 재학습 시에만 의미가 있습니다 — "
                   f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
         if args.dropout_override is not None:
             print(f"  ⚠️  --dropout_override는 재학습 시에만 의미가 있습니다 — "
@@ -616,6 +677,12 @@ def main():
         # optimize.py가 실제 사용한 n_prototypes 그대로 복원
         best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
         print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
+        # [추가] batch_size가 더 이상 trial.suggest_*가 아니라 상수(256)라
+        # study.best_params에 이 키 자체가 없음 — k/routing_scale과 같은
+        # 문제. .setdefault()로 채움: 구버전 study(batch_size가 실제로
+        # 탐색된 경우)는 이미 키가 있으니 그 값 그대로 보존, 신규 study는
+        # 여기서 256으로 채워짐.
+        best_params.setdefault("batch_size", 256)
         print(f"  Params: {best_params}")
 
         # ── PLE(Piecewise Linear Encoding) 구간 경계 계산 ───────
@@ -656,6 +723,34 @@ def main():
             model_kwargs["dropout"] = args.dropout_override
             best_params["dropout"] = args.dropout_override  # 저장/재출력 시 실제 학습값과 일치하도록
             print(f"  [--dropout_override] dropout: {_old_dropout} → {args.dropout_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.batch_size_override is not None:
+            # [통제 실험용] batch_size는 model_kwargs가 아니라 best_params
+            # (=TabERAWrapper.params, 학습 루프의 self.params["batch_size"])
+            # 로만 흘러가므로 model_kwargs는 안 건드림 — 모델 구조는 그대로.
+            _old_batch_size = best_params.get("batch_size")
+            best_params["batch_size"] = args.batch_size_override
+            print(f"  [--batch_size_override] batch_size: {_old_batch_size} → "
+                  f"{args.batch_size_override} (나머지 파라미터는 best_params 그대로)")
+        if args.regroup_warmup_epochs_override is not None:
+            # [통제 실험용] CentroidLayer 생성자 파라미터라 model_kwargs에
+            # 반영 — dropout_override와 같은 위치(모델 구조 파라미터).
+            _old_warmup = model_kwargs.get("regroup_warmup_epochs", 0)
+            model_kwargs["regroup_warmup_epochs"] = args.regroup_warmup_epochs_override
+            print(f"  [--regroup_warmup_epochs_override] regroup_warmup_epochs: "
+                  f"{_old_warmup} → {args.regroup_warmup_epochs_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.dead_reinit_patience_override is not None:
+            _old_patience = model_kwargs.get("dead_reinit_patience", 5)
+            model_kwargs["dead_reinit_patience"] = args.dead_reinit_patience_override
+            print(f"  [--dead_reinit_patience_override] dead_reinit_patience: "
+                  f"{_old_patience} → {args.dead_reinit_patience_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.dead_reinit_noise_scale_override is not None:
+            _old_noise_scale = model_kwargs.get("dead_reinit_noise_scale", 0.01)
+            model_kwargs["dead_reinit_noise_scale"] = args.dead_reinit_noise_scale_override
+            print(f"  [--dead_reinit_noise_scale_override] dead_reinit_noise_scale: "
+                  f"{_old_noise_scale} → {args.dead_reinit_noise_scale_override} "
                   f"(나머지 파라미터는 best_params 그대로)")
         model_kwargs.update(dict(
             # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
