@@ -30,24 +30,33 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
 1. **Embed** — `TabularEmbedder` maps `X → query_emb`. Categorical features are
    one-hot encoded (no learned parameters, no false ordinal structure — a
    raw integer code has no business implying distance between categories);
-   numeric features go through PLR(lite) — a learned periodic (sin/cos)
-   embedding followed by a Linear+ReLU shared across all numeric columns,
-   following TabR/ModernNCA. Both are vectorized (a single offset-indexed
+   numeric features go through PiecewiseLinearEmbeddings (`activation=False`,
+   matching TabM's default) — quantile bin boundaries are computed once from
+   the training data, and each numeric column gets its own trainable
+   per-bin embedding that's aggregated by the piecewise-linear encoding of
+   where a value falls between two bin edges. PLR(lite) — a learned periodic
+   (sin/cos) embedding followed by a Linear+ReLU shared across all numeric
+   columns, following TabR/ModernNCA — is available via
+   `--num_embedding plr_lite`. Both are vectorized (a single offset-indexed
    gather, no per-column Python loop).
 2. **Route (→ ①)** — `CentroidLayer` assigns each sample to one of `P`
    centroids via STE hard-argmax over a *scaled* cosine similarity
    (`routing_scale` widens the otherwise narrow [-1,1] range so the softmax
    isn't flat by construction — the same reason ArcFace/CosFace-style losses
-   and cosine-router MoE literature scale logits before softmax), producing
-   `hard_assignment` and `context_emb`. Centroids are trained with VQ-VAE's
-   full dual loss (`commitment_loss` pulls queries toward their centroid,
-   `codebook_loss` pulls centroids toward their queries — both operate on
-   L2-normalized vectors, matching what routing itself uses), kept at unit
-   norm via a CosFace-style reprojection after every optimizer step, and
-   protected from permanent dead centroids by a Jukebox/SoundStream-style
-   reset (a centroid with no assignments for several consecutive epochs is
-   reinitialized to a real embedding). See `docs/centroid-stability.md` for
-   the full mechanism and validation.
+   and cosine-router MoE literature scale logits before softmax; TabERA sets
+   this automatically from `P` via AdaCos's fixed-scale formula rather than
+   tuning it, see HPO parameters below), producing `hard_assignment` and
+   `context_emb`. Centroids are trained with VQ-VAE's full dual loss
+   (`commitment_loss` pulls queries toward their centroid, `codebook_loss`
+   pulls centroids toward their queries — both operate on L2-normalized
+   vectors, matching what routing itself uses), kept at unit norm via a
+   CosFace-style reprojection after every optimizer step, and protected from
+   permanent dead centroids by a Jukebox/SoundStream-style reset (a centroid
+   with no assignments for several consecutive epochs is reinitialized to a
+   real embedding plus small noise — this reset runs continuously through
+   training, independent of the optional `regroup_warmup_epochs` delay on
+   when group assignments start being published for retrieval). See
+   `docs/centroid-stability.md` for the full mechanism and validation.
 3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the
    sample's group (cross-group fallback if the group is smaller than K).
    `AttentionAggregator` turns similarities into `evidence_w` and aggregates
@@ -150,7 +159,8 @@ if a cheaper, lower-precision run is preferred.
 ## Validation
 
 `--ablation dual_space_faithfulness` checks whether ①② actually mean what they claim:
-- **Index integrity** — `sample_groups` matches live model state: 100% consistent, reproducibly, across datasets and seeds.
+- **Index integrity** — `sample_groups` matches live model state: 100% consistent, reproducibly, across datasets and seeds. Each `MemoryBank`/`FeatureStore` slot also carries the training-set row index it was written from, so the two stores can be checked for exact slot correspondence directly (equality, not a statistical estimate).
+- **Value reproducibility** — with `--refresh_on_best`, a stored key's cosine similarity to a fresh re-encoding of its raw features converges to ≈1.0 (floating-point precision); without it, the stored key is a one-off training-time snapshot and the two are only expected to be loosely correlated.
 - **Group separation** — centroids correspond to statistically distinct regions of feature space (ANOVA F-test for numeric, chi-square for categorical, Bonferroni-corrected). Strongly and consistently significant across numeric, categorical, and mixed-type datasets and seeds.
 
 *(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones. Affects which neighbors get retrieved, not speed.)*
@@ -191,9 +201,11 @@ automatically meaningful:
 - **`--shap_background` / `--shap_nsamples`** — SHAP `KernelExplainer` background-sample count and perturbation count for `rank_correlation`. `--shap_nsamples` defaults to the library's own `auto` formula (`2*F + 2048`) rather than a fixed value — see *Why SHAP* for why a fixed cap turned out to bias attributions on wide datasets. `--shap_background` defaults to 50; raising it only helps once `nsamples` is adequate (raising background alone, with `nsamples` still too low for `F`, made agreement worse in testing, not better). `--shap_repeats` reruns SHAP multiple times with different backgrounds to report its own Monte-Carlo noise, separate from sampling noise across explained examples.
 - **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
 - **`--cat_combine {onehot,sum,concat}`** — categorical encoding (default `onehot`). `sum`/`concat` exist for comparison and backward compatibility with earlier checkpoints.
-- **`--num_embedding {plr_lite,linear,ple}`** — numeric encoding (default `plr_lite`). `plr_lite` can be unstable on datasets with very few numeric columns (e.g. 1–5) — `linear`/`ple` are safer fallbacks there.
+- **`--num_embedding {ple,plr_lite,linear}`** — numeric encoding (default `ple`, PiecewiseLinearEmbeddings — see *Embed*). `plr_lite` (TabR/ModernNCA-style periodic embedding) is available for comparison; `linear` is a minimal fallback.
 - **`--regroup_log_every <N>`** — how often (in epochs) to print the `[Regroup]` routing-health line during training (default 10). Lower it (e.g. 1–2) to inspect whether `active_ratio`/dead-code-reset activity is actually settling by the end of training, not just at coarse checkpoints.
-- **`--loss_codebook_override <float>` / `--dropout_override <float>`** — controlled-ablation overrides: retrain with every other hyperparameter held at `best_params`, only this one value changed. Output filenames get a distinguishing tag (`..lcb<v>`, `..do<v>`) so runs don't overwrite each other. No effect combined with `--from_saved_state` (that path skips retraining entirely).
+- **`--refresh_on_best`** — after selecting the best checkpoint, re-encode every stored training sample's raw features through the frozen embedder (no dropout, no gradient) and overwrite `MemoryBank`'s stored keys with the result, then resync group assignments. Off by default. With it on, a stored key is guaranteed to be an exact, reproducible function of the sample's raw features rather than a one-off snapshot from whatever dropout mask happened to apply during training — see `--ablation dual_space_faithfulness`.
+- **`--regroup_warmup_epochs_override <int>` / `--dead_reinit_patience_override <int>` / `--dead_reinit_noise_scale_override <float>` / `--batch_size_override <int>`** — same controlled-ablation pattern as `--dropout_override` below, for the centroid layer's group-publication delay, dead-centroid reset patience, reset noise magnitude, and training batch size respectively.
+- **`--loss_codebook_override <float>` / `--dropout_override <float>`** — controlled-ablation overrides: retrain with every other hyperparameter held at `best_params`, only this one value changed. Output filenames get a distinguishing tag (`..lcb<v>`, `..do<v>`, etc.) so runs don't overwrite each other. No effect combined with `--from_saved_state` (that path skips retraining entirely).
 
 ---
 
@@ -202,7 +214,7 @@ automatically meaningful:
 - ①'s distinctive-feature contrast isn't equally sharp on every dataset.
 - Group sizes can be naturally imbalanced, reflecting the data itself — not a failure mode by itself.
 - `--from_saved_state` on GPU can show sub-decimal inference differences from a fresh run despite identical weights, likely from non-deterministic op scheduling (e.g. cuDNN).
-- `plr_lite` numeric encoding (default) trades some calibration (logloss) for discrimination (accuracy/AUROC) relative to a plain linear projection — a pattern consistent with what the literature it's drawn from also reports. Datasets with very few numeric columns and few binary-classification samples are the most exposed; `--num_embedding linear` is the fallback for those.
+- `plr_lite` numeric encoding trades some calibration (logloss) for discrimination (accuracy/AUROC) relative to a plain linear projection — a pattern consistent with what the literature it's drawn from also reports. This is why `ple` (PiecewiseLinearEmbeddings) is the default instead; `plr_lite` remains available via `--num_embedding plr_lite` for comparison or on datasets where it's preferred.
 - ③'s SHAP estimates inherit `KernelExplainer`'s own limitations: a feature-independence assumption during background perturbation (can be misleading on strongly correlated features) and a cost that scales with feature count, both discussed in *Why SHAP*. These are properties of the method, not of TabERA's use of it, but they bound how much weight ③'s attributions should be given relative to ①②'s architectural guarantees.
 - On at least one dataset (credit-g, N_train=800), centroid routing shows persistent instability across training (`active_ratio` oscillating, dead-code reset never tapering off by the end of a run) that isn't explained by `dropout`, `routing_scale`, or accuracy cost — ruled out via controlled ablation — and doesn't reproduce on other datasets tested with the same mechanism (e.g. mfeat-zernike converges cleanly). Root cause open; see `docs/centroid-stability.md` §8.
 
@@ -267,20 +279,18 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 | Parameter | Range | Role |
 |---|---|---|
 | `embed_dim` | {64, 128, 256} | Embedding dim D |
-| `embedder_layers` | {2, 3, 4} | ResidualMLP depth |
+| `embedder_layers` | {1, 2, 3, 4} | ResidualMLP depth |
 | `dropout` | 0.0–0.5 | — |
 | `loss_diversity` | 5e-2–5e-1 | Centroid spread penalty |
 | `loss_commitment` | 1e-2–1e-1 | Query→centroid pull (VQ commitment loss) |
 | `loss_codebook` | 1e-2–1e-1 | Centroid→query pull (VQ codebook loss, same scale as `loss_commitment` — see `docs/centroid-stability.md`) |
 | `lr` | 1e-4–1e-2 | — |
 | `weight_decay` | 1e-6–1e-2 | — |
-| `batch_size` | {128, 256, 512} | — |
-| `routing_scale` | 1–20 (log) | Cosine routing logit scale (see Architecture, step 2) |
 | `plr_freq_scale` * | 0.01–100 (log) | PLR(lite) periodic-embedding frequency init scale |
 | `plr_n_frequencies` * | 8–96 | PLR(lite) frequencies per numeric column |
 | `plr_out_dim` * | {4, 8, 16, 32} | PLR(lite) output dim per numeric column |
 
-\* only searched when `--num_embedding plr_lite` (the default).
+\* only searched when `--num_embedding plr_lite` (not the default — see below).
 
 > `k` (KNN neighbors) is fixed at 16, not searched — measured hyperparameter
 > importance (RandomForest on realized HPO trials, 22 datasets) placed it in
@@ -290,6 +300,19 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 >
 > `n_prototypes` (P) is **not** searched — auto-set as `P = sqrt(N_train)`
 > (min 4). Ranges P≈12 (`lymph`, N=148) to P≈185 (`nomao`, N=34,465).
+>
+> `routing_scale` is **not** searched — computed automatically from `P` via
+> AdaCos's fixed-scale formula (`s = √2·log(P−1)`, Zhang et al. 2019), which
+> keeps it in the same narrow, theoretically-motivated range a search would
+> have converged to anyway, without spending trial budget on it.
+>
+> `batch_size` is **not** searched — fixed at 256, following the common
+> practice (e.g. TabR's benchmark protocol) of pre-setting batch size per
+> dataset rather than tuning it alongside architecture/loss hyperparameters.
+>
+> `num_embedding` defaults to `ple` (PiecewiseLinearEmbeddings, matching
+> TabM) rather than `plr_lite` — see *Embed* above and `--num_embedding` in
+> the CLI reference.
 >
 > The Optuna objective isn't raw accuracy/RMSE — it's scaled by a
 > centroid-geometry penalty (0–5%, continuous, no fixed threshold) that
