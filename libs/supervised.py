@@ -116,6 +116,30 @@ class TabERAWrapper:
         # 있음 — 그래서 재고 데이터셋에서 A/B 비교부터 하고 기본값 전환을
         # 결정하는 걸 권장 (bare 플래그로 시작, HPO search space엔 아직
         # 안 넣음).
+        log_branch_gradients: bool = False,
+        # [진단용, 추가] query/context/agg_emb가 head concat 직전에 받는
+        # gradient norm·활성값 norm·head 첫 Linear의 block별 weight norm을
+        # epoch마다 기록(self.branch_gradient_history). 목적: "head가
+        # 세 브랜치 중 특정 하나(주로 query_emb)에만 의존하게 학습되는지"
+        # 진단 — context_emb/agg_emb ablation 시 성능이 거의 안 변한다는
+        # 기존 관찰(사후 정적 진단)을, 학습 "과정 중" gradient 흐름으로
+        # 보완하기 위함. TabERA.log_branch_gradients로 그대로 전달되며,
+        # retain_grad() 기반이라 학습 결과에는 영향 없음(메모리만 소폭 증가).
+        log_branch_gradients_first_n_epochs: int = 3,
+        log_evidence_stats: bool = False,
+        # [진단용, 추가] evidence_w(②의 AttentionAggregator 가중치)의 entropy·
+        # dominant weight를 epoch마다 기록(self.evidence_stats_history).
+        # out["evidence_w"]가 이미 매 forward에서 나오므로 backward/retain_grad
+        # 없이 순수 forward 통계만 뽑음 — log_branch_gradients보다 훨씬 저렴.
+        # 목적: --explain에서 학습 끝난 뒤 딱 한 시점(3개 샘플)만 봐서는
+        # "언제부터 evidence가 소수 이웃으로 붕괴됐는지" 알 수 없었던 것을
+        # 학습 전체 epoch에 걸쳐 정량적으로 보기 위함.
+        # [진단용, 추가] 위 진단 중 배치 단위 세부 기록(branch_gradient_
+        # batch_history)은 학습 전체에 남기면 메모리가 배치 수만큼 계속
+        # 쌓이므로, 학습 초반 n epoch만 배치 단위로 남기고 그 이후는
+        # epoch 평균(branch_gradient_history)만 남긴다 — OGM 계열 문헌이
+        # 강조하는 게 "초기 학습 dynamics"라, 초반만 촘촘히 보면 충분하다는
+        # 판단. 검증 안 된 기본값(3)이라 필요시 조정.
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -154,6 +178,21 @@ class TabERAWrapper:
         # 값을 [0,1] uniform 대신 실제 단위로 역변환해 보여준다.
         self.quantile_transformer = quantile_transformer
         self.refresh_on_best = refresh_on_best
+        # [진단용] 모델 forward()가 참조하는 플래그 자체는 TabERA에 있음 —
+        # 여기서 wrapper 생성 시점에 그대로 배선. state_dict에 안 들어가는
+        # 순수 런타임 속성이라 체크포인트 저장/로드와 무관.
+        self.log_branch_gradients = log_branch_gradients
+        self.model.log_branch_gradients = log_branch_gradients
+        self.log_branch_gradients_first_n_epochs = log_branch_gradients_first_n_epochs
+        # epoch별 요약(항상, log_branch_gradients=True인 동안 전체 학습에 걸쳐):
+        #   {"epoch", "query_grad_norm", "query_act_norm", "query_weight_norm", ...}
+        self.branch_gradient_history: List[Dict[str, float]] = []
+        # 배치 단위 세부 기록(처음 log_branch_gradients_first_n_epochs epoch만):
+        #   {"epoch", "batch", "branch", "grad_norm", "act_norm"}
+        self.branch_gradient_batch_history: List[Dict[str, float]] = []
+        self.log_evidence_stats = log_evidence_stats
+        # epoch별 evidence_w 요약: {"epoch", "entropy", "dominant_weight"}
+        self.evidence_stats_history: List[Dict[str, float]] = []
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -228,6 +267,12 @@ class TabERAWrapper:
         y_train: torch.Tensor,
         X_val: torch.Tensor,
         y_val: torch.Tensor,
+        skip_centroid_init: bool = False,
+        # [추가] True면 initialize_from_data()(KMeans++ 재초기화)를 건너뜀.
+        # freeze-encoder-retrain-head 실험처럼 이미 학습된 centroid를 그대로
+        # 유지한 채 head만 재학습하고 싶을 때 필수 — 안 그러면 fit() 진입
+        # 시점에 무조건 KMeans++로 centroid가 덮어써져서, 인코더를 얼려도
+        # 프로토타입 자체는 매번 새로 초기화되는 모순이 생김.
     ) -> None:
         criterion  = get_criterion(self.tasktype)  # weight_matrix GPU 이동
 
@@ -264,7 +309,8 @@ class TabERAWrapper:
         es         = EarlyStopping(patience=self.patience)
 
         # ── CentroidLayer 초기화 (이중 공간 설정) ─────────────
-        if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'initialize_from_data'):
+        if (not skip_centroid_init and hasattr(self.model, 'prototype_layer')
+                and hasattr(self.model.prototype_layer, 'initialize_from_data')):
             with torch.no_grad():
                 n_init   = min(len(X_train), 5000)
                 init_emb = self.model.embedder(X_train[:n_init])
@@ -273,6 +319,49 @@ class TabERAWrapper:
                 self.model.prototype_layer.initialize_from_data(
                     init_emb, init_x, y_labels=init_y
                 )
+
+        # [진단용, 추가] 순수 초기화 상태(학습 0 step) evidence entropy 측정.
+        # 목적: epoch 1(이미 몇 스텝 학습된 상태)의 낮은 entropy가 "학습이
+        # collapse를 유도했다"인지 "애초에 정규화 안 된 거리 공간에서
+        # softmax가 시작부터 뾰족했다"인지 구분(리뷰 지적 — Case A/B).
+        # MemoryBank가 아직 하나도 안 채워진 시점이라 정식 retrieve()는
+        # 못 씀 — 방금 만든 init_emb(학습 전 임베더로 인코딩된 X_train
+        # 샘플) 안에서 자기 자신을 제외한 top-k 최근접만 뽑아 같은
+        # 유사도 공식(-‖q-k‖², evidence_temperature 포함)을 그대로 적용한
+        # 근사치. 정식 MemoryBank.retrieve()와 후보 풀이 다르다는 한계는
+        # 있지만(랜덤 배치 내 검색 vs 그룹 제약 검색), "이 embedding
+        # 공간에서 raw 유클리드 거리 softmax가 얼마나 뾰족한가" 자체는
+        # 충분히 잰다.
+        if self.log_evidence_stats and hasattr(self.model, "ot_selector"):
+            with torch.no_grad():
+                _sample_n = min(512, init_emb.shape[0])
+                _q = init_emb[:_sample_n]
+                k_probe = min(self.model.k, _sample_n - 1)
+                if k_probe > 0:
+                    d2 = torch.cdist(_q, _q, p=2) ** 2         # (n, n)
+                    d2.fill_diagonal_(float("inf"))            # 자기 자신 제외
+                    topk_d2, _ = d2.topk(k_probe, largest=False, dim=-1)  # 최근접 k개
+                    _temp = getattr(self.model.ot_selector, "evidence_temperature", 1.0)
+                    ew_init = F.softmax((-topk_d2) / _temp, dim=-1)
+                    ent_init = float((-(ew_init * (ew_init + 1e-8).log()).sum(dim=-1)).mean().item())
+                    dom_init = float(ew_init.max(dim=-1).values.mean().item())
+                    _qn = float(_q.norm(dim=-1).mean().item())
+                    self.evidence_stats_history.append({
+                        "epoch": 0.0,
+                        "entropy": ent_init,
+                        "n_eff": float(np.exp(ent_init)),
+                        "dominant_weight": dom_init,
+                        "query_norm": _qn,
+                        "key_norm": _qn,  # 같은 배치 내 검색이라 query/key가 같은 분포
+                        "distance_mean": float(topk_d2.mean().item()),
+                        "distance_std": float(topk_d2.std().item()),
+                    })
+                    tqdm.write(
+                        f"  [EvidenceStats init] entropy={ent_init:.4f}  "
+                        f"n_eff={float(np.exp(ent_init)):.3f}  dominant_weight={dom_init:.4f}  "
+                        f"(학습 0 step, 순수 초기화 상태 — epoch 1 이후 값과 비교할 기준선)"
+                    )
+
         higher_is_better = (self.tasktype != "regression")
 
         best_state = None
@@ -321,6 +410,31 @@ class TabERAWrapper:
             perm    = torch.randperm(len(y_train), device=self.device)
             tr_loss_gpu = torch.zeros((), device=self.device)  # [최적화] GPU 텐서로 누적
             n_batch = 0
+            # [진단용] log_branch_gradients — 이번 epoch 누적용. 브랜치
+            # 이름은 use_query_emb_in_head/use_context_emb에 따라 forward()가
+            # self.model._branch_grad_tensors에 실제로 채운 키만 등장하므로
+            # 여기서는 dict를 비워두고 첫 배치에서 만난 키를 그대로 채택한다.
+            _branch_grad_sum: Dict[str, float] = {}
+            _branch_act_sum:  Dict[str, float] = {}
+            _branch_batches:  Dict[str, int] = {}  # [수정] 브랜치별 등장 배치 수를
+            # 따로 센다 — agg 브랜치는 memory.filled < k인 극초반 배치에서
+            # requires_grad=False라 tabera.py forward()가 아예 등록을 건너뛴다
+            # (위 tabera.py 주석 참고). 공유 카운터 하나로 나누면 그런 배치들
+            # 때문에 epoch 평균이 실제보다 작게 나오는 오류가 생김.
+            # [진단용] log_evidence_stats — evidence_w entropy/dominant weight
+            # 누적용. gradient 필요 없는 순수 forward 통계라 backward 전에도
+            # 계산 가능.
+            _evidence_entropy_sum  = 0.0
+            _evidence_dominant_sum = 0.0
+            _evidence_batches      = 0
+            # [추가] Step 0 진단 — "distance 값 자체가 큰가"(temperature 문제)
+            # vs "query/key norm이 커지는가"(normalization 문제) 구분용.
+            # evidence_diag가 None인 배치(memory warmup fallback)는 자동 제외.
+            _evidence_qnorm_sum = 0.0
+            _evidence_knorm_sum = 0.0
+            _evidence_dist_mean_sum = 0.0
+            _evidence_dist_std_sum  = 0.0
+            _evidence_diag_batches  = 0
 
             for start in range(0, len(y_train), self.params["batch_size"]):
                 idx = perm[start:start + self.params["batch_size"]]
@@ -335,6 +449,37 @@ class TabERAWrapper:
                 out = self.model(xb, labels=yb, sample_ids=idx)
                 lg  = out["logits"]
 
+                # [진단용] log_evidence_stats — evidence_w(②)가 소수 이웃으로
+                # 붕괴하는지(dominant→1, entropy→0) 매 배치 기록. AttentionAggregator
+                # 의 similarity가 -‖q-k‖²(temperature 없음)라, 임베더 norm이 커질수록
+                # softmax가 포화될 수 있다는 가설을 검증하기 위함 — --explain이 학습
+                # 끝난 뒤 소수 샘플만 보여주는 것과 달리, 학습 전체 epoch에 걸친 추세를 봄.
+                if self.log_evidence_stats:
+                    # [버그 수정] AttentionAggregator.forward()가 softmax 이후에
+                    # dropout을 또 거는데(evidence_w = self.dropout(evidence_w)),
+                    # 학습 모드에서는 살아남은 값이 1/(1-p)로 스케일업돼서(jasmine
+                    # dropout=0.5면 최대 2배) evidence_w가 더 이상 확률분포가
+                    # 아님(합이 1이 아니고 개별 값이 1을 넘을 수 있음) — 그 상태로
+                    # entropy를 재면 음수가 나오는 등 해석 불가능한 값이 됨(실측
+                    # 확인됨: entropy=-0.68, dominant_weight=1.02 같은 값 발생).
+                    # 합이 1이 되도록 재정규화해서 스케일 왜곡만 제거(dropout으로
+                    # 완전히 죽은 이웃의 정보 자체는 복구 안 됨 — 근사치임을 감안).
+                    ew = out["evidence_w"].detach()
+                    ew = ew / ew.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    _entropy   = float((-(ew * (ew + 1e-8).log()).sum(dim=-1)).mean().item())
+                    _dominant  = float(ew.max(dim=-1).values.mean().item())
+                    _evidence_entropy_sum  += _entropy
+                    _evidence_dominant_sum += _dominant
+                    _evidence_batches += 1
+
+                    _diag = out.get("evidence_diag")
+                    if _diag is not None:
+                        _evidence_qnorm_sum     += _diag["query_norm"]
+                        _evidence_knorm_sum     += _diag["key_norm"]
+                        _evidence_dist_mean_sum += _diag["distance_mean"]
+                        _evidence_dist_std_sum  += _diag["distance_std"]
+                        _evidence_diag_batches  += 1
+
                 if self.tasktype in ("regression", "binclass"):
                     task_loss = criterion(lg.squeeze(-1), yb.float())
                 else:
@@ -342,6 +487,26 @@ class TabERAWrapper:
 
                 loss = task_loss + out["aux_loss"]
                 loss.backward()
+
+                # [진단용] log_branch_gradients — clip_grad_norm_은 model.
+                # parameters()만 대상이라 아래 활성값(파라미터 아님)의 .grad에는
+                # 영향을 안 주므로, backward() 직후 아무데서나 읽어도 무방.
+                if self.log_branch_gradients:
+                    _fine_grained = epoch <= self.log_branch_gradients_first_n_epochs
+                    for name, t in self.model._branch_grad_tensors.items():
+                        if t.grad is None:
+                            continue
+                        g_norm = t.grad.norm(dim=-1).mean().item()
+                        a_norm = t.detach().norm(dim=-1).mean().item()
+                        _branch_grad_sum[name] = _branch_grad_sum.get(name, 0.0) + g_norm
+                        _branch_act_sum[name]  = _branch_act_sum.get(name, 0.0) + a_norm
+                        _branch_batches[name]  = _branch_batches.get(name, 0) + 1
+                        if _fine_grained:
+                            self.branch_gradient_batch_history.append({
+                                "epoch": float(epoch), "batch": float(n_batch),
+                                "branch": name, "grad_norm": g_norm, "act_norm": a_norm,
+                            })
+
                 nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
                 # [CosFace 표준] centroid_emb를 매 step 후 단위벡터로 강제
@@ -358,7 +523,11 @@ class TabERAWrapper:
             self.model.anneal(self.params.get("anneal_factor", 0.97))
 
             # ── (3) sample_groups 재계산(regroup_update) ───────────────
-            if hasattr(self.model, 'prototype_layer') and hasattr(self.model.prototype_layer, 'regroup_update'):
+            # skip_centroid_init=True(freeze-encoder-retrain-head 실험)면 이것도
+            # 건너뜀 — dead-centroid 재초기화가 gradient 없이 centroid_emb.data를
+            # 직접 덮어써서, "인코더 완전 고정" 조건을 깨뜨리기 때문.
+            if (not skip_centroid_init and hasattr(self.model, 'prototype_layer')
+                    and hasattr(self.model.prototype_layer, 'regroup_update')):
                 with torch.no_grad():
                     # [버그 수정] X_train 전체 대신 MemoryBank에 실제로 들어있는
                     # 내용(최대 memory_size개)만 클러스터링 → sample_groups가
@@ -504,6 +673,71 @@ class TabERAWrapper:
                         )
 
             avg_loss = (tr_loss_gpu / max(n_batch, 1)).item()  # [최적화] 에폭당 딱 1회만 동기화
+
+            # [진단용] log_branch_gradients — 이번 epoch의 브랜치별 gradient/
+            # activation norm 평균 + head 첫 Linear의 block별 weight norm
+            # (이 epoch 끝 시점 스냅샷)을 함께 기록. 셋을 같이 봐야 "학습
+            # 신호가 적었고, 그 결과 head도 구조적으로 그 브랜치에 작은
+            # weight만 배정했다"는 걸 gradient 하나만으로는 못 하는 방식으로
+            # 뒷받침할 수 있음(gradient 작다≠head가 그 브랜치를 안 쓴다 —
+            # 위 tabera.py forward()의 주의사항 참고, 최종 판단은 반드시
+            # --ablation *_shuffle/zero 결과와 같이 볼 것).
+            if self.log_branch_gradients and _branch_batches:
+                epoch_record: Dict[str, float] = {"epoch": float(epoch)}
+                for name in _branch_grad_sum:
+                    _n = _branch_batches.get(name, 0)
+                    if _n == 0:
+                        continue
+                    epoch_record[f"{name}_grad_norm"] = _branch_grad_sum[name] / _n
+                    epoch_record[f"{name}_act_norm"]  = _branch_act_sum[name] / _n
+                    epoch_record[f"{name}_n_batches"] = float(_n)  # 진단용 — 이 브랜치가
+                    # 이번 epoch 몇 배치에서 실제로 gradient를 받았는지(agg는
+                    # 학습 극초반 memory warmup 중엔 전체 배치보다 적을 수 있음).
+                with torch.no_grad():
+                    W = self.model._head_first_linear.weight  # (out, in)
+                    for name, (s, e) in self.model._head_block_slices.items():
+                        epoch_record[f"{name}_weight_norm"] = float(W[:, s:e].norm().item())
+                self.branch_gradient_history.append(epoch_record)
+                if epoch % self.regroup_log_every == 0:
+                    _names = list(_branch_grad_sum.keys())
+                    pbar.write(
+                        "  [BranchGrad] " + "  ".join(
+                            f"{n}: grad={epoch_record[f'{n}_grad_norm']:.4f} "
+                            f"act={epoch_record[f'{n}_act_norm']:.4f} "
+                            f"W={epoch_record[f'{n}_weight_norm']:.4f}"
+                            for n in _names
+                        )
+                    )
+
+            # [진단용] log_evidence_stats — evidence_w의 epoch 평균 entropy/
+            # dominant weight 기록. entropy가 0에 가깝고 dominant가 1에 가까울수록
+            # ②가 사실상 1개 이웃만 보는 hard 1-NN으로 붕괴했다는 뜻.
+            if self.log_evidence_stats and _evidence_batches > 0:
+                _ent_avg = _evidence_entropy_sum / _evidence_batches
+                ev_record = {
+                    "epoch": float(epoch),
+                    "entropy": _ent_avg,
+                    "n_eff": float(np.exp(_ent_avg)),  # [추가] "실질적으로 몇 명의
+                    # 이웃을 보는가" — entropy보다 직관적(entropy=0.05 → n_eff≈1.05명).
+                    "dominant_weight": _evidence_dominant_sum / _evidence_batches,
+                }
+                if _evidence_diag_batches > 0:
+                    ev_record["query_norm"]    = _evidence_qnorm_sum / _evidence_diag_batches
+                    ev_record["key_norm"]      = _evidence_knorm_sum / _evidence_diag_batches
+                    ev_record["distance_mean"] = _evidence_dist_mean_sum / _evidence_diag_batches
+                    ev_record["distance_std"]  = _evidence_dist_std_sum / _evidence_diag_batches
+                self.evidence_stats_history.append(ev_record)
+                if epoch % self.regroup_log_every == 0:
+                    _extra = ""
+                    if "query_norm" in ev_record:
+                        _extra = (f"  qnorm={ev_record['query_norm']:.2f} "
+                                  f"knorm={ev_record['key_norm']:.2f} "
+                                  f"dist={ev_record['distance_mean']:.2f}±{ev_record['distance_std']:.2f}")
+                    pbar.write(
+                        f"  [EvidenceStats] entropy={ev_record['entropy']:.4f}  "
+                        f"n_eff={ev_record['n_eff']:.3f}  "
+                        f"dominant_weight={ev_record['dominant_weight']:.4f}{_extra}"
+                    )
 
             # ── 검증 ──────────────────────────────────────
             self.model.eval()
@@ -687,6 +921,21 @@ class TabERAWrapper:
             self.centroid_geometry_diag["active_ratio_std"] = (
                 float(np.std(_active_ratio_history)) if len(_active_ratio_history) > 1 else 0.0
             )
+            # [추가] 학습 종료 시점(best_state 복원된 상태)의 centroid 간
+            # 평균 코사인 거리 — initialize_from_data()가 KMeans++ 직후
+            # 찍는 로그와 정확히 같은 정의(1 - cosine_sim, 대각선 제외
+            # 평균)라 "학습 시작 vs 끝"을 그대로 비교할 수 있음. --ema_codebook
+            # 도입 계기: EMA를 쓰면 diversity_loss(centroid 서로 밀어내기)가
+            # 자동으로 꺼지므로, centroid들이 서로 가까워지며 뭉치는(붕괴)
+            # 부작용이 생기는지 이 값으로 직접 확인 가능 — 학습 시작보다
+            # 끝에서 이 값이 뚜렷이 작아졌다면 그 부작용이 실제로 발생한 것.
+            with torch.no_grad():
+                c_norm   = F.normalize(self.model.prototype_layer.centroid_emb, dim=-1)
+                sim_mat  = c_norm @ c_norm.T
+                mask     = ~torch.eye(c_norm.shape[0], dtype=torch.bool, device=c_norm.device)
+                self.centroid_geometry_diag["avg_inter_dist_final"] = (
+                    (1.0 - sim_mat[mask]).mean().item()
+                )
 
     def _compute_centroid_margin_zscore(
         self, X_val: torch.Tensor, n_null_trials: int = 50,
