@@ -7,9 +7,17 @@ import sys, os, argparse
 # ── CUDA_VISIBLE_DEVICES: torch import 전 설정 ──────────────
 _parser_pre = argparse.ArgumentParser(add_help=False)
 _parser_pre.add_argument("--gpu_id", type=int, default=0)
+_parser_pre.add_argument("--deterministic", action="store_true")
 _pre, _ = _parser_pre.parse_known_args()
 if _pre.gpu_id >= 0:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre.gpu_id)
+if _pre.deterministic:
+    # torch.use_deterministic_algorithms(True)가 CUDA >=10.2에서 일부 cuBLAS
+    # 연산(예: 특정 matmul/conv 백워드)을 결정적으로 돌리려면 이 환경변수가
+    # CUDA 컨텍스트 생성(=torch import 시점) *이전*에 설정돼 있어야 함 —
+    # torch import 뒤에 os.environ으로 설정하면 이미 늦어서 조용히 무시됨.
+    # 그래서 --gpu_id와 같은 자리(pre-parser)에서 처리.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import joblib, json, pickle, datetime
 import numpy as np
@@ -273,7 +281,56 @@ def main():
     parser.add_argument("--savepath",  type=str, default=".",
                         help="optim_logs가 있는 상위 경로")
     parser.add_argument("--seed",      type=int, default=1,
-                        help="optimize.py와 동일한 seed 사용")
+                        help="optimize.py와 동일한 seed 사용 (데이터 분할=fold 선택 전용, "
+                             "libs/data.py의 KFold(random_state=42 고정)에서 몇 번째 fold를 "
+                             "test로 쓸지만 결정함 — 학습 초기화/배치 순서와는 무관)")
+    parser.add_argument("--train_seed", type=int, default=None,
+                        help=(
+                            "[통제 실험용] 학습 초기화·배치 순서 전용 seed — torch.manual_seed/"
+                            "np.random.seed에 --seed 대신 이 값을 씀. 데이터 분할(--seed, "
+                            "TabularDataset의 fold 선택)에는 영향을 주지 않는다. 지정 안 하면 "
+                            "기존 동작과 동일하게 --seed를 그대로 씀(하위 호환). "
+                            "run-to-run variance를 재려면 --seed(데이터 분할)는 고정하고 이 값만 "
+                            "바꿔가며 N번 반복 실행 — 같은 train/val/test split에서 가중치 초기화, "
+                            "DataLoader 배치 순서(supervised.py의 torch.randperm), "
+                            "dead-centroid reinit(tabera.py의 torch.randint/torch.randn)이 "
+                            "모두 이 seed 하나로 결정되는 torch 전역 RNG에서 나오기 때문에 이 "
+                            "값만 바꾸면 나머지는 고정한 채로 학습 궤적만 흔들 수 있다. "
+                            "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
+                        ))
+    parser.add_argument("--deterministic", action="store_true",
+                        help=(
+                            "[통제 실험용] torch.use_deterministic_algorithms(True) + "
+                            "cudnn.deterministic=True + cudnn.benchmark=False를 켜고 재학습. "
+                            "지금까지 측정한 --train_seed 간 변동성(test 성능/active_ratio_std/"
+                            "reinit count/조기종료 epoch)이 GPU 비결정성 때문인지, 아키텍처 "
+                            "자체의 chaotic sensitivity 때문인지 분리하기 위한 용도 — 이 플래그를 "
+                            "켠 채로 같은 --seed에 --train_seed만 바꿔가며 N번 반복했을 때 "
+                            "변동성이 (a) 거의 사라지면 GPU 비결정성이 주 원인, (b) 그대로 "
+                            "남으면 아키텍처의 chaotic sensitivity가 주 원인이라는 뜻. "
+                            "CUBLAS_WORKSPACE_CONFIG 환경변수는 이 플래그가 켜져 있으면 "
+                            "torch import 전에(--gpu_id와 같은 자리) 자동으로 설정됨. "
+                            "일부 연산이 결정적 구현이 없으면 RuntimeError로 즉시 중단되는데, "
+                            "이건 버그가 아니라 '어떤 연산이 비결정성의 소스인지'를 알려주는 "
+                            "유용한 정보이므로 에러 메시지의 연산 이름을 그대로 보고할 것 — "
+                            "--deterministic_warn_only로 우회하지 말고 먼저 보고."
+                        ))
+    parser.add_argument("--deterministic_warn_only", action="store_true",
+                        help=(
+                            "--deterministic가 RuntimeError로 중단될 때만 우회용으로 사용. "
+                            "결정적 구현이 없는 연산을 에러 대신 경고만 내고 그냥(비결정적으로) "
+                            "실행 — 즉 이 옵션을 켜면 '완전한 결정성 보장'이 깨지므로, 어떤 "
+                            "연산이 남아있는 비결정성의 원인인지 콘솔 경고를 확인하고 결과 "
+                            "해석 시 감안할 것. --deterministic 없이는 아무 효과 없음."
+                        ))
+    parser.add_argument("--run_tag", type=str, default=None,
+                        help=(
+                            "[통제 실험용] 파일명에 붙는 임의의 태그(예: 'r1', 'r2'). "
+                            "--seed/--train_seed/--deterministic가 전부 동일한 조합을 "
+                            "N번 반복 실행할 때(=순수 GPU 비결정성 크기 측정) 그냥 두면 "
+                            "매번 같은 파일명이라 이전 결과를 덮어쓰게 됨 — 이럴 때만 "
+                            "지정. 기본값 None이면 기존 동작과 동일(태그 없음)."
+                        ))
     parser.add_argument("--json",      type=str, default="dataset_id.json")
     parser.add_argument("--epochs",    type=int, default=200)
     parser.add_argument("--patience",  type=int, default=30)
@@ -292,8 +349,50 @@ def main():
                             "일치해야 dataset 분할이 같아짐 — 지금 CLI에 준 값을 "
                             "그대로 쓰므로 저장했을 때와 동일하게 넘길 것."
                         ))
+    parser.add_argument("--freeze_encoder_retrain_head", action="store_true",
+                        help=(
+                            "[통제 실험용] --from_saved_state로 불러온 모델에서 embedder/"
+                            "prototype_layer/ot_selector/context_proj를 전부 얼리고(gradient "
+                            "차단, KMeans++ 재초기화·regroup_update도 건너뜀 — centroid를 "
+                            "완전히 고정) head 계열(head/head_query_ln/head_context_ln/"
+                            "head_agg_ln)만 백지에서(reset_parameters) 다시 학습. linear_probe "
+                            "가 '새 분류기를 새로 학습'해서 context/agg_emb에 정보가 있다는 "
+                            "것만 보여준 것과 달리, 이건 '지금 이 head 구조가 그 정보를 실제로 "
+                            "쓰는 법을 배울 수 있는가'를 직접 검증 — 이렇게 재학습한 head가 "
+                            "원래(공동학습) 모델보다 test 성능이 오르면 원래 학습이 optimization "
+                            "dynamics(query path가 먼저 수렴해 나머지를 밀어냄) 때문에 그 정보를 "
+                            "못 썼다는 뜻이고, 그래도 안 오르면 head 구조 자체("
+                            "concat+MLP)가 구조적으로 그 정보를 못 쓴다는 뜻. "
+                            "--freeze_head_epochs로 재학습 epoch 수 조절. "
+                            "--from_saved_state 없이는 무효과."
+                        ))
+    parser.add_argument("--freeze_head_epochs", type=int, default=50,
+                        help=(
+                            "--freeze_encoder_retrain_head일 때 head만 재학습할 epoch 수. "
+                            "인코더가 고정돼 있어 head 혼자 수렴하는 데 필요한 epoch은 "
+                            "원래 공동학습보다 짧을 수 있음 — 검증 안 된 기본값(50), "
+                            "필요시 조정."
+                        ))
+    parser.add_argument("--linear_probe", action="store_true",
+                        help=(
+                            "[통제 실험용] --from_saved_state로 불러온 모델에서 "
+                            "query_emb/context_emb/agg_emb(+concat)를 각각 뽑아 sklearn "
+                            "LogisticRegression(분류)/Ridge(회귀)로 별도 학습해 test 성능을 "
+                            "비교. --ablation *_shuffle 결과(정확도 하락 없음)가 "
+                            "'context/agg emb에 애초에 정보가 없어서'인지 'concat+공유 "
+                            "MLP head가 그 정보를 못/안 쓰는 것뿐'인지 구분하려는 용도 — "
+                            "전자면 context/agg emb의 단독 probe 성능도 query_emb보다 "
+                            "훨씬 낮게 나오고, 후자면 context/agg emb 단독으로도 "
+                            "query_emb에 준하는 성능이 나옴. TabERA 자체는 재학습하지 "
+                            "않음(임베딩만 추출, sklearn은 별도로 가볍게 학습) — "
+                            "--from_saved_state 필수는 아니지만 없으면 방금 막 학습을 "
+                            "마친 모델 그대로 씀."
+                        ))
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor", "neighbor_noise",
+                                 "query_emb_zero", "query_emb_shuffle",
+                                 "context_emb_zero", "context_emb_shuffle",
+                                 "agg_emb_zero", "agg_emb_shuffle",
                                  "rank_correlation", "dual_space_faithfulness",
                                  "interaction_check", "centroid_geometry",
                                  "centroid_representativeness", "evidence_compensation",
@@ -312,6 +411,29 @@ def main():
                             "                         (random_neighbor와 함께 봐야 함 —\n"
                             "                         이 둘의 성능 하락 차이가 '틀린 이웃'과\n"
                             "                         '이웃 없음'의 영향을 분리해서 보여줌)\n"
+                            "  query_emb_zero/shuffle : [학습된 모델에 eval 시점만 적용,\n"
+                            "                         재학습 없음] head 입력의 query_emb\n"
+                            "                         슬롯을 0으로 채우거나(zero) 배치 내\n"
+                            "                         셔플(shuffle, permutation importance\n"
+                            "                         방식이라 분포 이탈 효과가 작아 더\n"
+                            "                         신뢰할 만함). '정상 학습된 모델이\n"
+                            "                         query_emb에 실제로 얼마나 의존하는가'를\n"
+                            "                         --no_query_emb(처음부터 빼고 재학습 —\n"
+                            "                         학습 자체가 붕괴하는지만 보여줌)와\n"
+                            "                         별개로 측정.\n"
+                            "  context_emb_zero/shuffle : 위와 대칭, context_emb 슬롯 대상.\n"
+                            "                         query_emb_* 결과와 나란히 놓고 보면\n"
+                            "                         'Explanation①(prototype 배정)이 예측을\n"
+                            "                         얼마나 진짜로 설명하는가'에 대한 직접\n"
+                            "                         증거가 됨.\n"
+                            "  agg_emb_zero/shuffle   : 위와 대칭, agg_emb(검색+attention 집계)\n"
+                            "                         슬롯 대상. query_emb_shuffle이 성능을\n"
+                            "                         무너뜨린 게 'agg_emb 자체가 기여 없음'\n"
+                            "                         때문인지 'query_emb와 agg_emb가 서로\n"
+                            "                         다른 샘플 것으로 짝이 어긋나 더\n"
+                            "                         헷갈리기' 때문인지 구분하기 위함 — 이\n"
+                            "                         모드는 agg_emb만 섞고 query_emb는\n"
+                            "                         그대로 둠(반대 조합).\n"
                             "  rank_correlation      : ③(SHAP) feature 순위가 Delta(단순\n"
                             "                         1차 perturbation) 순위와 어느 정도\n"
                             "                         정합하는지 보는 실험. [주의] Delta는\n"
@@ -370,6 +492,56 @@ def main():
                             "centroid_emb를 두고 서로 다른 방향으로 당기며 충돌하고 있는지' "
                             "검증용."
                         ))
+    parser.add_argument("--no_query_emb", action="store_true",
+                        help=(
+                            "[진단용] head 입력에서 query_emb(양자화 안 된 원본 임베더 출력)를 "
+                            "제외. --global_retrieve/--no_context_emb(과거 검증 완료)와 대칭인 "
+                            "새 ablation — 지금까지 query_emb가 head에서 빠진 조합은 한 번도 "
+                            "테스트된 적이 없었음. --no_context_emb와 반대로 켜면(둘 다 켜면 "
+                            "agg_emb만 남는 극단 케이스도 가능, 경고 출력됨) head가 순수 "
+                            "quantized 신호(context_emb)만으로 예측하는 vanilla VQ-VAE식 "
+                            "bottleneck에 가까워짐. 목적: (a) query_emb의 raw 값이 최종 성능에 "
+                            "실제로 얼마나 기여하는지, (b) 그 기여도가 클수록 Explanation①이 "
+                            "예측을 얼마나 '진짜로' 설명하는지에 대한 신뢰도가 낮아진다는 "
+                            "역상관 관계를 실측하기 위함. --detach_context_grad와 함께 쓰면 "
+                            "'context_emb의 값 자체 vs gradient 경로' 중 어느 쪽이 더 "
+                            "중요한지도 나눠서 볼 수 있음."
+                        ))
+    parser.add_argument("--ema_codebook", action="store_true",
+                        help=(
+                            "[구조 변경] codebook_loss(gradient 기반, centroid→query 방향)를 "
+                            "EMA(exponential moving average) 업데이트로 대체. commitment_loss"
+                            "(query→centroid 방향, embedder에 gradient)는 그대로 유지 — Huh et "
+                            "al.(2023)이 정리한 VQ-VAE 표준 구도(EMA는 codebook 쪽만 대체, "
+                            "commitment는 gradient 기반 유지)를 그대로 따름. [부작용] "
+                            "diversity_loss도 이 모드에서는 자동으로 꺼짐 — centroid_emb가 "
+                            "requires_grad=False가 되므로(EMA가 매 배치 .data를 통째로 "
+                            "덮어써서 gradient 기반 업데이트와 공존이 안 됨) diversity_loss를 "
+                            "계산해도 갈 곳이 없어 아예 호출을 생략함. 즉 이 모드는 "
+                            "'codebook_loss만 EMA로'가 아니라 'centroid를 EMA 하나로만 "
+                            "위치시키고 밀어내기(diversity) 효과는 포기'하는 트레이드오프임."
+                        ))
+    parser.add_argument("--ema_decay_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] --ema_codebook의 EMA decay(문헌 기본값 0.99 — "
+                            "van den Oord et al. 2017 Appendix, VQ-VAE-2/Jukebox/SoundStream "
+                            "공통. 이 프로젝트 데이터로 검증된 값 아님, 스윕 대상). "
+                            "--ema_codebook 없이는 무효과."
+                        ))
+    parser.add_argument("--blockwise_layernorm", action="store_true",
+                        help=(
+                            "[구조 변경] head 입력을 [query‖context‖agg] 하나로 묶어 "
+                            "nn.LayerNorm(_head_in) 하나로 정규화하던 기존 방식 대신, "
+                            "블록마다 따로 LayerNorm을 건 뒤 concat. 동기: context_emb/"
+                            "agg_emb_shuffle ablation에서 acc/auroc는 안 흔들리는데 "
+                            "logloss만 폭증하는 게 확인됨(routing/retrieval에 딸린 두 "
+                            "슬롯의 값이 흔들릴 때 결합 LayerNorm 통계를 통해 query_emb "
+                            "쪽 정규화까지 흔든다는 뜻) — 학습 중에도 dead-centroid 재초기화 "
+                            "등으로 이 두 슬롯이 흔들릴 때마다 같은 경로로 embedder gradient에 "
+                            "노이즈가 새어들었을 가능성. 기존 체크포인트는 head[0]이 단일 "
+                            "LayerNorm이라 이 플래그 없이 저장된 --from_saved_state와는 "
+                            "구조가 달라 호환 안 됨(옵트인 기본 False로 하위 호환 유지)."
+                        ))
     parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
                         help=(
                             "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
@@ -401,6 +573,19 @@ def main():
                             "학습 가능한 주기함수 + 공유 Linear+ReLU) — 필요시 여전히 선택 가능. "
                             "'linear'는 raw 값을 그대로 Linear에 투영 — 기존 동작, 하위 호환용."
                         ))
+    parser.add_argument("--evidence_metric", type=str, default="euclidean",
+                        choices=["euclidean", "cosine", "cosine_scaled"],
+                        help=(
+                            "AttentionAggregator(evidence_w, 설명②)의 유사도 공간 — cat_combine/"
+                            "num_embedding과 같은 성격의 구조 선택(Optuna 탐색 대상 아님). "
+                            "optimize.py --evidence_metric으로 이 값에 맞춰 HPO를 새로 돌린 뒤, "
+                            "여기서도 같은 값을 줘야 그 study를 찾음(study_pkl_tag가 파일명에 "
+                            "반영). euclidean(기본값)이면 기존과 완전히 동일 — 태그 없음. "
+                            "--evidence_metric_override(아래)와 다른 점: 이건 '그 metric으로 "
+                            "HPO된 study를 불러와서 재학습'이고, override는 '기존 euclidean "
+                            "study의 best_params에 이 값만 강제로 바꿔치기해서 재학습'(정식 "
+                            "HPO 없이 빠르게 확인하는 용도) — 둘 다 주면 override가 우선."
+                        ))
     parser.add_argument("--num_bins", type=int, default=8,
                         help="num_embedding=ple일 때 컬럼당 구간(bin) 개수 (기본 8 — 48보다 "
                              "여러 데이터셋에서 더 나은 calibration 확인 후 기본값 변경).")
@@ -411,6 +596,28 @@ def main():
                              "TabR 논문 권장 탐색 범위: LogUniform[0.01, 100.0]).")
     parser.add_argument("--plr_out_dim", type=int, default=8,
                         help="num_embedding=plr_lite일 때 컬럼당 최종 출력 차원 (기본 8).")
+    parser.add_argument("--confidence_scaling", action="store_true",
+                        help=(
+                            "[진단용] head에 들어가는 context_emb에 assignment "
+                            "confidence(top1_confidence — 실제 라우팅 soft에서 선택된 "
+                            "centroid의 확률, STE의 routing_probs와 달리 샘플마다 실제로 "
+                            "다름)를 곱함. 라우팅/검색 자체는 안 건드리고 head가 받는 "
+                            "신호의 크기만 조절 — 'context_emb norm이 지금(M=1, "
+                            "unit-norm centroid 그대로라 샘플 간 변동 0.3% 수준)처럼 "
+                            "정보가 없는 상태를 의도적으로 깨서, 애매한 배정은 head가 "
+                            "덜 신뢰하게 만들 수 있는가'를 검증. --confidence_scaling_"
+                            "detach와 조합해 Variant A(gradient 있음)/B(없음) 비교 가능. "
+                            "부작용 가능성: 애매한 샘플(confidence 낮음)은 gradient도 "
+                            "같이 작아짐(Variant A에서만) — 학습이 오히려 불안정해질 수 "
+                            "있어 검증 안 된 개입."
+                        ))
+    parser.add_argument("--confidence_scaling_detach", action="store_true",
+                        help=(
+                            "--confidence_scaling과 함께 쓸 때만 의미 있음(Variant B). "
+                            "confidence 값 자체는 곱하되 그 경로로 gradient는 안 흐르게 "
+                            "detach — '크기 조절 효과'와 'gradient 흐름 변화'를 분리해서 "
+                            "보기 위함."
+                        ))
     parser.add_argument("--context_projection", action="store_true",
                         help=(
                             "[구조 조정] context_emb를 head로 보내기 전 학습 가능한 "
@@ -419,6 +626,24 @@ def main():
                             "--context_projection으로 학습한 study가 있으면 그 "
                             "best_params를 쓰는 게 이상적이지만, 없으면 기존 study "
                             "best_params 위에 이 구조만 얹어 1회 재학습(별도 study 불필요)."
+                        ))
+    parser.add_argument("--loss_commitment_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 loss_commitment 값을 이 값으로 "
+                            "덮어쓰고 나머지는 그대로 재학습. jasmine(euclidean 0.010 → "
+                            "cosine 전용 HPO 0.097, 약 10배)과 mfeat-zernike(0.045 → "
+                            "0.071, 약 1.6배) 둘 다 cosine에서 commitment가 커졌는데, "
+                            "agg/query gradient는 정반대로 갈렸음(jasmine↓ mfeat-zernike↑) "
+                            "— commitment_loss 자체가 이 차이의 원인인지, 아니면 다른 "
+                            "하이퍼파라미터(embed_dim 등)와 우연히 같이 바뀐 것뿐인지 "
+                            "분리 검증하는 용도. loss_codebook_override와 같은 패턴."
+                        ))
+    parser.add_argument("--loss_diversity_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 loss_diversity 값을 이 값으로 "
+                            "덮어쓰고 나머지는 그대로 재학습. mfeat-zernike cosine 전용 "
+                            "HPO에서 diversity가 크게 줄었음(0.361→0.058, 약 6배) — "
+                            "이것도 agg gradient 변화의 후보 원인 중 하나로 같이 확인."
                         ))
     parser.add_argument("--loss_codebook_override", type=float, default=None,
                         help=(
@@ -441,6 +666,95 @@ def main():
                             "때(예: 10epoch 간격으로는 마지막 구간에서 실제로 안정됐는지 "
                             "판단이 안 될 때) 1~2로 낮춰서 재실행. --from_saved_state와 "
                             "같이 쓰면 재학습 자체를 안 하므로 아무 효과가 없다."
+                        ))
+    parser.add_argument("--log_branch_gradients", action="store_true",
+                        help=(
+                            "[진단용] head concat 직전(query_emb/context_emb/agg_emb) "
+                            "활성값에 retain_grad()를 걸어, epoch마다 브랜치별 "
+                            "gradient norm·activation norm·head 첫 Linear의 block별 "
+                            "weight norm을 기록(self.branch_gradient_history). "
+                            "--ablation *_shuffle/zero(학습 끝난 뒤 정적 진단)와 달리 "
+                            "학습 '과정 중' 각 브랜치가 얼마나 학습 신호를 받는지를 "
+                            "본다 — 'head가 query_emb에만 의존하도록 학습되는가'(멀티모달 "
+                            "학습의 modality imbalance/greedy learning 문헌과 구조적으로 "
+                            "유사한 현상) 진단용. retain_grad()는 값 자체를 안 바꾸므로 "
+                            "학습 결과(가중치/예측)에는 영향 없음(메모리만 소폭 증가). "
+                            "[주의] gradient가 작다는 것과 head가 그 브랜치를 실제로 "
+                            "안 쓴다는 것은 다른 얘기다 — 반드시 --ablation "
+                            "context_emb_shuffle/agg_emb_shuffle 결과와 같이 해석할 것. "
+                            "학습 후 meta.pkl에 branch_gradient_history/"
+                            "branch_gradient_batch_history로 저장됨. "
+                            "--from_saved_state와 같이 쓰면 재학습 자체를 안 하므로 "
+                            "아무 효과가 없다."
+                        ))
+    parser.add_argument("--log_branch_gradients_first_n_epochs", type=int, default=3,
+                        help=(
+                            "--log_branch_gradients의 배치 단위 세부 기록"
+                            "(branch_gradient_batch_history)을 처음 몇 epoch만 남길지. "
+                            "학습 전체에 걸쳐 배치 단위로 남기면 메모리가 계속 쌓이는데, "
+                            "OGM 계열 문헌이 강조하는 게 '초기 학습 dynamics'라 초반만 "
+                            "촘촘히 보면 충분하다는 판단(검증 안 된 기본값 3, 필요시 조정). "
+                            "이후 epoch는 epoch 평균(branch_gradient_history)만 남음."
+                        ))
+    parser.add_argument("--log_evidence_stats", action="store_true",
+                        help=(
+                            "[진단용] evidence_w(②의 AttentionAggregator 가중치)의 "
+                            "entropy·dominant weight를 epoch마다 기록"
+                            "(meta.pkl의 evidence_stats_history). --explain은 학습 "
+                            "끝난 뒤 소수 샘플만 보여줘서 '언제부터 evidence가 "
+                            "소수 이웃으로 붕괴됐는지'를 알 수 없었는데, 이 진단은 "
+                            "학습 전체 epoch에 걸친 추세를 정량적으로 보여줌. "
+                            "entropy가 0에 가깝고 dominant_weight가 1에 가까울수록 "
+                            "사실상 1개 이웃만 보는 hard 1-NN으로 붕괴했다는 뜻. "
+                            "backward/retain_grad 불필요한 순수 forward 통계라 "
+                            "--log_branch_gradients보다 오버헤드 적음."
+                        ))
+    parser.add_argument("--evidence_metric_override", type=str, default=None,
+                        choices=["euclidean", "cosine", "cosine_scaled"],
+                        help=(
+                            "[통제 실험용] AttentionAggregator의 evidence_w 유사도 공간. "
+                            "기본(None)이면 model_kwargs의 evidence_metric(보통 'euclidean', "
+                            "기존과 동일)을 그대로 씀. 'euclidean'은 -‖q-k‖²(raw, 정규화 "
+                            "안 됨) — jasmine 실측: query_emb norm이 학습 중 커지면서(최대 "
+                            "89배) evidence_w가 사실상 1-NN으로 붕괴, evidence_temperature "
+                            "스윕(0.5~10)으로도 해결 안 됨(고정 스칼라로는 계속 커지는 norm을 "
+                            "못 따라잡음). 'cosine'은 q,k를 CentroidLayer 라우팅과 동일하게 "
+                            "정규화 후 2·cos(q,k) — norm 자체가 계산에서 빠져 이 collapse "
+                            "메커니즘을 원천 제거. 'cosine_scaled'는 여기에 hyperspherical "
+                            "sharpness scale(√2·log(k-1), routing_scale과 같은 원리를 evidence "
+                            "후보 개수 k에 독립 적용 — routing_scale 값 자체를 재사용하는 "
+                            "건 아님)을 곱함. --dropout_override와 같은 패턴 — model_kwargs에 "
+                            "반영, --from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
+                        ))
+    parser.add_argument("--evidence_temperature_override", type=float, default=None,
+                        help=(
+                            "[통제 실험용] AttentionAggregator의 evidence_w = "
+                            "softmax(-‖q-k‖² / T)에서 T(evidence_temperature)를 이 값으로 "
+                            "설정하고 재학습(기본 1.0 = 기존과 동일, 하위 호환). jasmine/"
+                            "credit-g 실측: evidence entropy가 학습 초반부터 이미 ln(k) "
+                            "대비 크게 낮고(사실상 1-NN 붕괴) 학습 중 더 낮아짐 — 이게 "
+                            "raw(정규화 안 됨) 유클리드 거리 softmax의 calibration 문제인지 "
+                            "검증하기 위한 수동 스윕용. 추천 스윕값: 0.5/1/2/5/10. T>1이면 "
+                            "더 완만하게(여러 이웃), T<1이면 더 뾰족하게(소수 이웃에 집중). "
+                            "--dropout_override와 같은 패턴 — model_kwargs에 반영, "
+                            "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
+                        ))
+    parser.add_argument("--embed_dim_override", type=int, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 embed_dim 값을 이 값으로 덮어쓰고 "
+                            "나머지는 그대로 재학습. jasmine/mfeat-zernike/ada_agnostic 3개 "
+                            "데이터셋의 cosine 전용 HPO에서 embed_dim이 커지는 방향(→256)이면 "
+                            "agg/query gradient가 줄고, 작아지는 방향(→64)이면 느는 패턴이 "
+                            "일관되게 관찰됨(jasmine 64→256/agg↓, mfeat-zernike 256→64/agg↑, "
+                            "ada_agnostic 128→256/agg↓) — loss_commitment/diversity는 세 "
+                            "데이터셋 다 같은 방향으로 움직여 이 갈림을 설명 못 했지만, "
+                            "embed_dim은 방향이 갈려서 정확히 일치함. 다만 HPO가 embed_dim과 "
+                            "동시에 dropout/lr/layers/loss weight도 같이 바꿨으므로 상관관계일 "
+                            "뿐 인과는 아직 미검증 — 이 플래그로 embed_dim 하나만 격리해서 "
+                            "확인. --loss_codebook_override와 같은 패턴. [주의] embed_dim은 "
+                            "모델 구조(가중치 shape) 자체를 바꾸므로 --from_saved_state로 "
+                            "저장된 다른 embed_dim 체크포인트를 불러올 수 없음(애초에 "
+                            "--from_saved_state는 재학습을 안 해서 이 플래그와 같이 못 씀)."
                         ))
     parser.add_argument("--dropout_override", type=float, default=None,
                         help=(
@@ -546,8 +860,32 @@ def main():
                         ))
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # [수정] args.seed는 데이터 분할(fold 선택, libs/data.py KFold)에도 쓰이고
+    # 지금까지는 torch.manual_seed/np.random.seed에도 같이 묶여 있었음 —
+    # 즉 "같은 split, 다른 학습 초기화"로 N-seed 반복 실험을 돌릴 방법이
+    # 없었다(seed를 바꾸면 split도 같이 바뀜). --train_seed가 없으면
+    # 기존 동작(args.seed 하나로 전부)과 완전히 동일하게 유지.
+    train_seed = args.train_seed if args.train_seed is not None else args.seed
+    torch.manual_seed(train_seed)
+    np.random.seed(train_seed)
+    if args.train_seed is not None:
+        print(f"  [--train_seed] 학습 초기화/배치 순서 seed={train_seed} "
+              f"(데이터 분할은 --seed={args.seed} 그대로)")
+
+    # [추가] --deterministic: GPU 비결정성 vs 아키텍처 chaotic sensitivity 분리용.
+    # cudnn.deterministic/benchmark은 언제나 안전하게 켤 수 있지만,
+    # use_deterministic_algorithms(True)는 결정적 구현이 없는 연산을 만나면
+    # RuntimeError를 던진다 — 이걸 --deterministic_warn_only 없이 그대로
+    # 터뜨리는 게 의도적임: 어떤 연산이 원인인지 에러 메시지에 그대로 찍히므로,
+    # 그게 곧 "이 모델의 어느 부분이 비결정적인가"에 대한 직접적인 실측 정보가 됨.
+    if args.deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=args.deterministic_warn_only)
+        print(f"  [--deterministic] cudnn.deterministic=True, benchmark=False, "
+              f"use_deterministic_algorithms(True, warn_only={args.deterministic_warn_only})"
+              + (f" — CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG', '(미설정!)')}"
+                 if torch.cuda.is_available() else " (CUDA 없음, CPU라 애초에 대부분 결정적)"))
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     import platform
     env_info = "{0}:{1}".format(platform.node(), args.gpu_id)
@@ -578,17 +916,33 @@ def main():
         log_dir = args.savepath
 
     _save_tag = ("..detach_ctx" if args.detach_context_grad else "") \
+              + ("..confscale" if args.confidence_scaling else "") \
+              + ("..confscale_detach" if (args.confidence_scaling and args.confidence_scaling_detach) else "") \
+              + ("..no_query_emb" if args.no_query_emb else "") \
+              + ("..ema_codebook" if args.ema_codebook else "") \
+              + (f"..ema_decay{args.ema_decay_override:g}" if args.ema_decay_override is not None else "") \
+              + ("..blockLN" if args.blockwise_layernorm else "") \
+              + ("..freezeHead" if args.freeze_encoder_retrain_head else "") \
               + ("..ctx_proj" if args.context_projection else "") \
               + ("..cat_concat" if args.cat_combine == "concat" else "") \
               + ("..cat_onehot" if args.cat_combine == "onehot" else "") \
               + ("..num_ple" if args.num_embedding == "ple" else "") \
               + ("..num_plr" if args.num_embedding == "plr_lite" else "") \
               + (f"..lcb{args.loss_codebook_override:g}" if args.loss_codebook_override is not None else "") \
+              + (f"..lcm{args.loss_commitment_override:g}" if args.loss_commitment_override is not None else "") \
+              + (f"..ldv{args.loss_diversity_override:g}" if args.loss_diversity_override is not None else "") \
+              + (f"..ed{args.embed_dim_override}" if args.embed_dim_override is not None else "") \
               + (f"..do{args.dropout_override:g}" if args.dropout_override is not None else "") \
+              + (f"..evT{args.evidence_temperature_override:g}" if args.evidence_temperature_override is not None else "") \
+              + (f"..evM_{args.evidence_metric_override}" if args.evidence_metric_override is not None
+                 else (f"..evM_{args.evidence_metric}" if args.evidence_metric != "euclidean" else "")) \
               + (f"..bs{args.batch_size_override}" if args.batch_size_override is not None else "") \
               + (f"..rwe{args.regroup_warmup_epochs_override}" if args.regroup_warmup_epochs_override is not None else "") \
               + (f"..drp{args.dead_reinit_patience_override}" if args.dead_reinit_patience_override is not None else "") \
-              + (f"..drn{args.dead_reinit_noise_scale_override:g}" if args.dead_reinit_noise_scale_override is not None else "")
+              + (f"..drn{args.dead_reinit_noise_scale_override:g}" if args.dead_reinit_noise_scale_override is not None else "") \
+              + (f"..trainseed{args.train_seed}" if args.train_seed is not None else "") \
+              + ("..deterministic" if args.deterministic else "") \
+              + (f"..{args.run_tag}" if args.run_tag is not None else "")
 
     _saved_state = None
     if args.from_saved_state:
@@ -635,6 +989,28 @@ def main():
         if args.dropout_override is not None:
             print(f"  ⚠️  --dropout_override는 재학습 시에만 의미가 있습니다 — "
                   f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.train_seed is not None:
+            print(f"  ⚠️  --train_seed는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.deterministic:
+            print(f"  ⚠️  --deterministic은 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 재학습을 안 하므로 이 플래그를 무시합니다.")
+        if args.no_query_emb:
+            print(f"  ⚠️  --no_query_emb는 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 저장된 model_kwargs(head 입력 차원 포함)를 "
+                  f"그대로 쓰므로 이 플래그를 무시합니다.")
+        if args.ema_codebook:
+            print(f"  ⚠️  --ema_codebook은 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 저장된 model_kwargs(EMA 사용 여부 포함)를 "
+                  f"그대로 쓰므로 이 플래그를 무시합니다(체크포인트 자체가 EMA로 "
+                  f"학습됐다면 자동으로 EMA 구조로 복원됩니다).")
+        if args.blockwise_layernorm:
+            print(f"  ⚠️  --blockwise_layernorm은 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 저장된 model_kwargs(head LayerNorm 구조 포함)를 "
+                  f"그대로 쓰므로 이 플래그를 무시합니다(체크포인트가 이 구조로 학습됐다면 "
+                  f"자동으로 복원됩니다. 반대로 결합형 LayerNorm으로 저장된 체크포인트에 "
+                  f"이 플래그를 켜도 state_dict 모양이 달라 로드 자체는 저장된 구조를 "
+                  f"따르므로 문제없음).")
     else:
         # [수정] optimize.py가 실제로 저장한 파일명과 일치시키기 위해
         # study_pkl_tag()를 그대로 재사용 — 예전엔 여기서 태그 없이
@@ -652,6 +1028,7 @@ def main():
             context_projection=args.context_projection,
             cat_combine=args.cat_combine,
             num_embedding=args.num_embedding,
+            evidence_metric=args.evidence_metric,
         )
         fname = os.path.join(log_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
         if not os.path.exists(fname):
@@ -702,6 +1079,27 @@ def main():
 
         # ── 모델 구성 ──────────────────────────────────────────
         model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
+        # [추가] cat_combine/num_embedding과 같은 성격 — best_params에는 없는
+        # 구조 선택이라 여기서 명시적으로 채움. --evidence_metric_override가
+        # 뒤에서 더 우선시되도록 이 대입이 먼저 와야 함(순서 중요).
+        model_kwargs["evidence_metric"] = args.evidence_metric
+        if args.evidence_metric != "euclidean":
+            print(f"  [--evidence_metric] evidence_metric={args.evidence_metric} "
+                  f"(이 값으로 HPO된 study를 불러옴 — study_pkl_tag 참고)")
+        if args.loss_commitment_override is not None:
+            _old_commitment_w = model_kwargs.get("loss_weights", {}).get("commitment", 0.0)
+            model_kwargs.setdefault("loss_weights", {})["commitment"] = args.loss_commitment_override
+            best_params["loss_commitment"] = args.loss_commitment_override
+            print(f"  [--loss_commitment_override] loss_weights['commitment']: "
+                  f"{_old_commitment_w:.4g} → {args.loss_commitment_override:.4g} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.loss_diversity_override is not None:
+            _old_diversity_w = model_kwargs.get("loss_weights", {}).get("diversity", 0.0)
+            model_kwargs.setdefault("loss_weights", {})["diversity"] = args.loss_diversity_override
+            best_params["loss_diversity"] = args.loss_diversity_override
+            print(f"  [--loss_diversity_override] loss_weights['diversity']: "
+                  f"{_old_diversity_w:.4g} → {args.loss_diversity_override:.4g} "
+                  f"(나머지 파라미터는 best_params 그대로)")
         if args.loss_codebook_override is not None:
             # [통제 실험용] best_params가 찾은 loss_codebook 값(있다면)을
             # 무시하고 이 값으로 강제 — 나머지 하이퍼파라미터는 best_params
@@ -714,6 +1112,15 @@ def main():
             print(f"  [--loss_codebook_override] loss_weights['codebook']: "
                   f"{_old_codebook_w:.4g} → {args.loss_codebook_override:.4g} "
                   f"(나머지 파라미터는 best_params 그대로)")
+        if args.embed_dim_override is not None:
+            # [통제 실험용] embed_dim만 격리해서 바꿈 — cosine HPO가 embed_dim과
+            # 동시에 바꾼 dropout/lr/layers/loss weight는 best_params 그대로 둠.
+            # 모델 구조(가중치 shape)가 바뀌므로 재학습이 반드시 필요(로드 불가).
+            _old_embed_dim = model_kwargs.get("embed_dim")
+            model_kwargs["embed_dim"] = args.embed_dim_override
+            best_params["embed_dim"] = args.embed_dim_override
+            print(f"  [--embed_dim_override] embed_dim: {_old_embed_dim} → {args.embed_dim_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
         if args.dropout_override is not None:
             # [통제 실험용] dropout은 TabularEmbedder(ResidualMLP) 내부에서
             # query_emb 자체를 매 forward마다 흔드는 유일한 확률적 요소라,
@@ -723,6 +1130,20 @@ def main():
             model_kwargs["dropout"] = args.dropout_override
             best_params["dropout"] = args.dropout_override  # 저장/재출력 시 실제 학습값과 일치하도록
             print(f"  [--dropout_override] dropout: {_old_dropout} → {args.dropout_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.evidence_temperature_override is not None:
+            # [통제 실험용] AttentionAggregator의 evidence_w softmax temperature.
+            # best_params에는 애초에 없는 값(HPO 탐색 대상 아님, 기본 1.0)이라
+            # dropout_override와 달리 "덮어쓸 기존 값"이 없음 — model_kwargs에
+            # 직접 새로 설정.
+            model_kwargs["evidence_temperature"] = args.evidence_temperature_override
+            print(f"  [--evidence_temperature_override] evidence_temperature: "
+                  f"1.0(기본값) → {args.evidence_temperature_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
+        if args.evidence_metric_override is not None:
+            model_kwargs["evidence_metric"] = args.evidence_metric_override
+            print(f"  [--evidence_metric_override] evidence_metric: "
+                  f"euclidean(기본값) → {args.evidence_metric_override} "
                   f"(나머지 파라미터는 best_params 그대로)")
         if args.batch_size_override is not None:
             # [통제 실험용] batch_size는 model_kwargs가 아니라 best_params
@@ -763,10 +1184,23 @@ def main():
             use_offset_correction=True,
             global_retrieve=False,
             use_context_emb=True,
+            use_query_emb_in_head=not args.no_query_emb,
+            use_ema_codebook=args.ema_codebook,
+            ema_decay=args.ema_decay_override if args.ema_decay_override is not None else 0.99,
+            blockwise_layernorm=args.blockwise_layernorm,
             # [진단용] context_emb는 head에 그대로 전달하되 gradient만 끊음
             detach_context_grad=args.detach_context_grad,
             # [구조 조정] context_emb를 head 직전 Linear 프로젝션에 통과시킴
             use_context_projection=args.context_projection,
+            # [진단용] head concat 직전 브랜치별 gradient 계측 — state_dict
+            # 구조는 안 바꾸지만(detach_context_grad와 같은 이유로) 다른
+            # TabERA 동작 플래그들과 같은 자리에 모아두는 게 일관적이라
+            # 여기 합류시킴.
+            log_branch_gradients=args.log_branch_gradients,
+            # [진단용] context_emb를 head에 넣기 전 assignment confidence로
+            # 스케일 — 라우팅/검색은 안 건드림.
+            use_confidence_scaling=args.confidence_scaling,
+            confidence_scaling_detach=args.confidence_scaling_detach,
             # [후보 A 구현 → 채택 확정] categorical feature를 raw 정수 대신
             # 별도 처리 — TabZilla 29개 baseline 비교에서 cat_ratio와
             # AUROC gap의 견고한 상관관계(Spearman rho=-0.63, p=0.0003)
@@ -831,6 +1265,9 @@ def main():
         quantile_transformer=dataset.quantile_transformer,
         regroup_log_every=args.regroup_log_every,
         refresh_on_best=args.refresh_on_best,
+        log_branch_gradients=args.log_branch_gradients,
+        log_branch_gradients_first_n_epochs=args.log_branch_gradients_first_n_epochs,
+        log_evidence_stats=args.log_evidence_stats,
     )
     wrapper._data_id = args.openml_id
     if _saved_state is not None:
@@ -878,7 +1315,37 @@ def main():
                     print(f"  [--refresh_on_best] clean 임베딩 기준으로 sample_groups 재동기화 "
                           f"완료 (active={regroup_stats.get('active_ratio', 0)*100:.0f}%, "
                           f"reinit={regroup_stats.get('reinit_count', 0)})")
-        print(f"  [--from_saved_state] 복원 완료 (epoch 0부터 재학습 안 함)")
+        if args.freeze_encoder_retrain_head:
+            # ── 인코더 고정 + head만 재학습 ──────────────────────
+            HEAD_MODULE_NAMES = ("head", "head_query_ln", "head_context_ln",
+                                  "head_agg_ln", "context_proj")
+            n_frozen, n_trainable = 0, 0
+            for _name, _p in model.named_parameters():
+                _top = _name.split(".")[0]
+                if _top in HEAD_MODULE_NAMES:
+                    _p.requires_grad = True
+                    n_trainable += _p.numel()
+                else:
+                    _p.requires_grad = False
+                    n_frozen += _p.numel()
+            # head를 백지로 재초기화 — "기존 head를 이어서 미세조정"이 아니라
+            # "고정된 인코더 표현 위에서 head가 처음부터 그 정보를 쓰는 법을
+            # 배울 수 있는가"를 순수하게 보기 위함(기존 head 가중치가 이미
+            # query-only 지역 최적점에 있으면 거기서 못 벗어날 수 있으므로).
+            for _mod_name in HEAD_MODULE_NAMES:
+                _mod = getattr(model, _mod_name, None)
+                if _mod is None:
+                    continue
+                for _m in _mod.modules():
+                    if hasattr(_m, "reset_parameters"):
+                        _m.reset_parameters()
+            print(f"  [--freeze_encoder_retrain_head] 인코더 고정(파라미터 {n_frozen:,}개, "
+                  f"gradient 차단) — head 계열만 재초기화 후 재학습(파라미터 {n_trainable:,}개, "
+                  f"{args.freeze_head_epochs} epoch)")
+            wrapper.epochs = args.freeze_head_epochs
+            wrapper.fit(X_train, y_train, X_val, y_val, skip_centroid_init=True)
+        else:
+            print(f"  [--from_saved_state] 복원 완료 (epoch 0부터 재학습 안 함)")
     else:
         wrapper.fit(X_train, y_train, X_val, y_val)
 
@@ -2389,6 +2856,34 @@ def main():
                     print(f"    attention이 '누구를 볼지 못 정하는' 상태가 됐다는 뜻 —")
                     print(f"    성능이 덜 떨어진 건 uniform 평균이 이 데이터셋에서")
                     print(f"    우연히 나쁘지 않은 예측이기 때문일 수 있음.")
+            elif args.ablation in ("query_emb_zero", "query_emb_shuffle"):
+                print(f"  → 성능 하락 = '정상 학습된 head가 query_emb 슬롯에 실제로")
+                print(f"    얼마나 의존하는가'의 대가. --no_query_emb(처음부터 빼고")
+                print(f"    재학습 — 학습 붕괴로 확인됨)와는 다른 질문: 이건 재학습 없이")
+                print(f"    이미 학습된 가중치 그대로 이 슬롯 하나만 지워본 것.")
+                print(f"    하락폭이 크면 → head가 이 슬롯에 실제로 크게 의존 (예상대로).")
+                print(f"    하락폭이 작으면 → head가 이 슬롯을 거의 안 쓰면서도 학습")
+                print(f"    자체는 이 슬롯 없이는 불가능했다는 뜻 — 즉 query_emb의 역할이")
+                print(f"    '최종 예측 재료'가 아니라 '학습 중 gradient 경로 안정화'였을")
+                print(f"    가능성. shuffle이 zero보다 분포 이탈이 적어 더 신뢰할 것.")
+            elif args.ablation in ("context_emb_zero", "context_emb_shuffle"):
+                print(f"  → 성능 하락 = '정상 학습된 head가 context_emb(=Explanation①의")
+                print(f"    prototype 신호) 슬롯에 실제로 얼마나 의존하는가'의 대가.")
+                print(f"    하락폭이 query_emb_zero/shuffle보다 훨씬 작으면 → Explanation①이")
+                print(f"    보여주는 'Centroid_X로 배정됨'이라는 서사가 실제 예측 근거로서는")
+                print(f"    약하다는 뜻(그래도 그룹 자체의 존재는 검색 속도/해석에 별도로")
+                print(f"    유효 — 이 실험은 '예측 기여도'만 봄, ②retrieval 마스킹 가치나")
+                print(f"    그룹의 데이터 구조 반영 여부는 안 봄).")
+            elif args.ablation in ("agg_emb_zero", "agg_emb_shuffle"):
+                print(f"  → query_emb는 정상, agg_emb만 섞음 — query_emb_shuffle(정반대 조합,")
+                print(f"    agg_emb는 정상·query_emb만 섞음)과 나란히 놓고 비교할 것.")
+                print(f"    이번 하락폭이 크면 → agg_emb 자체가 예측에 기여(검색이 실제로")
+                print(f"    유용한 정보를 나름). 이번 하락폭이 작으면(query_emb_shuffle의")
+                print(f"    거의 랜덤 수준 붕괴와 대비된다면) → 성능은 사실상 query_emb")
+                print(f"    슬롯 하나가 거의 다 담당하고 있고, agg_emb는 '짝이 맞을 때만")
+                print(f"    의미 있는 보조 신호'이거나 거의 장식적인 슬롯일 가능성.")
+                print(f"    두 실험을 합치면 '짝 어긋남 자체의 대가'와 'agg_emb 단독 정보량'을")
+                print(f"    분리해서 볼 수 있음.")
 
             abl_save = {
                 "ablation_mode":  args.ablation,
@@ -2402,6 +2897,74 @@ def main():
             with open(abl_path, "wb") as f:
                 pickle.dump(abl_save, f)
             print(f"\n  저장: {abl_path}")
+
+    # ── Linear Probe ───────────────────────────────────────────
+    # [추가] query_emb/context_emb/agg_emb 각각에 별도 선형 분류기(또는
+    # 회귀, regression이면 Ridge)를 붙여서 "이 표현 자체에 타겟 정보가
+    # 있는가"를 직접 측정. shuffle ablation(예측 결과 관점)과 다른 질문 —
+    # shuffle이 0에 가까웠던 게 "정보가 없어서"(A)인지 "정보는 있는데
+    # concat+공유 MLP가 못 쓰는 것"(B)인지 구분하려는 용도. 재학습 없이
+    # --from_saved_state로 불러온 모델에서 임베딩만 뽑아 sklearn으로
+    # 별도 학습(TabERA 자체는 안 건드림).
+    if args.linear_probe:
+        print(f"\n{'='*60}")
+        print(f"  Linear Probe: query_emb / context_emb / agg_emb 정보량 확인")
+        print(f"{'='*60}")
+        model.eval()
+
+        def _extract_embeddings(X, batch_size=512):
+            qs, cs, ags = [], [], []
+            with torch.no_grad():
+                for start in range(0, len(X), batch_size):
+                    _out = model(X[start:start + batch_size])
+                    qs.append(_out["query_emb"].cpu())
+                    cs.append(_out["context_emb"].cpu())
+                    ags.append(_out["agg_emb"].cpu())
+            return (torch.cat(qs).numpy(), torch.cat(cs).numpy(), torch.cat(ags).numpy())
+
+        q_tr, c_tr, a_tr = _extract_embeddings(X_train)
+        q_te, c_te, a_te = _extract_embeddings(X_test)
+
+        import numpy as _np
+        from sklearn.linear_model import LogisticRegression, Ridge
+        from sklearn.metrics import accuracy_score, r2_score
+
+        if tasktype == "regression":
+            y_tr_np = (y_train * y_std).cpu().numpy()
+            y_te_np = (y_test * y_std).cpu().numpy()
+        else:
+            y_tr_np = y_train.cpu().numpy().astype(int)
+            y_te_np = y_test.cpu().numpy().astype(int)
+
+        probe_results = {}
+        reprs = {
+            "query_emb":     (q_tr, q_te),
+            "context_emb":   (c_tr, c_te),
+            "agg_emb":       (a_tr, a_te),
+            "concat(q+c+a)": (_np.concatenate([q_tr, c_tr, a_tr], axis=1),
+                              _np.concatenate([q_te, c_te, a_te], axis=1)),
+        }
+        for _name, (_tr, _te) in reprs.items():
+            if tasktype == "regression":
+                _clf = Ridge(alpha=1.0)
+                _clf.fit(_tr, y_tr_np)
+                _score = float(r2_score(y_te_np, _clf.predict(_te)))
+                _metric_name = "R2"
+            else:
+                _clf = LogisticRegression(max_iter=2000)
+                _clf.fit(_tr, y_tr_np)
+                _score = float(accuracy_score(y_te_np, _clf.predict(_te)))
+                _metric_name = "acc"
+            probe_results[_name] = _score
+            print(f"  {_name:20s} linear probe {_metric_name}={_score:.4f}")
+
+        probe_path = Path(log_dir) / f"data={openml_id}{_save_tag}..seed{args.seed}_linear_probe.pkl"
+        with open(probe_path, "wb") as f:
+            pickle.dump({
+                "probe_results": probe_results,
+                "openml_id": openml_id, "seed": args.seed, "tasktype": tasktype,
+            }, f)
+        print(f"\n  저장: {probe_path}")
 
 
 
@@ -2422,9 +2985,37 @@ def main():
         "val_metrics": val_metrics,
         "test_metrics":test_metrics,
         "seed":        args.seed,
+        "train_seed":  train_seed,
+        # [추가] optimize.py의 HPO trial들은 이미 trial.set_user_attr()로
+        # reinit_per_epoch/active_ratio_std를 study.pkl에 저장하고 있었음
+        # (몰랐던 게 아니라 이미 있었음) — 근데 이 최종 재학습(reproduce.py)
+        # 쪽 meta.pkl에는 안 담겨서, "채택된 모델 1개"의 학습 안정성
+        # 지표를 study.pkl까지 다시 뒤지지 않고는 못 봤음. wrapper가 이미
+        # 계산해둔 걸 그대로 옮겨 담기만 함 — 계산 로직 변경 없음.
+        "centroid_geometry_diag": wrapper.centroid_geometry_diag,
+        # [진단용] --log_branch_gradients=False면 둘 다 빈 리스트(학습을
+        # 안 했거나 --from_saved_state로 건너뛴 경우도 마찬가지) — 항상
+        # 키 자체는 존재하게 해서 다운스트림 분석 코드가 .get() 없이도
+        # 안전하게 접근 가능.
+        "branch_gradient_history": wrapper.branch_gradient_history,
+        "branch_gradient_batch_history": wrapper.branch_gradient_batch_history,
+        # [추가] epoch별 active_ratio 등 라우팅 안정성 전체 시계열 — 지금까지는
+        # centroid_geometry_diag(마지막 스냅샷 하나)만 저장돼서, "active_ratio가
+        # 낮은 epoch에 context/agg gradient도 같이 낮은가"처럼 branch_gradient_
+        # history와 시점을 맞춰 보는 분석이 불가능했다. 둘 다 epoch 키로
+        # zip 가능 (regroup_history는 매 epoch, branch_gradient_history는
+        # log_branch_gradients=True일 때만 매 epoch — 둘 다 켰으면 길이가 같음).
+        "regroup_history": wrapper.regroup_history,
+        "evidence_stats_history": wrapper.evidence_stats_history,
+        "deterministic": args.deterministic,
+        "deterministic_warn_only": args.deterministic_warn_only if args.deterministic else None,
         "use_offset_correction": True,
         "global_retrieve": False,
         "use_context_emb": True,
+        "use_query_emb_in_head": not args.no_query_emb,
+        "use_ema_codebook": args.ema_codebook,
+        "ema_decay": (args.ema_decay_override if args.ema_decay_override is not None else 0.99) if args.ema_codebook else None,
+        "blockwise_layernorm": args.blockwise_layernorm,
         "detach_context_grad": args.detach_context_grad,
         "use_context_projection": args.context_projection,
         "cat_embedding": True,  # [후보 A] categorical nn.Embedding 적용 여부 기록
@@ -2440,6 +3031,26 @@ def main():
         pickle.dump(meta, f)
 
     print(f"\n  저장: {pred_path}")
+    if wrapper.centroid_geometry_diag is not None:
+        _diag = wrapper.centroid_geometry_diag
+        print(f"  centroid_geometry_diag: "
+              f"reinit_per_epoch={_diag.get('reinit_per_epoch', float('nan')):.3f}  "
+              f"active_ratio_std={_diag.get('active_ratio_std', float('nan')):.4f}  "
+              f"margin_percentile={_diag.get('margin_percentile', float('nan')):.3f}  "
+              f"avg_inter_dist_final={_diag.get('avg_inter_dist_final', float('nan')):.3f} "
+              f"(← 위 '[CentroidLayer] KMeans++ ... avg_inter_dist=' 값과 비교 — "
+              f"학습 끝에서 뚜렷이 작아졌으면 centroid들이 서로 뭉쳤다는 뜻)")
+    if wrapper.branch_gradient_history:
+        _first, _last = wrapper.branch_gradient_history[0], wrapper.branch_gradient_history[-1]
+        _names = [k[:-len("_grad_norm")] for k in _first if k.endswith("_grad_norm")]
+        print(f"  branch_gradient_history: epoch {int(_first['epoch'])} → {int(_last['epoch'])}")
+        for _n in _names:
+            print(f"    {_n:8s}: grad {_first.get(f'{_n}_grad_norm', float('nan')):.4f} → "
+                  f"{_last.get(f'{_n}_grad_norm', float('nan')):.4f}   "
+                  f"W {_first.get(f'{_n}_weight_norm', float('nan')):.4f} → "
+                  f"{_last.get(f'{_n}_weight_norm', float('nan')):.4f}")
+        print(f"    (전체 곡선은 meta.pkl의 branch_gradient_history/"
+              f"branch_gradient_batch_history 참고 — 이 요약은 첫/끝 epoch만 비교)")
 
     # ── model state 저장 (--from_saved_state 용) ──────────────
     # model_kwargs에 이미 use_offset_correction 등 아키텍처 플래그가
@@ -2473,6 +3084,8 @@ def main():
         "val_metrics":  val_metrics,
         "test_metrics": test_metrics,
         "seed":         args.seed,
+        "train_seed":   train_seed,
+        "deterministic": args.deterministic,
     }, str(state_path))
     print(f"  저장: {state_path}")
 
