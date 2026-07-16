@@ -413,6 +413,16 @@ class CentroidLayer(nn.Module):
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
         routing_scale: float = 1.0,
+        use_ema_codebook: bool = False,
+        ema_decay: float = 0.99,   # [문헌 근거] van den Oord et al.(2017) Appendix,
+                                   # VQ-VAE-2(Razavi et al. 2019), Jukebox/SoundStream
+                                   # 등 EMA 기반 VQ 구현 전반에서 공통으로 쓰는 기본값.
+                                   # 다만 이 프로젝트 데이터로 검증된 값은 아님 —
+                                   # dead_reinit_patience/noise_scale과 같은 성격의
+                                   # "문헌 기본값, 스윕 대상"으로 취급할 것.
+        ema_eps: float = 1e-5,     # Laplace smoothing (VQ-VAE-2 Appendix A.1) —
+                                   # N_i(EMA 배정 횟수)가 0에 가까워질 때 분모가
+                                   # 불안정해지는 걸 막음.
     ) -> None:
         super().__init__()
         self.P                 = n_prototypes
@@ -442,6 +452,43 @@ class CentroidLayer(nn.Module):
         # ── centroid 임베딩 (학습 가능 파라미터: routing + FAISS 마스킹) ──
         self.centroid_emb = nn.Parameter(torch.empty(n_prototypes, embed_dim))
         nn.init.orthogonal_(self.centroid_emb)
+
+        # ── [추가] EMA 기반 codebook 업데이트 ──────────────────────
+        # Huh et al.(2023)이 정리한 표준 구도를 따름: codebook_loss(gradient
+        # 기반, centroid → query 방향)를 EMA가 대체하고 commitment_loss
+        # (query → centroid 방향, embedder에 gradient)는 그대로 둠. 이
+        # 프로젝트 특유의 제약: centroid_emb가 항상 단위벡터여야 하므로
+        # (CosFace 스타일) 표준 EMA 공식(가중평균)에 매 업데이트 후
+        # 재정규화를 추가함 — 두 단위벡터의 가중평균은 단위벡터가 아님.
+        #
+        # [중요한 설계 결정] diversity_loss도 원래 centroid_emb를 gradient로
+        # 밀어내는 손실인데, EMA는 매 배치 centroid_emb.data를 통째로
+        # 덮어쓰므로 그 직전에 optimizer.step()이 반영한 diversity_loss의
+        # gradient 효과가 즉시 지워짐(같은 파라미터를 두 메커니즘이 서로
+        # 다른 방식-누적 gradient vs hard overwrite-으로 동시에 건드리면
+        # 후자가 전자를 실질적으로 무효화함). 그래서 use_ema_codebook=True면
+        # centroid_emb를 아예 optimizer 대상에서 제외(requires_grad=False)
+        # 하고, diversity_loss도 호출 자체를 건너뜀(tabera.py에서 처리) —
+        # "밀어내기" 효과 없이 순수 EMA(=배정된 데이터의 이동평균)만으로
+        # centroid 위치가 정해짐. diversity_loss의 EMA-호환 버전(예: EMA
+        # 업데이트 직후 비-gradient 방식으로 서로 가까운 centroid를 살짝
+        # 밀어내는 로직)은 아직 없음 — 필요하면 별도로 설계해야 함.
+        self.use_ema_codebook = use_ema_codebook
+        self.ema_decay = ema_decay
+        self.ema_eps   = ema_eps
+        if use_ema_codebook:
+            self.centroid_emb.requires_grad_(False)
+            # N_i(EMA 배정 횟수 누적)를 1로 시작 — 0으로 시작하면 첫 배치
+            # 직후 분모가 극단적으로 작아 첫 업데이트가 과도하게 튐.
+            self.register_buffer("ema_cluster_size", torch.ones(n_prototypes))
+            # m_i(EMA 배정 임베딩 합) — KMeans++ 초기화 결과와 즉시 일치하도록
+            # centroid_emb(단위벡터) × ema_cluster_size로 시작. 이러면 첫
+            # ema_update() 호출 전까지는 centroid_emb.data / ema_cluster_size
+            # == centroid_emb.data 그대로라 초기화 직후 급격한 점프가 없음.
+            self.register_buffer(
+                "ema_embed_sum",
+                self.centroid_emb.data.clone() * self.ema_cluster_size.unsqueeze(-1)
+            )
 
         # [제거됨] IG(③) 전용 baseline buffer — ③이 SHAP으로 통일되면서
         # 더 이상 필요 없어짐 (모듈 docstring 참고). n_features 파라미터
@@ -555,12 +602,67 @@ class CentroidLayer(nn.Module):
         # 유지하되, 더 이상 이 함수 내부에서 쓰이지 않음(③=SHAP 통일).
         self.sample_groups = [[] for _ in range(self.P)]
 
+        # [추가] EMA buffer도 방금 정해진 실제 KMeans++ 결과와 일치시킴 —
+        # __init__ 시점엔 centroid_emb가 아직 orthogonal random 초기값이라
+        # 거기 맞춰 잡았던 ema_embed_sum이 이 시점엔 stale해짐. 여기서
+        # 다시 맞추지 않으면 첫 ema_update() 호출 때 "KMeans++가 잡아준
+        # 위치"에서 "orthogonal random 초기값 쪽" 방향으로 급격히 끌려가는
+        # 원치 않는 점프가 생김.
+        if self.use_ema_codebook:
+            self.ema_cluster_size.fill_(1.0)
+            self.ema_embed_sum.data = (
+                self.centroid_emb.data.clone() * self.ema_cluster_size.unsqueeze(-1)
+            )
+
         # 초기화 품질 로그: centroid 간 평균 코사인 거리
         sim_mat  = self.centroid_emb.data @ self.centroid_emb.data.T
         mask     = ~torch.eye(self.P, dtype=torch.bool, device=dev)
         avg_dist = (1.0 - sim_mat[mask]).mean().item()
         print(f"  [CentroidLayer] KMeans++ {self.P} centroids "
               f"from {N} samples. avg_inter_dist={avg_dist:.3f}")
+
+    # ─────────────────────────────────────────────────────────
+    # [추가] EMA 기반 codebook 업데이트 (codebook_loss의 gradient-free 대체)
+    # ─────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def ema_update(self, query_emb: torch.Tensor, hard_assignment: torch.Tensor) -> None:
+        """
+        van den Oord et al.(2017) Appendix / VQ-VAE-2(Razavi et al. 2019)
+        Appendix A.1의 표준 EMA 형태:
+            N_i ← decay·N_i + (1-decay)·n_i
+            m_i ← decay·m_i + (1-decay)·Σ(이번 배치에서 centroid i에 배정된 query_emb)
+            centroid_i ← m_i / N_i
+        에 이 프로젝트의 단위구 제약을 반영해 두 가지를 추가:
+          (a) Laplace smoothing — N_i가 0에 가까운 centroid의 분모 불안정 방지
+              (VQ-VAE-2 Appendix A.1 그대로)
+          (b) 매 업데이트 후 단위벡터로 재정규화 — 두 단위벡터의 가중평균은
+              단위벡터가 아니므로, CosFace 제약(매 optimizer step 후 재투영)과
+              동일한 불변조건을 EMA 경로에서도 유지해야 함.
+
+        query_emb는 detach된 상태로 넘겨받는다고 가정(호출부 책임) — 이 함수
+        자체도 @torch.no_grad()라 어차피 gradient는 안 생기지만, 명시적으로
+        detach된 텐서를 넘기는 게 호출부의 의도를 명확히 함.
+        """
+        if not self.use_ema_codebook:
+            return
+        P = self.P
+        one_hot     = F.one_hot(hard_assignment, num_classes=P).to(query_emb.dtype)  # (B, P)
+        batch_count = one_hot.sum(dim=0)                                              # (P,)
+        batch_sum   = one_hot.T @ query_emb                                           # (P, D)
+
+        d = self.ema_decay
+        self.ema_cluster_size.mul_(d).add_(batch_count, alpha=1 - d)
+        self.ema_embed_sum.mul_(d).add_(batch_sum, alpha=1 - d)
+
+        # Laplace smoothing (VQ-VAE-2 Appendix A.1 그대로)
+        n = self.ema_cluster_size.sum()
+        smoothed_size = (
+            (self.ema_cluster_size + self.ema_eps)
+            / (n + P * self.ema_eps) * n
+        )
+        new_centroid = self.ema_embed_sum / smoothed_size.unsqueeze(-1)
+        self.centroid_emb.data.copy_(F.normalize(new_centroid, dim=-1))
 
     # ─────────────────────────────────────────────────────────
     # (3) sample_groups 재계산 (regroup_update, 에폭 종료 후 호출)
@@ -679,6 +781,13 @@ class CentroidLayer(nn.Module):
                         self.centroid_emb.data[p] = new_vec.to(self.centroid_emb.dtype)
                         self.dead_streak[p] = 0
                         n_reinit += 1
+                        # [추가] EMA를 쓰는 경우, 이 centroid의 누적 통계도
+                        # 같이 리셋 — 안 하면 다음 ema_update()에서 죽어있던
+                        # 동안 쌓인(사실상 0에 수렴한) 낡은 N_i/m_i가 방금
+                        # 새로 심어준 위치를 도로 원래 자리로 끌어당길 수 있음.
+                        if self.use_ema_codebook:
+                            self.ema_cluster_size[p] = 1.0
+                            self.ema_embed_sum.data[p] = new_vec.to(self.ema_embed_sum.dtype)
 
         # [버그 수정] dead-code reinit이 여러 centroid를 동시에 재배치하면
         # (jasmine 실측: 한 번의 regroup_update에서 최대 11개, P=48의 20%
@@ -781,7 +890,7 @@ class CentroidLayer(nn.Module):
         query_emb: torch.Tensor,                          # (B, D)
         top_m: int = 1,                                    # 신규: 사용할 centroid 수
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
+               torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Hierarchical-extended forward.
 
@@ -794,11 +903,21 @@ class CentroidLayer(nn.Module):
 
         Returns
         ───────
-        context_emb     : (B, D)   — top-M centroid 가중 혼합 (gradient 흐름)
-        hard_assignment : (B,)     — Top-1 centroid (FAISS 마스킹 + 설명용)
-        routing_probs   : (B, P)   — 전체 분포 (entropy loss용, STE-style for M=1)
-        topM_idx        : (B, M)   — top-M centroid 인덱스 (retrieve용)
-        topM_weights    : (B, M)   — top-M softmax 가중치 (differentiable)
+        context_emb      : (B, D)   — top-M centroid 가중 혼합 (gradient 흐름)
+        hard_assignment   : (B,)     — Top-1 centroid (FAISS 마스킹 + 설명용)
+        routing_probs     : (B, P)   — 전체 분포 (entropy loss용, STE-style for M=1)
+        topM_idx          : (B, M)   — top-M centroid 인덱스 (retrieve용)
+        topM_weights      : (B, M)   — top-M softmax 가중치 (differentiable)
+        top1_confidence   : (B,)     — [추가] soft[hard_assignment] — STE로 인해
+            routing_probs 자체는 forward 값 기준 정확히 one-hot이라(=STE 정의상
+            forward=hard) 샘플별로 다른 "confidence"로 못 쓴다(모든 샘플에서
+            max()가 항상 정확히 1.0). 진짜 샘플마다 다른, gradient도 흐르는
+            confidence가 필요한 곳(head 입력 스케일링 등)은 이 값을 써야 함.
+            soft 전체가 아니라 top1 스칼라만 반환하는 이유: head는 결국
+            선택된 centroid 하나만 쓰므로 이거면 충분하고, (B,P) 전체를
+            들고 다니는 것보다 메모리도 적게 씀. M=1/M>1 관계없이 항상
+            "실제로 선택된 hard_assignment 위치의 soft 확률"을 반환함
+            (M>1이어도 hard_assignment는 top-1이므로 정의가 그대로 성립).
 
         Backward-compatibility
         ──────────────────────
@@ -822,6 +941,11 @@ class CentroidLayer(nn.Module):
 
         # ── hard_assignment: Top-1 (FAISS 마스킹 + 설명용) ──
         hard_assignment = topM_idx[:, 0]                  # (B,)
+
+        # ── [추가] top1_confidence: 실제 라우팅에 쓰이는 soft에서 선택된
+        # 위치의 확률 — routing_probs(STE 결과, forward=one-hot)와 달리
+        # 샘플마다 실제로 다름. M=1/M>1 분기와 무관하게 여기서 한 번만 계산.
+        top1_confidence = soft.gather(1, hard_assignment.unsqueeze(1)).squeeze(1)  # (B,)
 
         # ── routing_probs 분기 ──────────────────────────
         # M=1: 기존 STE 동작 유지 (backward gradient가 soft를 거쳐 흐르게 함)
@@ -867,7 +991,7 @@ class CentroidLayer(nn.Module):
             ).sum(dim=1)                                   # (B, D)
             context_emb = self.dropout(context_emb)
 
-        return context_emb, hard_assignment, routing_probs, topM_idx, topM_weights
+        return context_emb, hard_assignment, routing_probs, topM_idx, topM_weights, top1_confidence
 
     # ─────────────────────────────────────────────────────────
     # Auxiliary Losses (기존 tabr.py 호환)
