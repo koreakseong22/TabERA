@@ -30,6 +30,22 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def _evidence_hyperspherical_scale(k: int) -> float:
+    """evidence retrieval의 cosine softmax용 sharpness scale.
+
+    CentroidLayer의 routing_scale(search_space.py의 adacos_fixed_scale,
+    Zhang et al. 2019 AdaCos fixed-scale 공식 s=√2·log(C-1), C→centroid
+    수 P로 치환)과 "정규화된 hyperspherical 공간에서 softmax sharpness를
+    후보 개수로부터 계산한다"는 같은 원리를 쓴다 — 다만 routing_scale
+    값 자체를 재사용하는 게 아니라(그건 P=centroid 수 기준으로 계산된
+    값이라 여기 후보 개수(k=검색된 이웃 수)와 다른 축), evidence 쪽
+    후보 개수(k)에 맞춰 같은 공식을 독립적으로 다시 적용한 것이다.
+    P→C, k→C로 치환 근거의 성격 자체는 동일(검증된 이론이 아니라 유비
+    기반 실용적 근사 — A/B로 반드시 확인 필요).
+    """
+    return max(1.0, math.sqrt(2) * math.log(max(k - 1, 1)))
+
+
 class AttentionAggregator(nn.Module):
     """
     TabR 방식 이웃 집계 (순수 retrieval-augmented prediction).
@@ -42,7 +58,9 @@ class AttentionAggregator(nn.Module):
 
     def __init__(self, embed_dim, k, n_features, n_output, dropout=0.0,
                  use_offset_correction: bool = True,
-                 tasktype: str = "regression", n_classes: Optional[int] = None):
+                 tasktype: str = "regression", n_classes: Optional[int] = None,
+                 evidence_temperature: float = 1.0,
+                 evidence_metric: str = "euclidean"):
         """
         use_offset_correction : True(기본값)면 TabR 원본 그대로
             value = label_emb + T(query - neighbour).
@@ -67,12 +85,50 @@ class AttentionAggregator(nn.Module):
             classification 체크포인트는 --from_saved_state로 로드 불가
             (regression 체크포인트는 영향 없음, 오늘 categorical embedding
             변경 때와 동일한 성격의 하위 호환 범위).
+
+        evidence_temperature : [추가, 진단용] evidence_w = softmax(similarities
+            / evidence_temperature). 기본값 1.0 = 기존과 100% 동일(하위 호환).
+            similarities = -‖q-k‖²가 정규화 안 된 raw 유클리드 거리라, 학습
+            중 query_emb norm이 커지면(실측 확인됨, 데이터셋별 3.7~213배)
+            softmax가 포화돼 evidence_w가 사실상 1-NN으로 붕괴하는 현상이
+            관찰됨(jasmine/credit-g 둘 다, entropy가 학습 초반부터 이미
+            ln(k)=2.77 대비 크게 낮고 계속 더 낮아짐). CentroidLayer의
+            routing_scale(AdaCos 공식, search_space.py의 adacos_fixed_scale)
+            과 달리, 여기 similarities는 정규화 안 된 공간이라 같은 공식을
+            바로 못 씀 — 그래서 우선 자유 파라미터로 두고 수동 스윕
+            (reproduce.py --evidence_temperature_override)으로 sharpness
+            자체가 원인인지부터 격리 검증. 값을 검증하면 HPO나 (q,k를
+            먼저 정규화한 뒤 AdaCos류 공식을 쓰는) 더 근본적인 방식으로
+            나중에 대체 검토.
         """
         super().__init__()
         self.embed_dim = embed_dim
         self.k = k
         self.use_offset_correction = use_offset_correction
         self.tasktype = tasktype
+        self.evidence_temperature = evidence_temperature
+
+        # evidence_metric : [추가, 진단용] evidence_w를 계산할 유사도 공간.
+        #   "euclidean"(기본값, 기존과 100% 동일 — 하위 호환): -‖q-k‖²,
+        #     정규화 안 된 raw 유클리드 거리. 학습 중 query_emb norm이
+        #     커지면(실측: epoch당 query_norm-distance_mean 상관 rho=0.998)
+        #     softmax가 포화돼 evidence_w가 사실상 1-NN으로 붕괴하는 게
+        #     확인됨(jasmine, evidence_temperature 스윕으로도 해결 안 됨 —
+        #     고정 스칼라로는 학습 중 계속 커지는 norm을 못 따라잡음).
+        #   "cosine": q,k를 CentroidLayer 라우팅과 동일하게 unit-norm
+        #     정규화한 뒤 2·cos(q,k) — norm 자체가 유사도 계산에서 빠지므로
+        #     원리적으로 이 collapse 메커니즘이 발생할 수 없음. softmax
+        #     상수항(-2)은 어차피 없어지므로 생략(2·cos만 사용).
+        #   "cosine_scaled": 위에 _evidence_hyperspherical_scale(k)를 곱함 —
+        #     CentroidLayer의 routing_scale과 같은 원리(AdaCos fixed-scale,
+        #     Zhang et al. 2019)를 evidence 후보 개수(k)에 독립적으로 적용
+        #     (routing_scale 값 자체를 재사용하는 게 아님 — 축이 다름).
+        if evidence_metric not in ("euclidean", "cosine", "cosine_scaled"):
+            raise ValueError(
+                f"evidence_metric은 'euclidean'/'cosine'/'cosine_scaled' 중 "
+                f"하나여야 합니다: {evidence_metric}"
+            )
+        self.evidence_metric = evidence_metric
 
         # TabR 원본: label 임베딩 — regression(연속형)은 Linear,
         # classification(명목형 클래스)은 Embedding
@@ -131,13 +187,46 @@ class AttentionAggregator(nn.Module):
         보여주지 못해, MemoryBank/TabERA에서 nv 자체를 완전히 제거하며
         여기 시그니처에서도 제거함.
         """
-        # 1. TabR 방식 similarity: -||q||² + 2(q·k) - ||k||²
-        similarities = (
-            -query_emb.square().sum(-1, keepdim=True)
-            + 2 * (query_emb.unsqueeze(1) @ nk.transpose(-1, -2)).squeeze(1)
-            - nk.square().sum(-1)
-        )
-        evidence_w = F.softmax(similarities, dim=-1)    # (B, k)
+        # 1. 유사도 계산 — evidence_metric에 따라 분기
+        if self.evidence_metric == "euclidean":
+            # TabR 원본 방식: -||q||² + 2(q·k) - ||k||²  (= -‖q-k‖², raw)
+            similarities = (
+                -query_emb.square().sum(-1, keepdim=True)
+                + 2 * (query_emb.unsqueeze(1) @ nk.transpose(-1, -2)).squeeze(1)
+                - nk.square().sum(-1)
+            )
+        else:
+            # cosine / cosine_scaled: CentroidLayer 라우팅과 동일하게
+            # q,k를 먼저 unit-norm 정규화 — norm이 유사도 계산에서
+            # 완전히 빠지므로, query_emb norm이 학습 중 얼마나 커지든
+            # (실측: epoch당 최대 89배) 이 계산 자체는 영향을 안 받음.
+            q_n = F.normalize(query_emb, dim=-1)                     # (B, D)
+            k_n = F.normalize(nk, dim=-1)                            # (B, k, D)
+            cosine = (q_n.unsqueeze(1) @ k_n.transpose(-1, -2)).squeeze(1)  # (B, k)
+            if self.evidence_metric == "cosine":
+                # -‖q̂-k̂‖² = 2·cos(q̂,k̂) - 2 인데, softmax는 상수항(-2)에
+                # 불변이라 생략 — 2·cos만 사용(리뷰 지적 반영).
+                similarities = 2 * cosine
+            else:  # "cosine_scaled"
+                similarities = _evidence_hyperspherical_scale(self.k) * cosine
+
+        # [진단용, 추가] "distance/score 값 자체가 큰가"(temperature로 해결)
+        # vs "query/key norm이 학습 중 커져서"(normalization으로 해결) 원인을
+        # 구분하려면 이 넷을 같이 봐야 함 — 하나만 보면 두 원인을 못 가른다는
+        # 리뷰 지적 반영. metric이 뭐든 "-similarities"를 "distance"라고
+        # 부르는 건 euclidean 모드 한정으로만 문자 그대로 정확하지만
+        # (cosine 모드에선 부호 반전된 유사도일 뿐), 세 모드 다 "값이 작을
+        # 수록 가깝다"는 방향은 같아서 추세 비교에는 그대로 씀. gradient
+        # 불필요한 순수 통계라 no_grad.
+        with torch.no_grad():
+            evidence_diag = {
+                "query_norm":    float(query_emb.detach().norm(dim=-1).mean().item()),
+                "key_norm":      float(nk.detach().norm(dim=-1).mean().item()),
+                "distance_mean": float((-similarities).detach().mean().item()),
+                "distance_std":  float((-similarities).detach().std().item()),
+            }
+
+        evidence_w = F.softmax(similarities / self.evidence_temperature, dim=-1)    # (B, k)
         evidence_w = self.dropout(evidence_w)
 
         # 2. TabR 방식 value = label_emb + T(query - neighbour)
@@ -153,7 +242,7 @@ class AttentionAggregator(nn.Module):
         # 3. 가중합 → head 입력
         agg_emb = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
 
-        return agg_emb, evidence_w
+        return agg_emb, evidence_w, evidence_diag
 
     # ── 진단 인터페이스 ────────────────────────────────────
 
