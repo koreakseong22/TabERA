@@ -60,11 +60,28 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
 3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the
    sample's group (cross-group fallback if the group is smaller than K).
    `AttentionAggregator` turns similarities into `evidence_w` and aggregates
-   into `agg_emb`. Retrieved neighbors' labels are embedded via a learned
-   lookup table for classification (an index is a class, not a scalar) or a
-   linear layer for regression (the label *is* a scalar) — matching how TabR
-   itself distinguishes the two. `agg_emb` feeds straight into the
-   prediction head.
+   into `agg_emb`. The similarity itself is configurable via `evidence_metric`:
+   `euclidean` (TabR's original `-‖q-k‖²`, kept as the default for continuity
+   with TabR and existing checkpoints) or `cosine`/`cosine_scaled` (query and
+   neighbor keys L2-normalized before comparing — the same hyperspherical
+   treatment routing already gets via `routing_scale` above). The distinction
+   isn't cosmetic: under `euclidean`, nothing constrains embedding norm the
+   way normalization constrains centroids, so norms are free to grow over
+   training, and once they do, the unbounded `-‖q-k‖²` softmax saturates —
+   `evidence_w` collapses onto a single nearest neighbor regardless of `k`,
+   silently turning "which examples support this" into a 1-NN lookup.
+   `cosine` removes embedding norm from the comparison entirely; across every
+   dataset and seed tested, it keeps evidence spread across several neighbors
+   (effective neighbor count in the 7–12 range for `k=16`, vs. collapsing to
+   ≈1 under `euclidean`) with no measured cost to prediction accuracy.
+   `cosine_scaled` additionally applies AdaCos's fixed-scale formula to the
+   evidence candidate pool (substituting `k` for the class/prototype count
+   the formula was originally derived for) — the same idea already used for
+   `routing_scale`, extended here on an empirical rather than theoretical
+   basis. Retrieved neighbors' labels are embedded via a learned lookup table
+   for classification (an index is a class, not a scalar) or a linear layer
+   for regression (the label *is* a scalar) — matching how TabR itself
+   distinguishes the two. `agg_emb` feeds straight into the prediction head.
 4. **Predict** — `[query_emb ‖ context_emb ‖ agg_emb] → MLP head → ŷ`.
 5. **Attribute (→ ③, post-hoc)** — SHAP (`KernelExplainer`) estimates each
    feature's marginal contribution to `ŷ` by evaluating the model on many
@@ -73,7 +90,7 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
    exactly the two things TabERA's STE hard-routing and one-hot categorical
    encoding would break for a gradient-based method (see *Why SHAP*).
 
-**Design notes:** `diversity_loss` keeps centroids well-separated; `commitment_loss`/`codebook_loss` keep queries and centroids mutually anchored (§ above); cross-group fallback is fully vectorized (a single offset-indexed gather, no per-sample Python loop), which matters most on datasets where fallback rate is high.
+**Design notes:** `diversity_loss` keeps centroids well-separated; `commitment_loss`/`codebook_loss` keep queries and centroids mutually anchored (§ above); `evidence_metric` controls whether evidence-neighbor similarity is computed in raw or L2-normalized (hyperspherical) space — see *Retrieve & aggregate* above; cross-group fallback is fully vectorized (a single offset-indexed gather, no per-sample Python loop), which matters most on datasets where fallback rate is high.
 
 ---
 
@@ -202,6 +219,7 @@ automatically meaningful:
 - **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
 - **`--cat_combine {onehot,sum,concat}`** — categorical encoding (default `onehot`). `sum`/`concat` exist for comparison and backward compatibility with earlier checkpoints.
 - **`--num_embedding {ple,plr_lite,linear}`** — numeric encoding (default `ple`, PiecewiseLinearEmbeddings — see *Embed*). `plr_lite` (TabR/ModernNCA-style periodic embedding) is available for comparison; `linear` is a minimal fallback.
+- **`--evidence_metric {euclidean,cosine,cosine_scaled}`** — evidence-neighbor similarity space for `AttentionAggregator` (default `euclidean`, see *Retrieve & aggregate*). Fixed for a whole run/HPO study, same as `--cat_combine`/`--num_embedding`. `--evidence_metric_override` retrains an existing `best_params` config with only this value changed, for controlled comparison against a study that was never searched under the new metric.
 - **`--regroup_log_every <N>`** — how often (in epochs) to print the `[Regroup]` routing-health line during training (default 10). Lower it (e.g. 1–2) to inspect whether `active_ratio`/dead-code-reset activity is actually settling by the end of training, not just at coarse checkpoints.
 - **`--refresh_on_best`** — after selecting the best checkpoint, re-encode every stored training sample's raw features through the frozen embedder (no dropout, no gradient) and overwrite `MemoryBank`'s stored keys with the result, then resync group assignments. Off by default. With it on, a stored key is guaranteed to be an exact, reproducible function of the sample's raw features rather than a one-off snapshot from whatever dropout mask happened to apply during training — see `--ablation dual_space_faithfulness`.
 - **`--regroup_warmup_epochs_override <int>` / `--dead_reinit_patience_override <int>` / `--dead_reinit_noise_scale_override <float>` / `--batch_size_override <int>`** — same controlled-ablation pattern as `--dropout_override` below, for the centroid layer's group-publication delay, dead-centroid reset patience, reset noise magnitude, and training batch size respectively.
@@ -211,6 +229,25 @@ automatically meaningful:
 
 ## Known limitations
 
+- The prediction head's `[query_emb ‖ context_emb ‖ agg_emb] → MLP` fusion
+  doesn't reliably draw on `context_emb`/`agg_emb`, even when they
+  demonstrably carry real, `query_emb`-independent predictive information:
+  standalone linear classifiers trained on `context_emb` or `agg_emb` alone
+  reach accuracy comparable to, and sometimes exceeding, one trained on
+  `query_emb` alone, yet shuffling either branch at inference time changes
+  prediction accuracy by a statistically indistinguishable-from-zero amount.
+  This holds across `evidence_metric` choice, embedding dimension, and
+  per-block vs. shared layer normalization — all of which measurably change
+  *how much* gradient reaches these branches during training, but none of
+  which change whether the head ends up depending on them for `ŷ`.
+  Practically, this means ②'s `evidence_w`
+  and ①'s `context_emb` are a faithful readout of what retrieval and routing
+  did — they're real, load-bearing computations, not decorative — but that
+  doesn't guarantee the shared head's prediction actually weights them; the
+  two are architecturally identical only up through `agg_emb`/`context_emb`
+  themselves. An explicit fusion mechanism (e.g. a weighted or gated
+  combination instead of plain concatenation) is the leading candidate fix
+  and is under investigation.
 - ①'s distinctive-feature contrast isn't equally sharp on every dataset.
 - Group sizes can be naturally imbalanced, reflecting the data itself — not a failure mode by itself.
 - `--from_saved_state` on GPU can show sub-decimal inference differences from a fresh run despite identical weights, likely from non-deterministic op scheduling (e.g. cuDNN).
@@ -305,6 +342,13 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 > AdaCos's fixed-scale formula (`s = √2·log(P−1)`, Zhang et al. 2019), which
 > keeps it in the same narrow, theoretically-motivated range a search would
 > have converged to anyway, without spending trial budget on it.
+>
+> `evidence_metric` is **not** searched — a structural choice fixed for a
+> whole run via `--evidence_metric` (like `cat_combine`/`num_embedding`
+> below), defaulting to `euclidean` for continuity with TabR and existing
+> checkpoints. `cosine`/`cosine_scaled` are available and, based on the
+> evidence-collapse behavior described in *Retrieve & aggregate* above, are
+> the recommended choice for new runs.
 >
 > `batch_size` is **not** searched — fixed at 256, following the common
 > practice (e.g. TabR's benchmark protocol) of pre-setting batch size per
