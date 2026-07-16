@@ -1065,8 +1065,35 @@ class TabERA(nn.Module):
         n_classes: Optional[int] = None,
         routing_scale: float = 1.0,
         use_context_emb: bool = True,
+        use_query_emb_in_head: bool = True,
         detach_context_grad: bool = False,
+        use_ema_codebook: bool = False,
+        ema_decay: float = 0.99,
+        blockwise_layernorm: bool = False,
         use_context_projection: bool = False,
+        use_confidence_scaling: bool = False,      # [진단용, 추가] context_emb를
+            # head에 넣기 전 top1_confidence로 스케일 — 라우팅/검색은 안 건드림
+        confidence_scaling_detach: bool = False,   # [진단용, 추가] True면 스케일
+            # 값 자체는 쓰되 그 경로로 gradient는 안 흐름 (Variant B).
+            # use_confidence_scaling=False면 무효과.
+        evidence_temperature: float = 1.0,   # [진단용, 추가] AttentionAggregator의
+            # evidence_w = softmax(-‖q-k‖² / evidence_temperature). 기본값 1.0 =
+            # 기존과 동일(하위 호환). jasmine/credit-g 실측: 학습 초반부터
+            # entropy가 ln(k) 대비 크게 낮고(사실상 1-NN 붕괴) 학습 중 더 낮아짐 —
+            # 이게 raw(정규화 안 됨) 유클리드 거리 softmax에 temperature가 없어서
+            # 생기는 calibration 문제인지 검증하기 위한 자유 파라미터.
+            # [결론, 실측 완료] jasmine T=0.5~10 스윕 — 초기화 시점 sharpness는
+            # T로 정확히 조절되지만, 학습 후에는 T와 무관하게 전부 n_eff≈1.0으로
+            # 붕괴(query_norm이 학습 중 계속 커져 distance scale 자체가 시간에
+            # 따라 변하므로 고정 스칼라로는 못 따라잡음 — epoch vs query_norm
+            # rho=0.986, query_norm vs distance_mean rho=0.998). 그래서
+            # evidence_metric="cosine"/"cosine_scaled" 도입(아래) — temperature
+            # 자체는 기각됐지만 하위 호환을 위해 파라미터는 유지.
+        evidence_metric: str = "euclidean",   # [추가] "euclidean"(기본값, 기존과
+            # 동일)/"cosine"/"cosine_scaled". CentroidLayer 라우팅처럼 q,k를
+            # 먼저 정규화해 evidence_temperature로도 못 잡은 collapse(query_emb
+            # norm 성장에 유사도 계산이 그대로 종속되는 문제)를 원천 제거하려는
+            # 개입. evidence.py의 AttentionAggregator.__init__ docstring 참고.
         vectorized_fallback: bool = True,
         cat_col_idx: Optional[List[int]] = None,
         num_col_idx: Optional[List[int]] = None,
@@ -1092,6 +1119,18 @@ class TabERA(nn.Module):
                                             # 검증 안 된 값이라 스윕 가능하게 노출.
         dead_reinit_noise_scale: float = 0.01,  # [추가] 재초기화 시 노이즈 상대 크기,
                                             # 마찬가지로 검증 안 된 값이라 노출.
+        log_branch_gradients: bool = False,  # [진단용, 추가] head concat 직전
+                                            # query/context/agg 활성값에
+                                            # retain_grad()를 걸어 branch별
+                                            # gradient를 잴 수 있게 함. 값 자체는
+                                            # 안 바꾸므로(순수 .grad 보존) 학습
+                                            # 결과(가중치/예측)에 영향 없음 —
+                                            # 활성값을 추가로 붙들고 있어 메모리만
+                                            # 약간 증가. 그래서 옵트인(기본 False).
+                                            # state_dict/체크포인트와 무관한 순수
+                                            # 런타임 계측 플래그라 model_kwargs/
+                                            # _save_tag/--from_saved_state 하위
+                                            # 호환 체계에는 안 태움.
     ) -> None:
         super().__init__()
         self.k            = k
@@ -1108,6 +1147,7 @@ class TabERA(nn.Module):
         else:
             self._n_classes_for_labels = None
         self.n_features   = n_features
+        self.log_branch_gradients = log_branch_gradients
         self.loss_weights = loss_weights or {
             "diversity":    0.01,
             "commitment":   0.01,
@@ -1127,6 +1167,18 @@ class TabERA(nn.Module):
         # 기여하는가"만 깨끗하게 격리해서 재기 위함. T()처럼 꺼지면
         # 파라미터 자체가 안 생김(head 입력 차원이 줄어듦).
         self.use_context_emb = use_context_emb
+        # [진단용, 신규] query_emb(양자화 안 된 원본 임베더 출력)를 head
+        # 입력에서 제외 — use_context_emb와 대칭인 ablation. 지금까지는
+        # query_emb가 항상 무조건 head에 들어갔고(옵션으로 뺄 수 있던 적
+        # 없음), --no_context_emb는 "context_emb를 빼도 되는가"만 검증했지
+        # "query_emb와 context_emb를 같이 넣는 조합 자체가 최선인가"는 검증
+        # 공백이었음. True(기본, 기존 동작)면 지금과 동일. False면 head가
+        # agg_emb(+context_emb, use_context_emb=True인 경우)만으로 예측 —
+        # 즉 예측이 양자화된 신호만 통과하는 순수 VQ-VAE식 bottleneck에
+        # 가까워짐. 이걸로 (a) query_emb의 raw 값이 실제로 얼마나
+        # 필요한지, (b) 그만큼 Explanation①(prototype 배정)이 예측을
+        # 얼마나 "진짜로" 설명하는지(vs 그냥 곁다리 신호였는지)를 같이 잰다.
+        self.use_query_emb_in_head = use_query_emb_in_head
         # [진단용] centroid_emb는 diversity_loss(흩어뜨림)·codebook_loss
         # (배정된 쿼리 쪽으로 당김)·task_loss(head를 거친 예측 손실,
         # context_emb 경유)라는 서로 다른 목적의 gradient를 동시에 받음
@@ -1145,6 +1197,8 @@ class TabERA(nn.Module):
         # 직접 쓰는 설명①(hard_assignment, 그룹 텍스트 라벨, confidence)
         # 계산에는 전혀 관여하지 않음 — head 직전에만 끼움.
         self.use_context_projection = use_context_projection
+        self.use_confidence_scaling = use_confidence_scaling
+        self.confidence_scaling_detach = confidence_scaling_detach
         self.context_proj = (
             nn.Linear(embed_dim, embed_dim)
             if (use_context_projection and use_context_emb) else None
@@ -1177,6 +1231,8 @@ class TabERA(nn.Module):
             regroup_warmup_epochs=regroup_warmup_epochs,
             dead_reinit_patience=dead_reinit_patience,
             dead_reinit_noise_scale=dead_reinit_noise_scale,
+            use_ema_codebook=use_ema_codebook,
+            ema_decay=ema_decay,
         )
 
         # ── TabR 방식 이웃 집계 ──────────────────────────
@@ -1193,6 +1249,8 @@ class TabERA(nn.Module):
             use_offset_correction=use_offset_correction,
             tasktype=tasktype,
             n_classes=self._n_classes_for_labels,
+            evidence_temperature=evidence_temperature,
+            evidence_metric=evidence_metric,
         )
 
         # ── 메모리 뱅크 (검색 전용) ──────────────────
@@ -1218,15 +1276,57 @@ class TabERA(nn.Module):
             )
 
         # ── 예측 헤드: [query ‖ context ‖ agg_emb] → ŷ ──
-        # use_context_emb=False면 context_emb를 아예 제외 (head 입력 차원도
-        # 그만큼 줄어듦 — T()처럼 "안 쓰는 파라미터가 남아있는" 상태가 아니라
-        # 진짜로 없앤 상태로 비교하기 위함)
-        _head_in = embed_dim * (3 if use_context_emb else 2)
-        self.head = nn.Sequential(
-            nn.LayerNorm(_head_in),
-            nn.Linear(_head_in, embed_dim), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(embed_dim, n_output),
-        )
+        # use_context_emb=False면 context_emb를, use_query_emb_in_head=False면
+        # query_emb를 아예 제외 (head 입력 차원도 그만큼 줄어듦 — T()처럼
+        # "안 쓰는 파라미터가 남아있는" 상태가 아니라 진짜로 없앤 상태로
+        # 비교하기 위함). agg_emb는 항상 포함(최소 1개는 남음).
+        _n_head_parts = int(use_query_emb_in_head) + int(use_context_emb) + 1
+        if _n_head_parts == 1:
+            print("  ⚠️  use_query_emb_in_head=False, use_context_emb=False — "
+                  "head가 agg_emb만 보고 예측합니다(진단용 극단 케이스).")
+        _head_in = embed_dim * _n_head_parts
+
+        # [추가] blockwise_layernorm=False(기본)면 기존과 완전히 동일 —
+        # [query‖context‖agg]를 하나로 묶어 nn.LayerNorm(_head_in) 하나로
+        # 정규화. True면 각 블록을 따로 정규화한 뒤 concat — context_emb/
+        # agg_emb(둘 다 routing/retrieval에 딸려 있어 배치마다 값이
+        # 흔들릴 수 있음)의 통계 변화가 query_emb 쪽 정규화에 새어드는
+        # 경로 자체를 없앤다. 기존 체크포인트의 head[0]이 단일 LayerNorm
+        # (_head_in,) 모양이라 --from_saved_state 하위 호환을 위해 반드시
+        # 옵트인으로 둠(기본 False = state_dict 모양 그대로 유지).
+        self.blockwise_layernorm = blockwise_layernorm
+        if blockwise_layernorm:
+            self.head_query_ln   = nn.LayerNorm(embed_dim) if use_query_emb_in_head else None
+            self.head_context_ln = nn.LayerNorm(embed_dim) if use_context_emb else None
+            self.head_agg_ln     = nn.LayerNorm(embed_dim)  # agg_emb는 항상 포함됨
+            self.head = nn.Sequential(
+                nn.Linear(_head_in, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(embed_dim, n_output),
+            )
+        else:
+            self.head_query_ln = self.head_context_ln = self.head_agg_ln = None
+            self.head = nn.Sequential(
+                nn.LayerNorm(_head_in),
+                nn.Linear(_head_in, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(embed_dim, n_output),
+            )
+
+        # [진단용] log_branch_gradients가 참조하는 head 첫 Linear layer와,
+        # 그 in_features 축에서 각 브랜치가 차지하는 column 구간. combined
+        # 순서(_parts 조립 순서, forward() 참고)는 항상
+        # [query(있으면) → context(있으면) → agg(항상)] 이므로 여기서도
+        # 그 순서를 그대로 따른다 — forward()의 조립 순서가 바뀌면 이
+        # 매핑도 같이 바뀌어야 함.
+        self._head_first_linear = self.head[0] if blockwise_layernorm else self.head[1]
+        self._head_block_slices: Dict[str, Tuple[int, int]] = {}
+        _off = 0
+        if use_query_emb_in_head:
+            self._head_block_slices["query"] = (_off, _off + embed_dim)
+            _off += embed_dim
+        if use_context_emb:
+            self._head_block_slices["context"] = (_off, _off + embed_dim)
+            _off += embed_dim
+        self._head_block_slices["agg"] = (_off, _off + embed_dim)
 
     # ── Forward ────────────────────────────────────────
 
@@ -1243,8 +1343,11 @@ class TabERA(nn.Module):
         query_emb = self.embedder(X)               # (B, D)
 
         # 2. 프로토타입 라우팅 (CentroidLayer)
-        # prototypes.py가 5개 반환 (hierarchical 호환) → 필요한 3개만 사용
-        context_emb, hard_assignment, routing_probs, _, _ = \
+        # prototypes.py가 6개 반환 (hierarchical 호환 + top1_confidence) →
+        # 필요한 4개만 사용. top1_confidence: routing_probs(STE, forward=
+        # one-hot이라 confidence로 못 씀)와 달리 샘플마다 실제로 다른 값 —
+        # ①의 group_confidence 표시와 confidence scaling(옵션) 양쪽에 씀.
+        context_emb, hard_assignment, routing_probs, _, _, top1_confidence = \
             self.prototype_layer(query_emb)
 
         # 3. KNN 검색 + Attention 집계
@@ -1293,26 +1396,139 @@ class TabERA(nn.Module):
                 )
                 neighbour_labels = label_pool[rand_pos]
 
-            agg_emb, evidence_w = self.ot_selector(query_emb, nk, neighbour_labels)
+            agg_emb, evidence_w, evidence_diag = self.ot_selector(query_emb, nk, neighbour_labels)
 
         else:
             # Memory 미충족 fallback
             agg_emb    = torch.zeros_like(query_emb)
             evidence_w = torch.full((X.shape[0], self.k), 1.0 / self.k, device=X.device)
             topk_idx   = torch.zeros(X.shape[0], self.k, dtype=torch.long, device=X.device)
+            # [추가] fallback 경로는 진짜 검색이 아니라 균등분포를 그냥
+            # 채운 것이라 query/key norm·distance 자체가 없음 — None으로
+            # 표시해 supervised.py가 이 배치를 통계에서 자연스럽게 제외
+            # 하게 함(evidence_w의 uniform 값 자체는 의미 있는 신호가
+            # 아니므로 여기서 온 entropy=ln(k)를 "붕괴 안 됨"으로 잘못
+            # 해석하지 않도록).
+            evidence_diag = None
 
         # 4. 예측
-        # use_context_emb=False면 context_emb를 head 입력에서 제외
-        # (STE 라우팅/centroid 학습 자체는 그대로 — aux_loss가 별도로 학습시킴)
+        # use_context_emb=False면 context_emb를, use_query_emb_in_head=False면
+        # query_emb를 head 입력에서 제외 (STE 라우팅/centroid 학습 자체는
+        # 그대로 — aux_loss가 별도로 학습시킴, head 입력 여부와 무관)
+        _parts = []
+        if self.use_query_emb_in_head:
+            _query_for_head = query_emb
+            # [추가] eval-time perturbation — 이미 학습이 끝난 모델에 그대로
+            # 적용해서 "head가 query_emb를 실제로 얼마나 쓰는가"를 재학습
+            # 없이 재는 용도. --no_query_emb(처음부터 빼고 재학습)는 학습
+            # 자체가 가능한지를 보여줬을 뿐(붕괴함), 정상 학습된 모델이
+            # 이 슬롯에 얼마나 의존하는지는 안 보여줌 — 이 둘은 다른 질문.
+            #   query_emb_zero    : 이 슬롯을 0으로 — head가 학습 때 한 번도
+            #                       못 본 입력이라 "정보 제거"와 "분포 이탈"
+            #                       효과가 섞임(zero-ablation의 알려진 한계).
+            #   query_emb_shuffle : 배치 내에서 셔플 — 각 슬롯 자체의 값
+            #                       분포(LayerNorm이 보는 통계)는 그대로
+            #                       유지한 채 "이 샘플의 진짜 query_emb"라는
+            #                       연결만 끊음 — 표준 permutation
+            #                       importance와 같은 방식이라 분포 이탈
+            #                       효과가 zero보다 작음. 기본으로는 이쪽을
+            #                       더 신뢰할 것.
+            if ablation_mode == "query_emb_zero":
+                _query_for_head = torch.zeros_like(query_emb)
+            elif ablation_mode == "query_emb_shuffle":
+                _perm = torch.randperm(query_emb.shape[0], device=query_emb.device)
+                _query_for_head = query_emb[_perm]
+            if self.blockwise_layernorm:
+                _query_for_head = self.head_query_ln(_query_for_head)
+            _parts.append(_query_for_head)
         if self.use_context_emb:
             _ctx_for_head = context_emb
             if self.context_proj is not None:
                 _ctx_for_head = self.context_proj(_ctx_for_head)
+            # [진단용, 추가] confidence scaling — "라우팅은 그대로, head가
+            # 받는 신호의 크기만 assignment confidence로 조절"하는 실험용
+            # 개입. context_emb는 M=1(기본값)에서 항상 unit-norm centroid
+            # 하나 그대로라 norm이 샘플마다 다를 수 없었음(실측 확인:
+            # context_act_norm이 학습 내내 ~1.40, 변동 0.3% 수준) — 이
+            # 스케일링은 그 "norm에 정보가 없는" 상태를 의도적으로 깨고,
+            # 라우팅이 애매했던 샘플(top1_confidence 낮음)의 context_emb를
+            # 작게, 확신 있던 샘플은 크게 만들어 head에 전달한다.
+            # confidence_scaling_detach=False(Variant A)면 gradient가
+            # top1_confidence를 거쳐 centroid_emb/embedder까지 흐름 —
+            # "애매한 샘플일수록 gradient도 같이 작아진다"는 부작용이
+            # 있을 수 있음(리뷰 지적). True(Variant B)면 스케일 값 자체는
+            # forward에 반영하되 gradient는 그 경로로 안 흐름(순수 크기
+            # 조절만). 둘 다 실험해서 비교할 것 — 어느 쪽이 나은지 아직
+            # 검증 안 됨.
+            if self.use_confidence_scaling:
+                _conf = top1_confidence.detach() if self.confidence_scaling_detach else top1_confidence
+                _ctx_for_head = _ctx_for_head * _conf.unsqueeze(-1)
             if self.detach_context_grad:
                 _ctx_for_head = _ctx_for_head.detach()
-            combined = torch.cat([query_emb, _ctx_for_head, agg_emb], dim=-1)
-        else:
-            combined = torch.cat([query_emb, agg_emb], dim=-1)
+            # [추가] query_emb_zero/shuffle과 대칭 — context_emb 쪽도 같은
+            # 방식으로 eval-time에 얼마나 의존하는지 잴 수 있게 함.
+            if ablation_mode == "context_emb_zero":
+                _ctx_for_head = torch.zeros_like(_ctx_for_head)
+            elif ablation_mode == "context_emb_shuffle":
+                _perm = torch.randperm(_ctx_for_head.shape[0], device=_ctx_for_head.device)
+                _ctx_for_head = _ctx_for_head[_perm]
+            if self.blockwise_layernorm:
+                _ctx_for_head = self.head_context_ln(_ctx_for_head)
+            _parts.append(_ctx_for_head)
+        # [추가] query_emb_zero/shuffle, context_emb_zero/shuffle과 대칭 —
+        # agg_emb(검색·attention 집계 결과)도 같은 방식으로 잰다. query_emb_
+        # shuffle이 성능을 랜덤 수준까지 무너뜨린 게 "agg_emb는 원래 기여가
+        # 없다"인지, "head가 query_emb와 agg_emb를 짝(pair)으로 해석하도록
+        # 학습돼서 짝이 어긋나면 더 헷갈린다"인지 구분이 안 됐음 — 이 두
+        # 모드로 그 모호함을 직접 검증. agg_emb만 셔플하고 query_emb는
+        # 그대로 두면(반대로 query_emb_shuffle은 agg_emb를 그대로 두고
+        # query_emb만 섞었음), "agg_emb 단독의 기여도"와 "짝 어긋남의
+        # 대가"를 분리해서 볼 수 있음.
+        _agg_for_head = agg_emb
+        if ablation_mode == "agg_emb_zero":
+            _agg_for_head = torch.zeros_like(agg_emb)
+        elif ablation_mode == "agg_emb_shuffle":
+            _perm = torch.randperm(agg_emb.shape[0], device=agg_emb.device)
+            _agg_for_head = agg_emb[_perm]
+        if self.blockwise_layernorm:
+            _agg_for_head = self.head_agg_ln(_agg_for_head)
+        _parts.append(_agg_for_head)
+
+        # [진단용] log_branch_gradients=True면 head가 실제로 보는 시점(concat
+        # 직전)의 브랜치별 활성값에 retain_grad()를 건다. supervised.py가
+        # loss.backward() 직후 self._branch_grad_tensors[name].grad를 읽어
+        # "head가 각 브랜치에 얼마나 gradient를 돌려주는가"를 잰다.
+        # retain_grad()는 값을 바꾸지 않으므로(순수 .grad 보존) 이 진단을
+        # 켜도 학습 결과에는 영향이 없다 — 활성값을 추가로 붙들고 있어
+        # 메모리만 약간 증가(그래서 기본 False, train 중에만 동작).
+        #
+        # [주의 — gradient ≠ importance] 이게 재는 건 "학습 신호의 흐름"
+        # 이지 "예측이 실제로 그 브랜치를 쓰는가"가 아니다. 이미 잘 학습된
+        # 브랜치는 gradient가 작아도 여전히 예측에 크게 기여할 수 있다 —
+        # 반드시 --ablation *_shuffle/zero 결과, 그리고 head 첫 Linear의
+        # block별 weight norm(supervised.py가 epoch마다 같이 기록)과 함께
+        # 해석할 것. gradient가 작다는 것만으로 "head가 이 브랜치를 안
+        # 쓴다"고 결론 내리지 말 것.
+        if self.training and self.log_branch_gradients:
+            self._branch_grad_tensors = {}
+            if self.use_query_emb_in_head and _query_for_head.requires_grad:
+                _query_for_head.retain_grad()
+                self._branch_grad_tensors["query"] = _query_for_head
+            if self.use_context_emb and _ctx_for_head.requires_grad:
+                _ctx_for_head.retain_grad()
+                self._branch_grad_tensors["context"] = _ctx_for_head
+            # [주의] memory.filled < k인 극초반 배치는 agg_emb=torch.zeros_like(...)
+            # fallback이라 계산 그래프에 안 걸려 requires_grad=False임 — 이때는
+            # retain_grad()가 에러를 내므로 건너뛴다. 이 자체가 "메모리가 아직
+            # 안 채워진 동안은 agg 브랜치에 애초에 gradient가 흐를 수 없다"는
+            # 진단적으로 유의미한 사실이라, 억지로 걸지 않고 그 배치만 누락시킨다
+            # (supervised.py의 _branch_grad_sum이 dict.get() 기반이라 브랜치별로
+            # 등장 배치 수가 달라도 문제없이 누적됨).
+            if _agg_for_head.requires_grad:
+                _agg_for_head.retain_grad()
+                self._branch_grad_tensors["agg"] = _agg_for_head
+
+        combined = torch.cat(_parts, dim=-1)
         logits   = self.head(combined)
 
         # 5. 메모리 업데이트 (학습 시)
@@ -1321,18 +1537,39 @@ class TabERA(nn.Module):
             if self._feature_store is not None:
                 self._feature_store.update(X, sample_ids)
 
+        # 5.5 [추가] EMA codebook 업데이트 (학습 시, use_ema_codebook일 때만)
+        # — 매 배치마다 non-gradient로 centroid_emb를 직접 갱신. memory.update()
+        # 바로 다음(hard_assignment가 이미 이 배치에 대해 계산돼 있는 시점)에
+        # 두는 이유는 딱히 순서 의존성이 있어서가 아니라 같은 "배치 단위
+        # 부기(bookkeeping)" 묶음이라 여기 두는 게 자연스러워서.
+        if self.training and self.prototype_layer.use_ema_codebook:
+            self.prototype_layer.ema_update(query_emb.detach(), hard_assignment)
+
         # 6. 보조 손실
         aux_loss = torch.tensor(0.0, device=X.device)
         if self.training:
-            aux_loss = (
-                self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
-                + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
-                # [추가] codebook_loss — commitment_loss와 방향만 반대인 짝.
-                # .get()으로 하위 호환: 옛 체크포인트의 loss_weights에는
-                # "codebook" 키가 없어 --from_saved_state 로드 시 이 항은
-                # 0으로 처리됨(codebook_loss 자체가 아예 없던 상태와 동일).
-                + self.loss_weights.get("codebook", 0.0) * self.prototype_layer.codebook_loss(query_emb, hard_assignment)
-            )
+            if self.prototype_layer.use_ema_codebook:
+                # [중요] EMA를 쓰면 diversity_loss/codebook_loss 둘 다 뺀다.
+                # codebook_loss는 EMA가 대체(당연히 중복 적용 안 함).
+                # diversity_loss는 centroid_emb.requires_grad=False라 여기서
+                # 계산해도 gradient가 갈 곳이 없어 계산 자체가 낭비이고,
+                # 혹시라도 남겨두면 "centroid_emb에 gradient가 없다"는 걸
+                # 모르는 채 loss 값만 보고 "diversity가 반영되고 있다"고
+                # 착각하기 쉬움 — 아예 호출을 안 해서 그 착각의 여지를
+                # 없앤다. commitment_loss는 embedder 쪽 gradient라 그대로 둠.
+                aux_loss = (
+                    self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
+                )
+            else:
+                aux_loss = (
+                    self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
+                    + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
+                    # [추가] codebook_loss — commitment_loss와 방향만 반대인 짝.
+                    # .get()으로 하위 호환: 옛 체크포인트의 loss_weights에는
+                    # "codebook" 키가 없어 --from_saved_state 로드 시 이 항은
+                    # 0으로 처리됨(codebook_loss 자체가 아예 없던 상태와 동일).
+                    + self.loss_weights.get("codebook", 0.0) * self.prototype_layer.codebook_loss(query_emb, hard_assignment)
+                )
 
         out = {
             "logits":      logits,
@@ -1340,20 +1577,38 @@ class TabERA(nn.Module):
             "routing":     routing_probs,
             "hard_group":  hard_assignment,
             "evidence_w":  evidence_w,
+            "evidence_diag": evidence_diag,
             "topk_idx":    topk_idx,
             "agg_emb":     agg_emb,
+            # [추가, 진단용] linear probe(query_emb/context_emb/agg_emb 각각에 별도
+            # 선형 분류기를 붙여 "정보가 없어서 head가 무시하는가(A) vs 정보는
+            # 있는데 concat+공유 MLP가 못/안 쓰는가(B)"를 구분)를 위해 head에
+            # 들어가기 전(정규화/스케일링/ablation 적용 전) raw 값을 그대로 노출.
+            # head가 실제로 보는 값(_query_for_head 등, confidence_scaling·
+            # detach_context_grad·ablation_mode가 적용된 뒤)과는 다를 수 있음 —
+            # probe는 "이 표현 자체에 정보가 있는가"를 보는 거라 원본을 쓰는 게 맞음.
+            "query_emb":   query_emb,
+            "context_emb": context_emb,
             "ablation_mode": ablation_mode,
         }
 
         if return_explanations:
-            # 설명용 softmax — temperature scaling 적용
-            _temperature = 0.1
+            # [수정] 이전에는 고정 temperature=0.1을 별도로 써서, 실제
+            # 라우팅(CentroidLayer.forward()의 soft — routing_scale 사용,
+            # HPO가 데이터셋마다 다르게 찾은 값, jasmine 기준 5.44)과 다른
+            # 분포를 보여주고 있었음 — ①의 group_confidence가 "실제 모델이
+            # 이 배정에 얼마나 확신하는가"가 아니라 "0.1이라는 임의의
+            # 온도로 다시 계산한 별개의 숫자"였다는 뜻(faithfulness 문제).
+            # 실제 라우팅과 정확히 같은 공식(routing_scale 사용)으로 바꿔
+            # 설명과 실제 라우팅 분포가 항상 일치하게 함. .detach()는
+            # 그대로 유지(설명은 어차피 no_grad라 gradient 불필요).
             with torch.no_grad():
                 q_norm     = F.normalize(query_emb.detach(), dim=-1)       # (B, D)
                 c_norm     = F.normalize(
                     self.prototype_layer.centroid_emb.detach(), dim=-1)    # (P, D)
                 soft_probs = F.softmax(
-                    (q_norm @ c_norm.T) / _temperature, dim=-1)            # (B, P)
+                    (q_norm @ c_norm.T) * self.prototype_layer.routing_scale,
+                    dim=-1)                                                # (B, P)
 
             proto_exp = self.prototype_layer.explain_routing(hard_assignment, soft_probs)
             ev_exp    = self.ot_selector.explain_evidence(evidence_w)
@@ -1463,9 +1718,12 @@ class TabERA(nn.Module):
                  f"  Cross-group    : ON (adjacent centroid fallback)",
                  f"  Offset T()     : {'ON' if self.use_offset_correction else 'OFF (ablation)'}",
                  f"  Retrieve       : {'GROUP-CONSTRAINED' if not self.global_retrieve else 'GLOBAL (진단용, ablation)'}",
+                 f"  query_emb      : {'IN head input' if self.use_query_emb_in_head else 'EXCLUDED (진단용, ablation)'}",
                  f"  context_emb    : {'IN head input' if self.use_context_emb else 'EXCLUDED (진단용, ablation)'}",
                  f"  context grad   : {'STOP (진단용, ablation)' if self.detach_context_grad else 'flows to centroid_emb'}",
-                 f"  context proj   : {'Linear projection (구조 조정)' if self.context_proj is not None else 'none (raw concat)'}"]
+                 f"  context proj   : {'Linear projection (구조 조정)' if self.context_proj is not None else 'none (raw concat)'}",
+                 f"  codebook update: {'EMA (decay=' + str(self.prototype_layer.ema_decay) + '), diversity_loss OFF' if self.prototype_layer.use_ema_codebook else 'gradient (codebook_loss + diversity_loss)'}",
+                 f"  head LayerNorm : {'블록별(query/context/agg 따로)' if self.blockwise_layernorm else '결합(하나로 묶어서, 기존 방식)'}"]
 
         # [Limitation 진단] k가 평균 그룹 크기(N_train/P)보다 크면
         # cross-group fallback이 상시 발동할 위험이 있음 — 4개 데이터셋
