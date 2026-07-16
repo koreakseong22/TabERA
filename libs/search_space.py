@@ -58,6 +58,9 @@ def study_pkl_tag(
     context_projection: bool = False,
     cat_combine: str = "onehot",
     num_embedding: str = "ple",
+    evidence_metric: str = "euclidean",  # [추가] AttentionAggregator의 evidence_w
+        # 유사도 공간. euclidean(기본값, 기존과 동일)이면 태그 없음 —
+        # 기존에 이미 저장된 euclidean study들의 파일명이 안 바뀌게(하위 호환).
 ) -> str:
     """optimize.py가 저장하는 study .pkl 파일명의 태그 부분을 만든다.
 
@@ -82,7 +85,8 @@ def study_pkl_tag(
         + ("..cat_concat" if cat_combine == "concat" else "") \
         + ("..cat_sum" if cat_combine == "sum" else "") \
         + ("..num_ple" if num_embedding == "ple" else "") \
-        + ("..num_linear" if num_embedding == "linear" else "")
+        + ("..num_linear" if num_embedding == "linear" else "") \
+        + (f"..evM_{evidence_metric}" if evidence_metric != "euclidean" else "")
 
 
 def suggest_initial_trial() -> dict:

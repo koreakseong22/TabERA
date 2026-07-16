@@ -15,6 +15,27 @@ parser.add_argument("--n_trials",  type=int, default=100,    help="Number of opt
 parser.add_argument("--metric",    type=str, default="l2",
                     choices=["l2", "l1", "cosine", "mahalanobis", "wasserstein", "kl"],
                     help="Distance metric for TabR Retriever")
+parser.add_argument("--evidence_metric", type=str, default="euclidean",
+                    choices=["euclidean", "cosine", "cosine_scaled"],
+                    help=(
+                        "AttentionAggregator(evidence_w, 설명②)의 유사도 공간. "
+                        "Optuna 탐색 대상이 아니라 이 HPO 실행 전체에 고정 적용되는 "
+                        "구조 선택(no_offset_correction/context_projection과 같은 성격). "
+                        "euclidean(기본값)은 -‖q-k‖²(raw, 정규화 안 됨) — 4개 데이터셋 "
+                        "x 5-seed 실측 결과 evidence_w가 n_eff≈1.0(사실상 1-NN)으로 "
+                        "100% 재현되게 붕괴함이 확인됨. cosine은 q,k를 CentroidLayer "
+                        "라우팅과 동일하게 정규화 후 2·cos — 같은 실측에서 n_eff를 "
+                        "7.6~8.5로 안정적으로 유지, 성능은 유지~일부 개선(credit-g "
+                        "balanced accuracy 등). 지금까지의 euclidean best_params를 "
+                        "그대로 재사용한 비교였어서, cosine 구조에 맞는 HPO를 새로 "
+                        "돌리기 위한 플래그 — reproduce.py도 같은 이름의 플래그로 "
+                        "이 study를 다시 불러옴. [주의] 기존 --metric 플래그(choices에 "
+                        "cosine 포함)와 이름이 비슷해 보이지만 완전히 다른 것 — --metric은 "
+                        "params_to_model_kwargs()가 그 값을 안 읽어서 TabERA까지 전달된 "
+                        "적 없는 죽은 플래그(2026-07 확인). 원래 의도(TabR Retriever "
+                        "거리 지표 — FAISS 근사검색용이었을 가능성)를 알 수 없어 재활용 "
+                        "안 하고 이 플래그를 새로 만듦."
+                    ))
 parser.add_argument("--no_offset_correction", action="store_true",
                     help=(
                         "[ablation] AttentionAggregator의 value 구성에서 "
@@ -130,6 +151,7 @@ _ablation_tag = study_pkl_tag(
     context_projection=args.context_projection,
     cat_combine=args.cat_combine,
     num_embedding=args.num_embedding,
+    evidence_metric=args.evidence_metric,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -176,6 +198,9 @@ if train:
         print(f"  Diagnostic: task_loss gradient to centroid_emb DETACHED (diversity_loss only)")
     if args.context_projection:
         print(f"  Adjustment: context_emb routed through learned Linear projection before head")
+    if args.evidence_metric != "euclidean":
+        print(f"  Adjustment: evidence_metric={args.evidence_metric} "
+              f"(AttentionAggregator similarity space, default=euclidean)")
     print(f"  Encoding: cat_combine={args.cat_combine}, num_embedding={args.num_embedding}")
     print(f"  Save    : {fname}")
     print("=" * 60)
@@ -246,6 +271,7 @@ if train:
             global_retrieve=args.global_retrieve,
             detach_context_grad=args.detach_context_grad,
             use_context_projection=args.context_projection,
+            evidence_metric=args.evidence_metric,
             # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
             # 인코딩. 이게 없으면 cat_col_idx=None이 돼서 cat_combine/
             # num_embedding 설정과 무관하게 raw-encoding 경로로 빠짐 — HPO가
