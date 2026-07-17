@@ -126,6 +126,12 @@ class TabERAWrapper:
         # 보완하기 위함. TabERA.log_branch_gradients로 그대로 전달되며,
         # retain_grad() 기반이라 학습 결과에는 영향 없음(메모리만 소폭 증가).
         log_branch_gradients_first_n_epochs: int = 3,
+        # [진단용, 추가] 위 진단 중 배치 단위 세부 기록(branch_gradient_
+        # batch_history)은 학습 전체에 남기면 메모리가 배치 수만큼 계속
+        # 쌓이므로, 학습 초반 n epoch만 배치 단위로 남기고 그 이후는
+        # epoch 평균(branch_gradient_history)만 남긴다 — OGM 계열 문헌이
+        # 강조하는 게 "초기 학습 dynamics"라, 초반만 촘촘히 보면 충분하다는
+        # 판단. 검증 안 된 기본값(3)이라 필요시 조정.
         log_evidence_stats: bool = False,
         # [진단용, 추가] evidence_w(②의 AttentionAggregator 가중치)의 entropy·
         # dominant weight를 epoch마다 기록(self.evidence_stats_history).
@@ -134,12 +140,15 @@ class TabERAWrapper:
         # 목적: --explain에서 학습 끝난 뒤 딱 한 시점(3개 샘플)만 봐서는
         # "언제부터 evidence가 소수 이웃으로 붕괴됐는지" 알 수 없었던 것을
         # 학습 전체 epoch에 걸쳐 정량적으로 보기 위함.
-        # [진단용, 추가] 위 진단 중 배치 단위 세부 기록(branch_gradient_
-        # batch_history)은 학습 전체에 남기면 메모리가 배치 수만큼 계속
-        # 쌓이므로, 학습 초반 n epoch만 배치 단위로 남기고 그 이후는
-        # epoch 평균(branch_gradient_history)만 남긴다 — OGM 계열 문헌이
-        # 강조하는 게 "초기 학습 dynamics"라, 초반만 촘촘히 보면 충분하다는
-        # 판단. 검증 안 된 기본값(3)이라 필요시 조정.
+        # [진단용, 추가] fusion_mode="residual"의 α/β와 branch norm(‖LN(q)‖/
+        # ‖LN(c)‖/‖LN(a)‖) 궤적을 epoch마다 기록(self.fusion_trajectory_history).
+        # 지금까지는 meta.pkl에 최종값만 있어서 "처음부터 거의 안 움직였다"와
+        # "여러 번 오르내리다 지금 값에 안착했다"를 구분 못 했음 — evidence_w
+        # 진단과 같은 이유로 이것도 순수 forward 통계라 backward/retain_grad
+        # 없이 저렴하게 뽑음. fusion_mode!="residual"인 모델에 켜도 에러는
+        # 안 나되(out 딕셔너리에 항상 존재하는 키들이라) alpha/beta 값이 항상
+        # None으로 기록됨 — 그런 경우 그냥 안 켜는 게 맞음.
+        log_fusion_trajectory: bool = False,
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -193,6 +202,10 @@ class TabERAWrapper:
         self.log_evidence_stats = log_evidence_stats
         # epoch별 evidence_w 요약: {"epoch", "entropy", "dominant_weight"}
         self.evidence_stats_history: List[Dict[str, float]] = []
+        self.log_fusion_trajectory = log_fusion_trajectory
+        # epoch별 요약: {"epoch", "alpha", "beta", "query_norm_mean",
+        #                "context_norm_mean", "agg_norm_mean"}
+        self.fusion_trajectory_history: List[Dict[str, float]] = []
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -435,6 +448,35 @@ class TabERAWrapper:
             _evidence_dist_mean_sum = 0.0
             _evidence_dist_std_sum  = 0.0
             _evidence_diag_batches  = 0
+            # [진단용, 추가] self-retrieval rate — log_evidence_stats 플래그에
+            # 얹음(별도 CLI 플래그 안 만듦 — evidence 진단과 같은 성격,
+            # 오버헤드도 이미 계산된 값을 배치마다 누적하는 것뿐이라 저렴함).
+            _self_retrieval_top1_sum = 0.0
+            _self_retrieval_topk_sum = 0.0
+            _self_retrieval_batches  = 0
+            # [진단용, 추가] log_fusion_trajectory — norm/cos/grad는 배치마다
+            # 다르므로 epoch 평균을 위해 누적. alpha/beta 값 자체는 epoch
+            # 마지막 배치 시점 파라미터 값을 그대로 기록(파라미터는 "지금
+            # 어디 있는가"가 중요 — 평균 내면 "0.95→0.90으로 계속 하락"이
+            # "0.925로 안정"인 것처럼 흐려짐). grad는 반대로 "매 배치 존재하는
+            # 신호"라 평균이 자연스러움(clip_grad_norm_ 이전 raw grad).
+            _fusion_qnorm_sum = 0.0
+            _fusion_cnorm_sum = 0.0
+            _fusion_anorm_sum = 0.0
+            _fusion_combined_norm_sum = 0.0
+            _fusion_cos_qc_sum = 0.0
+            _fusion_cos_qa_sum = 0.0
+            _fusion_cos_ca_sum = 0.0
+            _fusion_norm_batches = 0
+            _fusion_cnorm_batches = 0     # context 관련 값들(cnorm, cos_qc, cos_ca)은
+            _fusion_combined_batches = 0  # use_context_emb/fusion_mode에 따라 None일
+            _fusion_cos_qc_batches = 0    # 수 있어 항목별로 분모를 따로 셈
+            _fusion_cos_qa_batches = 0
+            _fusion_cos_ca_batches = 0
+            _fusion_alpha_grad_sum = 0.0
+            _fusion_beta_grad_sum  = 0.0
+            _fusion_alpha_grad_batches = 0
+            _fusion_beta_grad_batches  = 0
 
             for start in range(0, len(y_train), self.params["batch_size"]):
                 idx = perm[start:start + self.params["batch_size"]]
@@ -448,6 +490,35 @@ class TabERAWrapper:
                 # 검증할 수 있다 (reproduce.py --ablation dual_space_faithfulness).
                 out = self.model(xb, labels=yb, sample_ids=idx)
                 lg  = out["logits"]
+
+                # [진단용, 추가] log_fusion_trajectory — ||LN(q)||/||LN(c)||/
+                # ||LN(a)||/||q+αc+βa||/cos(q,c)/cos(q,a)/cos(c,a) 배치 평균 누적.
+                # gradient 불필요(out의 head_* 값들은 이미 tabera.py에서 .detach()
+                # 처리됨) — 순수 forward 통계라 매 배치 켜둬도 저렴함(evidence_stats와
+                # 같은 이유). 항목마다 None일 수 있는 조건이 달라(예:
+                # use_context_emb=False면 context 관련 전부 None, concat 모드면
+                # combined_norm만 None) 분모(batches)를 항목별로 따로 센다.
+                if self.log_fusion_trajectory:
+                    if out.get("head_query_norm_mean") is not None:
+                        _fusion_qnorm_sum += out["head_query_norm_mean"]
+                    if out.get("head_context_norm_mean") is not None:
+                        _fusion_cnorm_sum += out["head_context_norm_mean"]
+                        _fusion_cnorm_batches += 1
+                    if out.get("head_agg_norm_mean") is not None:
+                        _fusion_anorm_sum += out["head_agg_norm_mean"]
+                    if out.get("head_combined_norm_mean") is not None:
+                        _fusion_combined_norm_sum += out["head_combined_norm_mean"]
+                        _fusion_combined_batches += 1
+                    if out.get("head_cos_qc_mean") is not None:
+                        _fusion_cos_qc_sum += out["head_cos_qc_mean"]
+                        _fusion_cos_qc_batches += 1
+                    if out.get("head_cos_qa_mean") is not None:
+                        _fusion_cos_qa_sum += out["head_cos_qa_mean"]
+                        _fusion_cos_qa_batches += 1
+                    if out.get("head_cos_ca_mean") is not None:
+                        _fusion_cos_ca_sum += out["head_cos_ca_mean"]
+                        _fusion_cos_ca_batches += 1
+                    _fusion_norm_batches += 1
 
                 # [진단용] log_evidence_stats — evidence_w(②)가 소수 이웃으로
                 # 붕괴하는지(dominant→1, entropy→0) 매 배치 기록. AttentionAggregator
@@ -480,6 +551,13 @@ class TabERAWrapper:
                         _evidence_dist_std_sum  += _diag["distance_std"]
                         _evidence_diag_batches  += 1
 
+                    # [진단용, 추가] self-retrieval — 값이 None인 배치(memory
+                    # warmup fallback, 또는 sample_ids 미전달)는 자연스럽게 제외
+                    if out.get("self_retrieval_top1_rate") is not None:
+                        _self_retrieval_top1_sum += out["self_retrieval_top1_rate"]
+                        _self_retrieval_topk_sum += out["self_retrieval_topk_rate"]
+                        _self_retrieval_batches  += 1
+
                 if self.tasktype in ("regression", "binclass"):
                     task_loss = criterion(lg.squeeze(-1), yb.float())
                 else:
@@ -487,6 +565,22 @@ class TabERAWrapper:
 
                 loss = task_loss + out["aux_loss"]
                 loss.backward()
+
+                # [진단용, 추가] log_fusion_trajectory — fusion_alpha/beta.grad를
+                # clip_grad_norm_/optimizer.step() 전에 읽음(그 이후엔 다음
+                # zero_grad()가 지울 값이라 이 시점이 유일한 기회). override로
+                # buffer가 됐으면(requires_grad=False) .grad가 항상 None이라
+                # 자동으로 걸러짐 — 그 경우 "grad=0"이 아니라 "애초에 안 잼"이
+                # 맞는 의미라 None으로 남기고 0으로 채우지 않는다.
+                if self.log_fusion_trajectory:
+                    _fa = getattr(self.model, "fusion_alpha", None)
+                    _fb = getattr(self.model, "fusion_beta", None)
+                    if _fa is not None and _fa.grad is not None:
+                        _fusion_alpha_grad_sum += abs(float(_fa.grad.item()))
+                        _fusion_alpha_grad_batches += 1
+                    if _fb is not None and _fb.grad is not None:
+                        _fusion_beta_grad_sum += abs(float(_fb.grad.item()))
+                        _fusion_beta_grad_batches += 1
 
                 # [진단용] log_branch_gradients — clip_grad_norm_은 model.
                 # parameters()만 대상이라 아래 활성값(파라미터 아님)의 .grad에는
@@ -726,6 +820,12 @@ class TabERAWrapper:
                     ev_record["key_norm"]      = _evidence_knorm_sum / _evidence_diag_batches
                     ev_record["distance_mean"] = _evidence_dist_mean_sum / _evidence_diag_batches
                     ev_record["distance_std"]  = _evidence_dist_std_sum / _evidence_diag_batches
+                # [진단용, 추가] self-retrieval rate — 배치 없으면(warmup fallback
+                # 뿐이었던 epoch 등) 키 자체를 안 넣음(0.0으로 채우면 "확인했는데
+                # 0%"와 "애초에 못 쟀음"이 구분 안 되므로).
+                if _self_retrieval_batches > 0:
+                    ev_record["self_retrieval_top1_rate"] = _self_retrieval_top1_sum / _self_retrieval_batches
+                    ev_record["self_retrieval_topk_rate"] = _self_retrieval_topk_sum / _self_retrieval_batches
                 self.evidence_stats_history.append(ev_record)
                 if epoch % self.regroup_log_every == 0:
                     _extra = ""
@@ -733,11 +833,82 @@ class TabERAWrapper:
                         _extra = (f"  qnorm={ev_record['query_norm']:.2f} "
                                   f"knorm={ev_record['key_norm']:.2f} "
                                   f"dist={ev_record['distance_mean']:.2f}±{ev_record['distance_std']:.2f}")
+                    if "self_retrieval_top1_rate" in ev_record:
+                        _extra += (f"  self_top1={ev_record['self_retrieval_top1_rate']*100:.2f}% "
+                                  f"self_topk={ev_record['self_retrieval_topk_rate']*100:.2f}%")
                     pbar.write(
                         f"  [EvidenceStats] entropy={ev_record['entropy']:.4f}  "
                         f"n_eff={ev_record['n_eff']:.3f}  "
                         f"dominant_weight={ev_record['dominant_weight']:.4f}{_extra}"
                     )
+
+            # [진단용, 추가] log_fusion_trajectory — epoch 마지막 alpha/beta
+            # 값(그 시점 nn.Parameter/buffer 그대로, 파라미터는 "지금 어디
+            # 있는가"가 중요해 평균 대신 마지막 값을 씀) + 이 epoch 동안의
+            # grad 절대값 평균(grad는 매 배치 존재하는 신호라 평균이 자연스러움)
+            # + branch norm/cos/combined-norm 평균(순수 forward 통계).
+            # fusion_mode!="residual"이면 model.fusion_alpha/beta 속성 자체가
+            # 없거나 None이므로 getattr로 방어.
+            if self.log_fusion_trajectory and _fusion_norm_batches > 0:
+                _alpha_val = getattr(self.model, "fusion_alpha", None)
+                _beta_val  = getattr(self.model, "fusion_beta", None)
+                fusion_record = {
+                    "epoch": float(epoch),
+                    "alpha": float(_alpha_val.detach().item()) if _alpha_val is not None else None,
+                    "beta":  float(_beta_val.detach().item())  if _beta_val  is not None else None,
+                    "mean_alpha_grad": (
+                        _fusion_alpha_grad_sum / _fusion_alpha_grad_batches
+                        if _fusion_alpha_grad_batches > 0 else None
+                    ),
+                    "mean_beta_grad": (
+                        _fusion_beta_grad_sum / _fusion_beta_grad_batches
+                        if _fusion_beta_grad_batches > 0 else None
+                    ),
+                    "query_norm_mean": _fusion_qnorm_sum / _fusion_norm_batches,
+                    "context_norm_mean": (
+                        _fusion_cnorm_sum / _fusion_cnorm_batches if _fusion_cnorm_batches > 0 else None
+                    ),
+                    "agg_norm_mean": _fusion_anorm_sum / _fusion_norm_batches,
+                    "combined_norm_mean": (
+                        _fusion_combined_norm_sum / _fusion_combined_batches
+                        if _fusion_combined_batches > 0 else None
+                    ),
+                    "cos_qc_mean": (
+                        _fusion_cos_qc_sum / _fusion_cos_qc_batches if _fusion_cos_qc_batches > 0 else None
+                    ),
+                    "cos_qa_mean": (
+                        _fusion_cos_qa_sum / _fusion_cos_qa_batches if _fusion_cos_qa_batches > 0 else None
+                    ),
+                    "cos_ca_mean": (
+                        _fusion_cos_ca_sum / _fusion_cos_ca_batches if _fusion_cos_ca_batches > 0 else None
+                    ),
+                }
+                self.fusion_trajectory_history.append(fusion_record)
+                if epoch % self.regroup_log_every == 0:
+                    _a, _b = fusion_record["alpha"], fusion_record["beta"]
+                    _ag, _bg = fusion_record["mean_alpha_grad"], fusion_record["mean_beta_grad"]
+                    _qn, _cn, _an = (fusion_record["query_norm_mean"], fusion_record["context_norm_mean"],
+                                     fusion_record["agg_norm_mean"])
+                    _zn = fusion_record["combined_norm_mean"]
+                    _a_str  = f"{_a:.4f}" if _a is not None else "N/A"
+                    _b_str  = f"{_b:.4f}" if _b is not None else "N/A"
+                    _ag_str = f"{_ag:.5f}" if _ag is not None else "N/A"
+                    _bg_str = f"{_bg:.5f}" if _bg is not None else "N/A"
+                    _line1 = (f"  [FusionTraj] alpha={_a_str}(grad={_ag_str}) beta={_b_str}(grad={_bg_str})  "
+                              f"||q||={_qn:.3f}  ||a||={_an:.3f}")
+                    if _cn is not None:
+                        _line1 += f"  ||c||={_cn:.3f}"
+                    if _zn is not None:
+                        _line1 += f"  ||q+αc+βa||={_zn:.3f}"
+                    pbar.write(_line1)
+                    _cqc, _cqa, _cca = (fusion_record["cos_qc_mean"], fusion_record["cos_qa_mean"],
+                                        fusion_record["cos_ca_mean"])
+                    if _cqc is not None or _cqa is not None or _cca is not None:
+                        _line2 = "    cos: "
+                        if _cqc is not None: _line2 += f"qc={_cqc:+.3f}  "
+                        if _cqa is not None: _line2 += f"qa={_cqa:+.3f}  "
+                        if _cca is not None: _line2 += f"ca={_cca:+.3f}"
+                        pbar.write(_line2)
 
             # ── 검증 ──────────────────────────────────────
             self.model.eval()
