@@ -196,17 +196,26 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
 
     # ② Neighbor evidence (Attention weight)
     ev = e["evidence"]
-    print(f"\n  ② Neighbor Evidence (Attention)")
+    # [명명 정정] "Neighbor Evidence"는 causal claim("이 이웃 때문에 예측했다")을
+    # 함의함 — 이 세션의 necessity 검증(agg_emb 제거해도 accuracy 거의 불변,
+    # 4데이터셋×5seed)에서 이 weight가 실제로 prediction을 좌우한다는 근거가
+    # 부족함이 확인됨. "Retrieved Neighbors"(무엇을 검색했는가, descriptive)로
+    # 표현을 낮추고, 그 아래 한 줄로 한계를 명시. context/agg branch 자체나
+    # 검색 메커니즘은 그대로 유지 — retrieval inspection/error analysis
+    # 용도로는 여전히 유효함.
+    print(f"\n  ② Retrieved Neighbors (Similarity)")
+    print(f"     (attention weight — 실제 예측 결정과의 인과관계는 검증되지 않음)")
     print(f"     dominant={ev['dominant_weight']:.1%},  entropy={ev['entropy']:.3f}")
 
-    # 기여도가 사실상 0인 이웃은 생략 (반올림하면 0.0%로 보이는 것도 포함) —
-    # 예측에 아무 영향을 안 준 이웃까지 보여주는 건 정보가 아니라 소음이다.
+    # attention weight가 사실상 0인 이웃은 생략 (반올림하면 0.0%로 보이는 것도
+    # 포함) — weight가 거의 없는 이웃까지 보여주는 건 정보가 아니라 소음이다.
+    # ["기여도"라는 표현은 안 씀 — 위 causal claim 이슈와 같은 이유]
     _WEIGHT_EPS = 1e-3
     shown = [(rank, idx, w) for rank, (idx, w) in enumerate(ev["top_neighbours"])
               if w > _WEIGHT_EPS]
 
     if not shown:
-        print(f"     (no neighbor contributed meaningfully)")
+        print(f"     (no neighbor received meaningful attention weight)")
 
     nf = e.get("neighbour_features")
     name_to_idx = {name: i for i, name in enumerate(col_names)} if col_names else {}
@@ -542,6 +551,54 @@ def main():
                             "LayerNorm이라 이 플래그 없이 저장된 --from_saved_state와는 "
                             "구조가 달라 호환 안 됨(옵트인 기본 False로 하위 호환 유지)."
                         ))
+    parser.add_argument("--value_mode", type=str, default="default",
+                        choices=["default", "label_only", "offset_only", "balanced"],
+                        help=(
+                            "[재개, ablation] AttentionAggregator의 value = "
+                            "label_emb + T(query-neighbour) 구성 방식. "
+                            "'default'(기존과 동일, 하위호환): 정규화 없이 그대로 더함. "
+                            "'label_only': T() 자체를 안 만듦, value=label_emb만 "
+                            "(use_offset_correction=False와 동일 — 이웃 label 정보 "
+                            "단독의 유용성 검증). 'offset_only': value=T(query-neighbour)만 "
+                            "(label_emb 항을 뺌 — 지금 모델이 사실상 이것만 쓰고 있는지 "
+                            "검증). 'balanced': value=LN(label_emb)+LN(T(query-neighbour)) "
+                            "(두 항을 unit-scale로 맞춘 뒤 더함). 동기: "
+                            "diagnose_value_components 실측에서 T(query-neighbour) 항이 "
+                            "label_emb보다 평균 4.9배 크다는 게 확인됨(mfeat-zernike) — "
+                            "concat 시절 embed_dim 스케일 격차 문제와 구조적으로 같은 "
+                            "패턴이 value 구성 단계에서 재현된 것으로 추정."
+                        ))
+    parser.add_argument("--allow_self_retrieval", action="store_true",
+                        help=(
+                            "[기본값 변경] 기본은 이제 self-retrieval 제외(exclude)가 켜져 "
+                            "있음 — 이 플래그를 주면 예전 기본 동작(제외 안 함)으로 되돌림. "
+                            "MemoryBank 검색 시 쿼리 자신과 sample_id가 같은 슬롯(이전 epoch에 "
+                            "저장해둔 자기 자신)을 후보에서 배제하는 게 기본 — MemoryBank가 "
+                            "label을 그대로 저장/반환하므로(self-retrieval 시 그 슬롯의 "
+                            "neighbour_label은 자기 자신의 진짜 정답) 배제하는 쪽이 구현상 더 "
+                            "정확함. 다만 이 옵션은 agg_emb의 predictive null 결과를 바꾸기 "
+                            "위한 게 아님 — 사전 분석(self-retrieval 비율과 agg-only 성능 간 "
+                            "뚜렷한 상관 없음)에서 이미 그 가설은 기각됨, 순수 구현 정확성 "
+                            "차원. '이례적 경로'(초대형 centroid 그룹, 드문 경우)는 기본 켜짐 "
+                            "상태에서도 아직 미반영(exclusion 적용 안 됨) — 재현 목적으로 예전 "
+                            "결과와 정확히 비교하려면 이 플래그로 예전 동작을 켤 것."
+                        ))
+    parser.add_argument("--fusion_mode", type=str, default="concat", choices=["concat", "residual"],
+                        help=(
+                            "[구조 변경] head가 [query,context,agg]를 합치는 방식. "
+                            "'concat'(기본값, 기존과 동일): [query‖context‖agg] → 공유 MLP. "
+                            "'residual': z = LN(q) + α·LN(c) + β·LN(a) (α,β 학습 가능한 "
+                            "스칼라) → embed_dim 크기 z 하나만 MLP에 통과. 동기: "
+                            "freeze_encoder_retrain_head 5-seed 실험(mfeat-zernike, "
+                            "embed_dim=256, evM_cosine, sharedLN/blockLN 둘 다)에서 "
+                            "인코더 고정+head 백지 재학습을 해도 원래 공동학습 head와 "
+                            "통계적으로 구분 안 되는 정확도(양쪽 paired p>0.4, d<0.2)로 "
+                            "수렴 — concat+공유 MLP 구조 자체가 정보를 못 끌어쓴다는 "
+                            "가설(시나리오 A)에 대한 직접 대응. residual 모드는 branch별 "
+                            "LayerNorm이 blockwise_layernorm 플래그와 무관하게 항상 켜짐. "
+                            "기존 체크포인트와 파라미터 구조가 달라 --from_saved_state "
+                            "호환 안 됨(옵트인 기본 'concat'으로 하위 호환 유지)."
+                        ))
     parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
                         help=(
                             "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
@@ -573,14 +630,24 @@ def main():
                             "학습 가능한 주기함수 + 공유 Linear+ReLU) — 필요시 여전히 선택 가능. "
                             "'linear'는 raw 값을 그대로 Linear에 투영 — 기존 동작, 하위 호환용."
                         ))
-    parser.add_argument("--evidence_metric", type=str, default="euclidean",
+    parser.add_argument("--evidence_metric", type=str, default="cosine",
                         choices=["euclidean", "cosine", "cosine_scaled"],
                         help=(
                             "AttentionAggregator(evidence_w, 설명②)의 유사도 공간 — cat_combine/"
                             "num_embedding과 같은 성격의 구조 선택(Optuna 탐색 대상 아님). "
+                            "[기본값 변경] euclidean → cosine. euclidean은 evidence collapse"
+                            "(정규화 안 된 유클리드 거리가 query_emb norm 성장에 종속돼 evidence_w가 "
+                            "사실상 1-NN으로 붕괴, n_eff≈1.0)가 4데이터셋×5seed로 확정된 채로 남아있던 "
+                            "값이라 기본값으로 두는 게 더 이상 맞지 않음 — cosine이 이미 여러 세션에 "
+                            "걸쳐 검증된 해결책(n_eff≈7.5~12, paired t-test 전부 p<0.005). "
+                            "[주의] 이 값에 따라 optimize.py가 찾는 HPO study 파일이 달라짐"
+                            "(study_pkl_tag가 cosine이면 '..evM_cosine' 태그 추가) — cosine 전용으로 "
+                            "HPO를 아직 안 돌린 데이터셋에서는 study를 못 찾을 수 있음. 그 경우 "
+                            "'--evidence_metric euclidean'으로 명시하거나 optimize.py를 "
+                            "'--evidence_metric cosine'으로 먼저 돌릴 것. "
                             "optimize.py --evidence_metric으로 이 값에 맞춰 HPO를 새로 돌린 뒤, "
                             "여기서도 같은 값을 줘야 그 study를 찾음(study_pkl_tag가 파일명에 "
-                            "반영). euclidean(기본값)이면 기존과 완전히 동일 — 태그 없음. "
+                            "반영). euclidean이면 기존과 완전히 동일 — 태그 없음. "
                             "--evidence_metric_override(아래)와 다른 점: 이건 '그 metric으로 "
                             "HPO된 study를 불러와서 재학습'이고, override는 '기존 euclidean "
                             "study의 best_params에 이 값만 강제로 바꿔치기해서 재학습'(정식 "
@@ -709,6 +776,28 @@ def main():
                             "backward/retain_grad 불필요한 순수 forward 통계라 "
                             "--log_branch_gradients보다 오버헤드 적음."
                         ))
+    parser.add_argument("--log_fusion_trajectory", action="store_true",
+                        help=(
+                            "[진단용] fusion_mode=residual일 때 α/β와 branch norm"
+                            "(||LN(q)||/||LN(c)||/||LN(a)||)을 epoch마다 기록"
+                            "(meta.pkl의 fusion_trajectory_history). 지금까지는 최종값만 "
+                            "있어서 '처음부터 거의 안 움직였다'와 '오르내리다 지금 값에 "
+                            "안착했다'를 구분 못 했음. norm까지 같이 봐야 'α≈1'이라는 "
+                            "숫자 자체가 실제 기여량과 비례하는지 판단 가능 "
+                            "(||LN(q)‖≫||αLN(c)||면 α가 1이어도 사실상 안 쓰는 것과 같음)."
+                        ))
+    parser.add_argument("--fusion_alpha_override", type=float, default=None,
+                        help=(
+                            "[구조 변경] fusion_mode=residual에서 α를 학습 가능한 "
+                            "파라미터 대신 이 값으로 고정(register_buffer, "
+                            "requires_grad=False). '학습이 α≈1을 선택했다'와 "
+                            "'α=1로 고정해도 비슷한 성능이 나온다'는 다른 주장 — "
+                            "{0, 0.5, 1, 2} 등으로 스윕해서 causal하게 확인하기 위함. "
+                            "fusion_mode!=residual이거나 --no_context_emb(해당 CLI가 "
+                            "있다면)와 같이 쓰면 TabERA 생성자가 ValueError."
+                        ))
+    parser.add_argument("--fusion_beta_override", type=float, default=None,
+                        help="fusion_alpha_override와 대칭, agg 쪽(β) 고정값.")
     parser.add_argument("--evidence_metric_override", type=str, default=None,
                         choices=["euclidean", "cosine", "cosine_scaled"],
                         help=(
@@ -922,6 +1011,11 @@ def main():
               + ("..ema_codebook" if args.ema_codebook else "") \
               + (f"..ema_decay{args.ema_decay_override:g}" if args.ema_decay_override is not None else "") \
               + ("..blockLN" if args.blockwise_layernorm else "") \
+              + ("..fusion_residual" if args.fusion_mode == "residual" else "") \
+              + ("..allowSelfRet" if args.allow_self_retrieval else "") \
+              + (f"..valMode_{args.value_mode}" if args.value_mode != "default" else "") \
+              + (f"..fa{args.fusion_alpha_override:g}" if args.fusion_alpha_override is not None else "") \
+              + (f"..fb{args.fusion_beta_override:g}" if args.fusion_beta_override is not None else "") \
               + ("..freezeHead" if args.freeze_encoder_retrain_head else "") \
               + ("..ctx_proj" if args.context_projection else "") \
               + ("..cat_concat" if args.cat_combine == "concat" else "") \
@@ -1011,6 +1105,11 @@ def main():
                   f"자동으로 복원됩니다. 반대로 결합형 LayerNorm으로 저장된 체크포인트에 "
                   f"이 플래그를 켜도 state_dict 모양이 달라 로드 자체는 저장된 구조를 "
                   f"따르므로 문제없음).")
+        if args.fusion_mode == "residual":
+            print(f"  ⚠️  --fusion_mode residual은 재학습 시에만 의미가 있습니다 — "
+                  f"--from_saved_state는 저장된 model_kwargs(head fusion 구조 포함)를 "
+                  f"그대로 쓰므로 이 플래그를 무시합니다(체크포인트가 residual로 학습됐다면 "
+                  f"자동으로 복원됩니다).")
     else:
         # [수정] optimize.py가 실제로 저장한 파일명과 일치시키기 위해
         # study_pkl_tag()를 그대로 재사용 — 예전엔 여기서 태그 없이
@@ -1177,18 +1276,23 @@ def main():
             # [수정] optimize.py와 동일하게 캡 제거 (memory_size가 다르면
             # HPO 때 찾은 best_params가 이 재현 실행에서 재현되지 않음)
             memory_size=len(y_train),
-            # 채택된 아키텍처: offset correction 사용, group-constrained
-            # retrieval, context_emb를 head 입력에 포함 (각각
-            # --no_offset_correction/--global_retrieve/--no_context_emb
-            # ablation으로 이미 검증 완료된 결정 — 더 이상 옵션으로 안 둠)
-            use_offset_correction=True,
+            # [재개] --no_offset_correction ablation으로 한 번 검증 완료돼
+            # "더 이상 옵션으로 안 둔다"고 닫았던 결정을, 이번 value ablation
+            # 실험(diagnose_value_components 실측 — T(query-neighbour) 항이
+            # label_emb보다 평균 4.9배 크다는 게 확인됨)을 위해 의식적으로
+            # 다시 연다. --value_mode로 통제.
+            use_offset_correction=(args.value_mode != "label_only"),
             global_retrieve=False,
             use_context_emb=True,
             use_query_emb_in_head=not args.no_query_emb,
             use_ema_codebook=args.ema_codebook,
             ema_decay=args.ema_decay_override if args.ema_decay_override is not None else 0.99,
+            value_mode=("default" if args.value_mode in ("default", "label_only") else args.value_mode),
             blockwise_layernorm=args.blockwise_layernorm,
-            # [진단용] context_emb는 head에 그대로 전달하되 gradient만 끊음
+            fusion_mode=args.fusion_mode,
+            exclude_self_retrieval=(not args.allow_self_retrieval),
+            fusion_alpha_override=args.fusion_alpha_override,
+            fusion_beta_override=args.fusion_beta_override,
             detach_context_grad=args.detach_context_grad,
             # [구조 조정] context_emb를 head 직전 Linear 프로젝션에 통과시킴
             use_context_projection=args.context_projection,
@@ -1268,6 +1372,7 @@ def main():
         log_branch_gradients=args.log_branch_gradients,
         log_branch_gradients_first_n_epochs=args.log_branch_gradients_first_n_epochs,
         log_evidence_stats=args.log_evidence_stats,
+        log_fusion_trajectory=args.log_fusion_trajectory,
     )
     wrapper._data_id = args.openml_id
     if _saved_state is not None:
@@ -3016,6 +3121,29 @@ def main():
         "use_ema_codebook": args.ema_codebook,
         "ema_decay": (args.ema_decay_override if args.ema_decay_override is not None else 0.99) if args.ema_codebook else None,
         "blockwise_layernorm": args.blockwise_layernorm,
+        "fusion_mode": args.fusion_mode,
+        "exclude_self_retrieval": (not args.allow_self_retrieval),
+        "value_mode": args.value_mode,
+        # [추가, 진단용] residual fusion의 학습된 α/β 최종값 — 전체 모델을
+        # 다시 로드하지 않고도 meta.pkl만으로 "이 run에서 head가 context/agg를
+        # 어느 정도 크기로 쓰기로 했는가"를 바로 볼 수 있게. concat 모드에서는
+        # 둘 다 None.
+        "fusion_alpha_final": (
+            float(model.fusion_alpha.detach().item())
+            if (args.fusion_mode == "residual" and model.fusion_alpha is not None) else None
+        ),
+        "fusion_beta_final": (
+            float(model.fusion_beta.detach().item())
+            if args.fusion_mode == "residual" else None
+        ),
+        # [추가] 이번 run에서 α/β가 학습됐는지(None) 아니면 고정됐는지(값) —
+        # fusion_alpha_final/beta_final만 보면 "학습해서 이 값이 됐다"와
+        # "애초에 이 값으로 고정해놨다"를 구분할 수 없어서 별도로 남김.
+        "fusion_alpha_override": args.fusion_alpha_override,
+        "fusion_beta_override": args.fusion_beta_override,
+        # [추가, 진단용] --log_fusion_trajectory로 기록한 epoch별 α/β·branch
+        # norm 궤적. 기본은 빈 리스트(플래그 안 켰으면).
+        "fusion_trajectory_history": getattr(wrapper, "fusion_trajectory_history", []),
         "detach_context_grad": args.detach_context_grad,
         "use_context_projection": args.context_projection,
         "cat_embedding": True,  # [후보 A] categorical nn.Embedding 적용 여부 기록
