@@ -2,17 +2,50 @@
 
 **Tabular Explainable Retrieval Architecture**
 
-A retrieval-augmented tabular model that produces architectural, example-based explanations alongside its predictions.
+A retrieval-augmented tabular model that surfaces prototype-group assignment and
+retrieved-neighbor context alongside its predictions, with an explicit,
+measured distinction between what's architecturally guaranteed and what's a
+best-effort descriptive aid.
 
 ---
 
 ## Background
 
-Post-hoc attribution methods (SHAP, LIME, IG) only ever answer "which features mattered," and only after the fact. Retrieval-augmented models (e.g., TabR) suggest a richer alternative: if a model predicts by comparing a query to stored training examples, the retrieval step itself explains "which group this belongs to" and "which examples this prediction is like" — something no post-hoc method can offer for an arbitrary model.
+Post-hoc attribution methods (SHAP, LIME, IG) only ever answer "which features
+mattered," and only after the fact. Retrieval-augmented models (e.g., TabR)
+suggest a richer alternative: if a model predicts by comparing a query to
+stored training examples, the retrieval step itself could explain "which group
+this belongs to" and "which examples this prediction is like" — something no
+post-hoc method can offer for an arbitrary model.
 
-TabERA is built around this idea: group assignment and neighbor retrieval are load-bearing parts of the forward pass, not add-ons, so the explanations they produce are guaranteed to reflect what the model actually did. These two layers — ① *which group* and ② *which neighbors* — are TabERA's core contribution. ② in particular is holistic by construction: showing a real neighbor sample already reflects however its features acted together, without decomposing them one at a time, so it implicitly carries feature-interaction information that a per-feature breakdown wouldn't.
+TabERA is built around this idea, with one important caveat learned from
+extensive ablation: **an explanation being computed as a load-bearing part of
+the forward pass does not by itself guarantee it's faithful to the
+prediction.** Concretely:
 
-A third, feature-level layer (→ ③) is added alongside ①② as a standard, complementary post-hoc device — the kind of "which individual features moved the prediction" summary people are used to from other tabular models. Because ①② already carry the paper's core, architecturally-guaranteed claim, ③'s job is narrower: pick whichever post-hoc attribution method works best, without that choice affecting ①②'s guarantees. TabERA uses SHAP here (see *Why SHAP* below for why, over IG/LIME/plain ablation).
+- **① Prototype group assignment** is architectural in the strong sense: the
+  assigned centroid and its confidence are a direct, reproducible readout of
+  the routing computation that actually happened, and `context_emb` — the
+  vector representation of that routing outcome — measurably carries
+  predictive information (linear-probe accuracy comparable to, sometimes
+  exceeding, `query_emb` alone; ablation shows removing it changes prediction
+  accuracy, directionally consistent across most datasets tested).
+- **② Retrieved neighbors** are a real, reproducible readout of what the
+  `MemoryBank`/`AttentionAggregator` retrieval step did — the same `k`
+  neighbors and `evidence_w` used in the forward pass, not a separate
+  explanation model. However, controlled ablation (removing `agg_emb` from
+  the prediction head entirely, or shuffling it at inference time) shows no
+  measurable, dataset-consistent change in prediction accuracy. TabERA
+  therefore presents ② as **retrieval context** — "these are the most
+  similar training examples the model found" — rather than a causal claim
+  that these specific neighbors drove the prediction. See *Known
+  limitations* for the full picture and *Explanations* below for how this
+  is worded in `--explain` output.
+
+A third, feature-level layer (→ ③) is added alongside ①② as a standard,
+complementary post-hoc device — the kind of "which individual features moved
+the prediction" summary people are used to from other tabular models. TabERA
+uses SHAP here (see *Why SHAP* below for why, over IG/LIME/plain ablation).
 
 ---
 
@@ -21,10 +54,10 @@ A third, feature-level layer (→ ③) is added alongside ①② as a standard, 
 ![TabERA architecture](docs/TabERA_Figure1.png)
 
 ```
-Query → Embedding → Centroid Routing → Group-constrained KNN → Prediction
-                          ↓                     ↓                   ↓
-                    "Which group?"      "Which neighbors?"   "Which features?"
-                    (architectural)      (architectural)      (post-hoc, SHAP)
+Query → Embedding → Centroid Routing → Group-constrained KNN → Fusion → Prediction
+                          ↓                     ↓                            ↓
+                    "Which group?"      "Retrieved context"           "Which features?"
+                    (architectural)      (descriptive, see caveat)     (post-hoc, SHAP)
 ```
 
 1. **Embed** — `TabularEmbedder` maps `X → query_emb`. Categorical features are
@@ -59,33 +92,45 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
    `docs/centroid-stability.md` for the full mechanism and validation.
 3. **Retrieve & aggregate (→ ②)** — `MemoryBank` runs K-NN restricted to the
    sample's group (cross-group fallback if the group is smaller than K).
-   `AttentionAggregator` turns similarities into `evidence_w` and aggregates
-   into `agg_emb`. The similarity itself is configurable via `evidence_metric`:
-   `euclidean` (TabR's original `-‖q-k‖²`, kept as the default for continuity
-   with TabR and existing checkpoints) or `cosine`/`cosine_scaled` (query and
-   neighbor keys L2-normalized before comparing — the same hyperspherical
-   treatment routing already gets via `routing_scale` above). The distinction
+   `MemoryBank` persists across epochs (a circular buffer, not reset per
+   epoch), so a training sample can, in later epochs, retrieve a copy of
+   *itself* stored from an earlier epoch; by default this candidate is
+   excluded (`exclude_self_retrieval`, on by default — see `--allow_self_retrieval`
+   in the CLI reference to disable it). `AttentionAggregator` turns
+   similarities into `evidence_w` and aggregates neighbor values into
+   `agg_emb`. Each value is `label_emb + T(query - neighbor)` — a learned
+   label embedding plus a learned offset term — combined via `value_mode`
+   (`default`, or `offset_only`/`balanced` for controlled ablation; see CLI
+   reference). The similarity itself is configurable via `evidence_metric`:
+   `cosine` (query and neighbor keys L2-normalized before comparing — the
+   default, and the same hyperspherical treatment routing already gets via
+   `routing_scale` above) or `euclidean` (TabR's original `-‖q-k‖²`, kept
+   available for comparison with TabR and older checkpoints). The distinction
    isn't cosmetic: under `euclidean`, nothing constrains embedding norm the
    way normalization constrains centroids, so norms are free to grow over
    training, and once they do, the unbounded `-‖q-k‖²` softmax saturates —
    `evidence_w` collapses onto a single nearest neighbor regardless of `k`,
-   silently turning "which examples support this" into a 1-NN lookup.
+   silently turning "which examples were retrieved" into a 1-NN lookup.
    `cosine` removes embedding norm from the comparison entirely; across every
    dataset and seed tested, it keeps evidence spread across several neighbors
    (effective neighbor count in the 7–12 range for `k=16`, vs. collapsing to
    ≈1 under `euclidean`) with no measured cost to prediction accuracy.
-   `cosine_scaled` additionally applies AdaCos's fixed-scale formula to the
-   evidence candidate pool (substituting `k` for the class/prototype count
-   the formula was originally derived for) — the same idea already used for
-   `routing_scale`, extended here on an empirical rather than theoretical
-   basis. Retrieved neighbors' labels are embedded via a learned lookup table
+   Retrieved neighbors' labels are embedded via a learned lookup table
    for classification (an index is a class, not a scalar) or a linear layer
    for regression (the label *is* a scalar) — matching how TabR itself
-   distinguishes the two. `agg_emb` feeds straight into the prediction head.
-4. **Predict** — `[query_emb ‖ context_emb ‖ agg_emb] → MLP head → ŷ`.
+   distinguishes the two.
+4. **Fuse & predict** — `agg_emb` and `context_emb` are combined with
+   `query_emb` via `fusion_mode`: `concat` (default —
+   `[query_emb ‖ context_emb ‖ agg_emb] → MLP head → ŷ`) or `residual`
+   (`z = LayerNorm(query_emb) + α·LayerNorm(context_emb) + β·LayerNorm(agg_emb)`,
+   with `α`/`β` learned scalars, `z → MLP head → ŷ`). Both are available and
+   validated; neither reliably makes the head's prediction depend on
+   `agg_emb` (see *Known limitations*) — `fusion_mode` is offered as a
+   diagnostic/comparison tool, not because one is known to be strictly
+   better.
 5. **Attribute (→ ③, post-hoc)** — SHAP (`KernelExplainer`) estimates each
    feature's marginal contribution to `ŷ` by evaluating the model on many
-   perturbed inputs, independent of steps 2–3. Being a black-box method, it
+   perturbed inputs, independent of steps 2–4. Being a black-box method, it
    needs neither a gradient nor a continuous path from a baseline to `X` —
    exactly the two things TabERA's STE hard-routing and one-hot categorical
    encoding would break for a gradient-based method (see *Why SHAP*).
@@ -99,12 +144,12 @@ Query → Embedding → Centroid Routing → Group-constrained KNN → Predictio
 | Level | Type | Answers |
 |---|---|---|
 | ① Prototype Group | Architectural | What kind of sample is this, and how confidently? |
-| ② Neighbor Evidence | Architectural | Which real training examples drove this prediction? |
+| ② Retrieved Neighbors | Descriptive (architectural readout, not a verified causal claim) | Which real training examples did the model retrieve as similar? |
 | ③ Feature Attribution | Post-hoc (SHAP) | Which features moved the prediction, and by how much? |
 
-**① Prototype Group** — assigned group + confidence, runner-up groups (each with their own confidence and target distribution), and what the group *represents*: majority class name + count/share (e.g. `"good" 27/47 (57%)`), plus a second class if it's ≥20%. This target-distribution info is ①'s core content — neither ② nor ③ carries it. Distinctive features are ranked by how unusual this group is *relative to other groups* (robust z-score, median/MAD), not vs. the whole dataset — numeric values inverse-transformed to real units, categorical shown as real category names with in-group share. No medoid is shown as a representative sample here: ② already shows real, prediction-relevant samples on stronger grounds, and a medoid would be fragile for small groups.
+**① Prototype Group** — assigned group + confidence, runner-up groups (each with their own confidence and target distribution), and what the group *represents*: majority class name + count/share (e.g. `"good" 27/47 (57%)`), plus a second class if it's ≥20%. This target-distribution info is ①'s core content — neither ② nor ③ carries it. Distinctive features are ranked by how unusual this group is *relative to other groups* (robust z-score, median/MAD), not vs. the whole dataset — numeric values inverse-transformed to real units, categorical shown as real category names with in-group share. No medoid is shown as a representative sample here: ② already shows real, retrieved samples on stronger grounds, and a medoid would be fragile for small groups.
 
-**② Neighbor Evidence** — the `k` actual retrieved neighbors and their `evidence_w`, the same values used in the forward pass. Neighbors with ~zero weight are dropped (noise, not signal). Each neighbor's shown features are picked by closeness to the query (smallest gap first — normalized distance for numeric, match/mismatch for categorical), not by the neighbor's own largest values — this is what explains *why* it's similar. Up to 4 features per neighbor, fewer if fewer are actually close (at least 1 always shown). Numeric/categorical shown separately; numeric in real units, categorical as name + original code (`checking_status=no checking [0]`).
+**② Retrieved Neighbors** — the `k` actual retrieved neighbors and their `evidence_w`, the same values used in the forward pass. Neighbors with ~zero weight are dropped (noise, not signal). Each neighbor's shown features are picked by closeness to the query (smallest gap first — normalized distance for numeric, match/mismatch for categorical), not by the neighbor's own largest values — this is what explains *why* it's similar. Up to 4 features per neighbor, fewer if fewer are actually close (at least 1 always shown). Numeric/categorical shown separately; numeric in real units, categorical as name + original code (`checking_status=no checking [0]`). **This weight reflects retrieval similarity, not a verified causal contribution to the prediction** — see *Known limitations*; `--explain` output includes this caveat directly under the ② header.
 
 **③ Feature Attribution** — SHAP values from `shap.KernelExplainer`, estimated by
 perturbing each feature against a small background sample from the training
@@ -114,15 +159,16 @@ needed for TabERA's one-hot categorical encoding or its STE hard routing.
 
 **Sample output:**
 ```
-① Prototype Group     → "Centroid_3" (94.3%) — "good" 27/47 (57%), also "fair" 12/47 (26%)
-                         Distinctive: alcohol=10.24, volatile_acidity=0.31, region=Piedmont (68%)
-② Neighbor Evidence   → #0 42.1%: alcohol=10.41, pH=3.28   #1 31.7%: alcohol=10.19
-③ Feature Attribution → volatile_acidity 15.1%
+① Prototype Group       → "Centroid_3" (94.3%) — "good" 27/47 (57%), also "fair" 12/47 (26%)
+                           Distinctive: alcohol=10.24, volatile_acidity=0.31, region=Piedmont (68%)
+② Retrieved Neighbors   → (attention weight — not verified to causally determine the prediction)
+                           #0 42.1%: alcohol=10.41, pH=3.28   #1 31.7%: alcohol=10.19
+③ Feature Attribution   → volatile_acidity 15.1%
 ```
 
 ### Why SHAP
 
-③ is deliberately swappable — it doesn't carry ①②'s architectural guarantee,
+③ is deliberately swappable — it doesn't carry ①'s architectural guarantee,
 so the choice of method is a practical one, not a claim the paper depends on.
 A few alternatives were ruled out:
 
@@ -175,10 +221,11 @@ if a cheaper, lower-precision run is preferred.
 
 ## Validation
 
-`--ablation dual_space_faithfulness` checks whether ①② actually mean what they claim:
+`--ablation dual_space_faithfulness` checks whether ①② actually reflect live model state:
 - **Index integrity** — `sample_groups` matches live model state: 100% consistent, reproducibly, across datasets and seeds. Each `MemoryBank`/`FeatureStore` slot also carries the training-set row index it was written from, so the two stores can be checked for exact slot correspondence directly (equality, not a statistical estimate).
 - **Value reproducibility** — with `--refresh_on_best`, a stored key's cosine similarity to a fresh re-encoding of its raw features converges to ≈1.0 (floating-point precision); without it, the stored key is a one-off training-time snapshot and the two are only expected to be loosely correlated.
 - **Group separation** — centroids correspond to statistically distinct regions of feature space (ANOVA F-test for numeric, chi-square for categorical, Bonferroni-corrected). Strongly and consistently significant across numeric, categorical, and mixed-type datasets and seeds.
+- **Self-retrieval** — with `MemoryBank` persisting across epochs, a training sample can retrieve a copy of itself from an earlier epoch as a "neighbor," which would otherwise return that sample's own true label directly through `neighbour_labels`. Measured rate varies widely by dataset (roughly 0.1%–27% of top-1 retrievals across datasets tested) and isn't explained by any single hyperparameter tried so far. Excluded by default (`exclude_self_retrieval`) — see `--allow_self_retrieval` in the CLI reference to reproduce the un-excluded behavior.
 
 *(Caveat: cross-group fallback can widen "neighbor within your group" more than expected — 75% of samples on the smallest dataset tested vs. 7–14% on larger ones. Affects which neighbors get retrieved, not speed.)*
 
@@ -209,61 +256,74 @@ automatically meaningful:
   majority baseline, cohesion vs. the run's other centroids), independent
   of group size?
 
----
-
-## CLI reference
-
-- **`--explain`** — prints ①②③ as text.
-- **`--ablation`** — `random_neighbor` (wrong-but-real neighbors, tests retrieval correctness), `neighbor_noise` (fake neighbors, tests whether neighbor info matters at all — read together with `random_neighbor`), `rank_correlation` (SHAP-vs-Delta rank consistency check, see *Validation*), `interaction_check` (direct test for feature interaction, to interpret `rank_correlation` disagreements correctly), `dual_space_faithfulness` (validation above), `centroid_geometry` (is routing distinguishable from random? see *Validation* and `docs/centroid-stability.md`), `centroid_representativeness` (does each centroid represent its own members, independent of size?), `dataset_profile` (quick diagnostic for a new dataset — prediction confidence, fallback rate).
-- **`--shap_background` / `--shap_nsamples`** — SHAP `KernelExplainer` background-sample count and perturbation count for `rank_correlation`. `--shap_nsamples` defaults to the library's own `auto` formula (`2*F + 2048`) rather than a fixed value — see *Why SHAP* for why a fixed cap turned out to bias attributions on wide datasets. `--shap_background` defaults to 50; raising it only helps once `nsamples` is adequate (raising background alone, with `nsamples` still too low for `F`, made agreement worse in testing, not better). `--shap_repeats` reruns SHAP multiple times with different backgrounds to report its own Monte-Carlo noise, separate from sampling noise across explained examples.
-- **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
-- **`--cat_combine {onehot,sum,concat}`** — categorical encoding (default `onehot`). `sum`/`concat` exist for comparison and backward compatibility with earlier checkpoints.
-- **`--num_embedding {ple,plr_lite,linear}`** — numeric encoding (default `ple`, PiecewiseLinearEmbeddings — see *Embed*). `plr_lite` (TabR/ModernNCA-style periodic embedding) is available for comparison; `linear` is a minimal fallback.
-- **`--evidence_metric {euclidean,cosine,cosine_scaled}`** — evidence-neighbor similarity space for `AttentionAggregator` (default `euclidean`, see *Retrieve & aggregate*). Fixed for a whole run/HPO study, same as `--cat_combine`/`--num_embedding`. `--evidence_metric_override` retrains an existing `best_params` config with only this value changed, for controlled comparison against a study that was never searched under the new metric.
-- **`--regroup_log_every <N>`** — how often (in epochs) to print the `[Regroup]` routing-health line during training (default 10). Lower it (e.g. 1–2) to inspect whether `active_ratio`/dead-code-reset activity is actually settling by the end of training, not just at coarse checkpoints.
-- **`--refresh_on_best`** — after selecting the best checkpoint, re-encode every stored training sample's raw features through the frozen embedder (no dropout, no gradient) and overwrite `MemoryBank`'s stored keys with the result, then resync group assignments. Off by default. With it on, a stored key is guaranteed to be an exact, reproducible function of the sample's raw features rather than a one-off snapshot from whatever dropout mask happened to apply during training — see `--ablation dual_space_faithfulness`.
-- **`--regroup_warmup_epochs_override <int>` / `--dead_reinit_patience_override <int>` / `--dead_reinit_noise_scale_override <float>` / `--batch_size_override <int>`** — same controlled-ablation pattern as `--dropout_override` below, for the centroid layer's group-publication delay, dead-centroid reset patience, reset noise magnitude, and training batch size respectively.
-- **`--loss_codebook_override <float>` / `--dropout_override <float>`** — controlled-ablation overrides: retrain with every other hyperparameter held at `best_params`, only this one value changed. Output filenames get a distinguishing tag (`..lcb<v>`, `..do<v>`, etc.) so runs don't overwrite each other. No effect combined with `--from_saved_state` (that path skips retraining entirely).
+For ②'s predictive relevance specifically, `--ablation context_emb_shuffle` /
+`agg_emb_shuffle` shuffle each branch at inference time on an already-trained
+model and measure the resulting accuracy change; `--fusion_alpha_override` /
+`--fusion_beta_override` (with `--fusion_mode residual`) pin a branch's
+contribution to a fixed value (e.g. `0` to fully remove it, or `1` to force
+full weight) instead of letting it train, for a direct necessity/sufficiency
+check without retraining a whole new architecture. Both are how the
+*Known limitations* entry on head fusion below was established.
 
 ---
 
 ## Known limitations
 
-- The prediction head's `[query_emb ‖ context_emb ‖ agg_emb] → MLP` fusion
-  doesn't reliably draw on `context_emb`/`agg_emb`, even when they
-  demonstrably carry real, `query_emb`-independent predictive information:
-  standalone linear classifiers trained on `context_emb` or `agg_emb` alone
-  reach accuracy comparable to, and sometimes exceeding, one trained on
-  `query_emb` alone, yet shuffling either branch at inference time changes
-  prediction accuracy by a statistically indistinguishable-from-zero amount.
-  This holds across `evidence_metric` choice, embedding dimension, and
-  per-block vs. shared layer normalization — all of which measurably change
-  *how much* gradient reaches these branches during training, but none of
-  which change whether the head ends up depending on them for `ŷ`.
-  Practically, this means ②'s `evidence_w`
-  and ①'s `context_emb` are a faithful readout of what retrieval and routing
-  did — they're real, load-bearing computations, not decorative — but that
-  doesn't guarantee the shared head's prediction actually weights them; the
-  two are architecturally identical only up through `agg_emb`/`context_emb`
-  themselves. An explicit fusion mechanism (e.g. a weighted or gated
-  combination instead of plain concatenation) is the leading candidate fix
-  and is under investigation.
+- **The prediction head does not reliably draw on `context_emb`/`agg_emb`,
+  even when they demonstrably carry real, `query_emb`-independent predictive
+  information.** Standalone linear classifiers trained on `context_emb` or
+  `agg_emb` alone reach accuracy comparable to, and sometimes exceeding, one
+  trained on `query_emb` alone. Yet:
+  - Shuffling either branch at inference time changes accuracy by an amount
+    that's small and inconsistent across datasets for `agg_emb`
+    specifically, and only weakly/inconsistently significant for `context_emb`.
+  - Freezing the trained encoder and retraining only the head from scratch
+    converges to accuracy statistically indistinguishable from the original
+    jointly-trained head — ruling out "the joint optimization just didn't
+    find it" as the explanation.
+  - Switching from `concat` to `residual` fusion (§ *Fuse & predict* above)
+    measurably changes how much the head's learned weights depend on each
+    branch (non-collapsing, actively-trained combination weights), but does
+    **not** produce a consistent accuracy improvement over a head that only
+    sees `query_emb` — across every dataset tested, forcing `agg_emb`'s
+    weight to exactly `0` performs statistically indistinguishably from
+    letting it train freely. Isolating `context_emb` alone (no `agg_emb`) is
+    the one variant that shows a weak, directionally consistent improvement
+    over `query_emb` alone on most (not all) datasets tested.
+  - Rebalancing the internal composition of `agg_emb` itself (the relative
+    scale of its two learned components) doesn't produce a consistent
+    accuracy effect either, and doesn't track with how imbalanced that
+    composition was to begin with.
+
+  Practically: **② (`evidence_w`, retrieved neighbors) and `context_emb`'s
+  routing outcome are a faithful readout of what retrieval and routing did**
+  — real, load-bearing computations, not decorative — **but this does not
+  mean the shared head's prediction actually depends on them.** This is why
+  `--explain` presents ② as retrieval context rather than a causal
+  explanation of `ŷ` (see *Explanations* above). `context_emb`/① is on
+  firmer footing than `agg_emb`/② specifically, per the ablation above.
+  Preserving retrieved-neighbor information as more than a single pooled
+  vector (rather than a further tweak to the current pooling/fusion) is the
+  leading open direction for closing this gap, but is a substantially larger
+  architecture change than anything validated so far and isn't started.
 - ①'s distinctive-feature contrast isn't equally sharp on every dataset.
 - Group sizes can be naturally imbalanced, reflecting the data itself — not a failure mode by itself.
 - `--from_saved_state` on GPU can show sub-decimal inference differences from a fresh run despite identical weights, likely from non-deterministic op scheduling (e.g. cuDNN).
 - `plr_lite` numeric encoding trades some calibration (logloss) for discrimination (accuracy/AUROC) relative to a plain linear projection — a pattern consistent with what the literature it's drawn from also reports. This is why `ple` (PiecewiseLinearEmbeddings) is the default instead; `plr_lite` remains available via `--num_embedding plr_lite` for comparison or on datasets where it's preferred.
-- ③'s SHAP estimates inherit `KernelExplainer`'s own limitations: a feature-independence assumption during background perturbation (can be misleading on strongly correlated features) and a cost that scales with feature count, both discussed in *Why SHAP*. These are properties of the method, not of TabERA's use of it, but they bound how much weight ③'s attributions should be given relative to ①②'s architectural guarantees.
-- On at least one dataset (credit-g, N_train=800), centroid routing shows persistent instability across training (`active_ratio` oscillating, dead-code reset never tapering off by the end of a run) that isn't explained by `dropout`, `routing_scale`, or accuracy cost — ruled out via controlled ablation — and doesn't reproduce on other datasets tested with the same mechanism (e.g. mfeat-zernike converges cleanly). Root cause open; see `docs/centroid-stability.md` §8.
+- ③'s SHAP estimates inherit `KernelExplainer`'s own limitations: a feature-independence assumption during background perturbation (can be misleading on strongly correlated features) and a cost that scales with feature count, both discussed in *Why SHAP*. These are properties of the method, not of TabERA's use of it, but they bound how much weight ③'s attributions should be given relative to ①'s architectural guarantee.
+- On at least one dataset (credit-g, N_train=800), centroid routing shows persistent instability across training (`active_ratio` oscillating, dead-code reset never tapering off by the end of a run) that isn't explained by `dropout`, `routing_scale`, or accuracy cost — ruled out via controlled ablation — and doesn't reproduce on other datasets tested with the same mechanism (e.g. mfeat-zernike converges cleanly). This same dataset is also an outlier in the fusion ablations above (the one case where isolating `context_emb` doesn't show the usual weak improvement). Root cause open; see `docs/centroid-stability.md` §8.
+- Self-retrieval (see *Validation*) is excluded by default, but the exclusion doesn't yet cover one rare code path (an unusually large single prototype group) — see the `--allow_self_retrieval` entry in the CLI reference.
 
 ---
 
 ## Contribution
 
-- **Architecturally-guaranteed explanations (①②)** — read directly off the forward pass, not estimated afterward.
-- **A clean separation of what's load-bearing from what's swappable**: ①② are architectural and central to the paper's claim; ③ is a standard post-hoc layer that could be any axiomatically-grounded attribution method — SHAP is used here for its categorical/numeric-agnostic behavior and Shapley's uniqueness guarantees, not because the paper's core claim depends on that specific choice.
+- **A load-bearing, reproducible readout of prototype routing (①)** — the assigned group, its confidence, and `context_emb` reflect the actual routing computation and carry measurable predictive information, read directly off the forward pass rather than estimated afterward.
+- **A reproducible readout of retrieval (②), reported with an explicit, measured faithfulness caveat** rather than an unqualified causal claim — retrieved neighbors and their attention weights are real, but their predictive necessity/sufficiency was tested directly (shuffle ablation, branch-isolation ablation, frozen-encoder retraining) rather than assumed from the fact that they're computed inside the forward pass.
+- **A clean separation of what's load-bearing from what's swappable**: ①② are architectural; ③ is a standard post-hoc layer that could be any axiomatically-grounded attribution method — SHAP is used here for its categorical/numeric-agnostic behavior and Shapley's uniqueness guarantees, not because the paper's core claim depends on that specific choice.
 - **A direct empirical check for feature interaction** (`--ablation interaction_check`), rather than assuming SHAP's theoretical interaction-handling automatically applies to a given dataset.
 - **Null-simulation-based diagnostics for the centroid layer itself** (`centroid_geometry`, `centroid_representativeness`) — checking routing structure and per-centroid representativeness against empirical baselines rather than assuming trained structure is automatically meaningful, plus a training-time mechanism (dual commitment/codebook loss, CosFace-style reprojection, dead-code reset) that measurably improves it without a manual floor on any hyperparameter (`docs/centroid-stability.md`).
-- **A documented limitation**: cross-group fallback rate depends on `K` vs. group size (`P = √N_train`) and can dominate small datasets.
+- **A documented, systematically-tested limitation** on head fusion (above), including what was ruled out (optimization failure, gradient starvation, value-composition imbalance, self-retrieval leakage) and what remains open (single-vector evidence pooling as the likely bottleneck).
 
 ---
 
@@ -272,9 +332,9 @@ automatically meaningful:
 | File | Component | Role |
 |---|---|---|
 | `libs/prototypes.py` | CentroidLayer | STE routing (scaled cosine similarity), KMeans++ init, dual commitment/codebook loss, dead-code reset, periodic sample-group regrouping — ① |
-| `libs/tabera.py` | TabERA, MemoryBank, TabularEmbedder | Model, feature encoding, group-constrained KNN store — ② |
-| `libs/evidence.py` | AttentionAggregator | `evidence_w`, direct retrieval path, task-aware label encoding — ② |
-| `libs/supervised.py` | TabERAWrapper | Training loop, sample-group regrouping, early stopping |
+| `libs/tabera.py` | TabERA, MemoryBank, TabularEmbedder | Model, feature encoding, group-constrained KNN store, self-retrieval exclusion, head fusion (`concat`/`residual`) — ② |
+| `libs/evidence.py` | AttentionAggregator | `evidence_w`, value composition (`value_mode`), direct retrieval path, task-aware label encoding — ② |
+| `libs/supervised.py` | TabERAWrapper | Training loop, sample-group regrouping, early stopping, diagnostic logging |
 | `libs/search_space.py` | HPO space | Optuna search space + auto `n_prototypes` |
 | `libs/data.py` | TabularDataset | OpenML loader |
 | `libs/eval.py` | Metrics | Accuracy, F1, AUROC, Logloss |
@@ -308,6 +368,25 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 # TabZilla benchmark (36 datasets)
 .\run_tabzilla.ps1
 ```
+
+---
+
+## CLI reference
+
+- **`--explain`** — prints ①②③ as text.
+- **`--ablation`** — `random_neighbor` (wrong-but-real neighbors, tests retrieval correctness), `neighbor_noise` (fake neighbors, tests whether neighbor info matters at all — read together with `random_neighbor`), `context_emb_shuffle` / `agg_emb_shuffle` (shuffles that branch at inference on an already-trained model, direct necessity check for ②'s predictive relevance — see *Known limitations*), `rank_correlation` (SHAP-vs-Delta rank consistency check, see *Validation*), `interaction_check` (direct test for feature interaction, to interpret `rank_correlation` disagreements correctly), `dual_space_faithfulness` (validation above), `centroid_geometry` (is routing distinguishable from random? see *Validation* and `docs/centroid-stability.md`), `centroid_representativeness` (does each centroid represent its own members, independent of size?), `dataset_profile` (quick diagnostic for a new dataset — prediction confidence, fallback rate).
+- **`--shap_background` / `--shap_nsamples`** — SHAP `KernelExplainer` background-sample count and perturbation count for `rank_correlation`. `--shap_nsamples` defaults to the library's own `auto` formula (`2*F + 2048`) rather than a fixed value — see *Why SHAP* for why a fixed cap turned out to bias attributions on wide datasets. `--shap_background` defaults to 50; raising it only helps once `nsamples` is adequate (raising background alone, with `nsamples` still too low for `F`, made agreement worse in testing, not better). `--shap_repeats` reruns SHAP multiple times with different backgrounds to report its own Monte-Carlo noise, separate from sampling noise across explained examples.
+- **`--from_saved_state <path>`** — reload a saved model state and rerun `--explain`/`--ablation` without retraining.
+- **`--cat_combine {onehot,sum,concat}`** — categorical encoding (default `onehot`). `sum`/`concat` exist for comparison and backward compatibility with earlier checkpoints.
+- **`--num_embedding {ple,plr_lite,linear}`** — numeric encoding (default `ple`, PiecewiseLinearEmbeddings — see *Embed*). `plr_lite` (TabR/ModernNCA-style periodic embedding) is available for comparison; `linear` is a minimal fallback.
+- **`--evidence_metric {euclidean,cosine,cosine_scaled}`** — evidence-neighbor similarity space for `AttentionAggregator` (default `cosine`, see *Retrieve & aggregate*). Fixed for a whole run/HPO study, same as `--cat_combine`/`--num_embedding`. `euclidean` is kept available for comparison with TabR's original formulation and older checkpoints, but is known to collapse `evidence_w` toward a single nearest neighbor as embedding norms grow during training (see *Retrieve & aggregate*). `--evidence_metric_override` retrains an existing `best_params` config with only this value changed, for controlled comparison against a study that was never searched under a different metric.
+- **`--fusion_mode {concat,residual}`** — how `query_emb`/`context_emb`/`agg_emb` combine before the prediction head (default `concat`, see *Fuse & predict*). `residual` uses learned scalar weights (`α`, `β`) instead of concatenation; provided for diagnosing head fusion (see *Known limitations*), not because it's established as strictly better. `--fusion_alpha_override <float>` / `--fusion_beta_override <float>` (only with `--fusion_mode residual`) pin `α`/`β` to a fixed value instead of training them — e.g. `0` to fully remove a branch's contribution for a necessity check.
+- **`--allow_self_retrieval`** — by default, `MemoryBank` excludes a training sample's own earlier-epoch entry from its own retrieval candidates (see *Validation*). This flag restores the un-excluded behavior, mainly for reproducing results computed before this exclusion existed. Does not yet cover the rare large-prototype-group code path (see *Known limitations*).
+- **`--value_mode {default,label_only,offset_only,balanced}`** — how `AttentionAggregator` composes each neighbor's value (default `default`: `label_emb + T(query - neighbor)`, unnormalized). `label_only` drops the offset term entirely (equivalent to `use_offset_correction=False`); `offset_only` drops the label term; `balanced` L2-normalizes each term before summing. Available for controlled ablation of ②'s internal composition; no option here is established as a general improvement (see *Known limitations*).
+- **`--regroup_log_every <N>`** — how often (in epochs) to print the `[Regroup]` routing-health line during training (default 10). Lower it (e.g. 1–2) to inspect whether `active_ratio`/dead-code-reset activity is actually settling by the end of training, not just at coarse checkpoints.
+- **`--refresh_on_best`** — after selecting the best checkpoint, re-encode every stored training sample's raw features through the frozen embedder (no dropout, no gradient) and overwrite `MemoryBank`'s stored keys with the result, then resync group assignments. Off by default. With it on, a stored key is guaranteed to be an exact, reproducible function of the sample's raw features rather than a one-off snapshot from whatever dropout mask happened to apply during training — see `--ablation dual_space_faithfulness`.
+- **`--regroup_warmup_epochs_override <int>` / `--dead_reinit_patience_override <int>` / `--dead_reinit_noise_scale_override <float>` / `--batch_size_override <int>`** — same controlled-ablation pattern as `--dropout_override` below, for the centroid layer's group-publication delay, dead-centroid reset patience, reset noise magnitude, and training batch size respectively.
+- **`--loss_codebook_override <float>` / `--dropout_override <float>`** — controlled-ablation overrides: retrain with every other hyperparameter held at `best_params`, only this one value changed. Output filenames get a distinguishing tag (`..lcb<v>`, `..do<v>`, etc.) so runs don't overwrite each other. No effect combined with `--from_saved_state` (that path skips retraining entirely).
 
 ---
 
@@ -345,10 +424,16 @@ python reproduce.py --gpu_id 0 --openml_id 11 --seed 1 --from_saved_state <path>
 >
 > `evidence_metric` is **not** searched — a structural choice fixed for a
 > whole run via `--evidence_metric` (like `cat_combine`/`num_embedding`
-> below), defaulting to `euclidean` for continuity with TabR and existing
-> checkpoints. `cosine`/`cosine_scaled` are available and, based on the
-> evidence-collapse behavior described in *Retrieve & aggregate* above, are
-> the recommended choice for new runs.
+> below), defaulting to `cosine`. Under the earlier `euclidean` default,
+> unconstrained embedding-norm growth during training saturates the
+> similarity softmax and collapses `evidence_w` onto a single nearest
+> neighbor (see *Retrieve & aggregate*); `cosine` avoids this at no measured
+> cost to prediction accuracy across every dataset and seed tested.
+>
+> `fusion_mode` is **not** searched — a structural choice fixed via
+> `--fusion_mode` (default `concat`). Neither `concat` nor `residual` is
+> established as generally better for prediction accuracy; `residual` is
+> offered as a diagnostic alternative (see *Known limitations*).
 >
 > `batch_size` is **not** searched — fixed at 256, following the common
 > practice (e.g. TabR's benchmark protocol) of pre-setting batch size per
@@ -377,7 +462,7 @@ TabERA/
 │   ├── supervised.py        # Training wrapper
 │   ├── eval.py
 │   ├── search_space.py      # HPO space
-│   └── data.py              # OpenML loader
+│   └── data.py               # OpenML loader
 ├── docs/                    # Design/technical notes (see centroid-stability.md)
 ├── optim_logs/ / figures/
 ├── optimize.py / reproduce.py / visualize_embeddings.py
