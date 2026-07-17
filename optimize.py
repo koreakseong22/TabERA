@@ -15,20 +15,20 @@ parser.add_argument("--n_trials",  type=int, default=100,    help="Number of opt
 parser.add_argument("--metric",    type=str, default="l2",
                     choices=["l2", "l1", "cosine", "mahalanobis", "wasserstein", "kl"],
                     help="Distance metric for TabR Retriever")
-parser.add_argument("--evidence_metric", type=str, default="euclidean",
+parser.add_argument("--evidence_metric", type=str, default="cosine",
                     choices=["euclidean", "cosine", "cosine_scaled"],
                     help=(
                         "AttentionAggregator(evidence_w, 설명②)의 유사도 공간. "
                         "Optuna 탐색 대상이 아니라 이 HPO 실행 전체에 고정 적용되는 "
                         "구조 선택(no_offset_correction/context_projection과 같은 성격). "
-                        "euclidean(기본값)은 -‖q-k‖²(raw, 정규화 안 됨) — 4개 데이터셋 "
+                        "[기본값 변경] euclidean → cosine(reproduce.py와 통일). euclidean은 "
+                        "-‖q-k‖²(raw, 정규화 안 됨) — 4개 데이터셋 "
                         "x 5-seed 실측 결과 evidence_w가 n_eff≈1.0(사실상 1-NN)으로 "
                         "100% 재현되게 붕괴함이 확인됨. cosine은 q,k를 CentroidLayer "
                         "라우팅과 동일하게 정규화 후 2·cos — 같은 실측에서 n_eff를 "
                         "7.6~8.5로 안정적으로 유지, 성능은 유지~일부 개선(credit-g "
-                        "balanced accuracy 등). 지금까지의 euclidean best_params를 "
-                        "그대로 재사용한 비교였어서, cosine 구조에 맞는 HPO를 새로 "
-                        "돌리기 위한 플래그 — reproduce.py도 같은 이름의 플래그로 "
+                        "balanced accuracy 등). euclidean으로 HPO하려면 명시적으로 "
+                        "'--evidence_metric euclidean'을 줄 것 — reproduce.py도 같은 이름의 플래그로 "
                         "이 study를 다시 불러옴. [주의] 기존 --metric 플래그(choices에 "
                         "cosine 포함)와 이름이 비슷해 보이지만 완전히 다른 것 — --metric은 "
                         "params_to_model_kwargs()가 그 값을 안 읽어서 TabERA까지 전달된 "
