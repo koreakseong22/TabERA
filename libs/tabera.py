@@ -532,6 +532,13 @@ class MemoryBank(nn.Module):
         k: int,
         hard_assignment: "Optional[torch.Tensor]" = None,
         sample_groups:   "Optional[List[List[int]]]" = None,  # 미사용 (캐시 우선)
+        exclude_ids: "Optional[torch.Tensor]" = None,  # (B,) — 이 sample_id와 일치하는
+            # MemoryBank 슬롯은 후보에서 제외(self-retrieval 방지). None이면 기존과
+            # 동일(제외 없음, 하위호환). [주의] "이례적 경로"(그룹 하나가
+            # self._outlier_threshold를 넘는 드문 경우, 아래 else 분기)는 이 인자를
+            # 아직 반영하지 않음 — 실제로 트리거하는 조건을 이 세션에서 재현/검증할
+            # 여유가 없어서 미구현으로 남김. 그 분기를 탈 만큼 큰 centroid가 있는
+            # 데이터셋에서는 self-retrieval이 여전히 가능할 수 있음.
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         완전 벡터화 k-NN 검색.
@@ -563,6 +570,11 @@ class MemoryBank(nn.Module):
         if hard_assignment is None or cached is None or n < k:
             keys_all = self._keys_norm[:n]  # 정규화 캐시 재사용
             sim      = q_norm @ keys_all.T
+            if exclude_ids is not None:
+                # (B, n) — 이 슬롯의 sample_id가 쿼리 자신의 sample_id와 같으면
+                # 유사도를 -inf로 눌러 topk 후보에서 배제
+                _self_mask = self.sample_ids[:n].unsqueeze(0) == exclude_ids.unsqueeze(1).to(dev)
+                sim = sim.masked_fill(_self_mask, -1e9)
             _, idx   = sim.topk(min(k, n), dim=-1)
             idx      = idx.clamp(0, n - 1)
             neighbour_labels = labels_full[idx]              # (B, k)
@@ -664,6 +676,21 @@ class MemoryBank(nn.Module):
 
                 sim_u = torch.bmm(Q_pad, keys_u.transpose(1, 2))
                 sim_u = sim_u.masked_fill(~valid_u.unsqueeze(1), -1e9)
+
+                if exclude_ids is not None:
+                    # exclude_ids를 Q_pad와 같은 (U_pad, max_q) 레이아웃으로 재배치.
+                    # 패딩 위치(실제 쿼리가 없는 (group_id,rank) 밖 자리)는 sentinel
+                    # -1(실제 sample_id로 절대 안 나오는 값 — sample_ids 버퍼 초기값과
+                    # 동일한 convention)로 남겨 어떤 후보와도 매칭 안 되게 함. 이
+                    # 자리는 결과 사용 시 i_final_u[group_id, rank]로 걸러지므로
+                    # 어차피 안 쓰이지만, 방어적으로 sentinel 처리.
+                    ids_nm       = exclude_ids[nm_idx].to(dev)         # (Bn,)
+                    ids_c_sorted = ids_nm[csort_idx]                   # (Bn,)
+                    Ids_pad = torch.full((U_pad, max_q), -1, dtype=ids_c_sorted.dtype, device=dev)
+                    Ids_pad[group_id, rank] = ids_c_sorted
+                    cand_ids_u = self.sample_ids[safe_u.reshape(-1)].view(U_pad, local_max_g)  # (U_pad, local_max_g)
+                    _self_mask_u = cand_ids_u.unsqueeze(1) == Ids_pad.unsqueeze(-1)  # (U_pad, max_q, local_max_g)
+                    sim_u = sim_u.masked_fill(_self_mask_u, -1e9)
 
                 k_eff = min(k, local_max_g)
                 _, top_u  = sim_u.topk(k_eff, dim=-1)
@@ -1055,6 +1082,19 @@ class TabERA(nn.Module):
         column_names: Optional[List[str]] = None,
         use_offset_correction: bool = True,
         global_retrieve: bool = False,
+        exclude_self_retrieval: bool = False,  # [추가] True면 MemoryBank 검색 시
+            # 쿼리 자신과 sample_id가 같은 슬롯(이전 epoch에 저장해둔 자기 자신)을
+            # 후보에서 제외. 기본 False(하위호환, 기존 체크포인트/재현 결과와 동일
+            # 동작). 동기: self-retrieval이 실측 결과 데이터셋마다 크게 다름
+            # (jasmine≈0.1~0.3%, mfeat-zernike≈20~27%) — MemoryBank가 label을 그대로
+            # 저장/반환하므로(TabR 방식 value 구성) self-retrieval 시 그 슬롯의
+            # neighbour_label은 자기 자신의 진짜 정답. 다만 agg_emb의 predictive
+            # null 결과와는 뚜렷한 상관을 못 찾음(self-retrieval 최고인 데이터셋이
+            # agg-only 성능도 최고이거나 최저이지 않았음) — 그래서 이 옵션은 "결론을
+            # 바꾸기 위해서"가 아니라 순수하게 구현 정확성(retrieval에서 자기 자신을
+            # 배제하는 게 일반적인 관례) 차원에서 추가. [주의] "이례적 경로"
+            # (centroid 그룹 하나가 매우 큰 드문 경우, MemoryBank.retrieve() 참고)는
+            # 이 옵션을 아직 반영 안 함 — 검증 없이 손대지 않기로 함.
         # [수정] AttentionAggregator의 이웃 라벨 인코딩(label_encoder)이
         # TabR 원본처럼 classification(nn.Embedding)/regression(nn.Linear)을
         # 구분하려면 tasktype이 필요함 — 기존엔 n_output만 받아서 binclass
@@ -1070,7 +1110,41 @@ class TabERA(nn.Module):
         use_ema_codebook: bool = False,
         ema_decay: float = 0.99,
         blockwise_layernorm: bool = False,
+        fusion_mode: str = "concat",   # [추가] head가 [query,context,agg]를 합치는 방식.
+            # "concat"(기본값, 기존과 100% 동일 — 하위 호환): [query‖context‖agg]를
+            #   이어붙여 공유 MLP에 통과. freeze_encoder_retrain_head 5-seed 실험
+            #   (mfeat-zernike, embed_dim=256, evM_cosine, sharedLN/blockLN 둘 다)에서
+            #   인코더 고정 + head 백지 재학습을 해도 원래 공동학습 head와 통계적으로
+            #   구분 안 되는 정확도로 수렴함(양쪽 다 paired p>0.4, d<0.2) — "정보는
+            #   linear probe로 확인될 만큼 있는데 concat+공유 MLP 구조 자체가 그
+            #   정보를 못 끌어쓴다"는 가설(시나리오 A)을 뒷받침. "residual"은 그
+            #   가설에 대한 직접 대응책: concat 대신 z = LN(q) + α·LN(c) + β·LN(a)
+            #   (α,β는 학습 가능한 스칼라)로 합쳐서 embed_dim 크기의 z 하나만
+            #   MLP에 넣음 — 공유 MLP의 첫 Linear가 특정 브랜치의 concat 구간
+            #   column을 슬라이스로 무시하는 경로 자체가 없어지고, α/β 값 자체가
+            #   "이 브랜치를 얼마나 쓰는가"의 직접 해석 가능한 지표가 됨. branch별
+            #   LayerNorm은 residual 모드에서 항상 켜짐(blockwise_layernorm 플래그와
+            #   무관) — LN 없이 그냥 더하면 embed_dim 메커니즘(사실 #5: context는
+            #   CosFace 재투영으로 norm≈1 고정, query/agg는 학습 중 무제한으로
+            #   커짐 — jasmine embed_dim=256에서 query_act≈130,000까지 실측됨)이
+            #   재현되어 사실상 query/agg만 더한 것과 같아짐. α,β는 1.0으로
+            #   초기화(각 branch가 LN으로 이미 비슷한 스케일이라 "처음엔 동등하게
+            #   더한다"는 것 외에 다른 근거 없는 값 — 학습이 알아서 줄이거나
+            #   키우게 둠). "gated"(attention 방식) 등 더 복잡한 fusion은 이걸로도
+            #   시나리오 A가 안 풀리면 다음 단계로 검토.
         use_context_projection: bool = False,
+        fusion_alpha_override: Optional[float] = None,  # [추가] residual fusion에서
+            # α를 학습 가능한 파라미터 대신 고정 스칼라로 못박음(nn.Buffer,
+            # requires_grad=False). 목적: "학습이 α≈1을 선택했다"와 "α=1로
+            # 고정해도 실제로 비슷한 성능이 나온다"는 다른 주장이다 — 전자는
+            # optimizer의 선택일 뿐이고, 후자라야 그 값에서 실제로 무슨 일이
+            # 벌어지는지(‖αc‖가 ‖q‖에 비해 크게/작게 기여하는지) 원인적으로
+            # 확인 가능. {0, 0.5, 1, 2} 등으로 스윕해서 accuracy/shuffle drop이
+            # 어떻게 변하는지 보는 게 목적. fusion_mode="residual"이 아니거나
+            # use_context_emb=False면 무의미하므로 검증에서 걸러냄. None(기본값)
+            # 이면 기존과 동일하게 학습 가능한 파라미터로 생성(하위 호환).
+        fusion_beta_override: Optional[float] = None,   # [추가] 위와 대칭, agg 쪽.
+
         use_confidence_scaling: bool = False,      # [진단용, 추가] context_emb를
             # head에 넣기 전 top1_confidence로 스케일 — 라우팅/검색은 안 건드림
         confidence_scaling_detach: bool = False,   # [진단용, 추가] True면 스케일
@@ -1094,6 +1168,11 @@ class TabERA(nn.Module):
             # 먼저 정규화해 evidence_temperature로도 못 잡은 collapse(query_emb
             # norm 성장에 유사도 계산이 그대로 종속되는 문제)를 원천 제거하려는
             # 개입. evidence.py의 AttentionAggregator.__init__ docstring 참고.
+        value_mode: str = "default",   # [추가] AttentionAggregator의 value 구성
+            # 방식. "default"(기존과 100% 동일, 하위호환)/"offset_only"/"balanced".
+            # evidence.py의 AttentionAggregator.__init__ docstring 참고 — 동기는
+            # diagnose_value_components 실측(T(query-neighbour) 항이 label_emb
+            # 항보다 평균 4.9배 크다는 게 mfeat-zernike에서 확인됨)에서 나옴.
         vectorized_fallback: bool = True,
         cat_col_idx: Optional[List[int]] = None,
         num_col_idx: Optional[List[int]] = None,
@@ -1160,6 +1239,7 @@ class TabERA(nn.Module):
         # "그룹-제약 KNN이 정확도에 요구하는 대가"를 격리해서 재기 위한
         # 일회성 진단용이며, 본 실험에는 기본값(False)을 씀.
         self.global_retrieve = global_retrieve
+        self.exclude_self_retrieval = exclude_self_retrieval
         # [진단용] context_emb(설명①의 신호)를 head 입력에서 아예 제외.
         # STE 라우팅/centroid 학습(diversity_loss, commitment_loss)은 그대로
         # 유지됨 — 이 둘은 centroid_emb를 직접 학습시키지 context_emb가
@@ -1199,6 +1279,23 @@ class TabERA(nn.Module):
         self.use_context_projection = use_context_projection
         self.use_confidence_scaling = use_confidence_scaling
         self.confidence_scaling_detach = confidence_scaling_detach
+        if fusion_mode not in ("concat", "residual"):
+            raise ValueError(f"fusion_mode은 'concat'/'residual' 중 하나여야 합니다: {fusion_mode}")
+        if fusion_mode == "residual" and not use_query_emb_in_head:
+            raise ValueError(
+                "fusion_mode='residual'은 query_emb를 베이스(잔차의 기준점)로 쓰므로 "
+                "use_query_emb_in_head=False와 같이 쓸 수 없습니다."
+            )
+        if fusion_alpha_override is not None and (fusion_mode != "residual" or not use_context_emb):
+            raise ValueError(
+                "fusion_alpha_override는 fusion_mode='residual'이고 use_context_emb=True일 "
+                "때만 의미가 있습니다."
+            )
+        if fusion_beta_override is not None and fusion_mode != "residual":
+            raise ValueError("fusion_beta_override는 fusion_mode='residual'일 때만 의미가 있습니다.")
+        self.fusion_mode = fusion_mode
+        self.fusion_alpha_is_fixed = fusion_alpha_override is not None
+        self.fusion_beta_is_fixed  = fusion_beta_override is not None
         self.context_proj = (
             nn.Linear(embed_dim, embed_dim)
             if (use_context_projection and use_context_emb) else None
@@ -1251,6 +1348,7 @@ class TabERA(nn.Module):
             n_classes=self._n_classes_for_labels,
             evidence_temperature=evidence_temperature,
             evidence_metric=evidence_metric,
+            value_mode=value_mode,
         )
 
         # ── 메모리 뱅크 (검색 전용) ──────────────────
@@ -1294,17 +1392,50 @@ class TabERA(nn.Module):
         # 경로 자체를 없앤다. 기존 체크포인트의 head[0]이 단일 LayerNorm
         # (_head_in,) 모양이라 --from_saved_state 하위 호환을 위해 반드시
         # 옵트인으로 둠(기본 False = state_dict 모양 그대로 유지).
+        #
+        # [추가] fusion_mode="residual"이면 애초에 concat을 안 하므로
+        # blockwise_layernorm 플래그와 무관하게 branch별 LayerNorm이 항상
+        # 필요함(합산 전 스케일을 맞춰야 함 — 위 fusion_mode docstring 참고).
         self.blockwise_layernorm = blockwise_layernorm
-        if blockwise_layernorm:
+        self._per_branch_ln = blockwise_layernorm or (fusion_mode == "residual")
+        if self._per_branch_ln:
             self.head_query_ln   = nn.LayerNorm(embed_dim) if use_query_emb_in_head else None
             self.head_context_ln = nn.LayerNorm(embed_dim) if use_context_emb else None
             self.head_agg_ln     = nn.LayerNorm(embed_dim)  # agg_emb는 항상 포함됨
+        else:
+            self.head_query_ln = self.head_context_ln = self.head_agg_ln = None
+
+        if fusion_mode == "residual":
+            # z = LN(q) + α·LN(c) + β·LN(a) → embed_dim 크기 하나만 MLP에 통과.
+            # α는 use_context_emb=False면 애초에 안 만듦(T()/context_proj와
+            # 같은 패턴 — "안 쓰는 파라미터가 남아있는" 상태가 아니라 진짜로
+            # 없앤 상태로 비교하기 위함).
+            # [추가] override가 주어지면 nn.Parameter 대신 register_buffer로
+            # 고정값을 등록 — optimizer.parameters()에 안 잡히므로 학습 중
+            # 절대 안 바뀜(디버깅으로 실수로 update되는 일 방지). state_dict에는
+            # 여전히 저장/복원됨(buffer도 state_dict에 포함되므로 --from_saved_state
+            # 호환 유지).
+            if use_context_emb:
+                if self.fusion_alpha_is_fixed:
+                    self.register_buffer("fusion_alpha", torch.tensor(float(fusion_alpha_override)))
+                else:
+                    self.fusion_alpha = nn.Parameter(torch.tensor(1.0))
+            else:
+                self.fusion_alpha = None
+            if self.fusion_beta_is_fixed:
+                self.register_buffer("fusion_beta", torch.tensor(float(fusion_beta_override)))
+            else:
+                self.fusion_beta = nn.Parameter(torch.tensor(1.0))
+            self.head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(embed_dim, n_output),
+            )
+        elif blockwise_layernorm:
             self.head = nn.Sequential(
                 nn.Linear(_head_in, embed_dim), nn.GELU(), nn.Dropout(dropout),
                 nn.Linear(embed_dim, n_output),
             )
         else:
-            self.head_query_ln = self.head_context_ln = self.head_agg_ln = None
             self.head = nn.Sequential(
                 nn.LayerNorm(_head_in),
                 nn.Linear(_head_in, embed_dim), nn.GELU(), nn.Dropout(dropout),
@@ -1317,16 +1448,22 @@ class TabERA(nn.Module):
         # [query(있으면) → context(있으면) → agg(항상)] 이므로 여기서도
         # 그 순서를 그대로 따른다 — forward()의 조립 순서가 바뀌면 이
         # 매핑도 같이 바뀌어야 함.
-        self._head_first_linear = self.head[0] if blockwise_layernorm else self.head[1]
+        # [주의] fusion_mode="residual"이면 concat 자체가 없어 "column 구간"
+        # 개념이 없음 — 그 대신 self.fusion_alpha/self.fusion_beta 값 자체가
+        # 이미 "브랜치별 기여"의 직접적이고 더 해석 가능한 지표이므로
+        # _head_block_slices는 빈 채로 둔다(log_branch_gradients의 weight-norm
+        # 진단은 concat 계열 모드 전용).
+        self._head_first_linear = self.head[0] if (blockwise_layernorm or fusion_mode == "residual") else self.head[1]
         self._head_block_slices: Dict[str, Tuple[int, int]] = {}
-        _off = 0
-        if use_query_emb_in_head:
-            self._head_block_slices["query"] = (_off, _off + embed_dim)
-            _off += embed_dim
-        if use_context_emb:
-            self._head_block_slices["context"] = (_off, _off + embed_dim)
-            _off += embed_dim
-        self._head_block_slices["agg"] = (_off, _off + embed_dim)
+        if fusion_mode == "concat":
+            _off = 0
+            if use_query_emb_in_head:
+                self._head_block_slices["query"] = (_off, _off + embed_dim)
+                _off += embed_dim
+            if use_context_emb:
+                self._head_block_slices["context"] = (_off, _off + embed_dim)
+                _off += embed_dim
+            self._head_block_slices["agg"] = (_off, _off + embed_dim)
 
     # ── Forward ────────────────────────────────────────
 
@@ -1358,7 +1495,28 @@ class TabERA(nn.Module):
                 # context_emb(위 2번)는 hard_assignment와 무관하게 이미
                 # 정상 계산됨 — 설명①은 그대로, 검색만 전역으로 바뀜.
                 hard_assignment=(None if self.global_retrieve else hard_assignment),
+                exclude_ids=(sample_ids if self.exclude_self_retrieval else None),
             )
+
+            # [진단용, 추가] self-retrieval 검증 — MemoryBank는 epoch를 넘어
+            # 유지되는 circular buffer라, retrieve()가 이번 배치 자기 자신을
+            # (이전 epoch에 저장해둔 자기 자신을) 이웃으로 돌려줄 가능성이
+            # 있음. MemoryBank가 label도 그대로 저장/반환하므로(update()의
+            # `labels` 인자, retrieve()의 `neighbour_labels` 반환값 — TabR
+            # 방식 value 구성에 직접 쓰임) self-retrieval이 실제로 일어나면
+            # 그 슬롯의 neighbour_label은 이 샘플의 진짜 정답 그 자체임.
+            # retrieve()가 update()보다 먼저 호출되므로(바로 아래 4번 항목,
+            # memory.update는 이 forward 마지막에 호출됨) **같은 iteration
+            # 안에서는 self-retrieval이 원천적으로 불가능** — 여기서 재는 건
+            # "이전 epoch에 저장된 자기 자신"과의 매칭만 해당.
+            _self_retrieval_top1_rate = None
+            _self_retrieval_topk_rate = None
+            if sample_ids is not None:
+                _stored_ids = self.memory.sample_ids[topk_idx]        # (B, k)
+                _is_self    = _stored_ids == sample_ids.unsqueeze(-1).to(_stored_ids.device)  # (B, k)
+                _self_retrieval_top1_rate = float(_is_self[:, 0].float().mean().item())
+                _self_retrieval_topk_rate = float(_is_self.any(dim=-1).float().mean().item())
+
 
             # ── Ablation: random_neighbor / neighbor_noise ───────
             # [수정 이력] 기존 random_neighbor는 nk/nv는 순수 노이즈로,
@@ -1410,6 +1568,8 @@ class TabERA(nn.Module):
             # 아니므로 여기서 온 entropy=ln(k)를 "붕괴 안 됨"으로 잘못
             # 해석하지 않도록).
             evidence_diag = None
+            _self_retrieval_top1_rate = None
+            _self_retrieval_topk_rate = None
 
         # 4. 예측
         # use_context_emb=False면 context_emb를, use_query_emb_in_head=False면
@@ -1438,7 +1598,7 @@ class TabERA(nn.Module):
             elif ablation_mode == "query_emb_shuffle":
                 _perm = torch.randperm(query_emb.shape[0], device=query_emb.device)
                 _query_for_head = query_emb[_perm]
-            if self.blockwise_layernorm:
+            if self._per_branch_ln:
                 _query_for_head = self.head_query_ln(_query_for_head)
             _parts.append(_query_for_head)
         if self.use_context_emb:
@@ -1472,7 +1632,7 @@ class TabERA(nn.Module):
             elif ablation_mode == "context_emb_shuffle":
                 _perm = torch.randperm(_ctx_for_head.shape[0], device=_ctx_for_head.device)
                 _ctx_for_head = _ctx_for_head[_perm]
-            if self.blockwise_layernorm:
+            if self._per_branch_ln:
                 _ctx_for_head = self.head_context_ln(_ctx_for_head)
             _parts.append(_ctx_for_head)
         # [추가] query_emb_zero/shuffle, context_emb_zero/shuffle과 대칭 —
@@ -1490,7 +1650,7 @@ class TabERA(nn.Module):
         elif ablation_mode == "agg_emb_shuffle":
             _perm = torch.randperm(agg_emb.shape[0], device=agg_emb.device)
             _agg_for_head = agg_emb[_perm]
-        if self.blockwise_layernorm:
+        if self._per_branch_ln:
             _agg_for_head = self.head_agg_ln(_agg_for_head)
         _parts.append(_agg_for_head)
 
@@ -1528,8 +1688,60 @@ class TabERA(nn.Module):
                 _agg_for_head.retain_grad()
                 self._branch_grad_tensors["agg"] = _agg_for_head
 
-        combined = torch.cat(_parts, dim=-1)
-        logits   = self.head(combined)
+        # [진단용, 추가] LN 적용 후, combine(그리고 있다면 α/β 곱셈) 이전의
+        # branch별 평균 L2 norm(배치 평균). "α≈1"이라는 숫자 하나만으로는
+        # residual 합산에서 그 branch가 실제로 얼마나 기여하는지 알 수 없음
+        # (예: ‖LN(q)‖=100, ‖LN(c)‖=5면 α=1이어도 q+αc≈q) — 이 norm과
+        # out["fusion_alpha"]/out["fusion_beta"](스칼라)를 곱하면 ‖αc‖/‖βa‖를
+        # 사후에 그대로 계산할 수 있음(스칼라 곱은 norm과 교환되므로 여기서
+        # 미리 곱해두지 않고 원재료만 남김 — α/β가 음수일 수도 있어 부호
+        # 정보를 norm 계산 전에 지우지 않기 위함).
+        _head_query_norm_mean = (
+            float(_query_for_head.detach().norm(dim=-1).mean().item())
+            if self.use_query_emb_in_head else None
+        )
+        _head_context_norm_mean = (
+            float(_ctx_for_head.detach().norm(dim=-1).mean().item())
+            if self.use_context_emb else None
+        )
+        _head_agg_norm_mean = float(_agg_for_head.detach().norm(dim=-1).mean().item())
+
+        # [진단용, 추가] branch 간 cosine similarity (배치 평균). norm만으로는
+        # "합쳐졌을 때 실제로 서로 강화하는지 상쇄하는지"를 알 수 없음 —
+        # ‖q‖=10, ‖αc‖=10이어도 cos(q,c)=1이면 ‖q+αc‖≈20, cos(q,c)=-1이면
+        # ‖q+αc‖≈0. fusion_mode와 무관하게 항상 계산(concat도 "합치는 방식과
+        # 무관하게 세 표현이 서로 얼마나 다른 정보를 담고 있는가"를 보여주는
+        # 값이라 비교 기준으로 유용).
+        _head_cos_qc_mean = (
+            float(F.cosine_similarity(_query_for_head.detach(), _ctx_for_head.detach(), dim=-1).mean().item())
+            if (self.use_query_emb_in_head and self.use_context_emb) else None
+        )
+        _head_cos_qa_mean = (
+            float(F.cosine_similarity(_query_for_head.detach(), _agg_for_head.detach(), dim=-1).mean().item())
+            if self.use_query_emb_in_head else None
+        )
+        _head_cos_ca_mean = (
+            float(F.cosine_similarity(_ctx_for_head.detach(), _agg_for_head.detach(), dim=-1).mean().item())
+            if self.use_context_emb else None
+        )
+
+        if self.fusion_mode == "residual":
+            # z = LN(q) + α·LN(c) + β·LN(a) — LN은 위에서 이미 branch별로
+            # 적용됨(self._per_branch_ln이 residual 모드에서 항상 True).
+            combined = _query_for_head + self.fusion_beta * _agg_for_head
+            if self.use_context_emb:
+                combined = combined + self.fusion_alpha * _ctx_for_head
+        else:
+            combined = torch.cat(_parts, dim=-1)
+        # [진단용, 추가] ‖q+αc+βa‖ 배치 평균 — 벡터 합의 norm은 개별 norm의
+        # 단순 합이 아니므로(위 cosine 참고) 실제로 합을 한 번 계산해야만
+        # 나옴. concat 모드에서는 이 양 자체가 존재하지 않으므로(combined가
+        # 다른 표현 공간) None.
+        _head_combined_norm_mean = (
+            float(combined.detach().norm(dim=-1).mean().item())
+            if self.fusion_mode == "residual" else None
+        )
+        logits = self.head(combined)
 
         # 5. 메모리 업데이트 (학습 시)
         if self.training and labels is not None:
@@ -1590,6 +1802,34 @@ class TabERA(nn.Module):
             "query_emb":   query_emb,
             "context_emb": context_emb,
             "ablation_mode": ablation_mode,
+            # [추가, 진단용] fusion_mode="residual"일 때 학습된 α(context 가중치)/
+            # β(agg 가중치) 현재값 — concat 모드의 head 첫 Linear weight-norm
+            # 진단을 대신하는, residual 모드 전용의 직접 해석 가능한 지표.
+            # concat 모드에서는 항상 None.
+            "fusion_alpha": (
+                float(self.fusion_alpha.detach().item())
+                if (self.fusion_mode == "residual" and self.fusion_alpha is not None) else None
+            ),
+            "fusion_beta": (
+                float(self.fusion_beta.detach().item())
+                if self.fusion_mode == "residual" else None
+            ),
+            # [추가] ||LN(q)||, ||LN(c)||, ||LN(a)|| 배치 평균 — fusion_mode와
+            # 무관하게 항상 계산됨(concat 모드에서도 self._per_branch_ln이면
+            # 의미 있음). residual 모드가 아니면 branch별 LN을 안 켰을 수
+            # 있어(blockwise_layernorm=False) 이 경우 LN 전 raw activation norm임 —
+            # self._per_branch_ln 값을 같이 확인해서 해석할 것.
+            "head_query_norm_mean":   _head_query_norm_mean,
+            "head_context_norm_mean": _head_context_norm_mean,
+            "head_agg_norm_mean":     _head_agg_norm_mean,
+            "head_combined_norm_mean": _head_combined_norm_mean,
+            "head_cos_qc_mean": _head_cos_qc_mean,
+            "head_cos_qa_mean": _head_cos_qa_mean,
+            "head_cos_ca_mean": _head_cos_ca_mean,
+            # [추가, 진단용] self-retrieval 비율. sample_ids가 None이면(추론
+            # 시 등) None — supervised.py가 자연스럽게 통계에서 제외함.
+            "self_retrieval_top1_rate": _self_retrieval_top1_rate,
+            "self_retrieval_topk_rate": _self_retrieval_topk_rate,
         }
 
         if return_explanations:
@@ -1723,7 +1963,8 @@ class TabERA(nn.Module):
                  f"  context grad   : {'STOP (진단용, ablation)' if self.detach_context_grad else 'flows to centroid_emb'}",
                  f"  context proj   : {'Linear projection (구조 조정)' if self.context_proj is not None else 'none (raw concat)'}",
                  f"  codebook update: {'EMA (decay=' + str(self.prototype_layer.ema_decay) + '), diversity_loss OFF' if self.prototype_layer.use_ema_codebook else 'gradient (codebook_loss + diversity_loss)'}",
-                 f"  head LayerNorm : {'블록별(query/context/agg 따로)' if self.blockwise_layernorm else '결합(하나로 묶어서, 기존 방식)'}"]
+                 f"  head LayerNorm : {'블록별(query/context/agg 따로)' if self._per_branch_ln else '결합(하나로 묶어서, 기존 방식)'}",
+                 f"  head fusion    : {'concat([q‖c‖a] → MLP, 기존 방식)' if self.fusion_mode == 'concat' else f'residual(z=LN(q)+α·LN(c)+β·LN(a) → MLP, α/β 학습됨)'}"]
 
         # [Limitation 진단] k가 평균 그룹 크기(N_train/P)보다 크면
         # cross-group fallback이 상시 발동할 위험이 있음 — 4개 데이터셋
