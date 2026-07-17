@@ -60,7 +60,22 @@ class AttentionAggregator(nn.Module):
                  use_offset_correction: bool = True,
                  tasktype: str = "regression", n_classes: Optional[int] = None,
                  evidence_temperature: float = 1.0,
-                 evidence_metric: str = "euclidean"):
+                 evidence_metric: str = "euclidean",
+                 value_mode: str = "default"):  # [추가] use_offset_correction=True일 때만
+            # 의미 있음(use_offset_correction=False면 value=label_emb만 — 이게
+            # "label_only" ablation, 이 파라미터와 별개로 이미 존재하던 플래그로
+            # 커버됨). "default"(기존과 100% 동일, 하위호환): value = label_emb +
+            # T(query-neighbour), 정규화 없이 그대로 더함. 동기: 실측(
+            # diagnose_value_components)으로 T(query-neighbour) 항의 norm이
+            # label_emb 항보다 평균 4.9배 크다는 게 확인됨(mfeat-zernike) —
+            # concat 시절 embed_dim 메커니즘(query_emb가 CosFace-정규화된
+            # context_emb를 norm 격차로 짓눌렀던 것)과 구조적으로 같은 패턴이
+            # AttentionAggregator 내부 value 구성 단계에서 재현된 것으로 보임.
+            # "offset_only": value = T(query-neighbour)만(label_emb 항 자체를
+            # 뺌) — "지금 모델이 사실상 라벨 정보를 거의 안 쓰고 이것만 쓰고
+            # 있는가"를 직접 검증. "balanced": value = LN(label_emb) +
+            # LN(T(query-neighbour)) — 두 항을 각각 unit-scale로 맞춘 뒤 더함,
+            # 스케일 불균형만 제거한 최소 개입.
         """
         use_offset_correction : True(기본값)면 TabR 원본 그대로
             value = label_emb + T(query - neighbour).
@@ -107,6 +122,14 @@ class AttentionAggregator(nn.Module):
         self.use_offset_correction = use_offset_correction
         self.tasktype = tasktype
         self.evidence_temperature = evidence_temperature
+        if value_mode not in ("default", "offset_only", "balanced"):
+            raise ValueError(f"value_mode은 'default'/'offset_only'/'balanced' 중 하나: {value_mode}")
+        if value_mode != "default" and not use_offset_correction:
+            raise ValueError(
+                "value_mode='offset_only'/'balanced'는 T()가 있어야(use_offset_correction=True) "
+                "의미가 있습니다."
+            )
+        self.value_mode = value_mode
 
         # evidence_metric : [추가, 진단용] evidence_w를 계산할 유사도 공간.
         #   "euclidean"(기본값, 기존과 100% 동일 — 하위 호환): -‖q-k‖²,
@@ -230,12 +253,16 @@ class AttentionAggregator(nn.Module):
         evidence_w = self.dropout(evidence_w)
 
         # 2. TabR 방식 value = label_emb + T(query - neighbour)
-        #    (use_offset_correction=False면 T() 항 없이 label_emb만 사용)
+        #    (use_offset_correction=False면 T() 항 없이 label_emb만 사용 — "label_only" ablation)
         label_emb = self._encode_labels(neighbour_labels)      # (B, k, D)
         if self.use_offset_correction:
-            values = label_emb + self.T(
-                query_emb.unsqueeze(1) - nk
-            )
+            offset_term = self.T(query_emb.unsqueeze(1) - nk)
+            if self.value_mode == "offset_only":
+                values = offset_term
+            elif self.value_mode == "balanced":
+                values = F.normalize(label_emb, dim=-1) + F.normalize(offset_term, dim=-1)
+            else:  # "default"
+                values = label_emb + offset_term
         else:
             values = label_emb
 
@@ -300,7 +327,17 @@ class AttentionAggregator(nn.Module):
         evidence_w: torch.Tensor,   # (B, k)
         top_n: int = 3,
     ) -> List[Dict]:
-        """이웃별 기여도 설명."""
+        """이웃별 attention weight(retrieval 결과) 요약.
+
+        [명명 정정] 예전 docstring은 "이웃별 기여도 설명"이었으나, 이 세션의
+        검증(agg_emb 제거 시 accuracy 거의 불변 — 4데이터셋×5seed necessity
+        test)에서 이 weight가 실제로 prediction을 좌우한다는 근거가 부족함이
+        확인됨. "기여도"라는 표현 자체가 causal claim("이 이웃 때문에 이렇게
+        예측했다")을 함의하므로 부적절 — 이 반환값은 "모델이 무엇을 검색해서
+        어떤 가중치를 줬는가"(retrieval evidence, descriptive)로만 취급할 것.
+        "왜 이렇게 예측했는가"(predictive faithfulness, causal)의 근거로
+        제시하지 말 것 — 그 claim은 현재 데이터로 뒷받침되지 않음.
+        """
         ew_np = evidence_w.detach().cpu().numpy()
         B, k  = ew_np.shape
         out   = []
