@@ -1086,6 +1086,13 @@ class CentroidLayer(nn.Module):
                                                   # 역정규화용이었음) — 호출부
                                                   # 시그니처 호환을 위해 유지
         norm_std:  Optional[np.ndarray] = None,  # 위와 동일
+        cos_sim: Optional[torch.Tensor] = None,  # [추가] (B, P) — scale 적용
+            # 전 raw cosine similarity(q_norm @ c_norm.T). routing_confidence는
+            # 이 값에 routing_scale을 곱한 뒤 softmax를 취한 것이라 scale에
+            # 좌우되는데(scale이 크면 1등이 아주 작은 코사인 차이로도 confidence
+            # 가 확 벌어짐), raw cosine을 같이 보여줘야 "기하학적으로 실제로
+            # 얼마나 가까운가"를 scale과 분리해서 판단할 수 있음. None이면
+            # (하위호환) 출력 dict에서 cosine_similarity=None.
     ) -> List[dict]:
         """
         샘플별 centroid 배정 설명.
@@ -1099,9 +1106,20 @@ class CentroidLayer(nn.Module):
         구별시키는 feature들의 실제 그룹 평균값(원값) — 보조 정보로
         같이 반환한다. 캐싱 전(supervised.py 연결 안 된 경우)이면
         각각 None/빈 리스트.
+
+        [명명 정정] 반환 dict의 "group_confidence"를 "routing_confidence"로
+        이름 바꿈 — "confidence"만 단독으로 쓰면 사용자가 "모델이 이 예측이
+        맞다고 확신하는 정도"(=classifier softmax)로 오해하기 쉬움. 이 값은
+        그게 아니라 "prototype routing 단계에서, 이 query가 다른 centroid
+        대비 배정된 centroid에 상대적으로 얼마나 우세한가"이고, 최종
+        classifier의 prediction confidence와는 별개(query→routing→context
+        →retrieval→fusion→classifier 파이프라인에서 classifier는 routing
+        외의 정보도 다 씀). margin/others_mass/cosine_similarity를 같이
+        반환해서 "55.6%가 높은 건지"를 절대값 하나만으로 판단 안 해도 되게 함.
         """
         pa   = hard_assignment.detach().cpu().numpy()
         pr   = routing_probs.detach().cpu().numpy()
+        cs   = cos_sim.detach().cpu().numpy() if cos_sim is not None else None
 
         out  = []
 
@@ -1116,13 +1134,22 @@ class CentroidLayer(nn.Module):
             )[:2]
             runners = [
                 {
-                    "label":       self.labels[i],
-                    "confidence":  float(pr[b, i]),
+                    "label":              self.labels[i],
+                    "routing_confidence": float(pr[b, i]),
                     "target_info": (self.target_labels.get(i)
                                      if self.target_labels is not None else None),
                 }
                 for i in runner_idx
             ]
+
+            # [추가] margin: 배정된 centroid와 바로 다음(1등 runner-up) 간의
+            # 확신도 차이 — "55% vs 54%"와 "55% vs 10%"를 구분해서 보여주기
+            # 위함. others_mass: 배정된 것 + 화면에 보여주는 runner-up들
+            # (위 2개) 밖에 나머지 전체 centroid가 나눠 갖는 확률 질량 —
+            # "다른 후보들도 꽤 있다"인지 "거의 이 셋이 전부다"인지 구분용.
+            margin = conf - (runners[0]["routing_confidence"] if runners else 0.0)
+            others_mass = 1.0 - conf - sum(r["routing_confidence"] for r in runners)
+            cosine_similarity = float(cs[b, p]) if cs is not None else None
 
             # ①의 주 콘텐츠: 이 그룹이 어떤 target(클래스)에 해당하는가
             target_info = (
@@ -1139,7 +1166,10 @@ class CentroidLayer(nn.Module):
             out.append({
                 "assigned_group":       label,
                 "centroid_idx":         p,
-                "group_confidence":     conf,
+                "routing_confidence":   conf,   # [명명 정정] 예전 group_confidence
+                "margin":               margin,
+                "others_mass":          max(0.0, others_mass),  # 부동소수점 오차로 미세 음수 방지
+                "cosine_similarity":    cosine_similarity,
                 "runners_up":           runners,
                 "target_info":          target_info,          # ← ①의 주 콘텐츠
                 "group_feature_labels": group_feature_labels,  # ← 보조 정보
