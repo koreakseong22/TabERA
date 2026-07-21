@@ -5075,7 +5075,7 @@ def main():
         )
         results.append(result)
 
-    # [v1.1, 추가] seed 2개 이상이면 mean±std 요약 — reproduce.py의 목적을
+    # [v1.1, 추가] seed 2개 이상이면 mean±std 요약 — reproduce.py의 목적을.
     # "best config를 여러 초기화로 재확인(robust evaluation)"까지 포함하는
     # 것으로 넓힌 것에 맞춰, 개별 seed 숫자 나열로 끝내지 않고 최종 요약까지
     # 자동으로 낸다.
