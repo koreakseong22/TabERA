@@ -115,7 +115,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과
 import optuna, torch, json, joblib, datetime, math, gc
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
-from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag
+from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
 import warnings
@@ -297,7 +297,7 @@ if train:
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,
-                                  device=str(device), epochs=100, patience=20)
+                                  device=str(device), **HPO_TRAINING_SCHEDULE)
         wrapper._data_id = args.openml_id   # 에폭 tqdm에 data_id 표시
         wrapper.fit(X_train, y_train, X_val, y_val)
 

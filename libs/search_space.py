@@ -15,6 +15,34 @@ import optuna
 
 
 # ─────────────────────────────────────────────────────────────
+# HPO ↔ reproduce 학습 스케줄 단일 소스
+# ─────────────────────────────────────────────────────────────
+
+HPO_TRAINING_SCHEDULE = {"epochs": 100, "patience": 20}
+"""optimize.py의 각 HPO trial과 reproduce.py의 최종 재현 학습이 반드시
+같은 epochs/patience를 쓰도록 강제하는 단일 소스.
+
+[배경] 예전엔 optimize.py에 epochs=100/patience=20이 하드코딩돼 있고,
+reproduce.py는 --epochs(기본 200)/--patience(기본 30)를 별도 CLI로
+노출하고 있어서, "HPO가 찾은 최적 config를 재현한다"는 이름의 스크립트가
+실제로는 HPO 때와 다른 학습 스케줄로 돌아가는 불일치가 있었음(adult(1590)
+데이터셋에서 실측: reproduce.py가 더 오래/관대하게 학습했는데도 val
+acc가 HPO best trial보다 오히려 낮게 나왔고, centroid 쏠림도 max_cluster_
+size 기준 optimize.py 대비 reproduce.py에서 훨씬 심하게 진행됨 —
+regroup/dead-centroid reinit이 매 epoch 실행되는 구조라, 학습이 길어질수록
+쏠림이 누적되는 방향으로 작동하는 것으로 추정).
+
+원본 MultiTab benchmark(Lee et al.)의 reproduce.py는 애초에 이런 불일치가
+구조적으로 발생할 수 없음 — HPO trial과 최종 재현이 model wrapper의
+같은 fit() 경로를 그대로 재사용하기 때문. 이 상수는 TabERA 쪽에서도 같은
+원칙(학습 스케줄은 하나의 소스에서만 나온다)을 강제하기 위함 —
+optimize.py/reproduce.py 둘 다 이 값을 직접 import해서 쓰고, 각자
+따로 epochs/patience 숫자를 하드코딩하거나 CLI 기본값으로 재정의하지
+않는다. 이 값 자체를 바꾸고 싶으면 여기 한 곳만 바꾸면 양쪽에 다 반영됨.
+"""
+
+
+# ─────────────────────────────────────────────────────────────
 # AdaCos fixed-scale 공식 (Zhang et al. 2019, CVPR)
 # ─────────────────────────────────────────────────────────────
 
