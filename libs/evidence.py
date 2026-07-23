@@ -551,7 +551,13 @@ class AttentionAggregator(nn.Module):
         credit-approval 3개 데이터셋), nv가 nk/label로 이미 설명되는
         잔차 이상의 추가 정보를 noise 대조군과 통계적으로 구분되게
         보여주지 못해, MemoryBank/TabERA에서 nv 자체를 완전히 제거하며
-        여기 시그니처에서도 제거함.
+        여기 시그니처에서도 제거함. [v3 → 제거] context_emb 인자도 같은
+        이유로 제거 — ContextOffsetFiLM/ContextEvidenceTemperature(centroid
+        context로 offset representation/evidence temperature를 조건화하는
+        실험)가 통제된 비교(dataset 1043, 동일 hyperparameter, 3-seed)에서
+        전부 baseline보다 나쁘거나(FiLM) 뚜렷한 이득이 없어(Temperature,
+        margin↔N_eff가 이미 -0.98로 자연 발생) 채택되지 않음 — 관련 실험
+        기록은 프로젝트 문서 참고.
         """
         # 1. 유사도 계산 — evidence_metric에 따라 분기
         if self.evidence_metric == "euclidean":
@@ -591,13 +597,32 @@ class AttentionAggregator(nn.Module):
                 "distance_mean": float((-similarities).detach().mean().item()),
                 "distance_std":  float((-similarities).detach().std().item()),
             }
+            # [Local Retriever 진단, 추가] similarity geometry — temperature와
+            # 독립적인 원인 분리용. evidence_w(softmax 이후)가 균등해 보여도,
+            # 그 원인이 (a) similarity 자체가 이미 거의 동률(sim1≈sim_k, margin
+            # 작음 — retrieval이 애초에 비슷한 이웃만 찾음)인지, (b) similarity는
+            # 벌어져 있는데 temperature가 커서 softmax가 눌린 것인지 구분
+            # 불가능함 — margin을 직접 저장해서 이 둘을 분리. similarities는
+            # 이미 계산된 텐서라 추가 forward 연산 없음(정렬만 추가).
+            _sim_sorted = similarities.detach().sort(dim=-1, descending=True).values  # (B, k)
+            evidence_diag["similarity_top1_per_sample"]   = _sim_sorted[:, 0]           # (B,) — 가장 가까운 이웃
+            evidence_diag["similarity_bottomk_per_sample"] = _sim_sorted[:, -1]          # (B,) — 검색된 k개 중 가장 먼 이웃
+            evidence_diag["similarity_margin_per_sample"] = _sim_sorted[:, 0] - _sim_sorted[:, -1]  # top1-topk
+            # [Local Retriever 진단, 추가] margin만으로는 shape을 구분 못함 —
+            # [0.95,0.94,...,0.91]과 [0.95,0.90,...,0.75]는 margin이 비슷해도
+            # (전자는 완만한 감소, 후자는 급격한 감소) 완전히 다른 retrieval
+            # geometry. std로 이 둘을 구분.
+            evidence_diag["similarity_std_per_sample"] = similarities.detach().std(dim=-1)  # (B,)
 
         evidence_w = F.softmax(similarities / self.evidence_temperature, dim=-1)    # (B, k)
+
+        # dropout은 softmax 직후 적용.
         evidence_w = self.dropout(evidence_w)
 
         # 2. TabR 방식 value = label_emb + T(query - neighbour)
         #    (use_offset_correction=False면 T() 항 없이 label_emb만 사용 — "label_only" ablation)
         label_emb = self._encode_labels(neighbour_labels)      # (B, k, D)
+
         if self.use_offset_correction:
             offset_term = self.T(query_emb.unsqueeze(1) - nk)
             if self.value_mode == "offset_only":
@@ -605,20 +630,8 @@ class AttentionAggregator(nn.Module):
             elif self.value_mode == "balanced":
                 values = F.normalize(label_emb, dim=-1) + F.normalize(offset_term, dim=-1)
             elif self.value_mode == "offset_normalized":
-                # [추가] offset_term만 unit-norm으로 정규화하고 label_emb는
-                # 그대로 둠 — value_component_collapse 실측(adult: offset
-                # norm이 label의 50,400배, offset_only의 agg cos_sim이
-                # default와 거의 동일)에서 나온 다음 질문("offset을 완전히
-                # 없애야 하나, scale만 통제해도 되나")을 직접 검증하기 위함.
-                # T()가 만드는 '방향'(discriminative할 수도 있는 정보)은
-                # 살리고 '크기 폭주'만 제거 — label_only(정보 완전 제거)와
-                # default(정보는 있는데 scale이 짓누름)의 중간 지점.
                 values = label_emb + F.normalize(offset_term, dim=-1)
             elif self.value_mode == "sum_normalized":
-                # [추가] label_emb+offset_term을 더한 뒤 그 합을 통째로
-                # unit-norm — "balanced"(각 항을 따로 정규화 후 더함, 즉
-                # 더한 뒤에는 norm이 1이 아닐 수 있음)와 다르게, 최종
-                # value 벡터 자체가 항상 unit-norm이 되도록 강제.
                 values = F.normalize(label_emb + offset_term, dim=-1)
             else:  # "default"
                 values = label_emb + offset_term
@@ -634,23 +647,6 @@ class AttentionAggregator(nn.Module):
 
         # 3. 가중합 → head 입력
         agg_emb = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
-
-        # [진단용, 추가] pooling 전 이웃별 values(B,k,D)를 device 밖(cpu,
-        # detach)으로 저장해둠 — "agg_emb가 collapse한 게 (a) 이웃별 값
-        # 자체가 이미 비슷해서인지, (b) evidence_w가 거의 균등해서
-        # 평균 내는 과정에서 collapse가 생기는지"를 구분하는 진단
-        # (reproduce.py의 analyze_retrieval_pipeline_collapse)에서만 씀 —
-        # 학습 루프 자체에는 전혀 영향 없음(단순 참조 저장, gradient 안 걸림).
-        self._last_values = values.detach()
-        # [진단용, 추가] value = label_emb + T(query-neighbour)의 두 성분을
-        # 따로 저장 — diagnose_value_components에서 이미 offset항이 label_emb
-        # 보다 평균 4.9배 크다는 게 확인된 바 있어서(mfeat-zernike), 만약
-        # T()(offset MLP) 자체가 입력(query-neighbour)과 거의 무관한 값만
-        # 내놓는 collapse된 함수라면, magnitude로 label_emb를 압도하면서
-        # agg_emb 전체의 collapse를 그대로 설명할 수 있음 — 이걸 분리해서
-        # 확인(reproduce.py의 analyze_value_component_collapse).
-        self._last_label_emb = label_emb.detach()
-        self._last_offset_term = offset_term.detach() if self.use_offset_correction else None
 
         return agg_emb, evidence_w, evidence_diag
 
