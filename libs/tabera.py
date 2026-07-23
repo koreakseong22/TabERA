@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from libs.prototypes   import CentroidLayer, PrototypeLayer  # PrototypeLayer = CentroidLayer alias
+from libs.prototypes   import CentroidLayer
 from libs.evidence     import AttentionAggregator, HeadCrossAttention
 
 
@@ -1104,9 +1104,26 @@ class TabERA(nn.Module):
         tasktype: str = "regression",
         n_classes: Optional[int] = None,
         routing_scale: float = 1.0,
-        use_context_emb: bool = True,
+        use_context_emb: bool = False,  # [2026-07, v2 freeze — 기본값 변경]
+            # 원래 기본값은 True(V1식 — context_emb를 classifier feature로
+            # head에 직접 결합). 세션 전체에 걸친 검증(FiLM/Temperature 실험,
+            # I(C;Y) 분석 등) 끝에 fusion_mode="residual"+use_context_emb=False
+            # (query+β·agg, context는 head에 안 감)가 TabERA v2 최종 채택
+            # architecture로 확정 — 이제 이게 기본값. 이전 V1식(concat+
+            # context_emb=True)으로 되돌리려면 명시적으로
+            # fusion_mode="concat", use_context_emb=True를 지정할 것(ablation/
+            # 비교 목적 외에는 권장하지 않음 — 이 세션에서 V1 구조는
+            # classifier feature로서의 context_emb가 query와 중복되고
+            # gate 계열이 전부 collapse하는 등 불리하다는 게 이미 확인됨).
         use_query_emb_in_head: bool = True,
         detach_context_grad: bool = False,
+        detach_query_warmup: bool = False,  # [v2, Phase 1-1 진단용] head 입력
+            # 직전(_query_for_head)만 detach — embedder/context/agg 경로는
+            # 그대로 학습됨(detach_context_grad와 대칭 위치). supervised.py의
+            # train loop가 epoch/step 기준으로 매 배치 이 값을 True/False로
+            # 갱신함(SupervisedTrainer.query_detach_warmup_epochs/_steps 참고).
+            # __init__ 기본값 False는 정적 초기값일 뿐 — 실제 on/off는
+            # 학습 중 supervised.py가 model.detach_query_warmup을 직접 덮어씀.
         use_ema_codebook: bool = False,
         ema_decay: float = 0.99,
         blockwise_layernorm: bool = False,
@@ -1126,8 +1143,12 @@ class TabERA(nn.Module):
             # 원 probe 실험 그대로 재현하려면 이것만 켜고 blockwise_layernorm은
             # 기본값(False) 유지 권장. 둘 다 켜면 LN 적용 후 L2-normalize(아래
             # forward() 참고) — 그 조합 자체는 검증 안 된 추가 실험임.
-        fusion_mode: str = "concat",   # [추가] head가 [query,context,agg]를 합치는 방식.
-            # "concat"(기본값, 기존과 100% 동일 — 하위 호환): [query‖context‖agg]를
+        fusion_mode: str = "residual",   # [2026-07, v2 freeze — 기본값 변경]
+            # 원래 기본값은 "concat". TabERA v2 최종 architecture로
+            # "residual"(query+β·agg, β 자유 학습)이 채택되어 기본값을
+            # 이걸로 바꿈 — 아래 "concat" 옵션 설명은 이제 하위호환/ablation
+            # 목적으로만 남겨둠. head가 [query,context,agg]를 합치는 방식.
+            # "concat"(V1식, 기존 기본값이었음): [query‖context‖agg]를
             #   이어붙여 공유 MLP에 통과. freeze_encoder_retrain_head 5-seed 실험
             #   (mfeat-zernike, embed_dim=256, evM_cosine, sharedLN/blockLN 둘 다)에서
             #   인코더 고정 + head 백지 재학습을 해도 원래 공동학습 head와 통계적으로
@@ -1160,6 +1181,22 @@ class TabERA(nn.Module):
             # use_context_emb=False면 무의미하므로 검증에서 걸러냄. None(기본값)
             # 이면 기존과 동일하게 학습 가능한 파라미터로 생성(하위 호환).
         fusion_beta_override: Optional[float] = None,   # [추가] 위와 대칭, agg 쪽.
+        fusion_gate_temperature: float = 1.0,   # [v2, Phase 2 후속, 추가]
+            # fusion_mode="gated_sum" 전용. g = softmax(gate_logits / T).
+            # 동기: gated_sum 3-seed 실험(adult/1590)에서 T=1(기본)이 epoch
+            # 14~22 사이 entropy→0으로 완전 collapse(seed마다 다른 단일
+            # branch로 winner-take-all) — 대조 실험(합성 데이터)으로 이
+            # collapse가 (a) 초기화 시점엔 없고(균등에서 시작) (b) 실제
+            # 예측 신호가 있을 때만 학습 중 서서히 진행됨을 확인, 즉 gate
+            # MLP 자체의 구조적 편향이 아니라 softmax의 winner-take-all
+            # positive-feedback 학습 동역학. T>1이면 gate_logits를 나눠서
+            # softmax 입력 스케일을 줄임 → 같은 logit 차이에 대해 확률
+            # 분포가 덜 뾰족해짐(T→∞면 균등, T=1이면 기존과 100% 동일 —
+            # 하위호환). 이 옵션의 목적은 "collapse를 누르면 necessity가
+            # 살아나는가?"를 직접 검증하는 것 — collapse 자체를 고치는
+            # 최종 해법이 아니라 진단용 개입(entropy_regularization/
+            # load_balancing/Gumbel-softmax보다 구현이 훨씬 단순해서
+            # 먼저 검증). fusion_mode!="gated_sum"이면 무의미.
 
         use_confidence_scaling: bool = False,      # [진단용, 추가] context_emb를
             # head에 넣기 전 top1_confidence로 스케일 — 라우팅/검색은 안 건드림
@@ -1320,6 +1357,8 @@ class TabERA(nn.Module):
         # 값은 그대로 전달되지만 task_loss가 centroid_emb로 역전파되지 않음
         # (centroid_emb는 diversity_loss만으로 학습됨).
         self.detach_context_grad = detach_context_grad
+        self.detach_query_warmup = detach_query_warmup  # [v2] supervised.py가 학습 중
+            # epoch/step 기준으로 매 배치 덮어씀 — 여기 값은 정적 초기값일 뿐.
         # [구조 조정] context_emb를 head로 보내기 전 학습 가능한 Linear를
         # 하나 거치게 함. detach_context_grad(gradient 완전 차단)와 달리
         # task_loss의 gradient가 여전히 centroid_emb까지 도달하되, 이
@@ -1330,12 +1369,12 @@ class TabERA(nn.Module):
         self.use_context_projection = use_context_projection
         self.use_confidence_scaling = use_confidence_scaling
         self.confidence_scaling_detach = confidence_scaling_detach
-        if fusion_mode not in ("concat", "residual"):
-            raise ValueError(f"fusion_mode은 'concat'/'residual' 중 하나여야 합니다: {fusion_mode}")
-        if fusion_mode == "residual" and not use_query_emb_in_head:
+        if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"):
+            raise ValueError(f"fusion_mode은 'concat'/'residual'/'gated_sum'/'anchor_gate'/'context_gated_beta' 중 하나여야 합니다: {fusion_mode}")
+        if fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") and not use_query_emb_in_head:
             raise ValueError(
-                "fusion_mode='residual'은 query_emb를 베이스(잔차의 기준점)로 쓰므로 "
-                "use_query_emb_in_head=False와 같이 쓸 수 없습니다."
+                f"fusion_mode='{fusion_mode}'은 query_emb를 head 입력의 한 branch로 "
+                "요구하므로 use_query_emb_in_head=False와 같이 쓸 수 없습니다."
             )
         if fusion_alpha_override is not None and (fusion_mode != "residual" or not use_context_emb):
             raise ValueError(
@@ -1344,7 +1383,12 @@ class TabERA(nn.Module):
             )
         if fusion_beta_override is not None and fusion_mode != "residual":
             raise ValueError("fusion_beta_override는 fusion_mode='residual'일 때만 의미가 있습니다.")
+        if fusion_gate_temperature != 1.0 and fusion_mode != "gated_sum":
+            raise ValueError("fusion_gate_temperature는 fusion_mode='gated_sum'일 때만 의미가 있습니다.")
+        if fusion_gate_temperature <= 0:
+            raise ValueError(f"fusion_gate_temperature는 양수여야 합니다: {fusion_gate_temperature}")
         self.fusion_mode = fusion_mode
+        self.fusion_gate_temperature = fusion_gate_temperature
         self.fusion_alpha_is_fixed = fusion_alpha_override is not None
         self.fusion_beta_is_fixed  = fusion_beta_override is not None
         self.context_proj = (
@@ -1486,7 +1530,7 @@ class TabERA(nn.Module):
         # 헷갈림. 대신 전용 2-branch head를 명시적으로 따로 만듦:
         # head_input = [updated_query ‖ context_emb] 고정(다른 조합 없음).
         if self.aggregator_mode == "pooling":
-            self._per_branch_ln = blockwise_layernorm or (fusion_mode == "residual")
+            self._per_branch_ln = blockwise_layernorm or (fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta"))
             if self._per_branch_ln:
                 self.head_query_ln   = nn.LayerNorm(embed_dim) if use_query_emb_in_head else None
                 self.head_context_ln = nn.LayerNorm(embed_dim) if use_context_emb else None
@@ -1519,6 +1563,83 @@ class TabERA(nn.Module):
                     nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
                     nn.Linear(embed_dim, n_output),
                 )
+            elif fusion_mode == "gated_sum":
+                # [v2, Phase 2] g_q,g_c,g_a = softmax(MLP([LN(q),LN(c),LN(a)]))
+                # → h = g_q·LN(q) + g_c·LN(c) + g_a·LN(a). residual(z=LN(q)+
+                # α·LN(c)+β·LN(a))과 다른 점 두 가지:
+                #   1. α/β는 전체 데이터셋에 걸친 global scalar였지만, 여기 g는
+                #      샘플마다 다른 값(gate_mlp가 세 branch를 다 보고 매 샘플
+                #      계산) — "이 샘플엔 retrieval이 더 필요하다"를 표현할 수
+                #      있음(residual은 구조적으로 불가능).
+                #   2. softmax라 g_q+g_c+g_a=1 강제 — sigmoid처럼 셋 다 낮게/
+                #      높게 나오는 scale ambiguity가 없고, 반드시 branch 간
+                #      allocation(하나가 오르면 남은 게 내려감)이 일어남.
+                # query도 다른 두 branch와 동등하게 gate 대상(residual은 query
+                # coefficient가 고정 1이라 이 부분이 근본적으로 다름).
+                self._gate_branch_names = (["query", "context", "agg"]
+                                            if use_context_emb else ["query", "agg"])
+                _n_gate = len(self._gate_branch_names)
+                self.fusion_gate_mlp = nn.Sequential(
+                    nn.Linear(_n_gate * embed_dim, embed_dim), nn.GELU(),
+                    nn.Linear(embed_dim, _n_gate),
+                )
+                self.head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+            elif fusion_mode == "anchor_gate":
+                # [v2, Phase 2 후속] h = LN(q) + σ(MLP([LN(q),LN(a)])) · LN(a).
+                # gated_sum(softmax, g_q+g_c+g_a=1 강제)이 query-only/agg-only
+                # 둘 다 AUROC≈0.90인데 fusion이 매번 경쟁으로 하나만 골라 쓴다는
+                # 걸 보여준 뒤 나온 설계 — softmax의 "합=1" 제약 자체가 "협력"을
+                # 구조적으로 막고 있었다는 진단에 대한 직접 대응. gated_sum과
+                # 다른 점: (1) query는 항상 계수 1로 고정된 anchor(gate 대상이
+                # 아님, residual의 "z=LN(q)+..."과 같은 발상) — gate는 agg
+                # 하나만 "얼마나 더할지" 결정, (2) sigmoid라 g∈(0,1) 독립적
+                # 값이라 q와 a가 동시에 100%씩 반영되는 것도 구조적으로 가능
+                # (softmax였으면 불가능). context는 이 fusion 자체에 안 들어감
+                # (use_context_emb와 무관 — 켜져 있어도 routing/aux_loss만
+                # 계속되고 head 입력에는 안 씀; "query 하나만으로도, agg 하나
+                # 만으로도 이미 충분히 강하다"가 확인된 뒤라 context는 우선
+                # 순위에서 뺀 설계).
+                self.fusion_agg_gate_mlp = nn.Sequential(
+                    nn.Linear(2 * embed_dim, embed_dim), nn.GELU(),
+                    nn.Linear(embed_dim, 1),
+                )
+                self.head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+            elif fusion_mode == "context_gated_beta":
+                # [v2, Phase 2 후속] h = LN(q) + β(context)·LN(a),
+                # β(context) = σ(MLP(LN(context_emb))).
+                # anchor_gate([LN(q),LN(a)]를 gate 입력으로 씀)와 결정적으로
+                # 다른 점: gate가 agg 내용 자체를 전혀 안 봄 — context_emb
+                # (centroid 라우팅 결과, "이 샘플이 속한 지역이 어디인가")
+                # 만 봄. 동기: (1) [q,a] gate(anchor_gate)도 0/1로 collapse한
+                # 걸 확인한 뒤, "이 특정 agg가 좋아 보이는가"를 매 샘플 새로
+                # 판단하게 하는 게 collapse의 원인일 수 있다는 가설 — 그
+                # 대신 "이 centroid 지역은 평소 retrieval을 얼마나 신뢰할
+                # 만한가"라는, 같은 centroid의 샘플들끼리는 거의 같은 값이
+                # 나올 훨씬 저차원적인 신호로 gate 입력을 제한. (2) fixed β
+                # sweep(adult/1590)에서 β=1.5가 seed1 단독/짧은 스케줄에서는
+                # 최고 성능이었지만 3-seed 정식 스케줄에서는 자유 학습 β
+                # (0.02~0.06, AUROC 0.9063±0.0006)보다 낮게 나옴(0.9029±
+                # 0.0019) — 모든 샘플에 동일한 β를 강제하는 것 자체가 collapse
+                # 없이도 이미 최적이 아닐 수 있다는 증거. context는 항상
+                # (use_context_emb 설정과 무관하게) prototype_layer에서 계산
+                # 되므로 여기서는 전용 LayerNorm(context_gate_ln)으로 별도
+                # 처리 — head_context_ln(use_context_emb=False면 None)에
+                # 의존하지 않음.
+                self.context_gate_ln = nn.LayerNorm(embed_dim)
+                self.fusion_context_beta_mlp = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim // 2), nn.GELU(),
+                    nn.Linear(embed_dim // 2, 1),
+                )
+                self.head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
             elif blockwise_layernorm or head_branch_l2norm:
                 # [수정] head_branch_l2norm=True면 global LayerNorm(_head_in)을
                 # 건너뜀 — 그 LN이 concat된 벡터 전체를 다시 joint하게
@@ -1544,12 +1665,13 @@ class TabERA(nn.Module):
             # [query(있으면) → context(있으면) → agg(항상)] 이므로 여기서도
             # 그 순서를 그대로 따른다 — forward()의 조립 순서가 바뀌면 이
             # 매핑도 같이 바뀌어야 함.
-            # [주의] fusion_mode="residual"이면 concat 자체가 없어 "column 구간"
-            # 개념이 없음 — 그 대신 self.fusion_alpha/self.fusion_beta 값 자체가
+            # [주의] fusion_mode="residual"/"gated_sum"이면 concat 자체가 없어
+            # "column 구간" 개념이 없음 — residual은 self.fusion_alpha/beta,
+            # gated_sum은 아래 forward()에서 반환하는 gate 통계(head_gate_*)가
             # 이미 "브랜치별 기여"의 직접적이고 더 해석 가능한 지표이므로
             # _head_block_slices는 빈 채로 둔다(log_branch_gradients의 weight-norm
             # 진단은 concat 계열 모드 전용).
-            self._head_first_linear = self.head[0] if (blockwise_layernorm or head_branch_l2norm or fusion_mode == "residual") else self.head[1]
+            self._head_first_linear = self.head[0] if (blockwise_layernorm or head_branch_l2norm or fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta")) else self.head[1]
             self._head_block_slices: Dict[str, Tuple[int, int]] = {}
             if fusion_mode == "concat":
                 _off = 0
@@ -1610,6 +1732,16 @@ class TabERA(nn.Module):
         # ①의 group_confidence 표시와 confidence scaling(옵션) 양쪽에 씀.
         context_emb, hard_assignment, routing_probs, _, _, top1_confidence = \
             self.prototype_layer(query_emb)
+
+        # [Local Retriever 진단] similarity geometry — evidence.py가 항상
+        # 계산하므로(새 모듈 아님) aggregator 호출 이전에 미리 초기화(cross_
+        # attention/memory-fallback 분기에서 out dict 구성 시 NameError
+        # 방지, 그리고 아래에서 채운 값을 뒤에서 다시 None으로 덮는 순서
+        # 버그 재발 방지).
+        _similarity_top1_per_sample = None
+        _similarity_bottomk_per_sample = None
+        _similarity_margin_per_sample = None
+        _similarity_std_per_sample = None
 
         # 3. KNN 검색 + Attention 집계
         if self.memory.filled.item() >= self.k:
@@ -1693,7 +1825,15 @@ class TabERA(nn.Module):
                     shuffle_neighbors=(ablation_mode == "shuffle_neighbors"),
                 )
             else:
-                agg_emb, evidence_w, evidence_diag = self.ot_selector(query_emb, nk, neighbour_labels)
+                agg_emb, evidence_w, evidence_diag = self.ot_selector(
+                    query_emb, nk, neighbour_labels
+                )
+                # [Local Retriever 진단] similarity geometry — evidence.py가
+                # 항상 계산해서 evidence_diag에 넣어둠(새 모듈 아님).
+                _similarity_top1_per_sample = evidence_diag.get("similarity_top1_per_sample")
+                _similarity_bottomk_per_sample = evidence_diag.get("similarity_bottomk_per_sample")
+                _similarity_margin_per_sample = evidence_diag.get("similarity_margin_per_sample")
+                _similarity_std_per_sample = evidence_diag.get("similarity_std_per_sample")
 
         else:
             # Memory 미충족 fallback
@@ -1710,6 +1850,16 @@ class TabERA(nn.Module):
             _self_retrieval_top1_rate = None
             _self_retrieval_topk_rate = None
 
+        # [v2, Phase 2] gated_sum 전용 진단 통계 기본값 — aggregator_mode=
+        # "cross_attention"이거나 fusion_mode!="gated_sum"이면 아래에서 안
+        # 채워지므로, out dict 구성 시 NameError 안 나게 여기서 미리 정의.
+        _head_gate_mean: Dict[str, float] = {}
+        _head_gate_var: Dict[str, float] = {}
+        _head_gate_entropy_mean = None
+        _head_gate_logit_mean: Dict[str, float] = {}
+        _head_gate_logit_gap_mean = None
+        _agg_beta_per_sample = None  # [v2, context_gated_beta 전용] centroid 상관관계 분석용
+
         # 4. 예측
         # use_context_emb=False면 context_emb를, use_query_emb_in_head=False면
         # query_emb를 head 입력에서 제외 (STE 라우팅/centroid 학습 자체는
@@ -1718,6 +1868,17 @@ class TabERA(nn.Module):
             _parts = []
             if self.use_query_emb_in_head:
                 _query_for_head = query_emb
+                # [v2, Phase 1-1 진단용] query detach warmup — head가 보는
+                # 사본만 끊는다. query_emb 자체(위 2/3번의 context_emb 라우팅,
+                # agg_emb retrieval 입력)는 detach 이전 상태 그대로라 embedder는
+                # 이 기간에도 context/agg 경로를 통해 classification loss
+                # gradient를 계속 받는다 — "embedder를 N epoch freeze"가
+                # 아니라 "head의 query 직접 경로만 잠근다"는 실험 의도를
+                # 그대로 반영. self.detach_query_warmup은 supervised.py의
+                # train loop가 epoch/step 기준으로 매 배치 True/False로
+                # 갱신함(기본 False, eval/inference 시엔 항상 False).
+                if self.detach_query_warmup:
+                    _query_for_head = _query_for_head.detach()
                 # [추가] eval-time perturbation — 이미 학습이 끝난 모델에 그대로
                 # 적용해서 "head가 query_emb를 실제로 얼마나 쓰는가"를 재학습
                 # 없이 재는 용도. --no_query_emb(처음부터 빼고 재학습)는 학습
@@ -1871,12 +2032,118 @@ class TabERA(nn.Module):
                 if self.use_context_emb else None
             )
     
+            _head_gate_mean: Dict[str, float] = {}
+            _head_gate_var: Dict[str, float] = {}
+            _head_gate_entropy_mean = None
+            _head_gate_logit_mean: Dict[str, float] = {}
+            _head_gate_logit_gap_mean = None
             if self.fusion_mode == "residual":
                 # z = LN(q) + α·LN(c) + β·LN(a) — LN은 위에서 이미 branch별로
                 # 적용됨(self._per_branch_ln이 residual 모드에서 항상 True).
                 combined = _query_for_head + self.fusion_beta * _agg_for_head
                 if self.use_context_emb:
                     combined = combined + self.fusion_alpha * _ctx_for_head
+            elif self.fusion_mode == "gated_sum":
+                # [v2, Phase 2] g = softmax(MLP([LN(q),LN(c),LN(a)])) — 순서는
+                # self._gate_branch_names(__init__에서 고정, gate_mlp의
+                # in_features 축 순서와 반드시 일치해야 함).
+                _branch_tensor = {"query": _query_for_head, "context": _ctx_for_head,
+                                   "agg": _agg_for_head}
+                _gate_input = torch.cat(
+                    [_branch_tensor[name] for name in self._gate_branch_names], dim=-1
+                )
+                _gate_logits = self.fusion_gate_mlp(_gate_input)          # (B, n_gate)
+                # [v2, Phase 2 후속] temperature — T=1.0(기본)이면 기존과
+                # 100% 동일. T>1이면 softmax 입력 스케일을 줄여서 같은 logit
+                # 차이에 대해 확률분포가 덜 뾰족해짐(collapse 완화 진단용).
+                _gate = F.softmax(_gate_logits / self.fusion_gate_temperature, dim=-1)  # (B, n_gate), 행마다 합=1
+                combined = torch.zeros_like(_query_for_head)
+                for _i, _name in enumerate(self._gate_branch_names):
+                    combined = combined + _gate[:, _i:_i + 1] * _branch_tensor[_name]
+                # [진단용] gate mean/variance(branch별, 배치 평균/분산)·entropy
+                # (배치 평균) — gradient 불필요, 순수 forward 통계.
+                with torch.no_grad():
+                    _gate_d = _gate.detach()
+                    for _i, _name in enumerate(self._gate_branch_names):
+                        _col = _gate_d[:, _i]
+                        _head_gate_mean[_name] = float(_col.mean().item())
+                        _head_gate_var[_name]  = float(_col.var(unbiased=False).item())
+                    # [v2, Phase 2 후속, 진단용] pre-softmax logit 자체의
+                    # branch별 배치 평균(temperature 적용 전 raw 값) — "gate가
+                    # 언제부터/얼마나 벌어지는가"를 gate_mean(post-softmax)과
+                    # 분리해서 보기 위함. temperature를 나누기 전 원본이라야
+                    # "MLP 자체가 벌린 정도"를 온전히 볼 수 있음(T로 나눈
+                    # 뒤 값을 보면 temperature 효과와 MLP 효과가 섞임).
+                    _logits_d = _gate_logits.detach()
+                    for _i, _name in enumerate(self._gate_branch_names):
+                        _head_gate_logit_mean[_name] = float(_logits_d[:, _i].mean().item())
+                    # logit gap: 최댓값-평균(나머지) — 값이 클수록 이미 한쪽으로
+                    # 확실히 쏠려 있다는 뜻. 샘플별로 계산 후 배치 평균.
+                    _sorted_logits, _ = _logits_d.sort(dim=-1, descending=True)
+                    _head_gate_logit_gap_mean = float((_sorted_logits[:, 0] - _sorted_logits[:, 1:].mean(dim=-1)).mean().item())
+                    # H(g) = -Σ g_i log(g_i), 샘플별로 계산 후 배치 평균.
+                    # softmax 출력이라 g_i>0 보장(log(0) 걱정 없음, 다만 float
+                    # 하한 대비 clamp).
+                    _ge = -(_gate_d.clamp_min(1e-12) * _gate_d.clamp_min(1e-12).log()).sum(dim=-1)
+                    _head_gate_entropy_mean = float(_ge.mean().item())
+            elif self.fusion_mode == "anchor_gate":
+                # [v2, Phase 2 후속] h = LN(q) + σ(MLP([LN(q),LN(a)])) · LN(a).
+                # query는 계수 1로 고정된 anchor — gate는 agg 하나만 "얼마나
+                # 더할지" 결정하는 단일 스칼라(branch 3개 중 하나를 고르는
+                # gated_sum의 다branch-softmax와 다름). context는 이 fusion에
+                # 안 들어감(__init__ 주석 참고).
+                _gate_input = torch.cat([_query_for_head, _agg_for_head], dim=-1)
+                _gate_logit = self.fusion_agg_gate_mlp(_gate_input)   # (B, 1)
+                _gate = torch.sigmoid(_gate_logit)                    # (B, 1), g_q는 항상 1(gate 대상 아님)
+                combined = _query_for_head + _gate * _agg_for_head
+                # [진단용] 기존 gated_sum 진단 필드(head_gate_mean/var/
+                # entropy/logit_mean/logit_gap)를 그대로 재사용 — key를
+                # "agg" 하나만 채움("query"는 gate 대상이 아니라 애초에
+                # 없음, supervised.py/reproduce.py의 누적 로직은 dict.items()
+                # 순회라 branch 개수가 달라도 그대로 동작).
+                with torch.no_grad():
+                    _gate_d = _gate.detach().squeeze(-1)          # (B,)
+                    _head_gate_mean["agg"] = float(_gate_d.mean().item())
+                    _head_gate_var["agg"]  = float(_gate_d.var(unbiased=False).item())
+                    _logit_d = _gate_logit.detach().squeeze(-1)   # (B,)
+                    _head_gate_logit_mean["agg"] = float(_logit_d.mean().item())
+                    # [진단용] "gap" 대응 — softmax의 top1-나머지평균과 같은
+                    # 성격으로, sigmoid에서는 |logit|이 "결정 경계(0)로부터
+                    # 얼마나 확신 있게 떨어져 있는가"를 뜻함(0이면 g=0.5,
+                    # 완전히 불확실).
+                    _head_gate_logit_gap_mean = float(_logit_d.abs().mean().item())
+                    # H(Bernoulli(g)) = -(g log g + (1-g) log(1-g)), 샘플별
+                    # 계산 후 배치 평균. 최댓값 log(2)≈0.693(g=0.5).
+                    _g = _gate_d.clamp(1e-12, 1 - 1e-12)
+                    _be = -(_g * _g.log() + (1 - _g) * (1 - _g).log())
+                    _head_gate_entropy_mean = float(_be.mean().item())
+            elif self.fusion_mode == "context_gated_beta":
+                # [v2, Phase 2 후속] h = LN(q) + β(context)·LN(a).
+                # anchor_gate와 결정적으로 다른 점: gate 입력이 agg가 아니라
+                # context_emb(raw, use_context_emb 설정과 무관하게 항상
+                # 존재 — 위 2번 라우팅 단계에서 계산됨). "이 retrieval이
+                # 좋은가"가 아니라 "이 centroid 지역은 retrieval을 얼마나
+                # 믿을까"를 묻는 설계(__init__ 주석 참고).
+                _ctx_gate_in = self.context_gate_ln(context_emb)
+                _beta_logit = self.fusion_context_beta_mlp(_ctx_gate_in)  # (B, 1)
+                _beta = torch.sigmoid(_beta_logit)                        # (B, 1)
+                combined = _query_for_head + _beta * _agg_for_head
+                # [진단용] anchor_gate와 같은 필드 재사용(key="agg") +
+                # centroid별 상관관계 분석용 per-sample β(배치 평균이 아닌
+                # 전체 벡터) — out dict의 "agg_beta_per_sample"로 별도 노출,
+                # reproduce.py가 centroid_id와 같이 저장해서 사후에 centroid
+                # 별 평균/purity 상관관계를 계산할 수 있게 함.
+                with torch.no_grad():
+                    _beta_d = _beta.detach().squeeze(-1)          # (B,)
+                    _head_gate_mean["agg"] = float(_beta_d.mean().item())
+                    _head_gate_var["agg"]  = float(_beta_d.var(unbiased=False).item())
+                    _blogit_d = _beta_logit.detach().squeeze(-1)  # (B,)
+                    _head_gate_logit_mean["agg"] = float(_blogit_d.mean().item())
+                    _head_gate_logit_gap_mean = float(_blogit_d.abs().mean().item())
+                    _g = _beta_d.clamp(1e-12, 1 - 1e-12)
+                    _be = -(_g * _g.log() + (1 - _g) * (1 - _g).log())
+                    _head_gate_entropy_mean = float(_be.mean().item())
+                    _agg_beta_per_sample = _beta_d.clone()
             else:
                 combined = torch.cat(_parts, dim=-1)
             # [진단용, 추가] ‖q+αc+βa‖ 배치 평균 — 벡터 합의 norm은 개별 norm의
@@ -1885,7 +2152,7 @@ class TabERA(nn.Module):
             # 다른 표현 공간) None.
             _head_combined_norm_mean = (
                 float(combined.detach().norm(dim=-1).mean().item())
-                if self.fusion_mode == "residual" else None
+                if self.fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") else None
             )
             logits = self.head(combined)
         else:
@@ -1972,7 +2239,18 @@ class TabERA(nn.Module):
             "logits":      logits,
             "aux_loss":    aux_loss,
             "routing":     routing_probs,
+            # [추가, v2 Phase 2 후속] 샘플별 hard centroid 할당 — 지금까지 내부
+            # 계산(prototype_layer 반환값)만 되고 out dict엔 없었음. centroid별
+            # β 분포/purity 상관관계 분석(context_gated_beta 진단)에 필요해서
+            # 노출. fusion_mode/use_context_emb와 무관하게 항상 계산되는
+            # 값이라 아무 설정에서나 채워짐(centroid routing 자체는 항상 함).
+            "centroid_id": hard_assignment,
             "hard_group":  hard_assignment,
+            # [추가, Centroid Retrieval Behavior Analysis용] top1_confidence —
+            # centroid_id와 마찬가지로 routing 자체는 항상 계산되므로 설정과
+            # 무관하게 항상 채워짐. explain_routing()의 "routing_confidence"와
+            # 같은 이름으로 통일(prototypes.py 명명 정정 이력 참고).
+            "routing_confidence": top1_confidence,
             "evidence_w":  evidence_w,
             "evidence_diag": evidence_diag,
             "topk_idx":    topk_idx,
@@ -1999,6 +2277,35 @@ class TabERA(nn.Module):
                 float(self.fusion_beta.detach().item())
                 if self.fusion_mode == "residual" else None
             ),
+            # [추가, v2 Phase 2] fusion_mode="gated_sum" 전용 — 샘플별 softmax
+            # gate의 배치 평균/분산(branch별 dict, concat/residual 모드에서는
+            # 항상 빈 dict) + gate entropy 배치 평균(branch 수가 n이면
+            # 이론적 최댓값 log(n) — 그 근처면 "거의 균등 분배", 0에 가까우면
+            # "특정 branch로 확신 있게 쏠림". supervised.py가 이 값을
+            # log_fusion_trajectory로 epoch 단위 궤적을 뽑음.
+            "head_gate_mean": _head_gate_mean,
+            "head_gate_var": _head_gate_var,
+            "head_gate_entropy_mean": _head_gate_entropy_mean,
+            # [추가, v2 Phase 2 후속] pre-softmax logit 배치 평균(branch별)과
+            # top1-나머지평균 gap — "MLP가 이미 벌려놨는지, softmax/학습
+            # 과정에서 벌어지는지"를 head_gate_mean(post-softmax)과 분리해서
+            # 봄. concat/residual 모드에서는 항상 빈 dict/None.
+            "head_gate_logit_mean": _head_gate_logit_mean,
+            "head_gate_logit_gap_mean": _head_gate_logit_gap_mean,
+            # [추가, v2, context_gated_beta 전용] 배치 평균이 아닌 샘플별
+            # β 벡터(B,) — centroid_id와 짝지어서 centroid별 β 분포/purity
+            # 상관관계를 사후 분석하기 위함. 다른 fusion_mode에서는 None.
+            "agg_beta_per_sample": _agg_beta_per_sample,
+            # [Local Retriever 진단] aggregator_mode="pooling"에서 항상
+            # 채워짐(cross_attention이면 None — HeadCrossAttention은 이
+            # 진단을 아직 지원 안 함). top1-bottomk margin이 좁으면 retrieval
+            # geometry 자체가 이미 균등(N_eff가 자연히 k 근처), margin이
+            # 넓으면 sharp — margin↔N_eff는 evidence_w = softmax(sim/T)의
+            # 수학적 성질로 항상 강한 음의 상관(r≈-0.98, 데이터셋 무관 확인됨).
+            "similarity_top1_per_sample": _similarity_top1_per_sample,
+            "similarity_bottomk_per_sample": _similarity_bottomk_per_sample,
+            "similarity_margin_per_sample": _similarity_margin_per_sample,
+            "similarity_std_per_sample": _similarity_std_per_sample,
             # [추가] ||LN(q)||, ||LN(c)||, ||LN(a)|| 배치 평균 — fusion_mode와
             # 무관하게 항상 계산됨(concat 모드에서도 self._per_branch_ln이면
             # 의미 있음). residual 모드가 아니면 branch별 LN을 안 켰을 수
@@ -2042,10 +2349,33 @@ class TabERA(nn.Module):
                 if self.aggregator_mode == "pooling"
                 else self.head_cross_attn.explain_evidence(evidence_w)
             )
+
+            # Retrieval signal magnitude (Integration).
+            # 주의: "기여도(contribution)"라고 부르지 않는다 — head가
+            # Head(q+βa) 같은 비선형 함수라 ‖βa‖가 prediction에 미치는
+            # 영향과 정확히 비례한다는 보장이 없다(evidence_w의 이전
+            # "기여도" 명명 정정과 같은 이유). 여기서 주는 건 순수하게
+            # "retrieval representation이 query 대비 얼마나 큰 신호였는가"
+            # 라는 magnitude 정보이지, causal attribution이 아니다.
+            with torch.no_grad():
+                _beta_val = getattr(self, "fusion_beta", None)
+                _beta_scalar = float(_beta_val.detach().item()) if _beta_val is not None else None
+                _query_norm_ps = query_emb.detach().norm(dim=-1).cpu().numpy()
+                _agg_norm_ps   = agg_emb.detach().norm(dim=-1).cpu().numpy() if agg_emb is not None else None
+            signal_exp = [
+                {
+                    "query_norm": float(_query_norm_ps[b]),
+                    "agg_norm": (float(_agg_norm_ps[b]) if _agg_norm_ps is not None else None),
+                    "beta": _beta_scalar,  # fusion_mode != "residual"면 None
+                }
+                for b in range(X.shape[0])
+            ]
+
             out["explanations"] = [
                 {
                     "prototype": proto_exp[b],
                     "evidence":  ev_exp[b],
+                    "retrieval_signal": signal_exp[b],
                 }
                 for b in range(X.shape[0])
             ]
@@ -2154,7 +2484,7 @@ class TabERA(nn.Module):
                  f"  context proj   : {'Linear projection (구조 조정)' if self.context_proj is not None else 'none (raw concat)'}",
                  f"  codebook update: {'EMA (decay=' + str(self.prototype_layer.ema_decay) + '), diversity_loss OFF' if self.prototype_layer.use_ema_codebook else 'gradient (codebook_loss + diversity_loss)'}",
                  f"  head LayerNorm : {'블록별(query/context/agg 따로)' if self._per_branch_ln else '결합(하나로 묶어서, 기존 방식)'}",
-                 f"  head fusion    : {'concat([q‖c‖a] → MLP, 기존 방식)' if self.fusion_mode == 'concat' else f'residual(z=LN(q)+α·LN(c)+β·LN(a) → MLP, α/β 학습됨)'}",
+                 f"  head fusion    : {'concat([q‖c‖a] → MLP, 기존 방식)' if self.fusion_mode == 'concat' else (f'residual(z=LN(q)+α·LN(c)+β·LN(a) → MLP, α/β 학습됨)' if self.fusion_mode == 'residual' else (f'gated_sum(h=Σ g_i·LN(branch_i), g=softmax(MLP([q,c,a])) 샘플별 학습됨)' if self.fusion_mode == 'gated_sum' else (f'anchor_gate(h=LN(q)+σ(MLP([q,a]))·LN(a), query anchor 고정+agg만 sigmoid gate)' if self.fusion_mode == 'anchor_gate' else f'context_gated_beta(h=LN(q)+β(context)·LN(a), β=σ(MLP(LN(context))), gate가 agg 내용은 안 보고 centroid 지역만 봄)')))}",
                  f"  branch L2norm  : {'ON (v1.1, concat 전 branch별 unit-L2-norm)' if getattr(self, 'head_branch_l2norm', False) else 'OFF (기존과 동일)'}",
                  f"  neighbor mixing: {(self.ot_selector.neighbor_interaction_mode or 'OFF (v1 그대로, pooling 전 이웃 상호작용 없음)') if self.aggregator_mode == 'pooling' else 'N/A (aggregator_mode=cross_attention — pooling 자체가 없음)'}",
                  f"  aggregator     : {'pooling(AttentionAggregator, 고정 weighted-sum)' if self.aggregator_mode == 'pooling' else f'cross_attention(HeadCrossAttention, n_heads=1, alpha={self.head_cross_attn.alpha.detach().item():.3f}, neighbor_source={self.head_cross_attn.neighbor_source})'}" ]
