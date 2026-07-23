@@ -149,7 +149,38 @@ class TabERAWrapper:
         # 안 나되(out 딕셔너리에 항상 존재하는 키들이라) alpha/beta 값이 항상
         # None으로 기록됨 — 그런 경우 그냥 안 켜는 게 맞음.
         log_fusion_trajectory: bool = False,
+        log_centroid_label_mi_trajectory: bool = False,  # [2026-07, 추가]
+            # I(C;Y)/H(Y) — centroid 배정이 label을 얼마나 설명하는가 —
+            # 를 epoch마다 기록(self.centroid_label_mi_history). 새 지표가
+            # 아니라 reproduce.py의 centroid_retrieval_behavior 분석에서
+            # 이미 검증한 지표(cross-dataset corr(I(C;Y)/H(Y), AUROC)≈0.92)를
+            # 최종값 하나가 아니라 학습 중 궤적으로 보기 위함 — "prototype이
+            # label-aware partition으로 조직되는 과정"을 직접 보여줄 수
+            # 있는지 확인. 매 epoch 검증 세트(X_val/y_val, 이미 forward pass
+            # 대상)에 대해 hard_assignment만 가볍게 추가 계산(embedder+
+            # prototype_layer만 — retrieve/aggregate/head는 안 거침, 저렴).
+            # tasktype="regression"이면 label이 연속값이라 무의미 — 그 경우
+            # 항상 빈 리스트로 남음(에러는 안 남).
+        query_detach_warmup_epochs: int = 0,
+        # [v2, Phase 1-1] 학습 시작 후 이 값 이하 epoch 동안 model.
+        # detach_query_warmup=True로 켠다(epoch 번호는 1-base, epoch<=N).
+        # 0(기본값)이면 항상 False — 기존 동작과 100% 동일(하위 호환).
+        # query_detach_warmup_steps와 동시에 0이 아니면 안 됨(아래 검증).
+        query_detach_warmup_steps: int = 0,
+        # [v2, Phase 1-1] epoch 대신 전역 optimizer step(배치) 기준으로 warmup
+        # 길이를 준다 — Phase 0에서 collapse가 epoch 1 안에서(약 20~140 배치
+        # 사이) 이미 대부분 끝난다는 게 확인돼서, 데이터셋마다 1 epoch당
+        # 배치 수가 다르면 epoch 단위 기준이 너무 거칠 수 있음(작은
+        # 데이터셋은 epoch=1이 몇 배치 안 될 수 있음). self.global_step(0-base,
+        # 매 배치 forward 전 검사 후 +1)이 이 값 미만인 동안만 detach.
+        # query_detach_warmup_epochs와 동시에 0이 아니면 안 됨.
     ) -> None:
+        if query_detach_warmup_epochs > 0 and query_detach_warmup_steps > 0:
+            raise ValueError(
+                "query_detach_warmup_epochs와 query_detach_warmup_steps는 "
+                "동시에 0이 아닐 수 없습니다 (해석이 모호해짐 — 어느 기준으로 "
+                "warmup 종료를 판단할지 하나만 고르세요)."
+            )
         self.model    = model.to(device)
         self.params   = params
         self.tasktype = tasktype
@@ -193,6 +224,14 @@ class TabERAWrapper:
         self.log_branch_gradients = log_branch_gradients
         self.model.log_branch_gradients = log_branch_gradients
         self.log_branch_gradients_first_n_epochs = log_branch_gradients_first_n_epochs
+        # [v2, Phase 1-1] query detach warmup — 아래 두 값 중 최대 하나만
+        # 0이 아님(위 __init__에서 검증). global_step은 train loop에서
+        # 배치마다 증가시키는 카운터(0-base) — fit()이 여러 번 안 불리는
+        # 한(재학습마다 새 SupervisedTrainer 인스턴스라 항상 0부터 시작) 문제 없음.
+        self.query_detach_warmup_epochs = query_detach_warmup_epochs
+        self.query_detach_warmup_steps  = query_detach_warmup_steps
+        self.global_step = 0
+        self.model.detach_query_warmup = False  # 정적 초기값 — train loop가 매 epoch/배치 갱신
         # epoch별 요약(항상, log_branch_gradients=True인 동안 전체 학습에 걸쳐):
         #   {"epoch", "query_grad_norm", "query_act_norm", "query_weight_norm", ...}
         self.branch_gradient_history: List[Dict[str, float]] = []
@@ -206,6 +245,8 @@ class TabERAWrapper:
         # epoch별 요약: {"epoch", "alpha", "beta", "query_norm_mean",
         #                "context_norm_mean", "agg_norm_mean"}
         self.fusion_trajectory_history: List[Dict[str, float]] = []
+        self.log_centroid_label_mi_trajectory = log_centroid_label_mi_trajectory
+        self.centroid_label_mi_history: List[Dict[str, float]] = []
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -420,6 +461,12 @@ class TabERAWrapper:
         for epoch in pbar:
             # ── 학습 ──────────────────────────────────────
             self.model.train()
+            # [v2, Phase 1-1] epoch 기준 query detach warmup — epoch 전체에서
+            # 고정이라 배치 루프 밖에서 한 번만 설정. step 기준(아래 배치
+            # 루프 안)과는 상호 배타적(__init__에서 검증 완료), 둘 다 0이면
+            # (기본값) 이 줄은 매 epoch False를 다시 쓸 뿐 기존 동작과 동일.
+            if self.query_detach_warmup_steps == 0:
+                self.model.detach_query_warmup = (epoch <= self.query_detach_warmup_epochs)
             perm    = torch.randperm(len(y_train), device=self.device)
             tr_loss_gpu = torch.zeros((), device=self.device)  # [최적화] GPU 텐서로 누적
             n_batch = 0
@@ -477,12 +524,36 @@ class TabERAWrapper:
             _fusion_beta_grad_sum  = 0.0
             _fusion_alpha_grad_batches = 0
             _fusion_beta_grad_batches  = 0
+            # [v2, Phase 2, 진단용] gated_sum의 gate mean/var/entropy 배치
+            # 누적 — branch별 dict라 collections.defaultdict 없이 그냥
+            # dict.get(name, 0.0)+=로 처리(등장하는 branch 이름이 매 배치
+            # 항상 같으므로 문제없음 — use_context_emb 여부로 학습 도중
+            # 바뀌지 않음). concat/residual 모드에서는 out["head_gate_mean"]이
+            # 항상 빈 dict라 이 sum들이 전부 0인 채로 남고, 아래 epoch
+            # 마감부에서 _fusion_gate_batches==0이면 gate 관련 필드를
+            # 전부 None으로 남겨 fusion_record에 안 채움.
+            _fusion_gate_mean_sum: dict = {}
+            _fusion_gate_var_sum: dict = {}
+            _fusion_gate_entropy_sum = 0.0
+            _fusion_gate_batches = 0
+            # [v2, Phase 2 후속] pre-softmax logit 배치 누적 — collapse가
+            # MLP 자체에서 시작되는지(초기부터 logit gap 큼) softmax/학습
+            # 과정에서 진행되는지(초기엔 작다가 점점 커짐) 구분하기 위함.
+            _fusion_gate_logit_mean_sum: dict = {}
+            _fusion_gate_logit_gap_sum = 0.0
 
             for start in range(0, len(y_train), self.params["batch_size"]):
                 idx = perm[start:start + self.params["batch_size"]]
                 xb, yb = X_train[idx], y_train[idx]
 
                 optimizer.zero_grad()
+
+                # [v2, Phase 1-1] step 기준 query detach warmup — epoch 기준
+                # (위 epoch 루프 상단)과 상호 배타적. global_step은 이 forward
+                # 호출 시점의 "지금까지 완료된 step 수"를 봐야 하므로 증가는
+                # forward 이후에 함(0-base: 첫 배치가 global_step=0일 때 검사됨).
+                if self.query_detach_warmup_epochs == 0 and self.query_detach_warmup_steps > 0:
+                    self.model.detach_query_warmup = (self.global_step < self.query_detach_warmup_steps)
 
                 # [추가] idx가 그대로 X_train 행 번호 — MemoryBank/FeatureStore가
                 # 이 배치를 저장할 때 같은 값을 sample_ids로 같이 넣어두면,
@@ -519,6 +590,26 @@ class TabERAWrapper:
                         _fusion_cos_ca_sum += out["head_cos_ca_mean"]
                         _fusion_cos_ca_batches += 1
                     _fusion_norm_batches += 1
+
+                if self.log_fusion_trajectory:
+                    # [v2, Phase 2] gated_sum 전용 — head_gate_mean/var는
+                    # {"query":..,"context":..,"agg":..} 형태 dict(빈 dict면
+                    # concat/residual 모드). entropy는 스칼라 or None.
+                    _gm = out.get("head_gate_mean")
+                    if _gm:
+                        for _name, _val in _gm.items():
+                            _fusion_gate_mean_sum[_name] = _fusion_gate_mean_sum.get(_name, 0.0) + _val
+                        for _name, _val in out.get("head_gate_var", {}).items():
+                            _fusion_gate_var_sum[_name] = _fusion_gate_var_sum.get(_name, 0.0) + _val
+                        if out.get("head_gate_entropy_mean") is not None:
+                            _fusion_gate_entropy_sum += out["head_gate_entropy_mean"]
+                        _fusion_gate_batches += 1
+                        for _name, _val in out.get("head_gate_logit_mean", {}).items():
+                            _fusion_gate_logit_mean_sum[_name] = (
+                                _fusion_gate_logit_mean_sum.get(_name, 0.0) + _val
+                            )
+                        if out.get("head_gate_logit_gap_mean") is not None:
+                            _fusion_gate_logit_gap_sum += out["head_gate_logit_gap_mean"]
 
                 # [진단용] log_evidence_stats — evidence_w(②)가 소수 이웃으로
                 # 붕괴하는지(dominant→1, entropy→0) 매 배치 기록. AttentionAggregator
@@ -612,6 +703,7 @@ class TabERAWrapper:
 
                 tr_loss_gpu += loss.detach()          # .item() 없이 GPU에 누적 (동기화 제거)
                 n_batch += 1
+                self.global_step += 1  # [v2, Phase 1-1] query_detach_warmup_steps 기준용
 
             scheduler.step()
             self.model.anneal(self.params.get("anneal_factor", 0.97))
@@ -794,11 +886,20 @@ class TabERAWrapper:
                 self.branch_gradient_history.append(epoch_record)
                 if epoch % self.regroup_log_every == 0:
                     _names = list(_branch_grad_sum.keys())
+                    # [버그 수정] weight_norm은 self.model._head_block_slices가
+                    # 채워진 concat 계열 모드에서만 존재(residual/gated_sum은
+                    # 위에서 이 dict가 비어있어 애초에 안 채워짐 — 각각
+                    # fusion_alpha/beta, head_gate_*로 branch별 기여를 따로
+                    # 보게 설계됨). 이전엔 이 케이스를 안 가리고 바로 f-string에서
+                    # epoch_record[f'{n}_weight_norm']를 읽어서 KeyError로 죽었음
+                    # (residual/gated_sum + --log_branch_gradients 조합 실측
+                    # 확인). .get()으로 없으면 "N/A" 출력하도록 수정.
                     pbar.write(
                         "  [BranchGrad] " + "  ".join(
                             f"{n}: grad={epoch_record[f'{n}_grad_norm']:.4f} "
                             f"act={epoch_record[f'{n}_act_norm']:.4f} "
-                            f"W={epoch_record[f'{n}_weight_norm']:.4f}"
+                            + (f"W={epoch_record[f'{n}_weight_norm']:.4f}"
+                               if f"{n}_weight_norm" in epoch_record else "W=N/A")
                             for n in _names
                         )
                     )
@@ -882,6 +983,31 @@ class TabERAWrapper:
                     "cos_ca_mean": (
                         _fusion_cos_ca_sum / _fusion_cos_ca_batches if _fusion_cos_ca_batches > 0 else None
                     ),
+                    # [v2, Phase 2] gated_sum 전용 — concat/residual 모드에서는
+                    # _fusion_gate_batches==0이라 전부 None/빈 dict.
+                    "gate_mean": (
+                        {k: v / _fusion_gate_batches for k, v in _fusion_gate_mean_sum.items()}
+                        if _fusion_gate_batches > 0 else {}
+                    ),
+                    "gate_var": (
+                        {k: v / _fusion_gate_batches for k, v in _fusion_gate_var_sum.items()}
+                        if _fusion_gate_batches > 0 else {}
+                    ),
+                    "gate_entropy_mean": (
+                        _fusion_gate_entropy_sum / _fusion_gate_batches
+                        if _fusion_gate_batches > 0 else None
+                    ),
+                    # [v2, Phase 2 후속] pre-softmax logit(temperature 적용 전
+                    # 원본) — MLP가 이미 얼마나 벌려놨는지를 gate_mean(post-
+                    # softmax, temperature 반영됨)과 분리해서 봄.
+                    "gate_logit_mean": (
+                        {k: v / _fusion_gate_batches for k, v in _fusion_gate_logit_mean_sum.items()}
+                        if _fusion_gate_batches > 0 else {}
+                    ),
+                    "gate_logit_gap_mean": (
+                        _fusion_gate_logit_gap_sum / _fusion_gate_batches
+                        if _fusion_gate_batches > 0 else None
+                    ),
                 }
                 self.fusion_trajectory_history.append(fusion_record)
                 if epoch % self.regroup_log_every == 0:
@@ -909,6 +1035,27 @@ class TabERAWrapper:
                         if _cqa is not None: _line2 += f"qa={_cqa:+.3f}  "
                         if _cca is not None: _line2 += f"ca={_cca:+.3f}"
                         pbar.write(_line2)
+                    # [v2, Phase 2] gated_sum 전용 — gate_mean이 채워져 있을
+                    # 때만(concat/residual이면 빈 dict라 자동으로 안 찍힘).
+                    if fusion_record["gate_mean"]:
+                        _gm, _gv = fusion_record["gate_mean"], fusion_record["gate_var"]
+                        _ge = fusion_record["gate_entropy_mean"]
+                        _line3 = "    gate: " + "  ".join(
+                            f"{name}={_gm[name]:.3f}(var={_gv.get(name, float('nan')):.4f})"
+                            for name in _gm
+                        )
+                        if _ge is not None:
+                            _line3 += f"  H={_ge:.3f}"
+                        pbar.write(_line3)
+                        _glm = fusion_record["gate_logit_mean"]
+                        _ggap = fusion_record["gate_logit_gap_mean"]
+                        if _glm:
+                            _line4 = "    gate_logit: " + "  ".join(
+                                f"{name}={_glm[name]:+.3f}" for name in _glm
+                            )
+                            if _ggap is not None:
+                                _line4 += f"  gap={_ggap:.3f}"
+                            pbar.write(_line4)
 
             # ── 검증 ──────────────────────────────────────
             self.model.eval()
@@ -925,6 +1072,43 @@ class TabERAWrapper:
                 val_logits = self._forward_batched(X_val[_val_perm])
                 val_m  = compute_metric(val_logits, y_val[_val_perm], self.tasktype)
             val_v = list(val_m.values())[0]
+
+            # [2026-07, 추가] log_centroid_label_mi_trajectory — I(C;Y)/H(Y)를
+            # 검증 세트에 대해 매 epoch 계산. embedder+prototype_layer만
+            # 거치는 가벼운 forward(retrieve/aggregate/head 불필요) — val
+            # forward와 별개 pass지만 X_val이 작아 비용이 낮음.
+            if self.log_centroid_label_mi_trajectory and self.tasktype != "regression":
+                with torch.no_grad():
+                    _q_val_mi = self.model.embedder(X_val)
+                    _, _hard_assignment_val, _, _, _, _ = self.model.prototype_layer(_q_val_mi)
+                    _cid_np = _hard_assignment_val.detach().cpu().numpy()
+                    _y_np = y_val.detach().round().long().cpu().numpy()
+
+                    def _entropy(labels):
+                        _, _counts = np.unique(labels, return_counts=True)
+                        _p = _counts / _counts.sum()
+                        return float(-(_p * np.log(_p + 1e-12)).sum())
+
+                    _H_Y = _entropy(_y_np)
+                    if _H_Y > 1e-9:
+                        _unique_c, _counts_c = np.unique(_cid_np, return_counts=True)
+                        _H_YC = sum(
+                            (n / len(_cid_np)) * _entropy(_y_np[_cid_np == c])
+                            for c, n in zip(_unique_c, _counts_c)
+                        )
+                        _norm_mi = (_H_Y - _H_YC) / _H_Y
+                        self.centroid_label_mi_history.append({
+                            "epoch": float(epoch),
+                            "H_Y": _H_Y,
+                            "H_Y_given_C": _H_YC,
+                            "norm_mi": _norm_mi,          # I(C;Y)/H(Y), 0~1
+                            "n_centroids_used": float(len(_unique_c)),
+                        })
+                        if epoch % self.regroup_log_every == 0:
+                            pbar.write(
+                                f"  [CentroidLabelMI] I(C;Y)/H(Y)={_norm_mi:.4f}  "
+                                f"H(Y|C)={_H_YC:.4f}  n_centroids_used={len(_unique_c)}"
+                            )
 
             # [버그 수정] regroup_warmup_epochs 도입 후 발견된 문제 — warmup
             # 중엔 sample_groups가 아직 한 번도 발행 안 된 상태([[],[],...])라,
