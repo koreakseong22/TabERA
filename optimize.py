@@ -2,7 +2,7 @@
 ## Paper info: TabERA — Tabular Hierarchical Explainable Retrieval Architecture
 ## Based on: MultiTab (Kyungeun Lee, kyungeun.lee@lgresearch.ai)
 
-import sys, os, argparse
+import os, argparse
 
 # ── CUDA_VISIBLE_DEVICES를 torch import 전 최우선 설정 ──────────
 # MultiTab 원본과 동일하게 argparse 직후, torch import 전에 설정
@@ -24,7 +24,7 @@ parser.add_argument("--evidence_metric", type=str, default="cosine",
                         "[기본값 변경] euclidean → cosine(reproduce.py와 통일). euclidean은 "
                         "-‖q-k‖²(raw, 정규화 안 됨) — 4개 데이터셋 "
                         "x 5-seed 실측 결과 evidence_w가 n_eff≈1.0(사실상 1-NN)으로 "
-                        "100% 재현되게 붕괴함이 확인됨. cosine은 q,k를 CentroidLayer "
+                        "100%% 재현되게 붕괴함이 확인됨. cosine은 q,k를 CentroidLayer "
                         "라우팅과 동일하게 정규화 후 2·cos — 같은 실측에서 n_eff를 "
                         "7.6~8.5로 안정적으로 유지, 성능은 유지~일부 개선(credit-g "
                         "balanced accuracy 등). euclidean으로 HPO하려면 명시적으로 "
@@ -74,6 +74,33 @@ parser.add_argument("--context_projection", action="store_true",
                         "일부를 대신 떠맡아 centroid_emb 왜곡을 줄이길 기대하는 "
                         "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
                         "centroid_x/confidence) 계산에는 관여하지 않음."
+                    ))
+parser.add_argument("--fusion_mode", type=str, default="residual",
+                    choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"],
+                    help=(
+                        "[2026-07, v2 freeze — 기본값 변경] TabERA v2 최종 architecture로 "
+                        "'residual'(query+β·agg)이 채택되어 기본값을 이걸로 바꿈 — 더 이상 "
+                        "이 플래그를 매번 명시할 필요 없음. 'concat'(V1식 — context_emb를 "
+                        "classifier feature로 head에 직접 결합)은 이제 ablation/비교 "
+                        "목적으로만 명시적으로 선택. study_pkl_tag는 concat을 기준으로 "
+                        "태그를 매기므로(fusion_mode != 'concat'이면 '..fusion_residual' "
+                        "태그) — 기존에 이미 '..fusion_residual..noctx..'로 저장된 study "
+                        "파일은 이 기본값 변경과 무관하게 그대로 재사용 가능(파일명 안 바뀜)."
+                    ))
+parser.add_argument("--use_context_emb", action="store_true",
+                    help=(
+                        "[2026-07, v2 freeze — 신규] fusion_mode='residual'에서 context_emb를 "
+                        "head 입력에 다시 포함시킴(V1식으로 되돌리기, ablation/비교 목적). "
+                        "기본값(플래그 안 줌)은 이제 False — v2 채택 구조(query+β·agg만, "
+                        "context_emb는 head에 안 감)가 기본. 예전 --no_context_emb 플래그는 "
+                        "하위호환을 위해 계속 받되(줘도 에러 안 남) 이제 아무 효과 없음 — "
+                        "이미 기본 동작이 그거라서."
+                    ))
+parser.add_argument("--no_context_emb", action="store_true",
+                    help=(
+                        "[2026-07, deprecated — 하위호환용] use_context_emb=False가 이제 "
+                        "기본값이라 이 플래그는 더 이상 아무 효과가 없음(줘도 안전 — 어차피 "
+                        "기본 동작). V1식으로 되돌리려면 --use_context_emb를 쓸 것."
                     ))
 parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
                     help=(
@@ -152,6 +179,8 @@ _ablation_tag = study_pkl_tag(
     cat_combine=args.cat_combine,
     num_embedding=args.num_embedding,
     evidence_metric=args.evidence_metric,
+    fusion_mode=args.fusion_mode,
+    use_context_emb=args.use_context_emb,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -238,7 +267,6 @@ if train:
 
     # ── Objective  (MultiTab 원본 구조와 동일) ─────────────
     def objective(trial):
-        global best_so_far
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id, metric=args.metric,
                                         num_embedding=args.num_embedding)
@@ -272,6 +300,8 @@ if train:
             detach_context_grad=args.detach_context_grad,
             use_context_projection=args.context_projection,
             evidence_metric=args.evidence_metric,
+            fusion_mode=args.fusion_mode,
+            use_context_emb=args.use_context_emb,
             # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
             # 인코딩. 이게 없으면 cat_col_idx=None이 돼서 cat_combine/
             # num_embedding 설정과 무관하게 raw-encoding 경로로 빠짐 — HPO가
@@ -445,4 +475,3 @@ if train:
     joblib.dump(study, fname)
     print(fname)
     print("#############################################")
-    #
