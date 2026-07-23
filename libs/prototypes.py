@@ -47,10 +47,6 @@ CentroidLayer — Dual-Space Prototype Representation
 - Dual-Space Prototype Representation (본 가설)
 - Straight-Through Estimator (Bengio et al. 2013)
 - VQ-VAE hard assignment trick (van den Oord et al. 2017)
-
-하위 호환성
-───────────
-PrototypeLayer = CentroidLayer  (alias 유지, 기존 tabr.py 수정 불필요)
 """
 
 from __future__ import annotations
@@ -1204,9 +1200,3 @@ class CentroidLayer(nn.Module):
                 line += f"  [{vals}]"
             lines.append(line)
         return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────
-# 하위 호환 alias (tabera.py import 수정 불필요)
-# ─────────────────────────────────────────────────────────────
-PrototypeLayer = CentroidLayer
