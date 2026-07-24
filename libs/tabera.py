@@ -1295,8 +1295,31 @@ class TabERA(nn.Module):
                                             # 런타임 계측 플래그라 model_kwargs/
                                             # _save_tag/--from_saved_state 하위
                                             # 호환 체계에는 안 태움.
+        disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜"
+            # retrieval-free baseline(Model 2)용. fusion_beta_override=0.0 +
+            # loss_*_override=0.0 조합(β=0으로 agg를 fusion에서만 차단)은
+            # STE routing의 backward(soft-argmax gradient가 여전히 query_emb
+            # 쪽으로 흐를 수 있음 — prototypes.py, "forward=argmax, backward=
+            # softmax 통과")까지는 못 끊는다는 지적(사용자) 반영 — 이 플래그는
+            # embedder 직후 곧바로 분기해서 prototype_layer/memory.retrieve/
+            # aggregator를 아예 호출하지 않음(STE를 포함해 그 무엇도 안 거침).
+            # z=query_emb를 그대로 head에 넣음(fusion_mode="residual"·
+            # aggregator_mode="pooling" 조합만 지원 — 그 외 조합에서 True면
+            # NotImplementedError). aux_loss=0(commitment/codebook/diversity
+            # 전부 hard_assignment가 없어서 애초에 계산 불가). retrieval 관련
+            # out dict 키(agg_emb/context_emb/centroid_id/fusion_beta/evidence_w
+            # 등)는 전부 None — ablation_mode나 branch 분석류 진단은 이 모드에서
+            # 의미가 없음(agg 자체가 없으므로). 순수하게 "Model 1/3과 비교할
+            # baseline accuracy"를 얻기 위한 스위치.
     ) -> None:
         super().__init__()
+        self.disable_retrieval_branch = disable_retrieval_branch
+        if disable_retrieval_branch and not (fusion_mode == "residual" and aggregator_mode == "pooling"):
+            raise NotImplementedError(
+                "disable_retrieval_branch=True는 fusion_mode='residual' + "
+                "aggregator_mode='pooling' 조합만 지원합니다 (현재: "
+                f"fusion_mode={fusion_mode!r}, aggregator_mode={aggregator_mode!r})."
+            )
         self.k            = k
         self.embed_dim    = embed_dim
         self.n_output     = n_output
@@ -1724,6 +1747,40 @@ class TabERA(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         # 1. 임베딩
         query_emb = self.embedder(X)               # (B, D)
+
+        # [2026-07, 추가] disable_retrieval_branch=True — "진짜" retrieval-free
+        # baseline(Model 2). prototype_layer/memory.retrieve/aggregator를
+        # 아예 호출하지 않고 곧바로 head로 감 — STE routing의 backward까지
+        # 포함해 retrieval 관련 gradient가 query_emb encoder 쪽으로 전혀
+        # 안 흐름(생성자에서 fusion_mode="residual"+aggregator_mode="pooling"
+        # 조합만 허용하도록 이미 검증됨). head_query_ln은 원래도 query 단독
+        # branch에 쓰이던 것 그대로 재사용(agg가 없으니 z=LN(q) 자체가 head
+        # 입력) — head의 파라미터/입력 차원은 평소와 완전히 동일, retrieval을
+        # "0으로 채워서 더하는" 게 아니라 그 항 자체가 없는 것.
+        if self.disable_retrieval_branch:
+            _z_no_retrieval = self.head_query_ln(query_emb) if self._per_branch_ln else query_emb
+            if getattr(self, "head_branch_l2norm", False):
+                _z_no_retrieval = F.normalize(_z_no_retrieval, dim=-1)
+            logits = self.head(_z_no_retrieval)
+            return {
+                "logits": logits,
+                "aux_loss": torch.zeros((), device=X.device, dtype=logits.dtype),  # commitment/codebook/diversity 전부 hard_assignment 없어서 계산 불가
+                "routing": None, "centroid_id": None, "hard_group": None,
+                "routing_confidence": None, "evidence_w": None, "evidence_diag": None,
+                "topk_idx": None, "agg_emb": None, "query_emb": query_emb,
+                "context_emb": None, "ablation_mode": ablation_mode,
+                "fusion_alpha": None, "fusion_beta": None,
+                "head_gate_mean": {}, "head_gate_var": {}, "head_gate_entropy_mean": None,
+                "head_gate_logit_mean": {}, "head_gate_logit_gap_mean": None,
+                "agg_beta_per_sample": None,
+                "similarity_top1_per_sample": None, "similarity_bottomk_per_sample": None,
+                "similarity_margin_per_sample": None, "similarity_std_per_sample": None,
+                "head_query_norm_mean": float(_z_no_retrieval.detach().norm(dim=-1).mean().item()),
+                "head_context_norm_mean": None, "head_agg_norm_mean": None,
+                "head_combined_norm_mean": float(_z_no_retrieval.detach().norm(dim=-1).mean().item()),
+                "head_cos_qc_mean": None, "head_cos_qa_mean": None, "head_cos_ca_mean": None,
+                "self_retrieval_top1_rate": None, "self_retrieval_topk_rate": None,
+            }
 
         # 2. 프로토타입 라우팅 (CentroidLayer)
         # prototypes.py가 6개 반환 (hierarchical 호환 + top1_confidence) →
