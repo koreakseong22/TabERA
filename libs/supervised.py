@@ -161,6 +161,48 @@ class TabERAWrapper:
             # prototype_layer만 — retrieve/aggregate/head는 안 거침, 저렴).
             # tasktype="regression"이면 label이 연속값이라 무의미 — 그 경우
             # 항상 빈 리스트로 남음(에러는 안 남).
+        log_shuffle_ablation_trajectory: bool = False,  # [2026-07, 추가]
+            # "retrieval은 optimization scaffold(학습 중엔 query representation을
+            # 형성하는 데 기여하지만, 추론 시점엔 query 자체가 이미 충분해져서
+            # agg 의존도가 낮다)"라는 가설(사용자 제안) 검증용. inference-time
+            # --ablation query_emb_shuffle/agg_emb_shuffle과 정확히 같은 조작을
+            # epoch마다(regroup_log_every 간격) 검증 세트에 대해 반복 —
+            # agg_grad_share(log_branch_gradients)는 이미 도는데, "gradient가
+            # agg로 흐르는 것"과 "실제로 agg가 prediction에 기여하는 것"은
+            # 다른 질문이라(이 프로젝트에서 여러 번 확인된 구분) 이 둘을 같은
+            # epoch 축에서 나란히 봐야 함. model(X_val, ablation_mode=...)를
+            # 그대로 재사용(model.py 쪽 신규 코드 없음) — retrieve/aggregate/
+            # head까지 다 거치는 forward라 log_centroid_label_mi_trajectory
+            # 보다는 비싸지만, X_val 크기 기준이라 감당 가능한 수준.
+            # tasktype="regression"이면 accuracy 개념이 없어 빈 리스트로 남음.
+        log_representation_drift_trajectory: bool = False,  # [2026-07, 추가/수정]
+            # "encoder가 agg가 주던 방향을 자신의 query representation 안으로
+            # 점점 흡수(internalize)한다"는 가설(사용자 제안) 검증용. scaffold
+            # 가설(retrieval contribution 감소)까지는 --log_shuffle_ablation_
+            # trajectory가 이미 보여주지만, "왜" 감소하는지는 간접 증거였음 —
+            # 이건 representation 자체의 이동을 직접 잼. 고정된 anchor 배치
+            # (X_val 앞 256개, 매 epoch 동일 샘플)에 대해 첫 로깅 epoch에서
+            # query_emb/agg_emb/centroid_id를 스냅샷으로 저장해두고, 그 이후
+            # epoch마다 같은 배치를 다시 흘려서 그 스냅샷 대비:
+            #   query_drift_from_epoch0 = mean‖q_t - q_0‖ (얼마나 움직였는가)
+            #   cos_drift_vs_agg0 = mean cos(q_t-q_0, a_0) — 핵심 지표. 움직인
+            #       "방향"이 초기 retrieval 방향(a_0, 고정 anchor)과 얼마나
+            #       같은가. [수정, 사용자 지적] 원래 ‖q_t-(q_0+β_0·a_0)‖를
+            #       "정답 방향"처럼 썼는데, a_t 자체가 매 epoch retrieval이
+            #       바뀌며 계속 변하는 값이라 애매했음 — a_0를 고정 기준점으로
+            #       "이 방향으로 이동했는가"만 묻는 cosine으로 교체.
+            #   cos_query_t_vs_agg0 = mean cos(q_t, a_0) — 최종 query 자체가
+            #       초기 retrieval과 얼마나 닮아가는가.
+            #   cos_query_agg_raw = mean cos(q_t, a_t) — 현재 시점 raw(LN 이전)
+            #       query/agg 관계(LN 이후 버전은 이미 log_fusion_trajectory의
+            #       cos_qa_mean에 있음).
+            #   centroid_stability_vs_epoch0 = 같은 centroid로 배정된 비율
+            # 을 기록. embedder+prototype+retrieve+aggregate까지 다 거치는
+            # forward라 비싸서, X_val 전체가 아니라 고정 256개 subset만 씀
+            # (--log_shuffle_ablation_trajectory는 X_val 전체를 쓰지만 그건
+            # accuracy 추정이 목적이라 표본이 커야 함 — 이건 representation
+            # 이동량의 평균 추정이라 256개면 충분히 안정적).
+            # tasktype="regression"이면 빈 리스트로 남음.
         query_detach_warmup_epochs: int = 0,
         # [v2, Phase 1-1] 학습 시작 후 이 값 이하 epoch 동안 model.
         # detach_query_warmup=True로 켠다(epoch 번호는 1-base, epoch<=N).
@@ -247,6 +289,13 @@ class TabERAWrapper:
         self.fusion_trajectory_history: List[Dict[str, float]] = []
         self.log_centroid_label_mi_trajectory = log_centroid_label_mi_trajectory
         self.centroid_label_mi_history: List[Dict[str, float]] = []
+        self.log_shuffle_ablation_trajectory = log_shuffle_ablation_trajectory
+        # epoch별: {"epoch", "acc_full", "acc_query_shuffle", "acc_agg_shuffle",
+        #           "delta_query_shuffle", "delta_agg_shuffle"}
+        self.shuffle_ablation_trajectory_history: List[Dict[str, float]] = []
+        self.log_representation_drift_trajectory = log_representation_drift_trajectory
+        self.representation_drift_history: List[Dict[str, float]] = []
+        self._drift_anchor = None  # 첫 로깅 epoch에 캐시되는 {"query_0","agg_0","beta_0","centroid_0"}
 
     # ── fit ─────────────────────────────────────────────────
 
@@ -477,6 +526,10 @@ class TabERAWrapper:
             _branch_grad_sum: Dict[str, float] = {}
             _branch_act_sum:  Dict[str, float] = {}
             _branch_batches:  Dict[str, int] = {}  # [수정] 브랜치별 등장 배치 수를
+            _branch_contrib_sum: Dict[str, float] = {}  # [추가, 사용자 요청] ‖W_name · t‖ —
+                # act_norm(‖t‖)/weight_norm(‖W_name‖)과 함께 봐서 magnitude(‖t‖ 증가)와
+                # alignment(t가 W_name의 "유용한 방향"과 얼마나 정렬됐는가)를 분리하기 위함.
+                # concat 전용(residual은 _head_block_slices가 비어있어 자동으로 안 쌓임).
             # 따로 센다 — agg 브랜치는 memory.filled < k인 극초반 배치에서
             # requires_grad=False라 tabera.py forward()가 아예 등록을 건너뛴다
             # (위 tabera.py 주석 참고). 공유 카운터 하나로 나누면 그런 배치들
@@ -686,6 +739,15 @@ class TabERAWrapper:
                         _branch_grad_sum[name] = _branch_grad_sum.get(name, 0.0) + g_norm
                         _branch_act_sum[name]  = _branch_act_sum.get(name, 0.0) + a_norm
                         _branch_batches[name]  = _branch_batches.get(name, 0) + 1
+                        # [추가, 사용자 요청] contribution norm(‖W_name · t‖, 이 배치 시점의
+                        # W 그대로 사용 — epoch 끝 스냅샷(query_weight_norm)과 살짝 다를 수
+                        # 있지만 한 epoch 안에서 W가 크게 안 변하므로 근사로 충분) — concat
+                        # 전용(_head_block_slices가 residual에서는 비어있어 이 if가 항상 False).
+                        if name in self.model._head_block_slices:
+                            _s, _e = self.model._head_block_slices[name]
+                            _W_block = self.model._head_first_linear.weight[:, _s:_e]
+                            _contrib = F.linear(t.detach(), _W_block).norm(dim=-1).mean().item()
+                            _branch_contrib_sum[name] = _branch_contrib_sum.get(name, 0.0) + _contrib
                         if _fine_grained:
                             self.branch_gradient_batch_history.append({
                                 "epoch": float(epoch), "batch": float(n_batch),
@@ -883,6 +945,22 @@ class TabERAWrapper:
                     W = self.model._head_first_linear.weight  # (out, in)
                     for name, (s, e) in self.model._head_block_slices.items():
                         epoch_record[f"{name}_weight_norm"] = float(W[:, s:e].norm().item())
+                # [추가, 사용자 요청] contribution_norm(‖W_name·t‖ epoch 평균)과
+                # 거기서 유도한 alignment(= contribution_norm / (weight_norm·act_norm),
+                # Cauchy-Schwarz 상한 대비 실제 비율 — 1에 가까울수록 t가 W_name의
+                # "유용한 방향"과 잘 정렬됨, 0에 가까우면 거의 직교). 이 비율로
+                # "contribution이 커진 게 norm(‖t‖) 증가 때문인지 alignment 개선
+                # 때문인지 둘 다인지"를 분해. weight_norm은 epoch 끝 스냅샷인데
+                # contrib는 epoch 내내 변하는 W로 누적한 평균이라 약간의 근사
+                # 오차가 있을 수 있음(한 epoch 안 W 변화가 작다는 전제).
+                for name in _branch_contrib_sum:
+                    _n = _branch_batches.get(name, 0)
+                    if _n == 0 or f"{name}_weight_norm" not in epoch_record:
+                        continue
+                    _contrib_mean = _branch_contrib_sum[name] / _n
+                    epoch_record[f"{name}_contrib_norm"] = _contrib_mean
+                    _denom = epoch_record[f"{name}_weight_norm"] * epoch_record[f"{name}_act_norm"]
+                    epoch_record[f"{name}_alignment"] = _contrib_mean / _denom if _denom > 1e-12 else float("nan")
                 self.branch_gradient_history.append(epoch_record)
                 if epoch % self.regroup_log_every == 0:
                     _names = list(_branch_grad_sum.keys())
@@ -900,6 +978,8 @@ class TabERAWrapper:
                             f"act={epoch_record[f'{n}_act_norm']:.4f} "
                             + (f"W={epoch_record[f'{n}_weight_norm']:.4f}"
                                if f"{n}_weight_norm" in epoch_record else "W=N/A")
+                            + (f" align={epoch_record[f'{n}_alignment']:.3f}"
+                               if f"{n}_alignment" in epoch_record else "")
                             for n in _names
                         )
                     )
@@ -1109,6 +1189,166 @@ class TabERAWrapper:
                                 f"  [CentroidLabelMI] I(C;Y)/H(Y)={_norm_mi:.4f}  "
                                 f"H(Y|C)={_H_YC:.4f}  n_centroids_used={len(_unique_c)}"
                             )
+
+            # [2026-07, 추가] log_shuffle_ablation_trajectory — "retrieval은
+            # optimization scaffold" 가설(사용자 제안) 검증용. inference-time
+            # --ablation query_emb_shuffle/agg_emb_shuffle과 정확히 같은 조작
+            # (model.forward()의 ablation_mode 인자 그대로 재사용, 새 model
+            # 코드 없음)을 검증 세트에 대해 epoch마다 반복해서, gradient가
+            # agg로 흐르는 것(log_branch_gradients)과 실제로 agg가 prediction에
+            # 기여하는 것이 학습 중 어떻게 갈라지는지(혹은 안 갈라지는지) 본다.
+            # regroup_log_every 간격으로만 계산(retrieve/aggregate/head까지
+            # 다 거치는 forward 3회라 log_centroid_label_mi_trajectory보다
+            # 비쌈 — 매 epoch은 과함).
+            if (self.log_shuffle_ablation_trajectory and self.tasktype != "regression"
+                    and epoch % self.regroup_log_every == 0):
+                with torch.no_grad():
+                    _bs = self.params.get("batch_size", 512)
+
+                    def _acc_with_mode(mode: str) -> float:
+                        _correct = 0
+                        for _start in range(0, len(X_val), _bs):
+                            _xb = X_val[_start:_start + _bs]
+                            _yb = y_val[_start:_start + _bs]
+                            _out_ab = self.model(_xb, ablation_mode=mode)
+                            _preds_ab, _ = get_preds_and_probs(_out_ab["logits"], self.tasktype)
+                            _yb_int = _yb.detach().round().long()
+                            _correct += (_preds_ab == _yb_int).sum().item()
+                        return _correct / len(X_val)
+
+                    _acc_full  = _acc_with_mode("none")
+                    _acc_qshuf = _acc_with_mode("query_emb_shuffle")
+                    _acc_ashuf = _acc_with_mode("agg_emb_shuffle")
+                    self.shuffle_ablation_trajectory_history.append({
+                        "epoch": float(epoch),
+                        "acc_full": _acc_full,
+                        "acc_query_shuffle": _acc_qshuf,
+                        "acc_agg_shuffle": _acc_ashuf,
+                        "delta_query_shuffle": _acc_qshuf - _acc_full,
+                        "delta_agg_shuffle": _acc_ashuf - _acc_full,
+                    })
+                    pbar.write(
+                        f"  [ShuffleAblationTraj] acc_full={_acc_full:.4f}  "
+                        f"Δquery_shuffle={_acc_qshuf - _acc_full:+.4f}  "
+                        f"Δagg_shuffle={_acc_ashuf - _acc_full:+.4f}"
+                    )
+
+            # [2026-07, 수정] log_representation_drift_trajectory — "encoder가
+            # agg 방향을 query representation 안으로 흡수한다"는 internalization
+            # 가설 직접 검증. 고정 anchor(X_val 앞 256개, 매 epoch 동일 샘플)
+            # 기준 query_emb 이동을 첫 로깅 epoch 대비로 잼.
+            # [수정, 사용자 지적] 원래 ‖q_t-(q_0+β_0·a_0)‖를 "정답 방향"처럼
+            # 썼는데, a_t 자체가 매 epoch retrieval(centroid 배정 + 이웃)이
+            # 바뀌면서 계속 변하는 값이라 a_0를 "정답"으로 고정하는 게 애매함.
+            # 대신 "q가 실제로 움직인 방향(Δ=q_t-q_0)이 초기 retrieval이 가리키던
+            # 방향(a_0)과 얼마나 닮았는가"인 cos(q_t-q_0, a_0)로 교체 — a_0는
+            # 여전히 고정 anchor(움직이는 target이 아니라 "이 방향으로 갔는가"를
+            # 묻는 고정 기준점)라 방향 해석이 훨씬 깔끔함. cos(q_t,a_0)/cos(q_t,a_t)
+            # 까지 같이 봐서 "이동량"뿐 아니라 "이동 방향"까지 커버.
+            # [2026-07, 추가] pre-LN(raw) / post-LN / post-first-Linear 세 단계의
+            # cos(q,a)를 같은 epoch·같은 anchor batch에서 동시에 기록 — "raw에서는
+            # 관계가 없는데 LN 이후엔 음의 상관이 생긴다"는 관찰(22에서 발견)이
+            # LayerNorm(또는 그 학습된 γ/β) 근처에서 만들어지는지, 아니면 그 뒤의
+            # 첫 Linear(W)까지 가야 더 벌어지는지 구분하기 위함. 이전엔 이 비교를
+            # 서로 다른 두 학습 실행(log_fusion_trajectory 따로, log_representation_
+            # drift_trajectory 따로)을 --deterministic 재현성에 기대어 겹쳐봤는데,
+            # 같은 실행 안에서 한 번에 재면 그 가정 자체가 필요 없어짐.
+            # fusion_mode="residual"이 아니면(head_query_ln/agg_ln/_head_first_linear
+            # 구성이 다르거나 없음) None으로 남김.
+            if (self.log_representation_drift_trajectory and self.tasktype != "regression"
+                    and epoch % self.regroup_log_every == 0):
+                with torch.no_grad():
+                    _n_anchor = min(256, len(X_val))
+                    _out_anchor = self.model(X_val[:_n_anchor], ablation_mode="none")
+                    _q_t = _out_anchor["query_emb"].detach()
+                    _a_t = _out_anchor["agg_emb"].detach()
+                    _c_t = _out_anchor.get("centroid_id")
+                    _c_t = _c_t.detach() if _c_t is not None else None
+                    _beta_t = _out_anchor.get("fusion_beta")
+
+                    _cos_pre_ln = F.cosine_similarity(_q_t, _a_t, dim=-1).mean().item()
+                    _cos_post_ln = None
+                    _cos_post_linear = None
+                    _hq_norm = _ha_norm = None
+                    _q_ln_norm = _a_ln_norm = None
+                    _q_raw_norm = _q_t.norm(dim=-1).mean().item()
+                    _a_raw_norm = _a_t.norm(dim=-1).mean().item()
+                    if (self.model.fusion_mode == "residual"
+                            and hasattr(self.model, "_head_first_linear")
+                            and getattr(self.model, "_per_branch_ln", False)):
+                        _q_ln = self.model.head_query_ln(_q_t)
+                        _a_ln = self.model.head_agg_ln(_a_t)
+                        if getattr(self.model, "head_branch_l2norm", False):
+                            _q_ln = F.normalize(_q_ln, dim=-1)
+                            _a_ln = F.normalize(_a_ln, dim=-1)
+                        _cos_post_ln = F.cosine_similarity(_q_ln, _a_ln, dim=-1).mean().item()
+                        _q_ln_norm = _q_ln.norm(dim=-1).mean().item()
+                        _a_ln_norm = _a_ln.norm(dim=-1).mean().item()
+
+                        _W = self.model._head_first_linear.weight
+                        _b = self.model._head_first_linear.bias
+                        _h_q = F.linear(_q_ln, _W, _b)
+                        _h_a = (float(_beta_t) if _beta_t is not None else 1.0) * F.linear(_a_ln, _W, None)
+                        _cos_post_linear = F.cosine_similarity(_h_q, _h_a, dim=-1).mean().item()
+                        # [추가, 사용자 지적] cosine은 방향만 보고 크기(projection magnitude)는
+                        # 안 봄 — head가 실제로 얼마나 큰 신호를 각 branch에서 받는지는 norm으로
+                        # 봐야 함. h_q=W@LN(q)+b(bias 포함), h_a=β·W@LN(a)(bias 없음, 순수 agg 기여분)
+                        # — compute_pre_fusion_gradient_attribution/compute_head_input_cancellation
+                        # (one-shot 버전)과 정확히 같은 분해를 매 epoch 재사용.
+                        _hq_norm = _h_q.norm(dim=-1).mean().item()
+                        _ha_norm = _h_a.norm(dim=-1).mean().item()
+
+                    if self._drift_anchor is None:
+                        self._drift_anchor = {
+                            "query_0": _q_t.clone(), "agg_0": _a_t.clone(),
+                            "centroid_0": _c_t.clone() if _c_t is not None else None,
+                        }
+                        _drift_q0 = 0.0
+                        _drift_a0 = 0.0
+                        _cos_drift_vs_a0 = 0.0  # Δ=q_t-q_0=0(anchor 시점)이라 방향 자체가 미정의 — 0으로 표시
+                        _cent_stab = 1.0
+                    else:
+                        _q0 = self._drift_anchor["query_0"]
+                        _a0 = self._drift_anchor["agg_0"]
+                        _drift_q0 = (_q_t - _q0).norm(dim=-1).mean().item()
+                        # [추가, 사용자 가설 C 검증] ‖a_t-a_0‖ — agg가 retrieved
+                        # weighted-average라서 query_emb(encoder 직접 출력)보다
+                        # "움직일 자유도"가 원래 작은지 직접 비교하기 위함. query_
+                        # drift_from_epoch0과 정확히 같은 정의를 agg에도 적용 —
+                        # 이 둘의 절대적 크기(‖q_t-q_0‖ vs ‖a_t-a_0‖)를 직접 비교하면
+                        # "query가 훨씬 더 많이 움직인다"는 게 실제로 사실인지 바로 보임.
+                        _drift_a0 = (_a_t - _a0).norm(dim=-1).mean().item()
+                        _cos_drift_vs_a0 = F.cosine_similarity(_q_t - _q0, _a0, dim=-1).mean().item()
+                        _c0 = self._drift_anchor["centroid_0"]
+                        _cent_stab = ((_c_t == _c0).float().mean().item()
+                                      if (_c_t is not None and _c0 is not None) else float("nan"))
+
+                    _a0_fixed = self._drift_anchor["agg_0"]
+                    self.representation_drift_history.append({
+                        "epoch": float(epoch),
+                        "query_drift_from_epoch0": _drift_q0,                                    # ‖q_t-q_0‖ — 얼마나 움직였는가
+                        "agg_drift_from_epoch0": _drift_a0,                                       # ‖a_t-a_0‖ — agg가 실제로 얼마나 움직이는가(가설 C 검증)
+                        "cos_drift_vs_agg0": _cos_drift_vs_a0,                                    # cos(q_t-q_0, a_0) — 그 방향이 초기 retrieval 방향과 같은가(핵심 지표)
+                        "cos_query_t_vs_agg0": F.cosine_similarity(_q_t, _a0_fixed, dim=-1).mean().item(),  # cos(q_t, a_0) — 최종 query가 초기 retrieval을 닮아가는가
+                        "cos_query_agg_raw": _cos_pre_ln,           # cos(q_t, a_t), pre-LN(raw)
+                        "cos_query_agg_post_ln": _cos_post_ln,      # cos(LN(q_t), LN(a_t)) — 같은 epoch·배치에서
+                        "cos_query_agg_post_linear": _cos_post_linear,  # cos(h_q, h_a) = cos(W@LN(q)+b, β·W@LN(a))
+                        "query_norm_raw": _q_raw_norm, "agg_norm_raw": _a_raw_norm,                # ‖q_t‖, ‖a_t‖ — pre-LN
+                        "query_norm_post_ln": _q_ln_norm, "agg_norm_post_ln": _a_ln_norm,          # ‖LN(q_t)‖, ‖LN(a_t)‖
+                        "hq_norm_post_linear": _hq_norm, "ha_norm_post_linear": _ha_norm,          # ‖h_q‖, ‖h_a‖ — head가 실제로 받는 신호 크기(핵심)
+                        "centroid_stability_vs_epoch0": _cent_stab,
+                    })
+                    pbar.write(
+                        f"  [RepDriftTraj] ‖q_t-q_0‖={_drift_q0:.3f}  ‖a_t-a_0‖={_drift_a0:.3f}  cos(Δq,a_0)={_cos_drift_vs_a0:+.3f}  "
+                        f"cos(q_t,a_0)={self.representation_drift_history[-1]['cos_query_t_vs_agg0']:+.3f}  "
+                        f"centroid_stability={_cent_stab:.1%}\n"
+                        f"    cos(q,a) pre-LN={_cos_pre_ln:+.3f}"
+                        + (f"  post-LN={_cos_post_ln:+.3f}  post-Linear={_cos_post_linear:+.3f}\n"
+                           f"    norm  raw(q/a)={_q_raw_norm:.2f}/{_a_raw_norm:.2f}  "
+                           f"post-LN(q/a)={_q_ln_norm:.2f}/{_a_ln_norm:.2f}  "
+                           f"post-Linear(h_q/h_a)={_hq_norm:.2f}/{_ha_norm:.2f}"
+                           if _cos_post_ln is not None else "  (post-LN/post-Linear/norm: fusion_mode≠residual, skip)")
+                    )
 
             # [버그 수정] regroup_warmup_epochs 도입 후 발견된 문제 — warmup
             # 중엔 sample_groups가 아직 한 번도 발행 안 된 상태([[],[],...])라,
