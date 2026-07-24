@@ -98,6 +98,15 @@ def study_pkl_tag(
     use_context_emb: bool = True,  # [2026-07, 추가] fusion_mode='residual'일 때만
         # 의미 있음(query+β·agg만 쓸지, context도 head에 넣을지). True(기본값)면
         # 태그 없음 — 하위 호환.
+    disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜" retrieval-free
+        # baseline(Model 2, TabERA.__init__ 참고). False(기본값)면 태그 없음 —
+        # 하위 호환. [교훈] fusion_mode를 "기본값=태그 없음"으로 짰다가 v2 freeze
+        # 이후 기본값이 바뀌면서 옛날 study 파일과 충돌한 사고가 있었음(위 참고) —
+        # 그 반복을 피하려고 이 플래그는 처음부터 "값이 뭐든 명시적으로 태그"
+        # 하는 대신, 기본값(False)일 때만 태그 생략하는 표준 패턴을 그대로 따름
+        # (이 자체가 위험한 게 아니라, "기본값 자체가 나중에 바뀔 수 있다"는 걸
+        # 놓치는 게 위험했던 것 — disable_retrieval_branch=False는 앞으로도
+        # 계속 "기존 TabERA와 동일"을 뜻하므로 여기서는 안전).
 ) -> str:
     """optimize.py가 저장하는 study .pkl 파일명의 태그 부분을 만든다.
 
@@ -139,8 +148,9 @@ def study_pkl_tag(
         + ("..num_ple" if num_embedding == "ple" else "") \
         + ("..num_linear" if num_embedding == "linear" else "") \
         + (f"..evM_{evidence_metric}" if evidence_metric != "euclidean" else "") \
-        + (f"..fusion_{fusion_mode}" if fusion_mode != "concat" else "") \
-        + ("..noctx" if (fusion_mode != "concat" and not use_context_emb) else "")
+        + f"..fusion_{fusion_mode}" \
+        + ("..noctx" if not use_context_emb else "") \
+        + ("..no_retrieval" if disable_retrieval_branch else "")
 
 
 def suggest_initial_trial() -> dict:
