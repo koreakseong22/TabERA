@@ -102,6 +102,19 @@ parser.add_argument("--no_context_emb", action="store_true",
                         "기본값이라 이 플래그는 더 이상 아무 효과가 없음(줘도 안전 — 어차피 "
                         "기본 동작). V1식으로 되돌리려면 --use_context_emb를 쓸 것."
                     ))
+parser.add_argument("--disable_retrieval_branch", action="store_true",
+                    help=(
+                        "[2026-07, 추가] '진짜' retrieval-free baseline(Model 2) HPO용 — "
+                        "reproduce.py의 같은 이름 플래그와 정확히 같은 의미. 이 모드에서는 "
+                        "k/n_prototypes/evidence_metric 등 retrieval 관련 하이퍼파라미터가 "
+                        "전혀 안 쓰이므로(모델이 아예 retrieval을 안 함) 이 플래그를 켠 채로 "
+                        "HPO를 새로 돌리는 건 대부분 낭비 — retrieval 있는 구조로 이미 돌린 "
+                        "study의 embed_dim/dropout/lr 등만 재사용하고 싶다면 reproduce.py "
+                        "쪽에서 --disable_retrieval_branch만 켜고 기존 study를 그대로 "
+                        "불러오는 게 낫다(다만 study_pkl_tag가 이 플래그 값에 따라 다른 "
+                        "파일을 가리키므로, 그러려면 optimize.py도 한 번은 이 플래그를 켠 "
+                        "채로 시작해 study 파일을 만들어야 함 — 파일명 태그: '..no_retrieval')."
+                    ))
 parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
                     help=(
                         "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
@@ -181,6 +194,7 @@ _ablation_tag = study_pkl_tag(
     evidence_metric=args.evidence_metric,
     fusion_mode=args.fusion_mode,
     use_context_emb=args.use_context_emb,
+    disable_retrieval_branch=args.disable_retrieval_branch,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -301,6 +315,7 @@ if train:
             use_context_projection=args.context_projection,
             evidence_metric=args.evidence_metric,
             fusion_mode=args.fusion_mode,
+            disable_retrieval_branch=args.disable_retrieval_branch,
             use_context_emb=args.use_context_emb,
             # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
             # 인코딩. 이게 없으면 cat_col_idx=None이 돼서 cat_combine/
