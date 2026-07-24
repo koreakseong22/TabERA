@@ -752,6 +752,215 @@ def print_branch_gradient_attribution(result: dict) -> None:
     print(f"   맞춰 업데이트되고 있지 않다는 직접 증거.)")
 
 
+def compute_pre_fusion_gradient_attribution(model, X, y, tasktype: str, batch_size: int = 512):
+    """residual fusion(z = query_emb + β·agg_emb, 필요시 + α·context_emb)
+    전용 one-shot gradient attribution.
+
+    [배경] compute_branch_gradient_attribution은 head 첫 Linear의 입력을
+    branch별 slice(_head_block_slices)로 나눠서 재는데, 이건 fusion_mode=
+    "concat"([q|c|a] → Linear로 branch별 W가 분리되는 경우)에만 성립하는
+    개념이다. residual에서는 head에 들어가기 전에 이미 branch들이 하나의
+    벡터 z로 합쳐져 있어("classifier는 W_z 하나만 본다") _head_block_slices
+    자체가 없고(tabera.py, concat일 때만 채워짐), 그 함수를 그대로 가져다
+    쓰면 구조적으로 안 맞는 질문을 하는 셈이 된다 — 그래서 이 함수를 새로
+    만들지 않고 concat 전용으로 남겨두기로 함(사용자 결정).
+
+    residual에서 자연스러운 질문은 "loss가 fusion **이전** 원본 표현
+    (query_emb/agg_emb/context_emb, out dict에 fusion_mode와 무관하게 항상
+    raw로 노출됨)에 얼마나 gradient를 돌려보내는가"이다. 여기에 직접
+    retain_grad()를 걸어 backward 한 번으로 측정한다 — head가 fusion 이후
+    실제로 어느 branch에 "맞춰 업데이트"되고 있는지 그 근원(query_emb vs
+    agg_emb, 분석계획 4번)을 residual 구조에 맞는 지점에서 본다.
+
+    재학습 불필요(가중치 고정, forward+backward 한 번) — --from_saved_state와
+    같이 쓸 수 있음. --log_branch_gradients(supervised.py)는 학습 도중 매
+    epoch 이 정보를 기록하지만 재학습이 필요했음 — 이건 그 one-shot 버전
+    (같은 raw query_emb/agg_emb/context_emb 지점을 잼, tabera.py:1994-1996
+    의 학습 중 hook과 동일한 대상).
+    """
+    model.eval()
+    criterion = get_criterion(tasktype)
+    branch_names = ("query_emb", "agg_emb", "context_emb")
+
+    grad_norms = {name: [] for name in branch_names}
+    act_norms  = {name: [] for name in branch_names}
+    for start in range(0, len(X), batch_size):
+        model.zero_grad(set_to_none=True)
+        X_batch = X[start:start + batch_size]
+        y_batch = y[start:start + batch_size]
+        out = model(X_batch)  # no_grad 밖 — autograd 정상 추적
+
+        tensors = {}
+        for name in branch_names:
+            t = out.get(name)
+            if t is None or not t.requires_grad:
+                continue  # context_emb가 detach_context_grad로 끊긴 설정 등은 자연히 스킵
+            t.retain_grad()
+            tensors[name] = t
+        if not tensors:
+            continue
+
+        logits = out["logits"]
+        if tasktype == "regression":
+            loss = criterion(logits.squeeze(-1), y_batch.float())
+        elif tasktype == "binclass":
+            loss = criterion(logits.squeeze(-1), y_batch.float())
+        else:
+            loss = criterion(logits, y_batch.long())
+        loss.backward()
+
+        for name, t in tensors.items():
+            if t.grad is None:
+                continue  # 이 배치에서 이 branch까지 gradient가 안 흐름 — 진단적으로 유의미하니 스킵만
+            grad_norms[name].append(t.grad.norm(dim=-1).detach().cpu())
+            act_norms[name].append(t.detach().norm(dim=-1).cpu())
+    model.zero_grad(set_to_none=True)
+
+    result = {}
+    for name in branch_names:
+        if not grad_norms[name]:
+            continue
+        g = torch.cat(grad_norms[name])
+        a = torch.cat(act_norms[name])
+        result[name] = {
+            "grad_norm_mean": float(g.mean()),
+            "grad_norm_std":  float(g.std()),
+            "act_norm_mean":  float(a.mean()),
+        }
+    total_grad = sum(r["grad_norm_mean"] for r in result.values())
+    for name, r in result.items():
+        r["grad_share"] = r["grad_norm_mean"] / total_grad if total_grad > 0 else float("nan")
+    return result
+
+
+def print_pre_fusion_gradient_attribution(result: dict) -> None:
+    print(f"\n{'='*60}")
+    print(f"  Pre-fusion Gradient Attribution (residual 전용, one-shot)")
+    print(f"{'='*60}")
+    print(f"  {'branch':<10}{'grad_norm':>14}{'grad_share':>12}{'act_norm':>14}")
+    for name, r in sorted(result.items(), key=lambda kv: -kv[1]["grad_norm_mean"]):
+        print(f"  {name:<10}{r['grad_norm_mean']:>14.6e}{r['grad_share']:>12.1%}{r['act_norm_mean']:>14.4f}")
+    print(f"  (raw query_emb/agg_emb/context_emb — fusion(z=q+βa) **이전**, head 진입 전")
+    print(f"   지점에서 잰 gradient. agg의 grad_share가 낮으면(예: query 대비 100배 이상")
+    print(f"   작으면) loss가 agg_emb 쪽으로 거의 안 흐른다는 뜻 — 단, gradient는 '학습")
+    print(f"   신호의 흐름'이지 '예측이 실제로 그 branch를 쓰는가'가 아니므로(이미 잘")
+    print(f"   학습된 branch는 gradient가 작아도 여전히 예측에 크게 기여할 수 있음),")
+    print(f"   --ablation agg_emb_zero/shuffle 결과와 반드시 같이 해석할 것.)")
+
+
+def compute_head_input_cancellation(model, X, batch_size: int = 512):
+    """residual fusion(z = LN(q) + β·LN(a)) 전용. representation은 크게
+    움직이는데(‖z-q‖=‖β·LN(a)‖ 큼) accuracy는 거의 안 변한다는 관찰(사용자
+    지적)에 대해 "head 진입 직후(첫 hidden layer)에서 이미 상쇄되는가"를
+    직접 검증.
+
+    [원리] head의 첫 Linear(W, bias b)는 선형이므로,
+        W@z + b = (W@LN(q) + b) + β·(W@LN(a))
+    이 항등식이 **항상** 정확히 성립한다(근사가 아님 — 아래서 실제 forward
+    출력과 비교해 부동소수점 오차 수준인지 sanity check까지 함). 좌변 두
+    항을 각각
+        h_q = W@LN(q) + b   (agg_emb_zero ablation이 만드는 값과 정확히 동일)
+        h_a = β·(W@LN(a))   (bias 없는 순수 agg 기여분)
+    로 부르면, cos(h_q, h_a)와 ‖h_q+h_a‖ vs ‖h_q‖+‖h_a‖를 비교해서 두 기여가
+    "반대 방향으로 상쇄"되는지 "직교라 서로 안 건드리는지" "같은 방향으로
+    강화"되는지 직접 구분할 수 있다. _head_block_slices(concat 전용)가 전혀
+    필요 없음 — "합 다음에 선형 레이어"라는 구조 자체가 이 분해를 보장하는
+    residual 고유의 성질.
+
+    raw query_emb/agg_emb(out dict에 항상 노출)에 model.head_query_ln/
+    model.head_agg_ln(forward 내부와 정확히 같은 모듈)을 그대로 적용해서
+    재현 — 새 파라미터 없음, 순수 관찰. head_branch_l2norm=True인 체크포인트도
+    forward와 동일한 순서(LN → L2norm)로 재현.
+
+    재학습 불필요(forward만) — --from_saved_state와 같이 쓸 수 있음.
+    """
+    if getattr(model, "fusion_mode", None) != "residual":
+        raise ValueError(f"이 진단은 fusion_mode='residual' 전용입니다 "
+                          f"(현재: {getattr(model, 'fusion_mode', None)}) — "
+                          f"'합 다음에 선형 레이어'라는 분해가 β가 스칼라인 "
+                          f"residual에서 가장 단순하게 성립함.")
+    if not hasattr(model, "_head_first_linear"):
+        raise ValueError("이 모델에는 _head_first_linear가 없습니다(구버전 체크포인트).")
+
+    model.eval()
+    W = model._head_first_linear.weight.detach()
+    b = model._head_first_linear.bias.detach() if model._head_first_linear.bias is not None else None
+
+    cos_chunks, hq_norm_chunks, ha_norm_chunks, hfull_norm_chunks = [], [], [], []
+    sanity_err_chunks = []
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            out = model(X[start:start + batch_size])
+            q, a = out["query_emb"], out["agg_emb"]
+            beta = float(out["fusion_beta"])
+
+            q_ln = model.head_query_ln(q) if model._per_branch_ln else q
+            a_ln = model.head_agg_ln(a) if model._per_branch_ln else a
+            if model.head_branch_l2norm:
+                q_ln = F.normalize(q_ln, dim=-1)
+                a_ln = F.normalize(a_ln, dim=-1)
+
+            h_q = F.linear(q_ln, W, b)              # W@LN(q) + b  (agg_emb_zero와 동일 지점)
+            h_a = beta * F.linear(a_ln, W, None)     # β·(W@LN(a))  (bias 없음)
+
+            # sanity check: 실제 forward가 만드는 첫-레이어 출력과 정확히 일치해야 함
+            z = q_ln + beta * a_ln
+            h_full = F.linear(z, W, b)
+            sanity_err_chunks.append((h_full - (h_q + h_a)).norm(dim=-1).cpu())
+
+            cos_chunks.append(F.cosine_similarity(h_q, h_a, dim=-1).cpu())
+            hq_norm_chunks.append(h_q.norm(dim=-1).cpu())
+            ha_norm_chunks.append(h_a.norm(dim=-1).cpu())
+            hfull_norm_chunks.append(h_full.norm(dim=-1).cpu())
+
+    cos      = torch.cat(cos_chunks).numpy()
+    hq_norm  = torch.cat(hq_norm_chunks).numpy()
+    ha_norm  = torch.cat(ha_norm_chunks).numpy()
+    hfull_norm = torch.cat(hfull_norm_chunks).numpy()
+    sanity_err = torch.cat(sanity_err_chunks).numpy()
+
+    # <1이면 h_q/h_a가 서로 상쇄(반대 방향 성분이 겹쳐서 합의 norm이 줄어듦),
+    # ≈1이면 대략 직교(서로 거의 안 건드림), >1이면 오히려 강화(같은 방향
+    # 정렬 — 두 unit vector가 완전히 같은 방향이면 최대 (‖hq‖+‖ha‖)/‖hq+ha‖=1
+    # 이 그대로 유지되므로 이 비율이 1을 넘는 건 사실 불가능하지 않고, 두
+    # norm이 서로 다를 때 삼각부등식 여유 안에서 소폭 발생 가능 — 1 근처가
+    # "간섭이 거의 없다"의 기준선).
+    cancellation_ratio = hfull_norm / (hq_norm + ha_norm + 1e-8)
+
+    return {
+        "cos_hq_ha_mean":   float(cos.mean()),
+        "cos_hq_ha_median": float(np.median(cos)),
+        "cos_hq_ha_p5":     float(np.percentile(cos, 5)),
+        "cos_hq_ha_p95":    float(np.percentile(cos, 95)),
+        "hq_norm_mean":     float(hq_norm.mean()),
+        "ha_norm_mean":     float(ha_norm.mean()),
+        "hfull_norm_mean":  float(hfull_norm.mean()),
+        "cancellation_ratio_mean":   float(cancellation_ratio.mean()),
+        "cancellation_ratio_median": float(np.median(cancellation_ratio)),
+        "sanity_max_reconstruction_error": float(sanity_err.max()),  # ≈0(부동소수점 오차 수준)이어야 정상 — 크면 코드 버그 의심
+        "cos_hq_ha_per_sample":            cos,
+        "cancellation_ratio_per_sample":   cancellation_ratio,
+    }
+
+
+def print_head_input_cancellation(result: dict) -> None:
+    print(f"\n{'='*60}")
+    print(f"  Head Input Cancellation (residual 전용, one-shot)")
+    print(f"{'='*60}")
+    print(f"  cos(h_q, h_a):       mean={result['cos_hq_ha_mean']:+.4f}  median={result['cos_hq_ha_median']:+.4f}  "
+          f"p5={result['cos_hq_ha_p5']:+.4f}  p95={result['cos_hq_ha_p95']:+.4f}")
+    print(f"  ‖h_q‖ mean={result['hq_norm_mean']:.4f}   ‖h_a‖ mean={result['ha_norm_mean']:.4f}   "
+          f"‖h_q+h_a‖ mean={result['hfull_norm_mean']:.4f}")
+    print(f"  cancellation_ratio(=‖h_q+h_a‖/(‖h_q‖+‖h_a‖)): mean={result['cancellation_ratio_mean']:.4f}  "
+          f"median={result['cancellation_ratio_median']:.4f}")
+    print(f"  sanity check(재구성 오차, ≈0이어야 정상): {result['sanity_max_reconstruction_error']:.2e}")
+    print(f"  (cos(h_q,h_a)가 음수이고 cancellation_ratio가 1보다 뚜렷이 작으면 — agg의")
+    print(f"   영향이 head 진입 직후(첫 hidden layer)에서 이미 상당 부분 상쇄된다는 뜻.")
+    print(f"   representation(‖z-q‖)은 크게 움직이는데 accuracy는 거의 안 변하는 현상에")
+    print(f"   대한 구조적 설명 후보 하나 — cos(query_emb, agg_emb)의 raw embedding 레벨")
+    print(f"   음수 부호가 head를 거치며 사라지는지/유지되는지/더 강해지는지 비교해서 볼 것.)")
+
+
 def compute_head_sensitivity(model, X, batch_size: int = 512, scale_factor: float = 10.0):
     """agg_emb(및 다른 branch)를 head 입력 지점에서 직접 zero/random(배치 내
     셔플)/scale(×10)로 바꿨을 때, 최종 logits가 얼마나 변하는지 직접 측정.
@@ -1318,9 +1527,11 @@ def run_single_seed(
               + ("..blockLN" if args.blockwise_layernorm else "") \
               + ("..branchL2norm" if args.head_branch_l2norm else "") \
               + ("..fusion_residual" if args.fusion_mode == "residual" else "") \
+              + ("..fusion_concat" if args.fusion_mode == "concat" else "") \
               + ("..fusion_gatedsum" if args.fusion_mode == "gated_sum" else "") \
               + ("..fusion_anchorgate" if args.fusion_mode == "anchor_gate" else "") \
               + ("..fusion_ctxgatedbeta" if args.fusion_mode == "context_gated_beta" else "") \
+              + ("..no_retrieval" if args.disable_retrieval_branch else "") \
               + (f"..gateT{args.fusion_gate_temperature:g}" if args.fusion_gate_temperature != 1.0 else "") \
               + ("..allowSelfRet" if args.allow_self_retrieval else "") \
               + (f"..valMode_{args.value_mode}" if args.value_mode != "default" else "") \
@@ -1453,6 +1664,7 @@ def run_single_seed(
             evidence_metric=args.evidence_metric,
             fusion_mode=args.fusion_mode,
             use_context_emb=not args.no_context_emb,
+            disable_retrieval_branch=args.disable_retrieval_branch,
         )
         fname = os.path.join(log_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
         if not os.path.exists(fname):
@@ -1625,6 +1837,7 @@ def run_single_seed(
             blockwise_layernorm=args.blockwise_layernorm,
             head_branch_l2norm=args.head_branch_l2norm,
             fusion_mode=args.fusion_mode,
+            disable_retrieval_branch=args.disable_retrieval_branch,
             exclude_self_retrieval=(not args.allow_self_retrieval),
             fusion_alpha_override=args.fusion_alpha_override,
             fusion_beta_override=args.fusion_beta_override,
@@ -1710,6 +1923,8 @@ def run_single_seed(
         log_evidence_stats=args.log_evidence_stats,
         log_fusion_trajectory=args.log_fusion_trajectory,
         log_centroid_label_mi_trajectory=args.log_centroid_label_mi_trajectory,
+        log_shuffle_ablation_trajectory=args.log_shuffle_ablation_trajectory,
+        log_representation_drift_trajectory=args.log_representation_drift_trajectory,
         query_detach_warmup_epochs=args.query_detach_warmup_epochs,
         query_detach_warmup_steps=args.query_detach_warmup_steps,
     )
@@ -3248,6 +3463,36 @@ def run_single_seed(
                 arrow = "▼" if delta < -0.001 else ("▲" if delta > 0.001 else "─")
                 print(f"  {k_name:<20} {v_full:>12.4f}  {v_abl:>12.4f}  {delta:>+9.4f} {arrow}")
 
+            # [추가] accuracy delta의 paired bootstrap CI — "이 Δ가 표본 크기
+            # 때문에 노이즈로도 나올 수 있는 수준인가"를 바로 판단하기 위함.
+            # (test set이 작은 데이터셋(예: N=100~300)에서 Δ가 몇 %p 안 되면
+            # 실제로 유의미한지 눈으로 판단하기 어려움 — 특히 934처럼 "완전히
+            # 0으로 안 돌아온다"는 주장을 하려면 이 CI가 0을 포함하는지가
+            # 핵심.) full/ablation 예측을 같은 샘플 인덱스로 페어링해서
+            # resampling — 독립 2-sample이 아니라 paired인 이유는 같은 테스트
+            # 샘플에 대한 두 조건(원본/ablation) 비교라서, 샘플별 난이도 차이가
+            # 상쇄되어 CI가 더 타이트하고 정확해짐(독립으로 재면 과도하게
+            # 넓어짐). forward pass 재실행 없이 이미 계산된 preds만 재표본
+            # 추출하므로 사실상 비용이 0에 가까움.
+            if tasktype != "regression":
+                _y_np = y_test.cpu().numpy() if torch.is_tensor(y_test) else np.asarray(y_test)
+                _pf_np = preds_test.cpu().numpy() if torch.is_tensor(preds_test) else np.asarray(preds_test)
+                _pa_np = abl_preds if isinstance(abl_preds, np.ndarray) else np.asarray(abl_preds)
+                _rng = np.random.default_rng(0)
+                _n = len(_y_np)
+                _n_boot = 2000
+                _correct_full = (_pf_np == _y_np).astype(np.float64)
+                _correct_abl  = (_pa_np == _y_np).astype(np.float64)
+                _boot_deltas = np.empty(_n_boot)
+                for _bi in range(_n_boot):
+                    _idx = _rng.integers(0, _n, size=_n)
+                    _boot_deltas[_bi] = _correct_abl[_idx].mean() - _correct_full[_idx].mean()
+                _ci_lo, _ci_hi = np.percentile(_boot_deltas, [2.5, 97.5])
+                _point_delta = _correct_abl.mean() - _correct_full.mean()
+                _sig = "0을 포함 안 함 → 유의미" if (_ci_lo > 0 or _ci_hi < 0) else "0을 포함 → 노이즈와 구분 안 됨"
+                print(f"\n  [Bootstrap CI, paired, n_boot=2000] Δaccuracy = {_point_delta:+.4f}  "
+                      f"95% CI [{_ci_lo:+.4f}, {_ci_hi:+.4f}]  (N_test={_n}) — {_sig}")
+
             # [추가] ECE(full vs ablation) — logloss가 크게 튀었을 때 그게
             # "calibration 자체가 망가진 것"인지 "accuracy는 그대로인 채 확률
             # 분포/logit scale만 흔들린 것"인지 구분하기 위함. 이 둘은 다른
@@ -3648,6 +3893,42 @@ def run_single_seed(
                              "tasktype": tasktype}, f)
             print(f"\n  저장: {sens_path}")
 
+    if args.head_input_cancellation and do_analysis:
+        if getattr(model, "fusion_mode", None) != "residual":
+            print(f"\n  ⚠️  --head_input_cancellation은 fusion_mode='residual'인 모델에서만 "
+                  f"의미가 있습니다 — 이 체크포인트는 fusion_mode='{getattr(model, 'fusion_mode', None)}' "
+                  f"라 건너뜁니다.")
+        else:
+            hic_result = compute_head_input_cancellation(model, X_test)
+            print_head_input_cancellation(hic_result)
+            hic_path = Path(log_dir) / f"data={openml_id}{_save_tag}..seed{args.seed}_head_input_cancellation.pkl"
+            with open(hic_path, "wb") as f:
+                pickle.dump({**hic_result, "openml_id": openml_id, "seed": args.seed,
+                             "tasktype": tasktype}, f)
+            print(f"\n  저장: {hic_path}")
+    if args.pre_fusion_gradient_attribution and do_analysis:
+        # [수정] args.fusion_mode가 아니라 실제 로드된 model.fusion_mode를 봐야
+        # 함 — --from_saved_state는 architecture 관련 CLI 플래그(--fusion_mode
+        # 포함)를 전부 무시하고 저장된 model_kwargs로 모델을 재구성하므로
+        # (위 1527-1531행 경고 참고), args.fusion_mode는 사용자가 --fusion_mode를
+        # 안 줬을 때의 기본값("residual")일 뿐 실제 로드된 체크포인트의 구조를
+        # 반영하지 않을 수 있다. --gradient_attribution/--head_sensitivity가
+        # model._head_block_slices(실제 모델 속성)로 판단하는 것과 같은 이유로
+        # 여기도 model.fusion_mode(실제 속성)로 판단.
+        if getattr(model, "fusion_mode", None) != "residual":
+            print(f"\n  ⚠️  --pre_fusion_gradient_attribution은 fusion_mode='residual'인 "
+                  f"모델에서만 의미가 있습니다(β가 있어야 raw agg_emb 항의 크기를 해석할 "
+                  f"기준이 생김) — 이 체크포인트는 fusion_mode='{getattr(model, 'fusion_mode', None)}' "
+                  f"라 건너뜁니다. concat 모드는 --gradient_attribution을 쓰세요.")
+        else:
+            pfg_result = compute_pre_fusion_gradient_attribution(model, X_test, y_test, tasktype)
+            print_pre_fusion_gradient_attribution(pfg_result)
+            pfg_path = Path(log_dir) / f"data={openml_id}{_save_tag}..seed{args.seed}_pre_fusion_gradient_attribution.pkl"
+            with open(pfg_path, "wb") as f:
+                pickle.dump({**pfg_result, "openml_id": openml_id, "seed": args.seed,
+                             "tasktype": tasktype}, f)
+            print(f"\n  저장: {pfg_path}")
+
 
 
     # ── 결과 저장 ──────────────────────────────────────────
@@ -3688,12 +3969,26 @@ def run_single_seed(
     _rb_entropy_chunks = []
     _rb_n_eff_chunks = []
     _rb_top1_weight_chunks = []
+    _rb_purity_chunks = []            # [추가] top-k 중 query와 같은 라벨인 비율 (unweighted)
+    _rb_weighted_purity_chunks = []   # [추가] evidence_w로 가중한 same-label 비율
     # [Local Retriever 진단, 추가] similarity geometry — temperature와 원인
     # 분리용(사용자 요청). evidence.py가 새 모듈 없이 항상 계산.
     _rb_sim_top1_chunks = []
     _rb_sim_bottomk_chunks = []
     _rb_sim_margin_chunks = []
     _rb_sim_std_chunks = []
+    # [추가, evidence utilization 진단] "agg_emb가 query_emb와 실질적으로
+    # 다른 정보를 담고 있는가"를 raw(head 진입 전, LN 적용 전) 표현 기준
+    # 샘플별로 직접 잼 — head_cos_qa_mean(--log_fusion_trajectory)은 LN
+    # 적용 후 배치 평균 스칼라 하나만 epoch별로 남기므로, 여기서는 (1) LN
+    # 없는 원본 표현 기준, (2) 샘플별 분포(퍼센타일 계산 가능) 두 가지
+    # 점에서 보완적. fusion_mode="residual"에서만 fusion_beta가 스칼라로
+    # 채워지므로(그 외 모드는 None) 이 블록은 residual 전용.
+    _rb_cos_qa_chunks = []
+    _rb_qnorm_chunks = []
+    _rb_anorm_chunks = []
+    _rb_beta_ratio_chunks = []   # β·‖agg_emb‖/‖query_emb‖ (샘플별)
+    _rb_shift_norm_chunks = []   # ‖z-q‖ = ‖β·agg_emb‖ (representation shift, 샘플별)
     with torch.no_grad():
         for _start in range(0, len(X_test), _pred_batch_size):
             _out = model(X_test[_start:_start + _pred_batch_size])
@@ -3727,11 +4022,48 @@ def run_single_seed(
                 )
                 _rb_n_eff_chunks.append(1.0 / _ew.square().sum(-1).clamp_min(1e-12))
                 _rb_top1_weight_chunks.append(_ew.max(dim=-1).values)
+                # [추가, 사용자 요청] retrieval label purity — "무엇을 가져왔는가"를
+                # 직접 잼. topk_idx는 memory bank(학습셋) 인덱스라 model.memory.labels
+                # 로 바로 라벨을 찾을 수 있음(새 forward 불필요, 이미 계산된 topk_idx/
+                # evidence_w 재사용). regression은 label purity 개념이 없어 스킵.
+                if tasktype != "regression":
+                    _batch_y = y_test[_start:_start + _pred_batch_size].cpu()
+                    _batch_y_int = torch.round(_batch_y).long()
+                    _neighbor_labels = model.memory.labels[_out["topk_idx"]].cpu().long()  # (B, k)
+                    _same_label = (_neighbor_labels == _batch_y_int.unsqueeze(-1)).float()  # (B, k)
+                    _rb_purity_chunks.append(_same_label.mean(dim=-1))            # unweighted: 단순 top-k 중 동일 라벨 비율
+                    _rb_weighted_purity_chunks.append((_ew * _same_label).sum(dim=-1))  # evidence_w-weighted: 실제 aggregation에 반영되는 비중까지 고려
                 if _out.get("similarity_top1_per_sample") is not None:
                     _rb_sim_top1_chunks.append(_out["similarity_top1_per_sample"].cpu())
                     _rb_sim_bottomk_chunks.append(_out["similarity_bottomk_per_sample"].cpu())
                     _rb_sim_margin_chunks.append(_out["similarity_margin_per_sample"].cpu())
                     _rb_sim_std_chunks.append(_out["similarity_std_per_sample"].cpu())
+                # [추가, evidence utilization 진단] fusion_mode="residual"일
+                # 때만 의미 있음(β가 스칼라로 존재하는 유일한 모드). q/a는
+                # raw(query_emb/agg_emb, LN 적용 전) — head가 실제로 보는
+                # LN(q)/LN(a)와는 다를 수 있지만, "이 두 표현 자체가 얼마나
+                # 다른 정보인가"를 보는 질문(분석계획 1번)엔 원본이 맞는
+                # 기준임. 0-division 방어로 clamp_min 사용.
+                if _out.get("fusion_beta") is not None:
+                    _q = _out["query_emb"].cpu()
+                    _a = _out["agg_emb"].cpu()
+                    _beta = float(_out["fusion_beta"])
+                    _q_norm = _q.norm(dim=-1)
+                    _a_norm = _a.norm(dim=-1)
+                    _rb_cos_qa_chunks.append(F.cosine_similarity(_q, _a, dim=-1))
+                    _rb_qnorm_chunks.append(_q_norm)
+                    _rb_anorm_chunks.append(_a_norm)
+                    _rb_beta_ratio_chunks.append(
+                        (abs(_beta) * _a_norm) / _q_norm.clamp_min(1e-12)
+                    )
+                    # z - q = β·agg_emb (+ α·context_emb, use_context_emb=True일
+                    # 때만) — 현재 기본값(use_context_emb=False)에서는 뒤 항이
+                    # 없어 β·agg_emb와 정확히 같지만, use_context_emb=True 비교
+                    # 실행에서도 정확하도록 alpha 항을 조건부로 더함.
+                    _shift = _beta * _a
+                    if _out.get("fusion_alpha") is not None and _out.get("context_emb") is not None:
+                        _shift = _shift + float(_out["fusion_alpha"]) * _out["context_emb"].cpu()
+                    _rb_shift_norm_chunks.append(_shift.norm(dim=-1))
     logits = torch.cat(_logits_chunks, dim=0).numpy()
     np.save(str(pred_path), logits)
 
@@ -3769,11 +4101,35 @@ def run_single_seed(
             n_eff=_rb_n_effs_all,
             top1_weight=_rb_top1_weights_all,
         )
+        if _rb_purity_chunks:
+            # [추가, 사용자 요청] retrieval label purity — "무엇을 가져왔는가".
+            # purity: top-k 이웃 중 query와 같은 라벨 비율(단순 카운트).
+            # weighted_purity: evidence_w로 가중한 버전 — 실제 agg_emb 계산에
+            # 반영되는 비중까지 고려(top1 하나가 정답이고 나머지가 오답이어도
+            # top1의 evidence_w가 압도적이면 weighted_purity는 높게 나옴 —
+            # purity와 weighted_purity의 차이 자체가 "attention이 정답 쪽에
+            # 잘 집중하는가"의 지표가 됨). tasktype="regression"이면 label
+            # purity 개념이 없어 둘 다 빈 상태로 남음(위 export 루프에서
+            # 애초에 append 안 함).
+            _rb_savez_kwargs["retrieval_label_purity"] = torch.cat(_rb_purity_chunks, dim=0).numpy()
+            _rb_savez_kwargs["retrieval_weighted_label_purity"] = torch.cat(_rb_weighted_purity_chunks, dim=0).numpy()
         if _rb_sim_top1_chunks:
             _rb_savez_kwargs["similarity_top1"] = torch.cat(_rb_sim_top1_chunks, dim=0).numpy()
             _rb_savez_kwargs["similarity_bottomk"] = torch.cat(_rb_sim_bottomk_chunks, dim=0).numpy()
             _rb_savez_kwargs["similarity_margin"] = torch.cat(_rb_sim_margin_chunks, dim=0).numpy()
             _rb_savez_kwargs["similarity_std"] = torch.cat(_rb_sim_std_chunks, dim=0).numpy()
+        # [추가, evidence utilization 진단 — 분석계획 1번] fusion_mode="residual"
+        # 일 때만 채워짐(그 외 모드는 fusion_beta가 None이라 위 루프에서
+        # 애초에 안 쌓임). cos_qa/q_norm/a_norm은 raw(LN 적용 전) query_emb/
+        # agg_emb 기준 — "두 표현이 실제로 다른 정보인가"를 head 내부
+        # 정규화와 무관하게 직접 보기 위함. beta_agg_ratio는 β·‖agg‖/‖query‖,
+        # representation_shift_norm은 ‖z-q‖(=‖β·agg_emb(+α·context_emb)‖).
+        if _rb_cos_qa_chunks:
+            _rb_savez_kwargs["cos_qa"] = torch.cat(_rb_cos_qa_chunks, dim=0).numpy()
+            _rb_savez_kwargs["query_emb_norm"] = torch.cat(_rb_qnorm_chunks, dim=0).numpy()
+            _rb_savez_kwargs["agg_emb_norm"] = torch.cat(_rb_anorm_chunks, dim=0).numpy()
+            _rb_savez_kwargs["beta_agg_ratio"] = torch.cat(_rb_beta_ratio_chunks, dim=0).numpy()
+            _rb_savez_kwargs["representation_shift_norm"] = torch.cat(_rb_shift_norm_chunks, dim=0).numpy()
         # [Local Retriever 진단, 추가] centroid별 "실제 예측 품질"을 보려면
         # 정답과 맞대조가 필요함 — sample count/margin/N_eff만으로는 "이
         # centroid가 좋은 local expert인가"를 못 봄(사용자 지적). logits는
@@ -3801,8 +4157,13 @@ def run_single_seed(
         _rb_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_centroid_retrieval_behavior.npz"
         np.savez(str(_rb_path), **_rb_savez_kwargs)
         print(f"  [export_centroid_retrieval_behavior] sample_id/centroid_id/routing_confidence/topk_idx/entropy/n_eff/top1_weight"
-              f"{'/similarity_top1/bottomk/margin/std' if _rb_sim_top1_chunks else ''}/y_true/{'error' if tasktype=='regression' else 'correct/error'} 샘플별 쌍 저장: {_rb_path}"
-              f" ({len(_rb_centroid_ids_all)}개, centroid_id/sample_id는 test set 기준)")
+              f"{'/retrieval_label_purity/retrieval_weighted_label_purity' if _rb_purity_chunks else ''}"
+              f"{'/similarity_top1/bottomk/margin/std' if _rb_sim_top1_chunks else ''}"
+              f"{'/cos_qa/query_emb_norm/agg_emb_norm/beta_agg_ratio/representation_shift_norm' if _rb_cos_qa_chunks else ''}"
+              f"/y_true/{'error' if tasktype=='regression' else 'correct/error'} 샘플별 쌍 저장: {_rb_path}"
+              f" ({len(_rb_centroid_ids_all)}개, centroid_id/sample_id는 test set 기준)"
+              + ("" if _rb_cos_qa_chunks else "\n  [주의] fusion_mode≠'residual'이라 cos_qa/beta_agg_ratio/"
+                 "representation_shift_norm은 저장되지 않았습니다(β가 없는 fusion_mode에서는 정의되지 않는 값)."))
 
 
     # [추가, v2 Phase 2] 위에서 누적한 gate 통계를 배치 가중평균으로 확정 —
@@ -3857,6 +4218,7 @@ def run_single_seed(
         "blockwise_layernorm": args.blockwise_layernorm,
         "head_branch_l2norm": args.head_branch_l2norm,
         "fusion_mode": args.fusion_mode,
+        "disable_retrieval_branch": args.disable_retrieval_branch,
         "exclude_self_retrieval": (not args.allow_self_retrieval),
         "value_mode": args.value_mode,
         "neighbor_interaction_mode": args.neighbor_interaction_mode,
@@ -3920,6 +4282,8 @@ def run_single_seed(
         # norm 궤적. 기본은 빈 리스트(플래그 안 켰으면).
         "fusion_trajectory_history": getattr(wrapper, "fusion_trajectory_history", []),
         "centroid_label_mi_history": getattr(wrapper, "centroid_label_mi_history", []),
+        "shuffle_ablation_trajectory_history": getattr(wrapper, "shuffle_ablation_trajectory_history", []),
+        "representation_drift_history": getattr(wrapper, "representation_drift_history", []),
         "detach_context_grad": args.detach_context_grad,
         "query_detach_warmup_epochs": args.query_detach_warmup_epochs,
         "query_detach_warmup_steps": args.query_detach_warmup_steps,
@@ -3957,6 +4321,25 @@ def run_single_seed(
                   f"{_last.get(f'{_n}_weight_norm', float('nan')):.4f}")
         print(f"    (전체 곡선은 meta.pkl의 branch_gradient_history/"
               f"branch_gradient_batch_history 참고 — 이 요약은 첫/끝 epoch만 비교)")
+    if getattr(wrapper, "shuffle_ablation_trajectory_history", None):
+        _sfirst = wrapper.shuffle_ablation_trajectory_history[0]
+        _slast  = wrapper.shuffle_ablation_trajectory_history[-1]
+        print(f"  shuffle_ablation_trajectory: epoch {int(_sfirst['epoch'])} → {int(_slast['epoch'])}")
+        print(f"    Δquery_shuffle: {_sfirst['delta_query_shuffle']:+.4f} → {_slast['delta_query_shuffle']:+.4f}")
+        print(f"    Δagg_shuffle  : {_sfirst['delta_agg_shuffle']:+.4f} → {_slast['delta_agg_shuffle']:+.4f}")
+        print(f"    (agg 쪽 delta가 학습 초반보다 후반에 0에 더 가까워지면 — 'retrieval은 "
+              f"optimization scaffold' 가설과 정합. 전체 곡선은 meta.pkl의 "
+              f"shuffle_ablation_trajectory_history 참고.)")
+    if getattr(wrapper, "representation_drift_history", None) and len(wrapper.representation_drift_history) > 1:
+        _dfirst = wrapper.representation_drift_history[1]  # [0]은 anchor 스냅샷 자체(항상 0)라 skip
+        _dlast  = wrapper.representation_drift_history[-1]
+        print(f"  representation_drift_trajectory: epoch {int(_dfirst['epoch'])} → {int(_dlast['epoch'])}")
+        print(f"    cos(q_t-q_0, a_0): {_dfirst['cos_drift_vs_agg0']:+.3f} → {_dlast['cos_drift_vs_agg0']:+.3f}  "
+              f"(증가 추세면 'query가 초기 retrieval 방향으로 이동'=흡수 신호)")
+        print(f"    cos(q_t, a_0)    : {_dfirst['cos_query_t_vs_agg0']:+.3f} → {_dlast['cos_query_t_vs_agg0']:+.3f}")
+        print(f"    centroid_stability_vs_epoch0: {_dfirst['centroid_stability_vs_epoch0']:.1%} → "
+              f"{_dlast['centroid_stability_vs_epoch0']:.1%}")
+        print(f"    (전체 곡선은 meta.pkl의 representation_drift_history 참고.)")
 
     # ── model state 저장 (--from_saved_state 용) ──────────────
     # model_kwargs에 이미 use_offset_correction 등 아키텍처 플래그가
@@ -4500,23 +4883,59 @@ def main():
                         ))
     parser.add_argument("--gradient_attribution", action="store_true",
                         help=(
-                            "[진단용] --log_branch_gradients(학습 중 epoch마다 기록, 재학습 "
-                            "필요)와 달리, 이미 학습된 모델(--from_saved_state)에 eval 데이터를 "
-                            "한 번 흘려서(forward+backward 1회) branch별(query/context/agg) "
-                            "gradient norm을 재는 가벼운 one-shot 측정. grad_share가 낮으면 "
+                            "[진단용, fusion_mode='concat' 전용] --log_branch_gradients(학습 중 "
+                            "epoch마다 기록, 재학습 필요)와 달리, 이미 학습된 모델"
+                            "(--from_saved_state)에 eval 데이터를 한 번 흘려서(forward+backward "
+                            "1회) branch별(query/context/agg) gradient norm을 재는 가벼운 "
+                            "one-shot 측정. head 첫 Linear 입력을 branch별 slice"
+                            "(_head_block_slices)로 나눠서 재는 방식이라 fusion_mode='concat'"
+                            "([q|c|a]→Linear로 branch별 weight가 분리되는 경우)에만 성립 — "
+                            "residual은 fusion 전에 이미 하나의 벡터로 합쳐져 있어 이 slice 개념 "
+                            "자체가 없음(자동으로 skip됨). residual에서는 대신 "
+                            "--pre_fusion_gradient_attribution을 쓸 것. grad_share가 낮으면 "
                             "loss가 그 branch를 거의 안 거쳐 흐른다는 뜻 — head가 실제로 그 "
                             "branch에 맞춰 업데이트되고 있지 않다는 직접 증거. 재학습 불필요."
                         ))
     parser.add_argument("--head_sensitivity", action="store_true",
                         help=(
-                            "[진단용] --ablation agg_emb_shuffle(다른 real 샘플 값으로 "
-                            "바꿔치기 — 그 값이 우연히 비슷하면 효과가 작게 나올 수 있음, "
-                            "특히 collapse된 표현에서)보다 더 직접적인 head sensitivity 측정. "
-                            "head 입력 지점에서 branch를 직접 zero(정보 제거)/random(배치 내 "
-                            "셔플)/scale(×10, 정보는 유지하고 크기만 키움)로 조작한 뒤 최종 "
-                            "logit이 얼마나 변하는지(L2 거리, 기준 logit norm 대비 상대값) 잼. "
-                            "zero도 scaled도 둘 다 낮으면 head가 그 branch의 존재/크기 모두에 "
-                            "무감각하다는 강한 증거. 재학습 불필요."
+                            "[진단용, fusion_mode='concat' 전용 — 이유는 --gradient_attribution과 "
+                            "동일(_head_block_slices가 concat에서만 채워짐)] --ablation "
+                            "agg_emb_shuffle(다른 real 샘플 값으로 바꿔치기 — 그 값이 우연히 "
+                            "비슷하면 효과가 작게 나올 수 있음, 특히 collapse된 표현에서)보다 더 "
+                            "직접적인 head sensitivity 측정. head 입력 지점에서 branch를 직접 "
+                            "zero(정보 제거)/random(배치 내 셔플)/scale(×10, 정보는 유지하고 크기만 "
+                            "키움)로 조작한 뒤 최종 logit이 얼마나 변하는지(L2 거리, 기준 logit "
+                            "norm 대비 상대값) 잼. zero도 scaled도 둘 다 낮으면 head가 그 branch의 "
+                            "존재/크기 모두에 무감각하다는 강한 증거. 재학습 불필요. residual에서는 "
+                            "--ablation agg_emb_zero/scaled 조합이 사실상 같은 역할을 함."
+                        ))
+    parser.add_argument("--pre_fusion_gradient_attribution", action="store_true",
+                        help=(
+                            "[진단용, fusion_mode='residual' 전용] --gradient_attribution의 "
+                            "residual 버전. head 첫 Linear 입력이 아니라, fusion **이전**의 raw "
+                            "query_emb/agg_emb/context_emb(out dict에 fusion_mode와 무관하게 항상 "
+                            "노출됨)에 직접 retain_grad()를 걸어 backward 1회로 gradient norm을 "
+                            "잼 — residual(z=q+βa)은 head 진입 전에 이미 branch들이 하나의 "
+                            "벡터로 합쳐져 있어 --gradient_attribution의 slice 기반 접근이 "
+                            "구조적으로 성립하지 않기 때문에 별도로 둠(억지로 같은 함수를 고쳐 "
+                            "쓰지 않음 — concat 전용 분석은 그대로 남겨둠). 분석계획 4번(∂loss/"
+                            "∂query_emb vs ∂loss/∂agg_emb)에 직접 답하는 지표. 재학습 불필요, "
+                            "--from_saved_state와 같이 쓸 수 있음."
+                        ))
+    parser.add_argument("--head_input_cancellation", action="store_true",
+                        help=(
+                            "[진단용, fusion_mode='residual' 전용] head 첫 Linear(W, bias b)가 "
+                            "선형이라는 사실만으로 W@z+b = (W@LN(q)+b) + β·(W@LN(a))가 항상 "
+                            "정확히 성립함(_head_block_slices 불필요 — '합 다음에 선형 레이어'"
+                            "라는 구조 자체가 보장하는 항등식). 이 h_q=W@LN(q)+b(=agg_emb_zero "
+                            "ablation이 만드는 값과 동일)와 h_a=β·(W@LN(a))(bias 없음) 사이의 "
+                            "cos/norm을 재서, representation(‖z-q‖=‖β·LN(a)‖)은 크게 움직이는데 "
+                            "accuracy는 거의 안 변하는 현상이 head 진입 직후(첫 hidden layer)에서 "
+                            "이미 상쇄되기 때문인지 직접 검증. cos(h_q,h_a)<0이고 "
+                            "cancellation_ratio(=‖h_q+h_a‖/(‖h_q‖+‖h_a‖))가 1보다 뚜렷이 작으면 "
+                            "상쇄 — raw embedding 레벨의 cos(query_emb,agg_emb) 음수 부호가 head를 "
+                            "거치며 사라지는지/유지되는지/증폭되는지 비교할 것. 재학습 불필요, "
+                            "--from_saved_state와 같이 쓸 수 있음."
                         ))
     parser.add_argument("--neighbor_interaction_mode", type=str, default=None,
                         choices=[None, "attn", "capacity_baseline", "interaction_free_baseline"],
@@ -4893,6 +5312,12 @@ def main():
                             "계산하므로 --log_evidence_stats가 겪었던 학습 중 dropout "
                             "재정규화 문제와 무관 — raw evidence_w를 그대로 씀. "
                             "N_eff=1/Σw_i²(유효 이웃 수), top1_weight=max(w_i). "
+                            "[2026-07, 추가] retrieval_label_purity(top-k 이웃 중 query와 "
+                            "같은 라벨 비율, unweighted)/retrieval_weighted_label_purity"
+                            "(evidence_w로 가중 — attention이 정답 쪽에 얼마나 잘 집중하는지"
+                            "까지 반영, purity와의 차이 자체가 신호). model.memory.labels를 "
+                            "topk_idx로 바로 조회(새 forward 없음). tasktype=regression이면 "
+                            "label purity 개념이 없어 저장 안 됨. "
                             "baseline/V2 모델을 포함해 항상 계산 가능. [추가] similarity_"
                             "top1/bottomk/margin/std(raw similarity geometry, softmax "
                             "이전)와 y_true/correct(분류)-또는-error(회귀는 squared "
@@ -4900,7 +5325,16 @@ def main():
                             "'실제 예측 품질'까지 groupby해서 볼 수 있음(단순 표본 수/"
                             "margin만으로는 '좋은 local expert인가'를 알 수 없다는 지적 "
                             "반영). logits는 이미 예측을 위해 계산된 값을 재사용(추가 "
-                            "forward 없음)."
+                            "forward 없음). [추가, evidence utilization 진단] "
+                            "fusion_mode='residual'일 때만: cos_qa(raw query_emb·agg_emb "
+                            "샘플별 cosine — ≈1이면 agg_emb가 사실상 query_emb의 중복 "
+                            "복사본, 0.2~0.5대인데 accuracy 효과가 있으면 진짜 새 정보), "
+                            "query_emb_norm/agg_emb_norm(샘플별 raw norm), "
+                            "beta_agg_ratio(β·‖agg_emb‖/‖query_emb‖, 샘플별 — mean/median/"
+                            "5%%/95%% 등 분포로 봐야 함), representation_shift_norm(‖z-q‖, "
+                            "agg_emb(+context_emb)가 query_emb를 실제로 얼마나 이동시켰는가) "
+                            "도 같이 저장. fusion_mode≠'residual'이면 β가 정의되지 않아 "
+                            "이 5개 필드는 저장되지 않음(콘솔에 안내 출력)."
                         ))
     parser.add_argument("--log_fusion_trajectory", action="store_true",
                         help=(
@@ -4926,6 +5360,63 @@ def main():
                             "tasktype=regression이면 label이 연속값이라 무의미 — 그 "
                             "경우 항상 빈 리스트로 남음(에러는 안 남)."
                         ))
+    parser.add_argument("--log_shuffle_ablation_trajectory", action="store_true",
+                        help=(
+                            "[2026-07, 신규] 'retrieval은 optimization scaffold(학습 중엔 "
+                            "query representation 형성에 기여하지만, 추론 시점엔 query "
+                            "자체가 이미 충분해져서 agg 의존도가 낮다)' 가설 검증용. "
+                            "inference-time --ablation query_emb_shuffle/agg_emb_shuffle과 "
+                            "정확히 같은 조작(model.forward()의 ablation_mode 그대로 재사용, "
+                            "새 model 코드 없음)을 검증 세트에 대해 epoch마다"
+                            "(--regroup_log_every 간격) 반복해서 accuracy delta를 기록"
+                            "(meta.pkl의 shuffle_ablation_trajectory_history). "
+                            "--log_branch_gradients의 agg_grad_share가 학습 내내 "
+                            "20~40%%를 유지해도, 이 델타가 학습 후반으로 갈수록 0에 "
+                            "가까워진다면 — '학습에는 쓰이지만 추론엔 덜 쓰인다'는 "
+                            "가설이 직접 뒷받침됨. retrieve/aggregate/head까지 다 거치는 "
+                            "forward를 3회(none/query_emb_shuffle/agg_emb_shuffle) 반복하므로 "
+                            "log_centroid_label_mi_trajectory보다 비쌈 — 매 epoch 대신 "
+                            "--regroup_log_every 간격으로만 계산. tasktype=regression이면 "
+                            "accuracy 개념이 없어 빈 리스트로 남음."
+                        ))
+    parser.add_argument("--log_representation_drift_trajectory", action="store_true",
+                        help=(
+                            "[2026-07, 신규/수정] 'encoder가 agg가 주던 방향을 query "
+                            "representation 안으로 점점 흡수(internalize)한다'는 가설 "
+                            "검증용. --log_shuffle_ablation_trajectory가 retrieval "
+                            "contribution이 '감소한다'는 건 보여주지만 '왜' 감소하는지는 "
+                            "간접 증거였음 — 이건 representation 자체의 이동을 직접 잼. "
+                            "고정 anchor(X_val 앞 256개, 매 epoch 동일 샘플)에 대해 첫 "
+                            "로깅 epoch의 query_emb/agg_emb/centroid_id를 스냅샷으로 "
+                            "저장해두고, 이후 epoch마다 같은 배치를 다시 흘려서 그 대비 "
+                            "query_drift_from_epoch0(‖q_t-q_0‖, 얼마나 움직였는가), "
+                            "cos_drift_vs_agg0(cos(q_t-q_0, a_0) — 핵심 지표, 움직인 "
+                            "'방향'이 초기 retrieval 방향과 같은가. a_t를 '정답'처럼 쓰면 "
+                            "a_t 자체도 매 epoch retrieval이 바뀌며 계속 움직여서 애매해지므로 "
+                            "a_0를 고정 기준점으로 쓴 cosine으로 설계), "
+                            "cos_query_t_vs_agg0(cos(q_t, a_0) — 최종 query가 초기 retrieval을 "
+                            "닮아가는가), cos_query_agg_raw(cos(q_t, a_t), pre-LN/raw), "
+                            "cos_query_agg_post_ln(cos(LN(q_t), LN(a_t)) — 같은 epoch·배치), "
+                            "cos_query_agg_post_linear(cos(h_q, h_a), h_q=W@LN(q_t)+b, "
+                            "h_a=β·W@LN(a_t) — head 첫 Linear를 지난 뒤. 세 값을 나란히 보면 "
+                            "raw에서는 안 보이던 방향성이 LN에서 생기는지, 아니면 그 뒤 Linear "
+                            "weight까지 가야 벌어지는지 구분됨 — 이전엔 이 비교를 서로 다른 두 "
+                            "실행(--log_fusion_trajectory 따로)을 --deterministic 재현성에 기대어 "
+                            "겹쳐봤는데, 이제 한 실행 안에서 동시에 나옴. fusion_mode≠residual이면 "
+                            "post_ln/post_linear는 None), "
+                            "[2026-07, 추가] query_norm_raw/agg_norm_raw/query_norm_post_ln/"
+                            "agg_norm_post_ln/hq_norm_post_linear/ha_norm_post_linear — cosine은 "
+                            "방향만 보고 크기(head가 실제로 받는 신호 magnitude)는 안 보므로, "
+                            "각 단계의 ‖·‖도 같이 기록(특히 hq_norm/ha_norm_post_linear는 head가 "
+                            "각 branch에서 실제로 받는 projection 크기 — 이게 학습 초반에 이미 "
+                            "안정화되는지, cosine 안정화 시점과 같은지 다른지 비교할 것). "
+                            "centroid_stability_vs_epoch0(같은 centroid로 배정된 비율)를 기록"
+                            "(meta.pkl의 representation_drift_history). "
+                            "embedder+prototype+retrieve+aggregate까지 다 거치는 forward라 "
+                            "X_val 전체가 아니라 고정 256개 subset만 씀 — "
+                            "--regroup_log_every 간격으로만 계산. tasktype=regression이면 "
+                            "빈 리스트로 남음."
+                        ))
     parser.add_argument("--fusion_alpha_override", type=float, default=None,
                         help=(
                             "[구조 변경] fusion_mode=residual에서 α를 학습 가능한 "
@@ -4938,6 +5429,28 @@ def main():
                         ))
     parser.add_argument("--fusion_beta_override", type=float, default=None,
                         help="fusion_alpha_override와 대칭, agg 쪽(β) 고정값.")
+    parser.add_argument("--disable_retrieval_branch", action="store_true",
+                        help=(
+                            "[2026-07, 추가] '진짜' retrieval-free baseline(Model 2) — "
+                            "사용자 지적: --fusion_beta_override 0.0 + --loss_*_override 0.0 "
+                            "조합은 head 쪽 fusion만 끊을 뿐, prototype routing이 STE "
+                            "(forward=argmax, backward=softmax 통과)라 encoder 쪽으로 "
+                            "gradient가 여전히 샐 수 있음 — 그래서 '진짜' 아님. 이 플래그는 "
+                            "embedder 직후 곧바로 분기해서 prototype_layer/memory.retrieve/"
+                            "aggregator를 아예 호출하지 않음(STE를 포함해 그 무엇도 안 거침). "
+                            "z=query_emb를 그대로 head에 넣음 — fusion_mode='residual'+"
+                            "aggregator_mode='pooling' 조합만 지원(그 외 조합이면 모델 생성 "
+                            "시점에 NotImplementedError). agg_emb/context_emb/centroid_id/"
+                            "fusion_beta 등 retrieval 관련 out dict 키는 전부 None — "
+                            "ablation_mode나 branch 분석류 진단은 이 모드에서 의미 없음(agg "
+                            "자체가 없음). aux_loss=0(commitment/codebook/diversity 전부 "
+                            "hard_assignment가 없어서 계산 불가). Model 1(full)/Model 3"
+                            "(query_shuffle ablation, 이미 있는 결과)과 나란히 놓고 accuracy "
+                            "비교하기 위한 순수 baseline 스위치. HPO(optimize.py)는 그대로 "
+                            "retrieval 있는 구조 기준 study를 재사용(k/n_prototypes 등은 이 "
+                            "모드에서 안 쓰이므로 무의미하지만 해는 없음) — study_pkl_tag에 "
+                            "'..no_retrieval' 태그가 붙어 기존 study와 안 섞임."
+                        ))
     parser.add_argument("--evidence_metric_override", type=str, default=None,
                         choices=["euclidean", "cosine", "cosine_scaled"],
                         help=(
