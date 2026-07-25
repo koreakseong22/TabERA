@@ -75,32 +75,31 @@ parser.add_argument("--context_projection", action="store_true",
                         "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
                         "centroid_x/confidence) 계산에는 관여하지 않음."
                     ))
-parser.add_argument("--fusion_mode", type=str, default="residual",
+parser.add_argument("--fusion_mode", type=str, default="concat",
                     choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"],
                     help=(
-                        "[2026-07, v2 freeze — 기본값 변경] TabERA v2 최종 architecture로 "
-                        "'residual'(query+β·agg)이 채택되어 기본값을 이걸로 바꿈 — 더 이상 "
-                        "이 플래그를 매번 명시할 필요 없음. 'concat'(V1식 — context_emb를 "
-                        "classifier feature로 head에 직접 결합)은 이제 ablation/비교 "
-                        "목적으로만 명시적으로 선택. study_pkl_tag는 concat을 기준으로 "
-                        "태그를 매기므로(fusion_mode != 'concat'이면 '..fusion_residual' "
-                        "태그) — 기존에 이미 '..fusion_residual..noctx..'로 저장된 study "
-                        "파일은 이 기본값 변경과 무관하게 그대로 재사용 가능(파일명 안 바뀜)."
+                        "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
+                        "폭넓은 비교 실험(6개 데이터셋)에서도 concat 대비 일관된 우위를 "
+                        "못 찾아 기본값을 원래대로('concat', main 브랜치와 동일) 되돌림. "
+                        "'residual'(query+β·agg)은 계속 명시적으로 선택 가능(비교/ablation "
+                        "목적). study_pkl_tag는 이제 concat/residual 둘 다 명시적으로 태그를 "
+                        "매김('..fusion_concat'/'..fusion_residual') — 이전(태그 없음=concat) "
+                        "규칙으로 저장된 옛날 study 파일은 새 태그 규칙과 파일명이 달라지므로 "
+                        "리네임이 필요할 수 있음(레포 마이그레이션 스크립트 참고)."
                     ))
 parser.add_argument("--use_context_emb", action="store_true",
                     help=(
-                        "[2026-07, v2 freeze — 신규] fusion_mode='residual'에서 context_emb를 "
-                        "head 입력에 다시 포함시킴(V1식으로 되돌리기, ablation/비교 목적). "
-                        "기본값(플래그 안 줌)은 이제 False — v2 채택 구조(query+β·agg만, "
-                        "context_emb는 head에 안 감)가 기본. 예전 --no_context_emb 플래그는 "
-                        "하위호환을 위해 계속 받되(줘도 에러 안 남) 이제 아무 효과 없음 — "
-                        "이미 기본 동작이 그거라서."
+                        "[2026-07, deprecated — 하위호환용] use_context_emb=True가 다시 "
+                        "기본값(v1 복원)이라 이 플래그는 더 이상 아무 효과가 없음(줘도 안전 — "
+                        "어차피 기본 동작). context_emb를 head에서 빼려면(v2식) "
+                        "--no_context_emb를 쓸 것."
                     ))
 parser.add_argument("--no_context_emb", action="store_true",
                     help=(
-                        "[2026-07, deprecated — 하위호환용] use_context_emb=False가 이제 "
-                        "기본값이라 이 플래그는 더 이상 아무 효과가 없음(줘도 안전 — 어차피 "
-                        "기본 동작). V1식으로 되돌리려면 --use_context_emb를 쓸 것."
+                        "[2026-07, 되돌림 — 다시 실제 동작하는 플래그] fusion_mode와 같은 "
+                        "이유로 use_context_emb 기본값을 True(v1)로 되돌리면서, 이 플래그가 "
+                        "다시 'context_emb를 head 입력에서 뺀다'(v2식 비교용)는 원래 의미를 "
+                        "함. --use_context_emb는 이제 하위호환용 no-op."
                     ))
 parser.add_argument("--disable_retrieval_branch", action="store_true",
                     help=(
@@ -149,6 +148,16 @@ parser.add_argument("--num_bins", type=int, default=8,
 # 거기엔 이 플래그들이 남아있음 — HPO가 찾은 값은 best_params에 저장되고
 # reproduce.py가 그 study를 재사용할 때 자동으로 반영됨.
 args = parser.parse_args()
+
+# [2026-07, 되돌림] use_context_emb=True가 다시 기본값(v1) — reproduce.py의
+# 같은 번역 로직을 그대로 재사용. --no_context_emb를 명시적으로 주지 않으면
+# (기본, 대부분의 실행) context_emb 포함(v1). --no_context_emb를 주면 v2식
+# (context_emb 제외)으로 명시적 전환. --use_context_emb는 이미 기본 동작과
+# 같아서 이제 아무 효과 없는 하위호환 플래그.
+if args.no_context_emb:
+    args.use_context_emb = False
+else:
+    args.use_context_emb = True
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
 

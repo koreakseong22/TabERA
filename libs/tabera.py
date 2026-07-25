@@ -1104,17 +1104,15 @@ class TabERA(nn.Module):
         tasktype: str = "regression",
         n_classes: Optional[int] = None,
         routing_scale: float = 1.0,
-        use_context_emb: bool = False,  # [2026-07, v2 freeze — 기본값 변경]
-            # 원래 기본값은 True(V1식 — context_emb를 classifier feature로
-            # head에 직접 결합). 세션 전체에 걸친 검증(FiLM/Temperature 실험,
-            # I(C;Y) 분석 등) 끝에 fusion_mode="residual"+use_context_emb=False
-            # (query+β·agg, context는 head에 안 감)가 TabERA v2 최종 채택
-            # architecture로 확정 — 이제 이게 기본값. 이전 V1식(concat+
-            # context_emb=True)으로 되돌리려면 명시적으로
-            # fusion_mode="concat", use_context_emb=True를 지정할 것(ablation/
-            # 비교 목적 외에는 권장하지 않음 — 이 세션에서 V1 구조는
-            # classifier feature로서의 context_emb가 query와 중복되고
-            # gate 계열이 전부 collapse하는 등 불리하다는 게 이미 확인됨).
+        use_context_emb: bool = True,  # [2026-07, 되돌림] fusion_mode와 같은 이유로
+            # 원래 기본값(True, V1식 — context_emb를 classifier feature로 head에
+            # 직접 결합)으로 되돌림. "context_emb가 불리하다"는 이전 결론은 이번
+            # 세션 내내 use_context_emb=False로만 돌렸기 때문에 이 세션의 엄격한
+            # 방법론(ablation/trajectory/bootstrap CI/retrieval-free baseline)으로
+            # 재검증된 적이 없음 — TabERA 원래 구조([query‖context‖agg])를 있는
+            # 그대로 두고 query dominance 현상을 다시 보는 게 이번 연구 질문에
+            # 더 깨끗하게 맞음(사용자 결정). use_context_emb=False로 되돌리려면
+            # fusion_mode="residual"과 함께 명시적으로 지정할 것(비교/ablation 목적).
         use_query_emb_in_head: bool = True,
         detach_context_grad: bool = False,
         detach_query_warmup: bool = False,  # [v2, Phase 1-1 진단용] head 입력
@@ -1143,12 +1141,17 @@ class TabERA(nn.Module):
             # 원 probe 실험 그대로 재현하려면 이것만 켜고 blockwise_layernorm은
             # 기본값(False) 유지 권장. 둘 다 켜면 LN 적용 후 L2-normalize(아래
             # forward() 참고) — 그 조합 자체는 검증 안 된 추가 실험임.
-        fusion_mode: str = "residual",   # [2026-07, v2 freeze — 기본값 변경]
-            # 원래 기본값은 "concat". TabERA v2 최종 architecture로
-            # "residual"(query+β·agg, β 자유 학습)이 채택되어 기본값을
-            # 이걸로 바꿈 — 아래 "concat" 옵션 설명은 이제 하위호환/ablation
-            # 목적으로만 남겨둠. head가 [query,context,agg]를 합치는 방식.
-            # "concat"(V1식, 기존 기본값이었음): [query‖context‖agg]를
+        fusion_mode: str = "concat",   # [2026-07, 되돌림] 세션 초반에 "v2 최종
+            # architecture"로 residual을 잠시 기본값으로 바꿨었으나, 이후 진행된
+            # 훨씬 넓은 범위의 실험(6개 데이터셋, concat/residual 양쪽 ablation·
+            # trajectory·retrieval-free baseline 비교)에서도 "어느 쪽이 일관되게
+            # 낫다"는 근거를 못 찾음 — 사실 이 결론은 main 브랜치 README에 애초에
+            # 이미 있던 것과 정확히 같은 방향(아래 freeze_encoder_retrain_head
+            # 실험 인용 참고). 그래서 기본값을 원래대로("concat", main과 동일)
+            # 되돌림 — "v2가 확정된 게 아니었다"는 뜻이지 "v2가 틀렸다"는 뜻은
+            # 아님. residual은 계속 --fusion_mode residual로 명시적으로 선택
+            # 가능(ablation/비교 목적).
+            # "concat"(기본값): [query‖context‖agg]를 이어붙여 공유 MLP에 통과.
             #   이어붙여 공유 MLP에 통과. freeze_encoder_retrain_head 5-seed 실험
             #   (mfeat-zernike, embed_dim=256, evM_cosine, sharedLN/blockLN 둘 다)에서
             #   인코더 고정 + head 백지 재학습을 해도 원래 공동학습 head와 통계적으로

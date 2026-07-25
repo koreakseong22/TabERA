@@ -4772,26 +4772,19 @@ def main():
                         ))
     parser.add_argument("--use_context_emb", action="store_true",
                         help=(
-                            "[2026-07, v2 freeze — 신규] fusion_mode='residual'에서 "
-                            "context_emb를 head 입력에 다시 포함시킴(V1식으로 되돌리기, "
-                            "ablation/비교 목적). 기본값(플래그 안 줌)은 이제 False — "
-                            "v2 채택 구조(query+β·agg만, context_emb는 head에 안 감)가 "
-                            "기본. 이 세션 전체의 controlled comparison이 이 기본값으로 "
-                            "돌아갔음(FiLM/Temperature 검증, I(C;Y) 분석 등)."
+                            "[2026-07, deprecated — 하위호환용] use_context_emb=True가 다시 "
+                            "기본값(v1 복원)이라 이 플래그는 더 이상 아무 효과가 없음(줘도 "
+                            "안전 — 어차피 기본 동작). context_emb를 head에서 빼려면(v2식) "
+                            "--no_context_emb를 쓸 것."
                         ))
     parser.add_argument("--no_context_emb", action="store_true",
                         help=(
-                            "[2026-07, deprecated — 하위호환용] use_context_emb=False가 "
-                            "이제 기본값이라 이 플래그는 더 이상 아무 효과가 없음(줘도 "
-                            "안전 — 어차피 기본 동작). V1식으로 되돌리려면 "
-                            "--use_context_emb를 쓸 것. [예전 help, 참고용] head 입력에서 "
-                            "context_emb(centroid 라우팅 결과)를 제외 — --no_query_emb와 "
-                            "대칭. fusion_mode='residual'과 같이 쓰면 z=LN(q)+β·LN(a)(context "
-                            "항 자체가 빠짐) — v2 gated_sum 실험에서 query-only/agg-only 둘 다 "
-                            "AUROC≈0.90인데 fusion이 경쟁으로 하나만 골라 쓴다는 게 "
-                            "확인된 뒤, '그냥 query+agg를 경쟁 없이 고정 비율로 더하기만 "
-                            "해도 좋아지는가'(cooperative sum, gate 없는 최소 baseline)를 "
-                            "보기 위한 용도로 추가됐던 플래그."
+                            "[2026-07, 되돌림 — 다시 실제 동작하는 플래그] fusion_mode와 같은 "
+                            "이유로 use_context_emb 기본값을 True(v1, [query‖context‖agg])로 "
+                            "되돌리면서, 이 플래그가 다시 원래 의미('head 입력에서 context_emb를 "
+                            "제외')를 함 — --no_query_emb와 대칭. fusion_mode='residual'과 같이 "
+                            "쓰면 z=LN(q)+β·LN(a)(context 항 자체가 빠짐). --use_context_emb는 "
+                            "이제 기본 동작과 같아서 아무 효과 없는 하위호환 플래그."
                         ))
     parser.add_argument("--ema_codebook", action="store_true",
                         help=(
@@ -5026,17 +5019,18 @@ def main():
                             "상태에서도 아직 미반영(exclusion 적용 안 됨) — 재현 목적으로 예전 "
                             "결과와 정확히 비교하려면 이 플래그로 예전 동작을 켤 것."
                         ))
-    parser.add_argument("--fusion_mode", type=str, default="residual",
+    parser.add_argument("--fusion_mode", type=str, default="concat",
                         choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"],
                         help=(
-                            "[2026-07, v2 freeze — 기본값 변경] TabERA v2 최종 architecture로 "
-                            "'residual'이 채택되어 기본값을 이걸로 바꿈 — 이 세션의 모든 "
-                            "controlled comparison이 실제로 이 설정으로 돌아갔음. 더 이상 "
-                            "이 플래그를 매번 명시할 필요 없음. 'concat'(V1식, 예전 기본값)은 "
-                            "이제 ablation/비교 목적으로만 명시적으로 선택. "
+                            "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
+                            "6개 데이터셋에 걸친 폭넓은 비교(ablation/trajectory/retrieval-free "
+                            "baseline)에서도 concat 대비 일관된 우위를 못 찾아 기본값을 원래대로 "
+                            "('concat', main 브랜치와 동일) 되돌림 — 'v2가 확정된 게 아니었다'는 "
+                            "뜻이지 틀렸다는 뜻은 아님, residual은 계속 --fusion_mode residual로 "
+                            "명시적으로 선택 가능(비교/ablation 목적). "
                             "head가 [query,context,agg]를 합치는 방식. "
-                            "'concat'(V1식): [query‖context‖agg] → 공유 MLP. "
-                            "'residual'(v2 기본값): z = LN(q) + α·LN(c) + β·LN(a) (α,β 학습 가능한 "
+                            "'concat'(기본값): [query‖context‖agg] → 공유 MLP. "
+                            "'residual': z = LN(q) + α·LN(c) + β·LN(a) (α,β 학습 가능한 "
                             "스칼라) → embed_dim 크기 z 하나만 MLP에 통과. 동기: "
                             "freeze_encoder_retrain_head 5-seed 실험(mfeat-zernike, "
                             "embed_dim=256, evM_cosine, sharedLN/blockLN 둘 다)에서 "
@@ -5602,19 +5596,17 @@ def main():
                         ))
     args = parser.parse_args()
 
-    # [2026-07, v2 freeze] use_context_emb=False가 이제 기본값 — 기존 7군데
-    # 흩어진 "not args.no_context_emb" 사용처를 하나하나 안 고치고, 여기서
-    # args.no_context_emb 자체를 보정해서 그 아래 로직은 전부 그대로 두는
-    # 방식(각 호출부를 개별 수정하는 것보다 훨씬 안전 — 하나 놓쳐서 옛
-    # 기본값이 남는 사고 방지). --use_context_emb를 명시적으로 주지 않으면
-    # (기본, 대부분의 실행) no_context_emb=True로 취급 — v2 기본 architecture.
-    # --use_context_emb를 주면 V1식으로 되돌아감(no_context_emb=False가
-    # 되어야 하므로, 이미 --no_context_emb를 실수로 같이 준 경우가 아니면
-    # 아래에서 False로 재설정).
-    if args.use_context_emb:
-        args.no_context_emb = False
-    else:
+    # [2026-07, 되돌림] use_context_emb=True가 다시 기본값(v1 복원) — 기존 여러
+    # 곳에 흩어진 "not args.no_context_emb" 사용처를 하나하나 안 고치고, 여기서
+    # args.no_context_emb 자체를 보정해서 그 아래 로직은 전부 그대로 두는 방식
+    # (각 호출부를 개별 수정하는 것보다 훨씬 안전). --no_context_emb를 명시적으로
+    # 주지 않으면(기본, 대부분의 실행) context_emb 포함(v1). --no_context_emb를
+    # 주면 v2식(context_emb 제외)으로 명시적 전환. --use_context_emb는 이제
+    # 기본 동작과 같아서 아무 효과 없는 하위호환 플래그.
+    if args.no_context_emb:
         args.no_context_emb = True
+    else:
+        args.no_context_emb = False
 
     if args.query_detach_warmup_epochs > 0 and args.query_detach_warmup_steps > 0:
         parser.error(
@@ -5622,14 +5614,11 @@ def main():
             "동시에 0이 아닐 수 없습니다 — 하나만 지정하세요."
         )
 
-    if args.no_query_emb and not args.use_context_emb:
-        # [2026-07, 수정] use_context_emb=False가 이제 기본값이라, 예전처럼
-        # "--no_query_emb와 --no_context_emb를 둘 다 명시적으로 켰을 때만"
-        # 경고하면 --no_query_emb 단독 사용(매우 흔해질 조합)마다 항상
-        # 스팸성으로 뜸 — 조건을 "--use_context_emb로 V1식을 명시적으로
-        # 요청하지 않은 채 --no_query_emb를 켰는가"로 바꿈(사실상 같은
-        # 극단 케이스를 가리키지만 새 기본값 기준으로 재정의).
-        print(f"  ℹ️  --no_query_emb를 켰고 context_emb는 이미 기본값으로 head에서 제외돼 있습니다 — "
+    if args.no_query_emb and args.no_context_emb:
+        # [2026-07, 되돌림] use_context_emb=True가 다시 기본값(v1)이라, 이제
+        # "극단 케이스"(head 입력이 agg_emb 하나만 남음)는 --no_query_emb와
+        # --no_context_emb를 둘 다 명시적으로 켰을 때만 발생 — 그 경우에만 경고.
+        print(f"  ℹ️  --no_query_emb와 --no_context_emb를 둘 다 켰습니다 — "
               f"head 입력이 agg_emb 하나만 남는 극단 케이스입니다. 의도한 게 맞는지 "
               f"확인해주세요(예: agg_emb 단독 representation 능력 실측 목적이면 정상).")
 
