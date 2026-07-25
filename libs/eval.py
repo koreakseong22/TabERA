@@ -55,10 +55,23 @@ def calculate_metric(
             nan_pct = (~np.isfinite(pr_np)).mean() * 100
             warnings.warn(f"[{split}] probs에 NaN/Inf {nan_pct:.1f}% → auroc/logloss=nan")
             pr_np = None
-        else:
-            # 행 합이 1이 되도록 재정규화 (float32 오차 보정)
+        elif pr_np.ndim == 2:
+            # [버그 수정] 이 재정규화는 (N, C) 형태(각 행이 클래스별 확률
+            # 분포, 합이 1이어야 함)에만 적용돼야 함. 원래 코드가 ndim
+            # 체크 없이 무조건 axis=-1로 sum했는데, binclass에서 probs를
+            # 1차원 배열(P(class=1) 스칼라, shape=(N,))로 넘기면 axis=-1이
+            # 전체 배열 하나를 가리켜서 "행 합"이 아니라 "전체 N개 확률의
+            # 합" 하나로 나눠버림 — 모든 확률이 대략 1/N 배로 쪼그라들어
+            # logloss가 수십 배 폭증하는 원인이 됐음(reproduce.py의 binary
+            # ablation 분기에서 실측: 정상 logloss 0.83이 이 버그 때문에
+            # 3.02로 나옴). 1차원 배열은 이미 각 원소가 그 자체로 유효한
+            # 확률(sigmoid 출력)이라 재정규화 자체가 필요 없음 — 아래
+            # else 분기에서 [0,1] 범위로 clip만 하고 넘어감(부동소수점
+            # 오차로 아주 살짝 벗어나는 경우 대비).
             row_sum = pr_np.sum(axis=-1, keepdims=True)
             pr_np = pr_np / np.where(row_sum > 0, row_sum, 1.0)
+        else:
+            pr_np = np.clip(pr_np, 0.0, 1.0)
 
     metrics: Dict[str, float] = {}
 

@@ -46,6 +46,306 @@ def _evidence_hyperspherical_scale(k: int) -> float:
     return max(1.0, math.sqrt(2) * math.log(max(k - 1, 1)))
 
 
+class NeighborInteractionBlock(nn.Module):
+    """[v2 후보 A] pooling(evidence_w 가중합) 이전에 k개 이웃 values
+    (label_emb + T(query-neighbour))끼리 self-attention으로 섞는 블록.
+
+    query token 없음(이웃끼리만 attend) — T()가 이미 query에 강하게
+    의존한다는 게 diagnose_value_components로 확인된 바 있어서, query
+    token까지 넣으면 "이웃 상호작용 효과"와 "query 의존 강화 효과"가
+    섞여 원인 분리가 안 됨. FFN 없음(self-attn + residual + LN만) —
+    mixing과 capacity 증가를 한번에 넣지 않기 위한 최소 개입.
+
+    evidence_w는 이 블록과 완전히 무관하게 그대로 계산됨(AttentionAggregator.
+    forward에서 유지) — 설명②로 노출되는 값이 이 블록의 존재 여부와
+    상관없이 forward pass에서 실제 쓰인 것과 항상 일치해야 하므로.
+
+    [스모크 테스트 확인 완료, 2026-07] shape/gradient/NaN 정상,
+    neighbor_interaction_mode=None 경로는 v1과 수치적으로 100% 동일
+    (bit-for-bit), neighbor 간 정보가 실제로 섞이는 것을 직접 교란
+    실험으로 확인(neighbor 3 교란 시 neighbor 0 출력 변화량 0.29,
+    interaction_free_baseline은 0.000000).
+    """
+
+    def __init__(self, embed_dim: int, n_heads: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(
+            embed_dim, n_heads, dropout=dropout, batch_first=True
+        )
+        self.ln = nn.LayerNorm(embed_dim)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        """values: (B, k, D) -> (B, k, D). k=1이면 self-attention이
+        항등에 가깝게 수렴(이웃이 자기 자신만 봄) — 에러는 안 남."""
+        attn_out, _ = self.mha(values, values, values, need_weights=False)
+        return self.ln(values + attn_out)
+
+
+class NeighborCapacityBaseline(nn.Module):
+    """[v2 대조군 b] "파라미터/비선형성만 늘어서 좋아진 것 아니냐"를
+    배제하기 위한 느슨한 baseline. 이웃끼리 섞지 않고(mixing 없음),
+    각 이웃의 value를 독립적으로 넓은 MLP에 통과시켜 대략 비슷한
+    파라미터 수를 태움. 파라미터 수를 attn 블록과 정확히 맞추지는
+    않음(대략적 capacity 참고용) — 엄밀한 대조군은
+    NeighborInteractionFreeBaseline(아래) 쪽.
+    """
+
+    def __init__(self, embed_dim: int, hidden_mult: int = 4, dropout: float = 0.0):
+        super().__init__()
+        hidden = embed_dim * hidden_mult
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, embed_dim),
+        )
+        self.ln = nn.LayerNorm(embed_dim)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.ln(values + self.mlp(values))
+
+
+class NeighborInteractionFreeBaseline(nn.Module):
+    """[v2 대조군 c, 핵심 necessity ablation] NeighborInteractionBlock과
+    정확히 같은 파라미터 구성(같은 nn.MultiheadAttention 클래스/설정,
+    파라미터 수 100% 동일 — 스모크 테스트로 확인)이되, attention을
+    이웃별 identity(자기 자신에게만 attend)로 강제해서 이웃 간 정보
+    교환을 구조적으로 차단. "attention이라는 연산 형태" 자체는 그대로
+    두고 "이웃끼리 실제로 섞이는가"만 켜고 끄는 대조군.
+
+    해석:
+      attn > interaction_free ≈ v1        → mixing 자체가 원인
+      attn ≈ interaction_free (둘 다 > v1) → capacity/projection 증가가 원인
+      attn ≈ interaction_free ≈ v1         → 이 경로 전체가 병목이 아님
+                                              (pooling bottleneck 가설 반증)
+
+    [주의] 이 실험이 검증하는 건 "pooling bottleneck 존재 여부"이지,
+    "Aggregator vs Head 전체 문제"의 완전한 답은 아님 — attn도 null이면
+    후보 B(head-level cross-attention)로 넘어가야 함.
+    """
+
+    def __init__(self, embed_dim: int, n_heads: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(
+            embed_dim, n_heads, dropout=dropout, batch_first=True
+        )
+        self.ln = nn.LayerNorm(embed_dim)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        k = values.shape[1]
+        # 대각선만 0, 나머지는 -inf인 additive attn_mask → softmax 후 각
+        # 위치가 자기 자신에게만 가중치 1을 줌(이웃 간 mixing 완전 차단).
+        # in_proj/out_proj 파라미터는 NeighborInteractionBlock과 완전히
+        # 동일하게 다 사용됨(파라미터 수 차이 0 — 스모크 테스트로 확인).
+        mask = torch.full((k, k), float("-inf"), device=values.device, dtype=values.dtype)
+        mask.fill_diagonal_(0.0)
+        attn_out, _ = self.mha(values, values, values, attn_mask=mask, need_weights=False)
+        return self.ln(values + attn_out)
+
+
+class HeadCrossAttention(nn.Module):
+    """[v2, head 재설계 최종안] AttentionAggregator의 고정 weighted-sum
+    pooling을 완전히 대체. retrieve()(어떤 k개를 찾을지)와 value 구성
+    (label_emb + T(query-neighbour), TabR 원본)은 그대로 유지하되, 그
+    k개를 어떻게 예측에 반영할지를 head 내부의 단일 cross-attention이
+    직접 맡음 — "무엇을 검색할지는 그대로, 사용 방식만 바꾼다".
+
+    Q = query_emb, K = nk(이웃 key 임베딩, retrieval과 같은 공간),
+    V = value(label_emb + T(query-neighbour)). n_heads=1, layer 1개
+    (최소 개입 — capacity/optimization/regularization 변수를 한번에
+    늘리지 않기 위함. 성공하면 그때 multi-head/multi-layer 고려).
+
+    updated_query = query_emb + alpha * attn_out   (residual, CLS-token 방식)
+      alpha는 학습 가능한 스칼라(기본) — alpha_override로 고정 가능.
+      0으로 고정하면 updated_query = query_emb가 되어 자동으로
+      query-only baseline이 재현됨(necessity ablation).
+
+    evidence_w = 이 cross-attention의 실제 softmax weight(B,k) — attn_out을
+    만드는 데 실제로 쓰인 값 그 자체이므로, 설명②가 다시 causal claim이
+    될 수 있음(v1은 head가 agg_emb를 안 써서 descriptive claim으로
+    재정의해야 했던 것과 대비되는 v2의 핵심 이득).
+
+    head 쪽 배선: TabERA에서 agg_emb 자리에 updated_query를 넣고
+    use_query_emb_in_head=False로 두면(기존에 이미 있던 플래그) head
+    입력이 정확히 [updated_query ‖ context_emb]가 됨(2-branch, B안) —
+    query_emb를 별도 branch로 안 넣는 이유는 residual 덕에 이미
+    updated_query 안에 들어있기 때문(중복 방지).
+
+    neighbor_source : [necessity/capacity 대조군, 생성자 시점 고정 —
+      재학습 필요]
+      "real"(기본값) — 실제 검색된 이웃.
+      "learned_const" — K/V를 검색 결과 대신 학습 가능한 상수 토큰
+        (nn.Parameter, (k,D))으로 완전히 대체. attention 모듈 자체
+        (W_q/W_k/W_v/W_out) 파라미터 수는 "real"과 100% 동일 — 늘어나는
+        건 상수 토큰 자체(k*embed_dim)뿐. "실제 검색 결과 없이도
+        cross-attention이라는 형태/capacity만으로 좋아지는가"를 격리.
+      "shuffled" — 매 forward마다(학습 중 포함) 배치 내에서 K/V를
+        무작위로 섞음. "learned_const"와 다른 점: 매 배치 다른 진짜
+        이웃 벡터 분포를 보되(그래서 "batch-level 통계"는 학습 가능),
+        "이 query와 이 이웃의 실제 대응"만 학습 내내 원천적으로 불가능
+        하게 만듦. "학습 후 post-hoc으로 섞는 것"(forward()의
+        shuffle_neighbors 인자, 아래)과 다름 — 그건 "real"로 다 학습된
+        모델에 대한 necessity 검증이고, 이건 애초에 대응을 본 적 없는
+        상태로 재학습해야 의미 있는 별도 baseline.
+    """
+
+    def __init__(self, embed_dim: int, k: int, tasktype: str = "regression",
+                 n_classes: Optional[int] = None, dropout: float = 0.0,
+                 use_offset_correction: bool = True,
+                 neighbor_source: str = "real",
+                 alpha_override: Optional[float] = None):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.k = k
+        self.tasktype = tasktype
+        self.use_offset_correction = use_offset_correction
+
+        if neighbor_source not in ("real", "learned_const", "shuffled"):
+            raise ValueError(
+                f"neighbor_source은 'real'/'learned_const'/'shuffled' 중 하나여야 합니다: {neighbor_source}"
+            )
+        self.neighbor_source = neighbor_source
+
+        # value 구성 — AttentionAggregator(value_mode="default")와 동일 로직
+        # (TabR 원본 유지, 여기서는 value_mode 변형은 안 둠 — 최소 개입).
+        if tasktype in ("binclass", "multiclass"):
+            if n_classes is None or n_classes < 2:
+                raise ValueError(f"tasktype='{tasktype}'면 n_classes(2 이상) 필요")
+            self.n_classes = n_classes
+            self.label_encoder = nn.Embedding(n_classes, embed_dim)
+        else:
+            self.n_classes = None
+            self.label_encoder = nn.Linear(1, embed_dim)
+
+        if self.use_offset_correction:
+            d_block = embed_dim * 2
+            self.T = nn.Sequential(
+                nn.Linear(embed_dim, d_block),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_block, embed_dim, bias=False),
+            )
+        else:
+            self.T = None
+
+        # n_heads=1 고정 — 클래스 docstring 참고(설명②를 모호하게 만들지
+        # 않기 위한 의도적 선택, capacity가 부족하면 그때 multi-head 검토).
+        self.mha = nn.MultiheadAttention(embed_dim, num_heads=1, dropout=dropout, batch_first=True)
+
+        if alpha_override is not None:
+            self.register_buffer("alpha", torch.tensor(float(alpha_override)))
+            self._alpha_is_learnable = False
+        else:
+            self.alpha = nn.Parameter(torch.tensor(1.0))
+            self._alpha_is_learnable = True
+
+        if neighbor_source == "learned_const":
+            self.const_tokens = nn.Parameter(torch.randn(k, embed_dim) * 0.02)
+        else:
+            self.const_tokens = None
+
+    def _encode_labels(self, neighbour_labels: torch.Tensor) -> torch.Tensor:
+        if self.tasktype in ("binclass", "multiclass"):
+            idx = neighbour_labels.round().long().clamp(0, self.n_classes - 1)
+            return self.label_encoder(idx)
+        else:
+            return self.label_encoder(neighbour_labels.unsqueeze(-1).float())
+
+    def forward(self, query_emb: torch.Tensor, nk: torch.Tensor,
+                neighbour_labels: torch.Tensor,
+                shuffle_neighbors: bool = False):
+        """
+        query_emb        : (B, D)
+        nk                : (B, k, D) — 이웃 key 임베딩 (K로 사용)
+        neighbour_labels  : (B, k)
+        shuffle_neighbors : [post-hoc ablation, 재학습 불필요] True면 배치
+          내에서 K/V를 무작위로 섞어(다른 샘플의 이웃을 붙여) query-이웃
+          대응을 깨뜨림 — cross-attention이 "이 query의 진짜 이웃"에
+          의존하는지 직접 검증(necessity). 학습 시에는 항상 False.
+        반환: updated_query(B,D), evidence_w(B,k) — 실제 예측에 쓰인
+          attention weight 그 자체, evidence_diag(dict).
+        """
+        B = query_emb.shape[0]
+
+        if self.neighbor_source == "learned_const":
+            # [capacity-only 대조군] 검색 결과 완전 무시 — label/T()로 만든
+            # 실제 값은 여기서 아예 안 씀(섞이면 real 정보가 새어들어감).
+            keys = self.const_tokens.unsqueeze(0).expand(B, -1, -1)
+            vals = self.const_tokens.unsqueeze(0).expand(B, -1, -1)
+        else:
+            label_emb = self._encode_labels(neighbour_labels)      # (B,k,D)
+            if self.use_offset_correction:
+                offset_term = self.T(query_emb.unsqueeze(1) - nk)
+                values = label_emb + offset_term
+            else:
+                values = label_emb
+            keys, vals = nk, values
+            # [수정] "shuffled"는 생성자 시점 고정 baseline(매 forward마다,
+            # 학습 중에도 항상 섞음) — forward() 인자 shuffle_neighbors는
+            # "real"로 다 학습된 모델에 대한 post-hoc necessity 검증이라
+            # 서로 다른 것. 둘 중 하나라도 True/설정돼 있으면 섞음(중첩
+            # 호출 시에도 안전하게 한 번만 섞임 — 매번 새 permutation).
+            if self.neighbor_source == "shuffled" or shuffle_neighbors:
+                perm = torch.randperm(B, device=query_emb.device)
+                keys = keys[perm]
+                vals = vals[perm]
+
+        attn_out, attn_w = self.mha(
+            query_emb.unsqueeze(1), keys, vals,
+            need_weights=True, average_attn_weights=True,
+        )
+        attn_out = attn_out.squeeze(1)     # (B, D)
+        evidence_w = attn_w.squeeze(1)     # (B, k) — 실제 예측에 쓰인 weight
+
+        updated_query = query_emb + self.alpha * attn_out
+        # [추가] attention entropy — Explanation②/faithfulness 분석,
+        # v1 evidence_w와의 entropy 비교, neighbor utilization 분석에
+        # 공통으로 쓸 수 있게 미리 계산해서 diag에 포함(호출부마다
+        # 따로 계산 안 해도 되게).
+        with torch.no_grad():
+            _attn_entropy = float(
+                (-(evidence_w * (evidence_w + 1e-8).log()).sum(-1)).mean().item()
+            )
+        evidence_diag = {
+            "alpha": float(self.alpha.detach().item()),
+            "attn_entropy_mean": _attn_entropy,
+        }
+        return updated_query, evidence_w, evidence_diag
+
+    def explain_evidence(
+        self,
+        evidence_w: torch.Tensor,   # (B, k)
+        top_n: int = 3,
+    ) -> List[Dict]:
+        """이웃별 attention weight 요약 — AttentionAggregator.explain_evidence와
+        인터페이스는 동일하지만, 여기서는 evidence_w가 실제로 updated_query
+        (= 예측에 쓰인 표현)를 만드는 데 쓰인 weight 그 자체이므로 "이
+        이웃 때문에 이렇게 예측했다"는 causal claim으로 취급해도 됨(v1의
+        AttentionAggregator.explain_evidence는 head가 agg_emb를 안 써서
+        descriptive claim으로만 제한해야 했음 — 그 caveat이 여기서는
+        구조적으로(head_attn_alpha_override로 강제 0이 아닌 한) 해소됨).
+        neighbor_source="learned_const"일 때는 evidence_w가 실제 검색
+        결과가 아닌 학습된 상수 토큰에 대한 가중치이므로, 이 경우
+        explain_evidence 결과를 "검색된 이웃"으로 표시하면 안 됨 — 호출부
+        (reproduce.py --explain)에서 self.neighbor_source를 확인해 문구를
+        분기할 것.
+        """
+        ew_np = evidence_w.detach().cpu().numpy()
+        B, k  = ew_np.shape
+        out   = []
+        for b in range(B):
+            w          = ew_np[b]
+            sorted_idx = np.argsort(w)[::-1]
+            top_n_list = [(int(i), float(w[i])) for i in sorted_idx[:top_n]]
+            out.append({
+                "top_neighbours":  top_n_list,
+                "dominant_weight": float(w.max()),
+                "ignored_ratio":   float((w < 0.05).mean()),
+                "entropy":         float(-(w * np.log(w + 1e-8)).sum()),
+            })
+        return out
+
+
 class AttentionAggregator(nn.Module):
     """
     TabR 방식 이웃 집계 (순수 retrieval-augmented prediction).
@@ -61,7 +361,17 @@ class AttentionAggregator(nn.Module):
                  tasktype: str = "regression", n_classes: Optional[int] = None,
                  evidence_temperature: float = 1.0,
                  evidence_metric: str = "euclidean",
-                 value_mode: str = "default"):  # [추가] use_offset_correction=True일 때만
+                 value_mode: str = "default",
+                 neighbor_interaction_mode: Optional[str] = None,  # [v2, 추가]
+                     # None(기본값, 기존과 100% 동일 — 하위 호환)/"attn"(후보 A)/
+                     # "capacity_baseline"/"interaction_free_baseline"(대조군).
+                     # pooling(evidence_w 가중합) 전에 k개 이웃 values끼리
+                     # 상호작용시킬지 여부. evidence_w 계산 자체에는 관여 안 함
+                     # — 설명②로 노출되는 값은 이 플래그와 무관하게 항상 forward
+                     # pass에서 실제 쓰인 것과 일치. 클래스 docstring 참고.
+                 interaction_n_heads: int = 2):  # [v2, 추가] neighbor_interaction_mode
+                     # 가 "attn"/"interaction_free_baseline"일 때만 의미 있음.
+            # [value_mode 설명, 이어짐] use_offset_correction=True일 때만
             # 의미 있음(use_offset_correction=False면 value=label_emb만 — 이게
             # "label_only" ablation, 이 파라미터와 별개로 이미 존재하던 플래그로
             # 커버됨). "default"(기존과 100% 동일, 하위호환): value = label_emb +
@@ -122,11 +432,15 @@ class AttentionAggregator(nn.Module):
         self.use_offset_correction = use_offset_correction
         self.tasktype = tasktype
         self.evidence_temperature = evidence_temperature
-        if value_mode not in ("default", "offset_only", "balanced"):
-            raise ValueError(f"value_mode은 'default'/'offset_only'/'balanced' 중 하나: {value_mode}")
+        if value_mode not in ("default", "offset_only", "balanced", "offset_normalized", "sum_normalized"):
+            raise ValueError(
+                f"value_mode은 'default'/'offset_only'/'balanced'/'offset_normalized'/"
+                f"'sum_normalized' 중 하나: {value_mode}"
+            )
         if value_mode != "default" and not use_offset_correction:
             raise ValueError(
-                "value_mode='offset_only'/'balanced'는 T()가 있어야(use_offset_correction=True) "
+                "value_mode='offset_only'/'balanced'/'offset_normalized'/'sum_normalized'는 "
+                "T()가 있어야(use_offset_correction=True) "
                 "의미가 있습니다."
             )
         self.value_mode = value_mode
@@ -182,6 +496,35 @@ class AttentionAggregator(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # [v2, 추가] neighbor_interaction_mode : None(기본값, 기존과 100%
+        # 동일 — 하위 호환)이면 pooling 전 어떤 이웃 간 상호작용도 없음
+        # (v1 그대로). "attn"이면 NeighborInteractionBlock(후보 A, self-
+        # attention among neighbours, query token 없음, FFN 없음).
+        # "capacity_baseline"/"interaction_free_baseline"은 "attn"과
+        # 비교하기 위한 대조군(각 클래스 docstring 참고) — 이웃 간 mixing이
+        # 구조적으로 불가능하면서 attn과 비슷한 자리에 비슷한 성격의 학습
+        # 가능한 변환을 넣음. 셋 다 evidence_w 계산에는 관여하지 않음 —
+        # evidence_w는 항상 원래 similarities에서만 계산됨(위 2번 단계).
+        valid_modes = (None, "attn", "capacity_baseline", "interaction_free_baseline")
+        if neighbor_interaction_mode not in valid_modes:
+            raise ValueError(
+                f"neighbor_interaction_mode은 {valid_modes} 중 하나여야 합니다: "
+                f"{neighbor_interaction_mode}"
+            )
+        self.neighbor_interaction_mode = neighbor_interaction_mode
+        if neighbor_interaction_mode == "attn":
+            self.neighbor_interaction = NeighborInteractionBlock(
+                embed_dim, n_heads=interaction_n_heads, dropout=dropout
+            )
+        elif neighbor_interaction_mode == "capacity_baseline":
+            self.neighbor_interaction = NeighborCapacityBaseline(embed_dim, dropout=dropout)
+        elif neighbor_interaction_mode == "interaction_free_baseline":
+            self.neighbor_interaction = NeighborInteractionFreeBaseline(
+                embed_dim, n_heads=interaction_n_heads, dropout=dropout
+            )
+        else:
+            self.neighbor_interaction = None
+
     def _encode_labels(self, neighbour_labels: torch.Tensor) -> torch.Tensor:
         """neighbour_labels (B, k) → label_emb (B, k, D).
         classification이면 반올림 후 long 캐스팅(부동소수점 오차 대비 —
@@ -208,7 +551,13 @@ class AttentionAggregator(nn.Module):
         credit-approval 3개 데이터셋), nv가 nk/label로 이미 설명되는
         잔차 이상의 추가 정보를 noise 대조군과 통계적으로 구분되게
         보여주지 못해, MemoryBank/TabERA에서 nv 자체를 완전히 제거하며
-        여기 시그니처에서도 제거함.
+        여기 시그니처에서도 제거함. [v3 → 제거] context_emb 인자도 같은
+        이유로 제거 — ContextOffsetFiLM/ContextEvidenceTemperature(centroid
+        context로 offset representation/evidence temperature를 조건화하는
+        실험)가 통제된 비교(dataset 1043, 동일 hyperparameter, 3-seed)에서
+        전부 baseline보다 나쁘거나(FiLM) 뚜렷한 이득이 없어(Temperature,
+        margin↔N_eff가 이미 -0.98로 자연 발생) 채택되지 않음 — 관련 실험
+        기록은 프로젝트 문서 참고.
         """
         # 1. 유사도 계산 — evidence_metric에 따라 분기
         if self.evidence_metric == "euclidean":
@@ -248,23 +597,53 @@ class AttentionAggregator(nn.Module):
                 "distance_mean": float((-similarities).detach().mean().item()),
                 "distance_std":  float((-similarities).detach().std().item()),
             }
+            # [Local Retriever 진단, 추가] similarity geometry — temperature와
+            # 독립적인 원인 분리용. evidence_w(softmax 이후)가 균등해 보여도,
+            # 그 원인이 (a) similarity 자체가 이미 거의 동률(sim1≈sim_k, margin
+            # 작음 — retrieval이 애초에 비슷한 이웃만 찾음)인지, (b) similarity는
+            # 벌어져 있는데 temperature가 커서 softmax가 눌린 것인지 구분
+            # 불가능함 — margin을 직접 저장해서 이 둘을 분리. similarities는
+            # 이미 계산된 텐서라 추가 forward 연산 없음(정렬만 추가).
+            _sim_sorted = similarities.detach().sort(dim=-1, descending=True).values  # (B, k)
+            evidence_diag["similarity_top1_per_sample"]   = _sim_sorted[:, 0]           # (B,) — 가장 가까운 이웃
+            evidence_diag["similarity_bottomk_per_sample"] = _sim_sorted[:, -1]          # (B,) — 검색된 k개 중 가장 먼 이웃
+            evidence_diag["similarity_margin_per_sample"] = _sim_sorted[:, 0] - _sim_sorted[:, -1]  # top1-topk
+            # [Local Retriever 진단, 추가] margin만으로는 shape을 구분 못함 —
+            # [0.95,0.94,...,0.91]과 [0.95,0.90,...,0.75]는 margin이 비슷해도
+            # (전자는 완만한 감소, 후자는 급격한 감소) 완전히 다른 retrieval
+            # geometry. std로 이 둘을 구분.
+            evidence_diag["similarity_std_per_sample"] = similarities.detach().std(dim=-1)  # (B,)
 
         evidence_w = F.softmax(similarities / self.evidence_temperature, dim=-1)    # (B, k)
+
+        # dropout은 softmax 직후 적용.
         evidence_w = self.dropout(evidence_w)
 
         # 2. TabR 방식 value = label_emb + T(query - neighbour)
         #    (use_offset_correction=False면 T() 항 없이 label_emb만 사용 — "label_only" ablation)
         label_emb = self._encode_labels(neighbour_labels)      # (B, k, D)
+
         if self.use_offset_correction:
             offset_term = self.T(query_emb.unsqueeze(1) - nk)
             if self.value_mode == "offset_only":
                 values = offset_term
             elif self.value_mode == "balanced":
                 values = F.normalize(label_emb, dim=-1) + F.normalize(offset_term, dim=-1)
+            elif self.value_mode == "offset_normalized":
+                values = label_emb + F.normalize(offset_term, dim=-1)
+            elif self.value_mode == "sum_normalized":
+                values = F.normalize(label_emb + offset_term, dim=-1)
             else:  # "default"
                 values = label_emb + offset_term
         else:
             values = label_emb
+
+        # [v2, 추가] pooling(evidence_w 가중합) 전에 이웃 간 상호작용/
+        # 대조군 변환 적용. evidence_w는 위에서 이미 계산 완료 —
+        # 이 블록과 무관. neighbor_interaction_mode=None이면 values는
+        # 그대로 통과(기존 v1과 수치적으로 100% 동일 — 스모크 테스트 확인).
+        if self.neighbor_interaction is not None:
+            values = self.neighbor_interaction(values)
 
         # 3. 가중합 → head 입력
         agg_emb = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)

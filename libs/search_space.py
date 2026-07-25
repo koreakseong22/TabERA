@@ -15,6 +15,34 @@ import optuna
 
 
 # ─────────────────────────────────────────────────────────────
+# HPO ↔ reproduce 학습 스케줄 단일 소스
+# ─────────────────────────────────────────────────────────────
+
+HPO_TRAINING_SCHEDULE = {"epochs": 200, "patience": 30}
+"""optimize.py의 각 HPO trial과 reproduce.py의 최종 재현 학습이 반드시
+같은 epochs/patience를 쓰도록 강제하는 단일 소스.
+
+[배경] 예전엔 optimize.py에 epochs=100/patience=20이 하드코딩돼 있고,
+reproduce.py는 --epochs(기본 200)/--patience(기본 30)를 별도 CLI로
+노출하고 있어서, "HPO가 찾은 최적 config를 재현한다"는 이름의 스크립트가
+실제로는 HPO 때와 다른 학습 스케줄로 돌아가는 불일치가 있었음(adult(1590)
+데이터셋에서 실측: reproduce.py가 더 오래/관대하게 학습했는데도 val
+acc가 HPO best trial보다 오히려 낮게 나왔고, centroid 쏠림도 max_cluster_
+size 기준 optimize.py 대비 reproduce.py에서 훨씬 심하게 진행됨 —
+regroup/dead-centroid reinit이 매 epoch 실행되는 구조라, 학습이 길어질수록
+쏠림이 누적되는 방향으로 작동하는 것으로 추정).
+
+원본 MultiTab benchmark(Lee et al.)의 reproduce.py는 애초에 이런 불일치가
+구조적으로 발생할 수 없음 — HPO trial과 최종 재현이 model wrapper의
+같은 fit() 경로를 그대로 재사용하기 때문. 이 상수는 TabERA 쪽에서도 같은
+원칙(학습 스케줄은 하나의 소스에서만 나온다)을 강제하기 위함 —
+optimize.py/reproduce.py 둘 다 이 값을 직접 import해서 쓰고, 각자
+따로 epochs/patience 숫자를 하드코딩하거나 CLI 기본값으로 재정의하지
+않는다. 이 값 자체를 바꾸고 싶으면 여기 한 곳만 바꾸면 양쪽에 다 반영됨.
+"""
+
+
+# ─────────────────────────────────────────────────────────────
 # AdaCos fixed-scale 공식 (Zhang et al. 2019, CVPR)
 # ─────────────────────────────────────────────────────────────
 
@@ -61,6 +89,24 @@ def study_pkl_tag(
     evidence_metric: str = "euclidean",  # [추가] AttentionAggregator의 evidence_w
         # 유사도 공간. euclidean(기본값, 기존과 동일)이면 태그 없음 —
         # 기존에 이미 저장된 euclidean study들의 파일명이 안 바뀌게(하위 호환).
+    fusion_mode: str = "concat",  # [2026-07, 추가] optimize.py가 이제 fusion_mode를
+        # 실제로 바꿀 수 있게 되면서(예전엔 항상 암묵적으로 concat 고정) 처음으로
+        # 필요해짐 — concat으로 한 번, residual+no_context_emb로 한 번 돌리면
+        # 태그 없이는 둘 다 같은 파일명이라 나중 게 앞 걸 덮어씀. concat(TabERA
+        # 생성자 기본값)이면 태그 없음 — 기존에 이미 저장된 study들의 파일명이
+        # 안 바뀌게(하위 호환).
+    use_context_emb: bool = True,  # [2026-07, 추가] fusion_mode='residual'일 때만
+        # 의미 있음(query+β·agg만 쓸지, context도 head에 넣을지). True(기본값)면
+        # 태그 없음 — 하위 호환.
+    disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜" retrieval-free
+        # baseline(Model 2, TabERA.__init__ 참고). False(기본값)면 태그 없음 —
+        # 하위 호환. [교훈] fusion_mode를 "기본값=태그 없음"으로 짰다가 v2 freeze
+        # 이후 기본값이 바뀌면서 옛날 study 파일과 충돌한 사고가 있었음(위 참고) —
+        # 그 반복을 피하려고 이 플래그는 처음부터 "값이 뭐든 명시적으로 태그"
+        # 하는 대신, 기본값(False)일 때만 태그 생략하는 표준 패턴을 그대로 따름
+        # (이 자체가 위험한 게 아니라, "기본값 자체가 나중에 바뀔 수 있다"는 걸
+        # 놓치는 게 위험했던 것 — disable_retrieval_branch=False는 앞으로도
+        # 계속 "기존 TabERA와 동일"을 뜻하므로 여기서는 안전).
 ) -> str:
     """optimize.py가 저장하는 study .pkl 파일명의 태그 부분을 만든다.
 
@@ -77,6 +123,21 @@ def study_pkl_tag(
     두 파일이 이 함수 하나를 공유하게 해서, 앞으로 태그 구성 항목이
     늘어나도(예: 새 ablation 플래그 추가) 한 곳만 고치면 항상 일치하도록
     한다.
+
+    [주의 — fusion_mode를 태그에 넣기로 한 결정 변경 이력] V2 시절에는
+    fusion_mode를 "재학습 시점 구조 선택"으로 취급해 일부러 태그에서
+    뺐음(concat/residual/gated_sum/anchor_gate/context_gated_beta 여러
+    설계를 같은 HPO study 위에서 비교하기 위함 — reproduce.py 쪽 설계
+    의도). 그런데 optimize.py가 fusion_mode를 실제로 못 바꿨던 그 시절엔
+    이게 안전했지만(HPO는 항상 암묵적으로 concat이었으므로), 이제
+    optimize.py도 --fusion_mode를 받게 되면서(V2 채택 구조로 HPO 자체를
+    다시 돌리기 위함) 파일명 충돌 위험이 실재하게 됨 — 그래서 여기서는
+    태그에 포함시킴. optimize.py/reproduce.py 둘 다 각자의 args.fusion_mode/
+    args.no_context_emb를 그대로 이 함수에 전달해야 함 — "study는 fusion_mode
+    A로 탐색됐는데 reproduce.py가 fusion_mode B로 재현 시도" 같은 실수 조합은
+    이제 서로 다른 파일을 가리키므로 애초에 섞일 수 없음(같은 파일명을
+    가리키려면 두 스크립트에 같은 --fusion_mode/--no_context_emb를 명시적으로
+    맞춰줘야 함 — 이게 오히려 안전한 방향).
     """
     return ("..no_offset" if no_offset_correction else "") \
         + ("..global_retrieve" if global_retrieve else "") \
@@ -86,7 +147,10 @@ def study_pkl_tag(
         + ("..cat_sum" if cat_combine == "sum" else "") \
         + ("..num_ple" if num_embedding == "ple" else "") \
         + ("..num_linear" if num_embedding == "linear" else "") \
-        + (f"..evM_{evidence_metric}" if evidence_metric != "euclidean" else "")
+        + (f"..evM_{evidence_metric}" if evidence_metric != "euclidean" else "") \
+        + f"..fusion_{fusion_mode}" \
+        + ("..noctx" if not use_context_emb else "") \
+        + ("..no_retrieval" if disable_retrieval_branch else "")
 
 
 def suggest_initial_trial() -> dict:
@@ -144,13 +208,17 @@ def get_search_space(
         # ── 모델 구조 ───────────────────────────────────
         "embed_dim":       trial.suggest_categorical("embed_dim",   [64, 128, 256]),
         # n_prototypes: optimize.py에서 sqrt(N)으로 자동 설정 (탐색 대상 아님)
-        # [수정] k 고정(16) — RandomForest 기반 하이퍼파라미터 중요도 분석
-        # (22개 데이터셋, 100 trial씩) 결과 k importance=0.027로 최하위권,
-        # 그리고 이전에 이미 인과적으로도 검증됨(global_retrieve ablation —
-        # group-constrained retrieval의 k 값 자체가 성능을 좌우하지 않음).
-        # 12차원 탐색 공간에서 안 중요한 차원을 고정해 trial 예산을 lr/
-        # plr_freq_scale 같은 실제 중요한 차원에 더 배분.
-        "k":               16,
+        # [2026-07, 재개방] retrieval geometry 분석(centroid_retrieval_behavior,
+        # margin/N_eff/topk_idx overlap)이 끝나고 "centroid마다 retrieval
+        # behavior가 실제로 다르다"는 결론이 확인된 뒤 k를 다시 탐색
+        # 대상으로 되돌림. 예전에 k=16으로 고정했던 근거(RandomForest
+        # 중요도 분석 k importance=0.027)는 embedder_layers 때와 같은
+        # restriction-of-range 문제(애초에 탐색 공간에 없었던 study들
+        # 위에서 나온 결과라 재확인 자체가 불가능한 순환논리)일 수 있어
+        # 재검증 필요 — 특히 이제 fusion_mode=residual+no_context_emb를
+        # HPO 시점부터 직접 탐색하므로(아래 참고), k의 중요도도 이
+        # architecture 기준으로 다시 봐야 함.
+        "k":               trial.suggest_categorical("k", [4, 8, 16, 32, 48, 64]),
         # [원복 — 2026-07] embedder_layers를 [2,4] → [1,4]로 되돌림.
         # 좁혔던 근거({1:2, 2:1, 3:9, 4:10} 분포, 아래 원래 주석)가 이후
         # 재검토 결과 두 가지 문제가 있었음:

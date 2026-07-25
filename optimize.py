@@ -2,7 +2,7 @@
 ## Paper info: TabERA — Tabular Hierarchical Explainable Retrieval Architecture
 ## Based on: MultiTab (Kyungeun Lee, kyungeun.lee@lgresearch.ai)
 
-import sys, os, argparse
+import os, argparse
 
 # ── CUDA_VISIBLE_DEVICES를 torch import 전 최우선 설정 ──────────
 # MultiTab 원본과 동일하게 argparse 직후, torch import 전에 설정
@@ -24,7 +24,7 @@ parser.add_argument("--evidence_metric", type=str, default="cosine",
                         "[기본값 변경] euclidean → cosine(reproduce.py와 통일). euclidean은 "
                         "-‖q-k‖²(raw, 정규화 안 됨) — 4개 데이터셋 "
                         "x 5-seed 실측 결과 evidence_w가 n_eff≈1.0(사실상 1-NN)으로 "
-                        "100% 재현되게 붕괴함이 확인됨. cosine은 q,k를 CentroidLayer "
+                        "100%% 재현되게 붕괴함이 확인됨. cosine은 q,k를 CentroidLayer "
                         "라우팅과 동일하게 정규화 후 2·cos — 같은 실측에서 n_eff를 "
                         "7.6~8.5로 안정적으로 유지, 성능은 유지~일부 개선(credit-g "
                         "balanced accuracy 등). euclidean으로 HPO하려면 명시적으로 "
@@ -75,6 +75,45 @@ parser.add_argument("--context_projection", action="store_true",
                         "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
                         "centroid_x/confidence) 계산에는 관여하지 않음."
                     ))
+parser.add_argument("--fusion_mode", type=str, default="concat",
+                    choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"],
+                    help=(
+                        "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
+                        "폭넓은 비교 실험(6개 데이터셋)에서도 concat 대비 일관된 우위를 "
+                        "못 찾아 기본값을 원래대로('concat', main 브랜치와 동일) 되돌림. "
+                        "'residual'(query+β·agg)은 계속 명시적으로 선택 가능(비교/ablation "
+                        "목적). study_pkl_tag는 이제 concat/residual 둘 다 명시적으로 태그를 "
+                        "매김('..fusion_concat'/'..fusion_residual') — 이전(태그 없음=concat) "
+                        "규칙으로 저장된 옛날 study 파일은 새 태그 규칙과 파일명이 달라지므로 "
+                        "리네임이 필요할 수 있음(레포 마이그레이션 스크립트 참고)."
+                    ))
+parser.add_argument("--use_context_emb", action="store_true",
+                    help=(
+                        "[2026-07, deprecated — 하위호환용] use_context_emb=True가 다시 "
+                        "기본값(v1 복원)이라 이 플래그는 더 이상 아무 효과가 없음(줘도 안전 — "
+                        "어차피 기본 동작). context_emb를 head에서 빼려면(v2식) "
+                        "--no_context_emb를 쓸 것."
+                    ))
+parser.add_argument("--no_context_emb", action="store_true",
+                    help=(
+                        "[2026-07, 되돌림 — 다시 실제 동작하는 플래그] fusion_mode와 같은 "
+                        "이유로 use_context_emb 기본값을 True(v1)로 되돌리면서, 이 플래그가 "
+                        "다시 'context_emb를 head 입력에서 뺀다'(v2식 비교용)는 원래 의미를 "
+                        "함. --use_context_emb는 이제 하위호환용 no-op."
+                    ))
+parser.add_argument("--disable_retrieval_branch", action="store_true",
+                    help=(
+                        "[2026-07, 추가] '진짜' retrieval-free baseline(Model 2) HPO용 — "
+                        "reproduce.py의 같은 이름 플래그와 정확히 같은 의미. 이 모드에서는 "
+                        "k/n_prototypes/evidence_metric 등 retrieval 관련 하이퍼파라미터가 "
+                        "전혀 안 쓰이므로(모델이 아예 retrieval을 안 함) 이 플래그를 켠 채로 "
+                        "HPO를 새로 돌리는 건 대부분 낭비 — retrieval 있는 구조로 이미 돌린 "
+                        "study의 embed_dim/dropout/lr 등만 재사용하고 싶다면 reproduce.py "
+                        "쪽에서 --disable_retrieval_branch만 켜고 기존 study를 그대로 "
+                        "불러오는 게 낫다(다만 study_pkl_tag가 이 플래그 값에 따라 다른 "
+                        "파일을 가리키므로, 그러려면 optimize.py도 한 번은 이 플래그를 켠 "
+                        "채로 시작해 study 파일을 만들어야 함 — 파일명 태그: '..no_retrieval')."
+                    ))
 parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
                     help=(
                         "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
@@ -110,12 +149,22 @@ parser.add_argument("--num_bins", type=int, default=8,
 # reproduce.py가 그 study를 재사용할 때 자동으로 반영됨.
 args = parser.parse_args()
 
+# [2026-07, 되돌림] use_context_emb=True가 다시 기본값(v1) — reproduce.py의
+# 같은 번역 로직을 그대로 재사용. --no_context_emb를 명시적으로 주지 않으면
+# (기본, 대부분의 실행) context_emb 포함(v1). --no_context_emb를 주면 v2식
+# (context_emb 제외)으로 명시적 전환. --use_context_emb는 이미 기본 동작과
+# 같아서 이제 아무 효과 없는 하위호환 플래그.
+if args.no_context_emb:
+    args.use_context_emb = False
+else:
+    args.use_context_emb = True
+
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과 동일한 위치
 
 import optuna, torch, json, joblib, datetime, math, gc
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
-from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag
+from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
 import warnings
@@ -152,6 +201,9 @@ _ablation_tag = study_pkl_tag(
     cat_combine=args.cat_combine,
     num_embedding=args.num_embedding,
     evidence_metric=args.evidence_metric,
+    fusion_mode=args.fusion_mode,
+    use_context_emb=args.use_context_emb,
+    disable_retrieval_branch=args.disable_retrieval_branch,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -238,7 +290,6 @@ if train:
 
     # ── Objective  (MultiTab 원본 구조와 동일) ─────────────
     def objective(trial):
-        global best_so_far
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id, metric=args.metric,
                                         num_embedding=args.num_embedding)
@@ -272,6 +323,9 @@ if train:
             detach_context_grad=args.detach_context_grad,
             use_context_projection=args.context_projection,
             evidence_metric=args.evidence_metric,
+            fusion_mode=args.fusion_mode,
+            disable_retrieval_branch=args.disable_retrieval_branch,
+            use_context_emb=args.use_context_emb,
             # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
             # 인코딩. 이게 없으면 cat_col_idx=None이 돼서 cat_combine/
             # num_embedding 설정과 무관하게 raw-encoding 경로로 빠짐 — HPO가
@@ -297,7 +351,7 @@ if train:
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,
-                                  device=str(device), epochs=100, patience=20)
+                                  device=str(device), **HPO_TRAINING_SCHEDULE)
         wrapper._data_id = args.openml_id   # 에폭 tqdm에 data_id 표시
         wrapper.fit(X_train, y_train, X_val, y_val)
 
