@@ -467,7 +467,10 @@ def compute_branch_linear_contribution(model, X, batch_size: int = 512):
       지표 — 정확한 분해는 아니지만 "이 branch가 대략 몇 %를 차지하는가"의
       직관적 요약으로는 유효).
     """
-    if not hasattr(model, "_head_first_linear") or not hasattr(model, "_head_block_slices"):
+    # ⚠ hasattr만으로는 부족하다 — proto_residual은 속성이 있되 None이다
+    #   (통합 head가 없어 "첫 Linear" 개념 자체가 없음).
+    if (getattr(model, "_head_first_linear", None) is None
+            or not getattr(model, "_head_block_slices", None)):
         raise ValueError("이 모델에는 _head_first_linear/_head_block_slices가 없습니다 "
                           "(구버전 체크포인트이거나 예상 밖의 head 구조).")
     if not model._head_block_slices:
@@ -485,16 +488,22 @@ def compute_branch_linear_contribution(model, X, batch_size: int = 512):
     handle = model._head_first_linear.register_forward_hook(_hook)
 
     per_branch_norms = {name: [] for name in slices}
+    _cached_head_inputs = []
     try:
         with torch.no_grad():
             for start in range(0, len(X), batch_size):
                 model(X[start:start + batch_size])
                 x = captured["x"]  # (B, in) — head 첫 Linear가 실제로 받은 입력
+                # [Step 2 진단] Jacobian 계산에서 재사용 — model()을 다시 부르지
+                # 않기 위해서다. forward를 반복하면 memory/feature_store 경로가
+                # 다시 타면서 위험하고, 비용도 두 배가 된다.
+                _cached_head_inputs.append(x.cpu())
                 for name, (s, e) in slices.items():
                     contrib = x[:, s:e] @ W[:, s:e].T   # (B, out) — 이 branch만의 선형 기여
                     per_branch_norms[name].append(contrib.norm(dim=-1).cpu())
     finally:
         handle.remove()
+    model._last_head_inputs = _cached_head_inputs
 
     result = {}
     means = {}
@@ -514,6 +523,85 @@ def compute_branch_linear_contribution(model, X, batch_size: int = 512):
     return result
 
 
+def compute_branch_jacobian(model, X=None, batch_size: int = 256):
+    """head **전체**를 통과한 뒤의 ∂logit/∂branch — "head가 이 branch를
+    실제로 얼마나 사용하는가"를 비선형까지 포함해서 잰다.
+
+    [왜 필요한가] compute_branch_linear_contribution은 head **첫 Linear**의
+    ‖W_i x_i‖만 본다. 그건 "입력이 첫 층에 얼마나 크게 들어가는가"이지
+    "최종 출력이 그 branch에 얼마나 민감한가"가 아니다. 첫 층에서 크게
+    들어가도 이후 층에서 죽을 수 있고, 반대도 가능하다.
+    지금까지의 분석(CKA/CCA/probe/within-variance)은 전부 **representation**
+    분석이었고, head가 그 표현을 어떻게 쓰는지는 거의 측정하지 않았다.
+
+    [해석]
+      ‖∂logit/∂agg‖ share ≈ 0    head가 agg를 아예 무시 —
+                                  value/T/candidate set 무엇을 바꿔도 안 씀
+      share 충분히 큼             head는 쓰는데 내용이 나쁨 —
+                                  그때 비로소 value/candidate set을 볼 이유가 생김
+
+    ⚠ **모델 forward를 다시 부르지 않는다.** compute_branch_linear_contribution이
+      no_grad로 이미 돌면서 캐시해둔 head 입력(model._last_head_inputs)을 쓴다.
+      forward를 반복하면 memory/feature_store 경로를 다시 타고, 비용도 두 배다.
+      따라서 이 함수는 compute_branch_linear_contribution **뒤에** 호출해야 한다.
+
+    ⚠ `_head_block_slices`는 {name: (start, end)} **튜플**이다. `x[:, sl]`처럼
+      쓰면 (start, end)가 인덱스 배열로 해석되어 end == in_features일 때
+      CUDA index-out-of-bounds가 난다. 반드시 `x[:, s:e]`로 슬라이싱할 것.
+
+    반환: {branch: {"jac_norm_mean", "share_of_total"}}
+    """
+    import torch as _t
+    if not getattr(model, "_head_block_slices", None):
+        raise ValueError("_head_block_slices가 없습니다 "
+                         "(fusion_mode='concat'에서만 의미가 있습니다).")
+    cached = getattr(model, "_last_head_inputs", None)
+    if not cached:
+        raise ValueError("model._last_head_inputs가 비어 있습니다 — "
+                         "compute_branch_linear_contribution을 먼저 호출하세요.")
+    slices = model._head_block_slices
+    head = getattr(model, "head", None) or getattr(model, "head_v2", None)
+    if head is None:
+        raise ValueError("model.head / model.head_v2를 찾을 수 없습니다.")
+
+    # _head_first_linear부터 끝까지가 미분 대상 (그 앞의 LayerNorm 등은 이미
+    # 캐시된 입력에 반영돼 있다).
+    sub = head
+    try:
+        mods = list(head)
+        for _i, _m in enumerate(mods):
+            if _m is model._head_first_linear:
+                sub = _t.nn.Sequential(*mods[_i:])
+                break
+    except TypeError:
+        pass
+
+    was = model.training
+    model.eval()
+    dev = next(model.parameters()).device
+    sums = {n: 0.0 for n in slices}
+    n_seen = 0
+    try:
+        for xb in cached:
+            x = xb.to(dev).clone().requires_grad_(True)
+            logits = sub(x)
+            # 클래스 선택에 의존하지 않도록 로짓 노름을 스칼라로 축약
+            scalar = (logits ** 2).sum(-1).clamp_min(1e-12).sqrt().sum()
+            g = _t.autograd.grad(scalar, x)[0]
+            for nm, (s_, e_) in slices.items():
+                sums[nm] += float(g[:, s_:e_].norm(dim=-1).sum())
+            n_seen += len(x)
+    finally:
+        if was:
+            model.train()
+    if n_seen == 0:
+        return {}
+    means = {nm: v / n_seen for nm, v in sums.items()}
+    tot = sum(means.values()) or 1e-12
+    return {nm: {"jac_norm_mean": v, "share_of_total": v / tot}
+            for nm, v in means.items()}
+
+
 def print_branch_linear_contribution(result: dict) -> None:
     print(f"\n{'='*60}")
     print(f"  Branch별 선형 기여도 (||W_i x_i||, head 첫 Linear 입력 기준)")
@@ -527,7 +615,8 @@ def print_branch_linear_contribution(result: dict) -> None:
     print(f"   'classifier가 이 branch를 얼마나 반영하는가'에 더 가까운 지표.)")
 
 
-def analyze_branch_information(model, X, tasktype: str, batch_size: int = 512):
+def analyze_branch_information(model, X, tasktype: str, batch_size: int = 512, y=None,
+                               n_shuffles: int = 5, residual_null: bool = False):
     """"agg_emb가 크게 기여하지만 정보가 없을 수도 있다"는 가설(사용자 제안,
     시나리오 1/2/3)을 직접 검증. norm(크기)이 아니라 정보량을 잼:
 
@@ -622,19 +711,324 @@ def analyze_branch_information(model, X, tasktype: str, batch_size: int = 512):
         }
 
 
-    # redundancy: agg_emb/context_emb를 query_emb로 선형회귀했을 때 R²
-    def _linreg_r2(target, source):
+    # ── 행렬 형상 메타 (probe/redundancy 해석 가능 구간 판정용) ──────
+    # [2026-07] p>n이면 선형 모델이 무엇이든 완벽히 맞출 수 있다. 그 구간에서
+    # 나온 R²/gain은 "중복도"가 아니라 "보간 용량"을 재는 것이므로 해석하면
+    # 안 된다. 값만 보고는 구분이 안 되므로 형상을 항상 같이 저장한다.
+    def _mat_meta(m):
+        m = np.asarray(m, dtype=np.float64)
+        n_, p_ = m.shape
+        mm = (m - m.mean(0)) / (m.std(0) + 1e-12)
+        try:
+            s = np.linalg.svd(mm, compute_uv=False)
+            tol = s.max() * max(mm.shape) * np.finfo(float).eps
+            rank = int((s > tol).sum())
+            cond = float(s.max() / s[rank - 1]) if rank > 0 else float("nan")
+            # effective rank: 특이값 분포의 엔트로피 지수 — rank가 형식적으로
+            # 꽉 차 있어도 실제로 몇 방향이 살아있는지 본다.
+            pr = s / (s.sum() + 1e-300)
+            eff = float(np.exp(-(pr * np.log(pr + 1e-300)).sum()))
+        except Exception:
+            rank, cond, eff = -1, float("nan"), float("nan")
+        return {"n": int(n_), "p": int(p_), "p_over_n": float(p_ / max(n_, 1)),
+                "rank": rank, "effective_rank": eff, "cond": cond}
+
+    # redundancy: agg_emb/context_emb를 query_emb로 회귀했을 때 R²
+    #
+    # [2026-07 계측기 보정] 이전에는 in-sample LinearRegression의 .score()를
+    # 썼다. 1493(n=160, embed_dim=256)에서 agg_from_query_r2 / context_from_
+    # query_r2가 **정확히 1.000**으로 나왔는데, 같은 형상에서 query와 완전히
+    # 독립인 난수를 타깃으로 넣어도 1.000이 나온다 — p>n이면 OLS가 무엇이든
+    # 정확히 맞추기 때문이다. 즉 그 값은 representation redundancy가 아니라
+    # linear interpolation capacity를 재고 있었다.
+    # → out-of-fold + Ridge(RidgeCV, fold 학습부에서만 alpha 선택)로 교체.
+    #   각 샘플의 예측은 그 샘플을 뺀 fold로 학습한 모델에서 나오므로 p>n
+    #   에서도 값이 정직하다(맞출 수 없으면 R²가 0 이하로 내려간다).
+    # 옛 값은 *_insample로 함께 저장해 인공물 크기를 직접 대조할 수 있게 한다.
+    # redundancy_method 키의 유무로 구/신 pkl을 구분할 수 있다.
+    from sklearn.linear_model import RidgeCV
+    from sklearn.model_selection import KFold, cross_val_predict as _cvp
+    from sklearn.pipeline import make_pipeline as _mkpipe
+    from sklearn.preprocessing import StandardScaler as _SS
+    from sklearn.metrics import r2_score as _r2
+
+    _RIDGE_ALPHAS = np.logspace(-2, 4, 13)
+    _RED_FOLDS = int(min(5, len(embs["query"])))
+
+    def _linreg_r2(target, source):   # 옛 방식(in-sample OLS) — 대조용으로만
         reg = LinearRegression().fit(source, target)
-        r2 = reg.score(source, target)  # sklearn 기본 R²(다중 출력이면 각
-        # 출력의 R²를 평균 — multioutput='uniform_average'가 기본값)
-        return float(r2)
+        return float(reg.score(source, target))
 
-    redundancy = {
-        "agg_from_query_r2":     _linreg_r2(embs["agg"], embs["query"]),
-        "context_from_query_r2": _linreg_r2(embs["context"], embs["query"]),
+    def _oof_r2(target, source):
+        if _RED_FOLDS < 2:
+            return float("nan")
+        cv = KFold(n_splits=_RED_FOLDS, shuffle=True, random_state=0)
+        est = _mkpipe(_SS(), RidgeCV(alphas=_RIDGE_ALPHAS))
+        pred = _cvp(est, np.asarray(source, dtype=np.float64),
+                    np.asarray(target, dtype=np.float64), cv=cv)
+        return float(_r2(target, pred, multioutput="uniform_average"))
+
+    # (target, source) 쌍. agg↔context는 양방향 — evidence_w가 사실상 균등하고
+    # 검색이 centroid 그룹 내로 제한되면 agg = 그룹요약 + f(q) 가 되어 context와
+    # 같은 층위의 정보를 나를 수 있는데, query로부터의 R²만으로는 "둘 사이의"
+    # 중복이 안 잡히기 때문이다. 비대칭이면 포함 관계를 시사한다.
+    _RED_PAIRS = {
+        "agg_from_query":     ("agg", "query"),
+        "context_from_query": ("context", "query"),
+        "context_from_agg":   ("context", "agg"),
+        "agg_from_context":   ("agg", "context"),
     }
+    redundancy = {
+        "redundancy_method": "out_of_fold_ridge",
+        "redundancy_n_folds": _RED_FOLDS,
+        "redundancy_alphas": [float(a) for a in _RIDGE_ALPHAS],
+        "shape_meta": {k: _mat_meta(v) for k, v in embs.items()},
+    }
+    for _nm, (_t, _s) in _RED_PAIRS.items():
+        try:
+            redundancy[f"{_nm}_r2"] = _oof_r2(embs[_t], embs[_s])
+        except Exception as _re:
+            redundancy[f"{_nm}_r2"] = float("nan")
+            redundancy[f"{_nm}_error"] = f"{type(_re).__name__}: {_re}"
+        try:
+            redundancy[f"{_nm}_r2_insample"] = _linreg_r2(embs[_t], embs[_s])
+        except Exception:
+            redundancy[f"{_nm}_r2_insample"] = float("nan")
 
-    return {"branch_info": info, "redundancy": redundancy}
+    # [2026-07, 추가/수정] Information gain — "agg가 라벨에 대해 query보다 새 정보를
+    # 주는가"를 직접 잰다.
+    # [왜 R²로는 부족한가] agg_from_query R²는 "agg를 query로 **선형 복원**할 수
+    # 있는가"만 본다. R²가 낮아도 그 성분이 라벨과 무관하면 쓸모없고, 반대로
+    # R²가 높아도 남은 소수 성분이 결정적일 수 있다. 여기서는 같은 선형 분류기를
+    # query만 / query+agg / query+context 로 각각 학습해 성능 차이를 본다.
+    #
+    # [중요 — in-sample 평가는 쓰면 안 된다] 처음엔 probe를 같은 데이터로 학습·
+    # 평가했는데, embed_dim이 128~256이고 샘플이 수백 개면 선형 분류기가 완벽히
+    # 분리해서 AUROC이 정확히 1.0에 붙어버린다(실측: 10개 중 6개). 그러면 gain을
+    # 잴 여지 자체가 없어져 "천장에 안 닿은 데이터셋에서만 gain이 보이는" 착시가
+    # 생긴다. 그래서 **out-of-fold 예측**(StratifiedKFold cross_val_predict)으로
+    # 바꿨다 — 각 샘플의 예측은 그 샘플을 뺀 fold로 학습한 모델에서 나온다.
+    # 그래도 embedding 자체는 test set 전체로 만들어진 것이므로 절대 성능이 아니라
+    # 세 입력 간 **상대 비교**용이다.
+    information_gain = None
+    if y is not None and tasktype != "regression":
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.metrics import roc_auc_score
+            from sklearn.model_selection import StratifiedKFold, cross_val_predict
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
+            # y가 torch tensor(CPU/CUDA 모두) 일 수 있음 — np.asarray는 CUDA
+            # tensor에서 TypeError를 던진다. detach().cpu()를 거쳐 안전하게 변환.
+            if hasattr(y, "detach"):
+                _y = y.detach().cpu().numpy().ravel()
+            else:
+                _y = np.asarray(y).ravel()
+            # 분류 라벨은 정수여야 함(float로 저장된 경우 반올림)
+            if _y.dtype.kind == "f":
+                _y = np.rint(_y).astype(int)
+            _cls, _cnt = np.unique(_y, return_counts=True)
+            # [2026-07] 희소 클래스 처리.
+            # StratifiedKFold는 "가장 작은 클래스의 표본 수 >= n_splits"를 요구한다.
+            # 1493(one-hundred-plants, 100클래스)의 test fold는 클래스당 1~2개뿐이라
+            # _cnt.min()==1 이 되어 n_splits=2조차 못 잡고 통째로 측정 불가가 됐다
+            # (그리고 그 경우 아래 print_branch_information이 KeyError로 죽었다).
+            # 여기서 재는 것은 절대 성능이 아니라 query / query+agg / query+context
+            # 세 입력 간 **상대 비교**이므로, 표본이 2개 미만인 클래스를 빼고 남은
+            # 부분집합에서 세 probe를 모두 '동일하게' 평가하면 비교 자체는 유효하다.
+            # 다만 무엇을 얼마나 뺐는지 결과 dict에 남긴다 — 뺀 비율이 크면
+            # (n_samples_used / n_samples_total) 해석에 주의해야 한다.
+            _keep_cls = _cls[_cnt >= 2]
+            _n_dropped_cls = int(len(_cls) - len(_keep_cls))
+            if _n_dropped_cls > 0:
+                _mask = np.isin(_y, _keep_cls)
+            else:
+                _mask = np.ones(len(_y), dtype=bool)
+            _y_used = _y[_mask]
+            if len(_y_used) > 0:
+                _cls_u, _cnt_u = np.unique(_y_used, return_counts=True)
+            else:
+                _cls_u, _cnt_u = np.array([]), np.array([])
+            _nfold = int(min(5, _cnt_u.min())) if len(_cls_u) >= 2 else 0
+            if len(_cls_u) >= 2 and _nfold >= 2:
+                _cv = StratifiedKFold(n_splits=_nfold, shuffle=True, random_state=0)
+                # fold 목록을 한 번만 만들어 모든 probe가 재사용한다(동일 분할 보장 +
+                # 반복 계산 회피). StandardScaler는 파이프라인 안에 그대로 둔다 —
+                # 밖으로 빼서 전체 데이터에 fit하면 fold 간 정보 누출이 된다.
+                _folds = list(_cv.split(np.zeros(len(_y_used)), _y_used))
+                _y_idx = np.searchsorted(_cls_u, _y_used)
+
+                def _probe(mat):
+                    clf = make_pipeline(StandardScaler(),
+                                        LogisticRegression(max_iter=2000))
+                    p = cross_val_predict(clf, mat, _y_used, cv=_folds,
+                                          method="predict_proba")
+                    if p.shape[1] == 2:
+                        auc = float(roc_auc_score(_y_used, p[:, 1]))
+                    else:
+                        auc = float(roc_auc_score(_y_used, p, multi_class="ovr",
+                                                  average="macro"))
+                    acc = float((p.argmax(axis=1) == _y_idx).mean())
+                    return auc, acc
+
+                # 마스킹된 feature를 한 번만 만들어 재사용
+                _q = np.asarray(embs["query"])[_mask]
+                _extra = {"agg": np.asarray(embs["agg"])[_mask],
+                          "context": np.asarray(embs["context"])[_mask]}
+                _dq = _q.shape[1]
+
+                auc_q, acc_q = _probe(_q)
+
+                # ── null 대조 ────────────────────────────────────────────
+                # [왜 필요한가] gain = AUROC(q+x) - AUROC(q) 는 우리가 원하는
+                # "x가 추가한 정보"와, 원하지 않는 "차원이 늘어난 데서 오는
+                # out-of-fold 페널티"의 합이다. synthetic 검증에서 x가 순수
+                # 노이즈일 때도 gain이 0이 아니라 음수로 나왔고(16차원/2클래스
+                # -0.009, 32차원/50클래스 -0.067), 차원↑·클래스당 표본↓일수록
+                # 커졌다. 즉 gain≈0을 기준선으로 쓰면 데이터셋마다 기준이 달라진다.
+                #
+                # plain null : x의 행 순서를 셔플 → 차원/스케일/fold 동일, 라벨
+                #              대응 제거. 해석이 단순해 기본 결과용.
+                # resid null : x를 query로 선형회귀한 뒤 **잔차만** 셔플 →
+                #              query와의 선형 상관(공선성)까지 보존. plain은
+                #              공선성도 같이 깨므로 페널티를 과대추정할 수
+                #              있는데(L2 probe에서 기존 feature와 공선인 열은
+                #              독립 노이즈 열보다 페널티가 작다), 그 편향은
+                #              agg_from_query R²가 클수록 커진다. R-3 해석용
+                #              보조 진단이며 기본 비활성(--branch_info_residual_null).
+                #
+                # delta = gain - null_mean 이 "차원 페널티를 뺀 순수 기여"에
+                # 더 가깝다. 다만 어느 쪽도 완전한 통제는 아니므로 두 값을
+                # 나란히 저장해 차이 자체를 진단으로 쓴다.
+                _n_shuf = max(0, int(n_shuffles))
+
+                # [2026-07] residualization을 OLS → Ridge로 교체.
+                # p>n이면 OLS 잔차가 **정확히 0**이 되어 셔플해도 원본과 같아진다
+                # (1493 실측: resid_null_std=0.0, delta_resid=0.0 — 이건 "정보가
+                # 없다"가 아니라 "대조군이 만들어지지 않았다"였다). Ridge는 축소
+                # 추정이라 잔차가 남는다. 그래도 저랭크 branch에서는 여전히 축퇴할
+                # 수 있으므로 resid_norm_ratio를 재서 가드한다.
+                _resid_cache = {}
+
+                def _resid_parts(x):
+                    if id(x) in _resid_cache:
+                        return _resid_cache[id(x)]
+                    est = _mkpipe(_SS(), RidgeCV(alphas=_RIDGE_ALPHAS))
+                    est.fit(_q, x)
+                    pred = est.predict(_q)
+                    resid = x - pred
+                    denom = np.linalg.norm(x - x.mean(0)) + 1e-300
+                    ratio = float(np.linalg.norm(resid) / denom)
+                    _resid_cache[id(x)] = (pred, resid, ratio)
+                    return _resid_cache[id(x)]
+
+                def _null_gain(x, kind, seed):
+                    r = np.random.RandomState(seed)
+                    perm = r.permutation(len(x))
+                    if kind == "plain":
+                        x_null = x[perm]
+                    else:  # 'resid'
+                        pred, resid, _ = _resid_parts(x)
+                        x_null = pred + resid[perm]
+                    buf = np.empty((len(x), _dq + x.shape[1]), dtype=np.float64)
+                    buf[:, :_dq] = _q
+                    buf[:, _dq:] = x_null
+                    a, c = _probe(buf)
+                    return a - auc_q, c - acc_q
+
+                information_gain = {
+                    "auroc_query": auc_q, "acc_query": acc_q,
+                    "n_folds": _nfold, "eval": "out-of-fold (cross_val_predict)",
+                    "n_shuffles": _n_shuf,
+                    "residual_null": bool(residual_null),
+                    "n_classes_total": int(len(_cls)),
+                    "n_classes_used": int(len(_cls_u)),
+                    "n_classes_dropped": _n_dropped_cls,
+                    "n_samples_total": int(len(_y)),
+                    "n_samples_used": int(_mask.sum()),
+                    # [필수 확인] query만으로 이미 천장(AUROC≈1)에 닿으면 gain을
+                    # 잴 여지가 없다 — 그 경우 이 측정은 무효로 취급해야 한다.
+                    "query_auroc_ceiling": bool(auc_q >= 0.999),
+                    # [필수 확인] probe 입력의 형상. p/n > 1이면 선형 probe가
+                    # 과결정 구간에 있어 gain/null 모두 해석 불가로 봐야 한다.
+                    "probe_meta": {
+                        "query":         _mat_meta(_q),
+                        "query_agg":     {"n": int(len(_q)), "p": int(_dq + _extra["agg"].shape[1]),
+                                          "p_over_n": float((_dq + _extra["agg"].shape[1]) / max(len(_q), 1))},
+                        "query_context": {"n": int(len(_q)), "p": int(_dq + _extra["context"].shape[1]),
+                                          "p_over_n": float((_dq + _extra["context"].shape[1]) / max(len(_q), 1))},
+                    },
+                }
+                information_gain["probe_overdetermined"] = bool(
+                    information_gain["probe_meta"]["query_agg"]["p_over_n"] > 1.0)
+
+                for _name, _x in _extra.items():
+                    buf = np.empty((len(_x), _dq + _x.shape[1]), dtype=np.float64)
+                    buf[:, :_dq] = _q
+                    buf[:, _dq:] = _x
+                    _auc, _acc = _probe(buf)
+                    information_gain[f"auroc_query_{_name}"] = _auc
+                    information_gain[f"acc_query_{_name}"]   = _acc
+                    information_gain[f"auroc_gain_{_name}"]  = _auc - auc_q
+                    information_gain[f"acc_gain_{_name}"]    = _acc - acc_q
+
+                    # null은 base 측정이 dict에 들어간 **뒤에** 계산한다 —
+                    # null 계산이 실패해도 base 결과는 남아서, "측정이 안 된
+                    # 것"과 "대조가 깨진 것"을 pkl만 보고 구분할 수 있다.
+                    _kinds = ["plain"] + (["resid"] if residual_null else [])
+                    for _kind in _kinds:
+                        _sfx = "shuffled" if _kind == "plain" else "resid_null"
+                        _dsfx = "delta" if _kind == "plain" else "delta_resid"
+                        try:
+                            if _n_shuf <= 0:
+                                continue
+                            if _kind == "resid":
+                                # 잔차가 사실상 0이면 x_null == x 라 대조군이
+                                # 성립하지 않는다. 0을 저장하면 "정말 0"과
+                                # 구분이 안 되므로 NaN + 플래그로 남긴다.
+                                _, _, _ratio = _resid_parts(_x)
+                                information_gain[f"resid_norm_ratio_{_name}"] = _ratio
+                                if _ratio < 1e-6:
+                                    information_gain[f"resid_null_degenerate_{_name}"] = True
+                                    for _k in (f"auroc_gain_{_name}_delta_resid",
+                                               f"acc_gain_{_name}_delta_resid",
+                                               f"auroc_gain_{_name}_resid_null_mean",
+                                               f"acc_gain_{_name}_resid_null_mean"):
+                                        information_gain[_k] = float("nan")
+                                    continue
+                                information_gain[f"resid_null_degenerate_{_name}"] = False
+                            _ga = [_null_gain(_x, _kind, s) for s in range(_n_shuf)]
+                            _aa = np.array([g[0] for g in _ga], dtype=float)
+                            _cc = np.array([g[1] for g in _ga], dtype=float)
+                            information_gain[f"auroc_gain_{_name}_{_sfx}_mean"] = float(_aa.mean())
+                            information_gain[f"auroc_gain_{_name}_{_sfx}_std"]  = float(_aa.std())
+                            information_gain[f"acc_gain_{_name}_{_sfx}_mean"]   = float(_cc.mean())
+                            information_gain[f"acc_gain_{_name}_{_sfx}_std"]    = float(_cc.std())
+                            information_gain[f"auroc_gain_{_name}_{_dsfx}"] = float(
+                                information_gain[f"auroc_gain_{_name}"] - _aa.mean())
+                            information_gain[f"acc_gain_{_name}_{_dsfx}"] = float(
+                                information_gain[f"acc_gain_{_name}"] - _cc.mean())
+                        except Exception as _ne:
+                            import traceback as _ntb
+                            information_gain[f"null_error_{_name}_{_kind}"] = (
+                                f"{type(_ne).__name__}: {_ne}")
+                            information_gain[f"null_traceback_{_name}_{_kind}"] = (
+                                _ntb.format_exc()[-500:])
+            else:
+                information_gain = {"error": (
+                    f"클래스 수/최소 빈도 부족(classes_total={len(_cls)}, "
+                    f"classes_with_ge2={len(_cls_u)}, "
+                    f"min_count_after_filter={int(_cnt_u.min()) if len(_cnt_u) else 0})")}
+        except Exception as _e:
+            import traceback as _tb
+            _msg = f"{type(_e).__name__}: {_e}"
+            print(f"  ⚠️  information gain 계산 실패(무시함): {_msg}")
+            # 진단을 위해 예외 내용을 결과에도 남긴다 — 콘솔을 놓쳐도
+            # pkl만 보면 원인을 알 수 있게.
+            information_gain = {"error": _msg, "traceback": _tb.format_exc()[-800:]}
+
+    return {"branch_info": info, "redundancy": redundancy,
+            "information_gain": information_gain}
 
 
 def print_branch_information(result: dict) -> None:
@@ -661,9 +1055,108 @@ def print_branch_information(result: dict) -> None:
     print(f"   비슷한 신호(head에 도달하는 선형 기여도 자체가 샘플마다 안 변함).)")
 
 
-    print(f"\n  Redundancy(query_emb로부터 선형 복원 가능한 정도, R²):")
-    print(f"    agg_emb     ~ f(query_emb) : R²={red['agg_from_query_r2']:.3f}")
-    print(f"    context_emb ~ f(query_emb) : R²={red['context_from_query_r2']:.3f}")
+    _oof = red.get("redundancy_method") == "out_of_fold_ridge"
+    _lbl = "out-of-fold Ridge" if _oof else "in-sample OLS [구버전]"
+    print(f"\n  Redundancy(선형 복원 가능한 정도, R² — {_lbl}):")
+    _sm = red.get("shape_meta") or {}
+    if _sm:
+        print(f"    {'branch':<10}{'n':>7}{'p':>7}{'p/n':>8}{'rank':>7}{'eff_rank':>10}")
+        for _b in ("query", "context", "agg"):
+            _m = _sm.get(_b)
+            if _m:
+                print(f"    {_b:<10}{_m['n']:>7}{_m['p']:>7}{_m['p_over_n']:>8.2f}"
+                      f"{_m['rank']:>7}{_m['effective_rank']:>10.1f}")
+        _pn = max((m["p_over_n"] for m in _sm.values()), default=0.0)
+        if _pn > 1.0:
+            print(f"    ⚠️  p/n>1 — in-sample 선형회귀라면 R²가 내용과 무관하게 "
+                  f"1.000이 되는 구간. out-of-fold 값만 해석할 것.")
+    _pairs = [("agg_emb", "query_emb", "agg_from_query"),
+              ("context_emb", "query_emb", "context_from_query"),
+              ("context_emb", "agg_emb", "context_from_agg"),
+              ("agg_emb", "context_emb", "agg_from_context")]
+    for _t, _s, _k in _pairs:
+        if f"{_k}_r2" not in red:
+            continue
+        _line = f"    {_t:<11} ~ f({_s:<11}): R²={red[f'{_k}_r2']:+.3f}"
+        if f"{_k}_r2_insample" in red:
+            _line += f"   (in-sample {red[f'{_k}_r2_insample']:.3f})"
+        print(_line)
+        if red.get(f"{_k}_error"):
+            print(f"      ⚠️  {red[f'{_k}_error']}")
+    if "context_from_agg_r2" in red:
+        _mx = max(red["context_from_agg_r2"], red["agg_from_context_r2"])
+        if _mx > 0.9:
+            print("      → 두 branch가 사실상 같은 정보(R²>0.9) — head 입력이 "
+                  "[query ‖ 그룹요약 ‖ 그룹요약]에 가까움.")
+        elif _mx < 0.5:
+            print("      → 두 branch가 서로 다른 정보를 나름(R²<0.5).")
+    if _oof:
+        print("    (음수 R²는 '평균으로 예측하는 것보다 못하다' = 복원 불가라는 뜻. "
+              "in-sample 값과 크게 벌어지면 그 차이가 과적합/보간 용량의 크기.)")
+    ig = result.get("information_gain")
+    if ig and "error" in ig:
+        # [2026-07] 이전에는 error dict도 truthy라 아래 ig['auroc_query']에서
+        # KeyError로 죽었다(1493처럼 클래스당 표본이 1개인 경우 재현).
+        print("\n  [information gain] 측정 불가 — " + str(ig["error"]))
+        if "traceback" in ig:
+            print("    (traceback은 결과 pkl의 information_gain['traceback']에 저장됨)")
+    elif ig:
+        print("\n  [information gain] 동일 선형 probe를 입력만 바꿔 학습 (AUROC / acc)")
+        _pm = ig.get("probe_meta") or {}
+        if _pm:
+            _qa = _pm.get("query_agg", {})
+            print(f"    probe 형상: n={_qa.get('n','?')}, "
+                  f"p(query)={_pm.get('query',{}).get('p','?')}, "
+                  f"p(query+agg)={_qa.get('p','?')}, "
+                  f"p/n={_qa.get('p_over_n', float('nan')):.2f}")
+            if ig.get("probe_overdetermined"):
+                print("    ⚠️  p/n>1 — 선형 probe가 과결정 구간. gain·null·delta "
+                      "모두 해석 불가로 볼 것(표본을 늘리거나 이 데이터셋은 제외).")
+        print(f"    query only        : {ig['auroc_query']:.4f} / {ig['acc_query']:.4f}")
+        print(f"    query + agg       : {ig['auroc_query_agg']:.4f} / {ig['acc_query_agg']:.4f}"
+              f"   (gain {ig['auroc_gain_agg']:+.4f} / {ig['acc_gain_agg']:+.4f})")
+        print(f"    query + context   : {ig['auroc_query_context']:.4f} / {ig['acc_query_context']:.4f}"
+              f"   (gain {ig['auroc_gain_context']:+.4f} / {ig['acc_gain_context']:+.4f})")
+        if ig.get("n_shuffles", 0) > 0:
+            print(f"\n    [null 대조] shuffle {ig['n_shuffles']}회 — "
+                  f"delta = gain − null_mean (차원 페널티 보정)")
+            for _n in ("agg", "context"):
+                _g = ig.get(f"auroc_gain_{_n}")
+                _pm = ig.get(f"auroc_gain_{_n}_shuffled_mean")
+                if _g is None or _pm is None:
+                    _err = ig.get(f"null_error_{_n}_plain")
+                    if _err:
+                        print(f"    {_n:<8}: null 계산 실패 — {_err}")
+                    continue
+                _ps = ig.get(f"auroc_gain_{_n}_shuffled_std", float('nan'))
+                print(f"    {_n:<8}: gain {_g:+.4f} | plain null {_pm:+.4f}±{_ps:.4f}"
+                      f" | delta {ig[f'auroc_gain_{_n}_delta']:+.4f}")
+                if ig.get(f"resid_null_degenerate_{_n}"):
+                    print(f"    {'':<8}  resid null 축퇴 — 잔차 비율 "
+                          f"{ig.get(f'resid_norm_ratio_{_n}', float('nan')):.2e} "
+                          f"< 1e-6 이라 대조군이 원본과 같아짐. delta_resid=NaN.")
+                _rm = ig.get(f"auroc_gain_{_n}_resid_null_mean")
+                if _rm is not None and _rm == _rm:
+                    _rs = ig.get(f"auroc_gain_{_n}_resid_null_std", float('nan'))
+                    _dr = ig[f"auroc_gain_{_n}_delta_resid"]
+                    print(f"    {'':<8}  resid null {_rm:+.4f}±{_rs:.4f}"
+                          f" | delta_resid {_dr:+.4f}  [보조 진단]")
+                    if abs(ig[f"auroc_gain_{_n}_delta"] - _dr) > 0.02:
+                        print(f"    {'':<8}  → 두 delta 차이가 큼: gain의 상당 부분이 "
+                              f"query와의 공선성에서 옴(R-3 관련).")
+        print("    (gain이 0에 가까우면 그 branch가 라벨에 대해 query 이상의 정보를 주지 못함. "
+              "test set 위에서 probe를 학습·평가하므로 절대값이 아닌 상대 비교용. "
+              "선형 probe 기준이므로 '정보가 없다'가 아니라 "
+              "'linearly-decodable 정보가 없다'로 서술할 것)")
+        if ig.get("n_classes_dropped", 0) > 0:
+            print(f"    ⚠️  표본 2개 미만 클래스 {ig['n_classes_dropped']}개 제외 "
+                  f"(클래스 {ig['n_classes_used']}/{ig['n_classes_total']}, "
+                  f"샘플 {ig['n_samples_used']}/{ig['n_samples_total']}). "
+                  f"세 probe 모두 같은 부분집합에서 평가되므로 상대 비교는 유효하지만, "
+                  f"제외 비율이 크면 해석에 주의.")
+        if ig.get("query_auroc_ceiling"):
+            print(f"    ⚠️  auroc_query={ig['auroc_query']:.4f} — 천장 포화. "
+                  f"gain을 잴 여지가 없으므로 이 데이터셋의 information gain은 무효로 볼 것.")
     print(f"  (R²가 높으면(예: >0.7) 그 branch가 query_emb에서 선형적으로 거의")
     print(f"   복원 가능한 중복 정보라는 뜻 — agg_emb_shuffle이 안 먹히는 이유가")
     print(f"   '정보가 없어서'가 아니라 'query_emb에 이미 있는 정보라서'일 수 있음.)")
@@ -1515,7 +2008,11 @@ def run_single_seed(
     if len(getattr(args, '_train_seed_list', [train_seed])) > 1 or train_seed != args.seed:
         print(f"  [train_seed={train_seed}] 학습 초기화/배치 순서 seed (데이터 분할은 --seed={args.seed} 그대로)")
 
-    _save_tag = ("..detach_ctx" if args.detach_context_grad else "") \
+    _save_tag = (f"..retrproj_{args.retr_proj_mode}" if args.retr_proj_mode != "none" else "") \
+              + (f"..snn{args.snn_lambda:g}" if args.snn_lambda else "") \
+              + ("..detachretr" if args.detach_retr_grad else "") \
+              + ("..global_retrieve" if args.global_retrieve else "") \
+              + ("..detach_ctx" if args.detach_context_grad else "") \
               + (f"..qDetachWarmupE{args.query_detach_warmup_epochs}" if args.query_detach_warmup_epochs > 0 else "") \
               + (f"..qDetachWarmupS{args.query_detach_warmup_steps}" if args.query_detach_warmup_steps > 0 else "") \
               + ("..confscale" if args.confidence_scaling else "") \
@@ -1532,6 +2029,8 @@ def run_single_seed(
               + ("..fusion_anchorgate" if args.fusion_mode == "anchor_gate" else "") \
               + ("..fusion_ctxgatedbeta" if args.fusion_mode == "context_gated_beta" else "") \
               + ("..no_retrieval" if args.disable_retrieval_branch else "") \
+              + (f"..infT{args.inference_evidence_temperature:g}" if args.inference_evidence_temperature is not None else "") \
+              + (f"..k{args.k_override}" if args.k_override is not None else "") \
               + (f"..gateT{args.fusion_gate_temperature:g}" if args.fusion_gate_temperature != 1.0 else "") \
               + ("..allowSelfRet" if args.allow_self_retrieval else "") \
               + (f"..valMode_{args.value_mode}" if args.value_mode != "default" else "") \
@@ -1564,6 +2063,23 @@ def run_single_seed(
               + ("..deterministic" if args.deterministic else "") \
               + (f"..{args.run_tag}" if args.run_tag is not None else "")
 
+    # [2026-07 가드] run_tag가 파일명에 그대로 들어가므로 검증한다.
+    # [왜] PowerShell 변수는 **대소문자를 구분하지 않는다**. `$S`(체크포인트
+    # 경로)와 `$s`(seed)를 함께 쓴 스크립트에서 `--run_tag stab_s$s`가
+    # `stab_s` + 전체 경로로 확장돼, 학습과 추론이 다 끝난 뒤 np.save 단계에서
+    # OSError(Errno 22)로 죽었다. 몇 분치 계산이 통째로 버려진다 —
+    # 시작 직후에 걸러야 한다.
+    if args.run_tag is not None:
+        _bad = [c for c in ('/', '\\', ':', '=', '*', '?', '"', '<', '>', '|') if c in args.run_tag]
+        if _bad or len(args.run_tag) > 64:
+            raise SystemExit(
+                f"--run_tag 값이 파일명으로 쓸 수 없습니다: {args.run_tag!r}\n"
+                + (f"  금지 문자 포함: {_bad}\n" if _bad else "")
+                + (f"  길이 {len(args.run_tag)} > 64\n" if len(args.run_tag) > 64 else "")
+                + "  PowerShell 변수는 대소문자를 구분하지 않습니다 — $S(경로)와 "
+                  "$s(seed)를 함께 쓰면\n  같은 변수로 취급되어 경로가 태그에 "
+                  "끼어듭니다. 변수명을 서로 다르게 지으세요.")
+
     _saved_state = None
     if args.from_saved_state:
         # ── --from_saved_state: study 파일 불필요, 저장된 model_kwargs를
@@ -1576,6 +2092,23 @@ def run_single_seed(
         # 받은 게 아님) weights_only=False로 명시.
         _saved_state = torch.load(args.from_saved_state, map_location=device, weights_only=False)
         model_kwargs = _saved_state["model_kwargs"]
+        # [2026-07] 로드한 체크포인트의 **실제** 구조 설정을 찍는다.
+        # [왜] meta.pkl은 args를 기록하므로 --from_saved_state 실행에서는
+        # 실제 모델과 어긋난다. 예: P1(retr_proj=linear) 체크포인트를 불러
+        # ablation을 돌려도 meta에는 retr_proj_mode='none'(기본값)이 남는다.
+        # 이 때문에 정상 결과를 "잘못된 체크포인트"로 오판한 사례가 있었다.
+        _key_cfg = {k: model_kwargs.get(k) for k in
+                    ("retr_proj_mode", "detach_retr_grad", "snn_lambda", "snn_tau",
+                     "unif_beta", "global_retrieve", "disable_retrieval_branch",
+                     "value_mode", "use_offset_correction", "k", "embed_dim",
+                     "n_prototypes", "fusion_mode")
+                    if k in model_kwargs}
+        print(f"  [from_saved_state] 체크포인트의 실제 설정: "
+              + ", ".join(f"{k}={v}" for k, v in _key_cfg.items()))
+        if _key_cfg.get("retr_proj_mode", "none") != "none":
+            print(f"    ⚠️  이 체크포인트는 retrieval 전용 표현(retr_proj="
+                  f"{_key_cfg['retr_proj_mode']})으로 학습됐습니다. "
+                  f"meta.pkl의 retr_proj_mode는 args 기준이라 다를 수 있습니다.")
         best_params  = _saved_state.get("best_params", {})
         if best_params:
             print(f"  Params(저장된 값): {best_params}")
@@ -1650,13 +2183,17 @@ def run_single_seed(
         # "data={id}..model=tabera.pkl"로 고정해뒀는데, optimize.py의
         # --num_embedding 기본값이 ple로 바뀌면서 실제 저장 파일명엔
         # "..num_ple"이 붙어 조용히 어긋나는 사고가 났음(FileNotFoundError).
-        # no_offset_correction/global_retrieve는 reproduce.py에 CLI 플래그
-        # 자체가 없음(이미 "채택 확정"돼 하드코딩된 값 — 아래 meta 저장부의
-        # use_offset_correction=True/global_retrieve=False와 동일) — 그래서
-        # 여기도 같은 고정값(False, False)으로 명시.
+        # no_offset_correction은 reproduce.py에 CLI 플래그 자체가 없음
+        # (이미 "채택 확정"돼 하드코딩) — False 고정.
+        # [2026-07] global_retrieve는 S1 실험을 위해 CLI 플래그로 열었다.
+        # 여기가 False로 고정돼 있으면 --global_retrieve를 줘도 baseline
+        # study(그룹 제약 O)의 best_params를 읽어와서, "전역 검색인데
+        # 그룹 제약용으로 튜닝된 하이퍼파라미터"로 학습하게 된다 —
+        # 에러 없이 조용히 틀리는 경로라 반드시 args를 따라가야 한다.
         _study_tag = study_pkl_tag(
             no_offset_correction=False,
-            global_retrieve=False,
+            retr_proj_mode=args.retr_proj_mode,
+            global_retrieve=args.global_retrieve,
             detach_context_grad=args.detach_context_grad,
             context_projection=args.context_projection,
             cat_combine=args.cat_combine,
@@ -1752,6 +2289,18 @@ def run_single_seed(
             print(f"  [--loss_codebook_override] loss_weights['codebook']: "
                   f"{_old_codebook_w:.4g} → {args.loss_codebook_override:.4g} "
                   f"(나머지 파라미터는 best_params 그대로)")
+        if args.k_override is not None:
+            # [통제 실험용] k(검색 이웃 수)만 격리해서 바꿈. evidence_temperature
+            # 실험과 짝을 이루기 위한 것 — sharp attention이 해로운 것이
+            # (a) sharpening 자체 때문인지 (b) k가 큰 상태에서 소수만 쓰게 만들어
+            # 추정 분산이 폭증해서인지 분리하려면 k도 같이 줄여봐야 한다
+            # (k=48에서 n_eff≈1.4면 48개 평균 대비 분산이 30배 이상).
+            # memory/aggregator의 shape에 영향을 주므로 재학습 필수(로드 불가).
+            _old_k = model_kwargs.get("k")
+            model_kwargs["k"] = args.k_override
+            best_params["k"] = args.k_override
+            print(f"  [--k_override] k: {_old_k} → {args.k_override} "
+                  f"(나머지 파라미터는 best_params 그대로)")
         if args.embed_dim_override is not None:
             # [통제 실험용] embed_dim만 격리해서 바꿈 — cosine HPO가 embed_dim과
             # 동시에 바꾼 dropout/lr/layers/loss weight는 best_params 그대로 둠.
@@ -1823,7 +2372,12 @@ def run_single_seed(
             # label_emb보다 평균 4.9배 크다는 게 확인됨)을 위해 의식적으로
             # 다시 연다. --value_mode로 통제.
             use_offset_correction=(args.value_mode != "label_only"),
-            global_retrieve=False,
+            retr_proj_mode=args.retr_proj_mode,
+            detach_retr_grad=args.detach_retr_grad,
+            snn_lambda=args.snn_lambda,
+            snn_tau=args.snn_tau,
+            unif_beta=args.unif_beta,
+            global_retrieve=args.global_retrieve,
             use_context_emb=not args.no_context_emb,
             use_query_emb_in_head=not args.no_query_emb,
             use_ema_codebook=args.ema_codebook,
@@ -1838,6 +2392,7 @@ def run_single_seed(
             head_branch_l2norm=args.head_branch_l2norm,
             fusion_mode=args.fusion_mode,
             disable_retrieval_branch=args.disable_retrieval_branch,
+            learn_evidence_temperature=args.learn_evidence_temperature,
             exclude_self_retrieval=(not args.allow_self_retrieval),
             fusion_alpha_override=args.fusion_alpha_override,
             fusion_beta_override=args.fusion_beta_override,
@@ -1932,6 +2487,26 @@ def run_single_seed(
     if _saved_state is not None:
         # ── 재학습 생략, 저장된 상태 그대로 복원 ──────────────
         model.load_state_dict(_saved_state["state_dict"])
+        # [2026-07, 추가] --inference_evidence_temperature — 로드된 가중치는
+        # 그대로 두고 **추론 시점의 softmax 온도만** 바꾼다.
+        # [왜 별도 플래그가 필요한가] --evidence_temperature_override는 재학습
+        # 경로용이라, 그걸로 실험하면 encoder까지 다시 학습되어 agg 변화가
+        # "attention이 sharpen돼서"인지 "모델이 다르게 학습돼서"인지 구분이
+        # 안 된다. 이 플래그는 동일 가중치에서 T만 바꾸므로
+        # cos(agg_before, agg_after)가 순수하게 aggregation 효과만 반영한다.
+        # evidence_temperature는 학습 파라미터가 아니라 forward에서 나눗셈에
+        # 쓰이는 스칼라 속성이라(evidence.py: softmax(similarities / T)),
+        # state_dict 로딩 이후 덮어써도 안전하다.
+        if args.inference_evidence_temperature is not None:
+            _agg_mod = getattr(model, "ot_selector", None)
+            if _agg_mod is None or not hasattr(_agg_mod, "evidence_temperature"):
+                print(f"  ⚠️  --inference_evidence_temperature: AttentionAggregator가 "
+                      f"없어(aggregator_mode≠'pooling'?) 무시합니다.")
+            else:
+                _old_T = _agg_mod.evidence_temperature
+                _agg_mod.evidence_temperature = args.inference_evidence_temperature
+                print(f"  [inference-only] evidence_temperature {_old_T} → "
+                      f"{args.inference_evidence_temperature} (가중치는 그대로, 재학습 없음)")
         # state_dict에 안 잡히는 것들(plain Python 속성이라 buffer가 아님)
         # — sample_groups는 group-constrained 검색에 필수라 이게 없으면
         # retrieve()가 제대로 동작 안 함. group_labels/target_labels는
@@ -1955,6 +2530,40 @@ def run_single_seed(
             model.feature_store._ptr         = ptr
             model.feature_store._filled      = filled
             model.feature_store._sample_ids  = sample_ids.to(device)
+        # [2026-07 버그 수정] sample_groups를 복원해도 그것만으로는 부족하다.
+        # retrieve()가 실제로 보는 것은 memory._cached_groups이고, 이건
+        # register_buffer가 아닌 plain 속성이라 state_dict에 안 들어간다.
+        # 따라서 --from_saved_state 실행은 아래 조건에 걸려 **그룹 제약 없이
+        # 전체 검색**으로 동작해 왔다:
+        #     if hard_assignment is None or cached is None or n < k:  (tabera.py:570)
+        # 실측 확인: 검색된 이웃이 자기 그룹 안에 있는 비율이 1493에서 0.235,
+        # 46에서 0.528, 1489에서 0.668 (제약이 걸렸다면 1.000이어야 함).
+        # 이 때문에 from_saved_state로 산출한 purity/margin/n_eff/topk 계열
+        # 진단이 전부 "전역 검색" 기준이었다. 여기서 캐시를 재구성한다.
+        if model.prototype_layer.sample_groups is not None:
+            try:
+                model.memory.cache_sample_groups(
+                    model.prototype_layer.sample_groups,
+                    device,
+                    centroid_emb=model.prototype_layer.centroid_emb.detach(),
+                )
+                _cg = getattr(model.memory, "_cached_groups", None)
+                if _cg is None:
+                    print("  ⚠️  cache_sample_groups 호출했으나 캐시가 비었습니다 "
+                          "(모든 그룹이 비어 있음) — 전역 검색으로 동작합니다.")
+                else:
+                    _sz = model.memory._cached_group_sizes
+                    print(f"  [group cache] 재구성 완료 — P={_cg.shape[0]}, "
+                          f"최대 그룹={_cg.shape[1]}, 중앙값={int(_sz.median().item())}, "
+                          f"k={model.k}")
+                    _n_fb = int((_sz < model.k).sum().item())
+                    if _n_fb:
+                        print(f"  ⚠️  그룹 {_n_fb}/{len(_sz)}개가 k({model.k})보다 작습니다 "
+                              f"— 해당 샘플은 retrieve()에서 cross-group/전역으로 "
+                              f"폴백합니다(tabera.py의 fallback_mask).")
+            except Exception as _ce:
+                print(f"  ⚠️  group cache 재구성 실패: {type(_ce).__name__}: {_ce} "
+                      f"— 전역 검색으로 동작합니다.")
         if model.prototype_layer.sample_groups is None:
             print(f"  ⚠️  저장된 state에 sample_groups가 없습니다 — 이 파일은 이번"
                   f" --from_saved_state 지원 이전 버전으로 저장된 것 같습니다."
@@ -1965,10 +2574,77 @@ def run_single_seed(
         # 실행. 저장 당시 이미 refresh된 상태였다면 keys를 다시 같은 값으로
         # 덮어쓸 뿐이라 안전(no-op에 가까움).
         if args.refresh_on_best:
+            # ── [메타 진단] memory staleness ─────────────────────────
+            # memory.keys[i]는 학습 중 특정 시점에, **dropout mask가 걸린 채**
+            # 계산된 1회성 스냅샷이다. 반면 inference query는 eval 모드의
+            # 결정론적 임베딩이다. 즉 refresh 전에는
+            #     memory space = noisy embedding manifold
+            #     test  space  = deterministic embedding manifold
+            # 로 서로 다른 공간이며, 이 상태에서 train/test routing을 비교하면
+            # **encoder drift + dropout noise + distribution shift**가 섞인다.
+            #
+            # 이 블록은 refresh가 실제로 무엇을 바꿨는지 정량화한다 —
+            # 지금까지 계산한 모든 train-side routing 지표
+            # (train k-coverage / occupancy 상관 / group size 분포)의
+            # 신뢰 구간을 결정하는 메타 진단이다.
+            _stale_prev = None
+            try:
+                _nm0 = int(model.memory.filled.item())
+                if _nm0 > 0:
+                    _stale_prev = model.memory.keys[:_nm0].detach().float().clone()
+                    _stale_prev_assign = None
+                    _cN0 = torch.nn.functional.normalize(
+                        model.prototype_layer.centroid_emb.detach().float(), dim=-1)
+                    _stale_prev_assign = (
+                        torch.nn.functional.normalize(_stale_prev, dim=-1) @ _cN0.T
+                    ).argmax(-1)
+            except Exception:
+                _stale_prev = None
+
             refresh_stats = model.refresh_memory_keys()
             if refresh_stats is not None:
                 print(f"  [--refresh_on_best] memory.keys {refresh_stats['n_refreshed']}개 "
                       f"슬롯을 frozen weight로 재계산 완료")
+
+                if _stale_prev is not None:
+                    try:
+                        import torch.nn.functional as _sF
+                        _new = model.memory.keys[:_stale_prev.shape[0]].detach().float()
+                        # ① representation drift — 평균만 보면 안 된다.
+                        #    일부 샘플만 크게 어긋나는 경우를 p5로 잡는다.
+                        _cos = _sF.cosine_similarity(_stale_prev, _new, dim=-1).cpu().numpy()
+                        # ② routing drift — cos이 낮아도 centroid 경계를 안 넘으면
+                        #    routing 분석에는 영향이 없다. 둘을 나눠 봐야 한다.
+                        #    (전체 회전이면 cos↓ / assignment 유지,
+                        #     경계 crossing이면 cos↓ / assignment 변경)
+                        _new_assign = (_sF.normalize(_new, dim=-1) @ _cN0.T).argmax(-1)
+                        _agree = float((_new_assign == _stale_prev_assign).float().mean())
+                        # ③ geometry drift — 배정 centroid까지의 거리 변화
+                        _d_old = float((1 - (_sF.normalize(_stale_prev, dim=-1) @ _cN0.T).max(-1).values).mean())
+                        _d_new = float((1 - (_sF.normalize(_new, dim=-1) @ _cN0.T).max(-1).values).mean())
+                        print(f"  [memory staleness] cos(q_memory, q_refresh): "
+                              f"mean={_cos.mean():.4f} std={_cos.std():.4f} "
+                              f"p5={np.percentile(_cos,5):.4f} p50={np.percentile(_cos,50):.4f} "
+                              f"p95={np.percentile(_cos,95):.4f}")
+                        print(f"  [memory staleness] assignment agreement={_agree*100:.1f}%  "
+                              f"| centroid dist {_d_old:.4f} → {_d_new:.4f}")
+                        # npz에도 남긴다 — 사후에 "이 실행의 진단이 얼마나
+                        # 믿을 만한가"를 판정하려면 결과 파일 안에 있어야 한다.
+                        globals()["_MEMORY_STALENESS"] = dict(
+                            cos_mean=float(_cos.mean()), cos_std=float(_cos.std()),
+                            cos_p5=float(np.percentile(_cos, 5)),
+                            cos_p50=float(np.percentile(_cos, 50)),
+                            cos_p95=float(np.percentile(_cos, 95)),
+                            assign_agreement=_agree,
+                            centroid_dist_before=_d_old, centroid_dist_after=_d_new,
+                        )
+                        if _cos.mean() < 0.9 or _agree < 0.9:
+                            print(f"  ⚠️  [memory staleness] refresh 전 train-side routing 지표는 "
+                                  f"**다른 encoder state**에서 계산된 값입니다 — "
+                                  f"기존 train k-coverage / occupancy 상관 / group size 재검증 필요.")
+                    except Exception as _se:
+                        print(f"  [memory staleness] 진단 실패: {type(_se).__name__}: {_se}")
+
                 regroup_stats = wrapper._resync_groups_after_refresh()
                 if regroup_stats is not None:
                     print(f"  [--refresh_on_best] clean 임베딩 기준으로 sample_groups 재동기화 "
@@ -3414,6 +4090,32 @@ def run_single_seed(
 
         # ── random_neighbor / neighbor_noise: 성능 비교 ─────────────
         else:
+            # [2026-07] agg_emb_constant/centered는 "평가 세트 전체의 agg_emb
+            # 평균"을 기준으로 상수/잔차를 가른다. 배치 평균을 쓰면 배치마다
+            # 기준이 달라지므로, 먼저 한 번 훑어서 전체 평균을 구해 model에
+            # 넣어둔다(=이 진단은 test 통계를 쓰는 사후 분석이라는 뜻).
+            if args.ablation in ("agg_emb_constant", "agg_emb_centered"):
+                with torch.no_grad():
+                    _mu_chunks = []
+                    for _s in range(0, X_test.shape[0], 256):
+                        _o = model(X_test[_s:_s + 256], ablation_mode="none")
+                        if _o.get("agg_emb") is None:
+                            raise RuntimeError(
+                                "agg_emb가 None입니다 — --disable_retrieval_branch "
+                                "같은 모드에서는 이 ablation을 쓸 수 없습니다.")
+                        _mu_chunks.append(_o["agg_emb"].detach())
+                    _agg_all = torch.cat(_mu_chunks, dim=0)
+                    model._ablation_agg_mean = _agg_all.mean(dim=0)
+                    # [정의 일치] analyze_branch_information의 relative_variation과
+                    # 같은 식을 쓴다: 평균을 뺀 편차의 std / ‖mean‖.
+                    # (elementwise std — reproduce.py:589와 동일)
+                    _rel_var = float(
+                        (_agg_all - model._ablation_agg_mean).std()
+                        / model._ablation_agg_mean.norm().clamp_min(1e-12))
+                print(f"  [agg 분해] 평가 세트 전체 agg_emb 평균 계산 완료 — "
+                      f"‖mean‖={float(model._ablation_agg_mean.norm()):.4f}, "
+                      f"relative_variation={_rel_var:.4f} "
+                      f"(작을수록 agg가 샘플과 무관한 상수에 가까움)")
             with torch.no_grad():
                 abl_logits_list = []
                 full_evw_list, abl_evw_list = [], []
@@ -3848,10 +4550,24 @@ def run_single_seed(
         else:
             contrib_result = compute_branch_linear_contribution(model, X_test)
             print_branch_linear_contribution(contrib_result)
+            # [Step 2 진단] head 전체를 통과한 ∂logit/∂branch.
+            # 첫 Linear의 ‖W_i x_i‖(위)와 다른 것을 잰다 — 위는 "입력이
+            # 얼마나 크게 들어가는가", 이건 "출력이 얼마나 민감한가".
+            _jac = {}
+            try:
+                _jac = compute_branch_jacobian(model, X_test)
+                if _jac:
+                    print(f"\n  [branch Jacobian] ∂logit/∂branch (head 전체 통과)")
+                    for _nm, _v in sorted(_jac.items(),
+                                          key=lambda kv: -kv[1]["share_of_total"]):
+                        print(f"    {_nm:<12} norm={_v['jac_norm_mean']:.4e}  "
+                              f"share={_v['share_of_total']*100:5.1f}%")
+            except Exception as _je:
+                print(f"  ⚠️  branch Jacobian 계산 실패: {type(_je).__name__}: {_je}")
             contrib_path = Path(log_dir) / f"data={openml_id}{_save_tag}..seed{args.seed}_branch_contribution.pkl"
             with open(contrib_path, "wb") as f:
                 pickle.dump({**contrib_result, "openml_id": openml_id, "seed": args.seed,
-                             "tasktype": tasktype}, f)
+                             "tasktype": tasktype, "jacobian": _jac}, f)
             print(f"\n  저장: {contrib_path}")
 
     if args.branch_information and do_analysis:
@@ -3859,7 +4575,10 @@ def run_single_seed(
             print(f"\n  ⚠️  --branch_information은 fusion_mode='concat'에서만 의미가 있습니다 — "
                   f"건너뜁니다.")
         else:
-            info_result = analyze_branch_information(model, X_test, tasktype)
+            info_result = analyze_branch_information(
+                model, X_test, tasktype, y=y_test,
+                n_shuffles=getattr(args, "branch_info_shuffles", 5),
+                residual_null=getattr(args, "branch_info_residual_null", False))
             print_branch_information(info_result)
             info_path = Path(log_dir) / f"data={openml_id}{_save_tag}..seed{args.seed}_branch_information.pkl"
             with open(info_path, "wb") as f:
@@ -3969,6 +4688,11 @@ def run_single_seed(
     _rb_entropy_chunks = []
     _rb_n_eff_chunks = []
     _rb_top1_weight_chunks = []
+    _rb_query_retr_chunks = []   # [Step 2 진단] test query_emb (= 라우팅 공간)
+    _rb_branch_chunks = {}       # [Step 2 진단] head 3-branch 표현 {name: [chunks]}
+    _rb_evraw_chunks  = {}       # [Step 2 진단] T 사후 스윕용 원본 (sim/val/ew)
+    _rb_neighbor_label_chunks = []    # [2026-07] 검색된 이웃의 실제 라벨 (N, k)
+    _rb_neighbor_sid_chunks   = []    # [2026-07] 검색된 이웃의 **원본 train 행 번호** (N, k)
     _rb_purity_chunks = []            # [추가] top-k 중 query와 같은 라벨인 비율 (unweighted)
     _rb_weighted_purity_chunks = []   # [추가] evidence_w로 가중한 same-label 비율
     # [Local Retriever 진단, 추가] similarity geometry — temperature와 원인
@@ -3977,6 +4701,13 @@ def run_single_seed(
     _rb_sim_bottomk_chunks = []
     _rb_sim_margin_chunks = []
     _rb_sim_std_chunks = []
+    _rb_val_pwcos_chunks = []    # [추가] value 구성요소별 이웃 간 다양성
+    _rb_lbl_pwcos_chunks = []
+    _rb_off_pwcos_chunks = []
+    _rb_val_disp_chunks = []     # [추가] 상대 퍼짐(크기 차이까지 포함)
+    _rb_lbl_disp_chunks = []
+    _rb_off_disp_chunks = []
+    _rb_agg_emb_chunks = []      # [추가] agg_emb 원본 — 개입 전/후 cos 비교용
     # [추가, evidence utilization 진단] "agg_emb가 query_emb와 실질적으로
     # 다른 정보를 담고 있는가"를 raw(head 진입 전, LN 적용 전) 표현 기준
     # 샘플별로 직접 잼 — head_cos_qa_mean(--log_fusion_trajectory)은 LN
@@ -4022,6 +4753,54 @@ def run_single_seed(
                 )
                 _rb_n_eff_chunks.append(1.0 / _ew.square().sum(-1).clamp_min(1e-12))
                 _rb_top1_weight_chunks.append(_ew.max(dim=-1).values)
+                # [Step 2 진단] test query의 routing 공간 임베딩.
+                # ds=1489에서 "centroid capacity는 충분한데 test만 소수 centroid로
+                # 몰린다"(train Gini 0.20 / test 0.96)가 관측됐다. 원인이
+                # ① encoder representation shift ② centroid 배치 ③ P 과잉
+                # 중 무엇인지 가르려면 query 임베딩 자체가 필요하다.
+                # ⚠ **query_emb**를 쓴다(query_retr 아님).
+                #   centroid routing은 `self.prototype_layer(query_emb)`이고
+                #   memory.keys도 `embedder(raw)` = query_emb다.
+                #   query_retr는 retr_proj 적용 후의 **검색 전용 공간**이라
+                #   retr_proj_mode != none이면 라우팅과 다른 공간이 된다.
+                #   (실측: query_retr로 계산했을 때 test entropy 3.911이 나왔는데
+                #    같은 샘플의 routing_confidence는 0.556 — top1=0.556이면
+                #    entropy 상한이 2.53이라 산술적으로 불가능. 공간 불일치의 증거.)
+                if _out.get("query_emb") is not None:
+                    _rb_query_retr_chunks.append(_out["query_emb"].detach().float().cpu())
+                # ── [Step 2 진단] head 3-branch 표현 ────────────────
+                # 질문: head가 agg_emb를 안 쓰는 이유가
+                #   (A) agg가 context/query와 정보가 중복이라 쓸 게 없어서인가
+                #   (B) 정보는 있는데 concat+공유 MLP가 못 쓰는가
+                # 기존 기록은 B 쪽을 가리킨다 —
+                #   · tabera.py:1128 probe 실측(1043/31): concat(q+c+a)가
+                #     최고 단일 branch보다도 낮고, branch별 L2-normalize로 회복
+                #   · 인계 문서: I(Y;agg|query) 근사 d_plain=+0.0071 (5/5 양수, p=0.016)
+                # ⚠ 그러나 그 기록들은 전부 --refresh_on_best 없이(stale sample_groups)
+                #   나온 것이라 agg_emb 자체가 다른 그룹에서 검색한 결과였다.
+                #   fresh 조건에서 재측정이 필요하다.
+                # ⚠ 그리고 기존 조건부는 query 기준이다 — **context 조건부**
+                #   중복(I(Y;agg|context))은 아직 측정된 적이 없다.
+                #
+                # head 입력 직전(정규화/ablation 적용 전) raw 값을 저장한다 —
+                # "이 표현 자체에 정보가 있는가"를 보는 것이므로 원본이 맞다.
+                for _nm, _key in (("query", "query_emb"),
+                                  ("context", "context_emb"),
+                                  ("agg", "agg_emb")):
+                    _v = _out.get(_key)
+                    if _v is not None:
+                        _rb_branch_chunks.setdefault(_nm, []).append(
+                            _v.detach().float().cpu())
+                # [Step 2 진단] T 사후 스윕용 원본 — agg(T) = softmax(sim/T) @ values
+                _ed = _out.get("evidence_diag") or {}
+                for _nm, _key in (("sim", "similarities_raw"),
+                                  ("val", "values_raw"),
+                                  ("ew",  "evidence_w_raw"),
+                                  ("T",   "evidence_T")):
+                    _v = _ed.get(_key)
+                    if _v is not None:
+                        _rb_evraw_chunks.setdefault(_nm, []).append(
+                            _v.detach().float().cpu())
                 # [추가, 사용자 요청] retrieval label purity — "무엇을 가져왔는가"를
                 # 직접 잼. topk_idx는 memory bank(학습셋) 인덱스라 model.memory.labels
                 # 로 바로 라벨을 찾을 수 있음(새 forward 불필요, 이미 계산된 topk_idx/
@@ -4030,6 +4809,25 @@ def run_single_seed(
                     _batch_y = y_test[_start:_start + _pred_batch_size].cpu()
                     _batch_y_int = torch.round(_batch_y).long()
                     _neighbor_labels = model.memory.labels[_out["topk_idx"]].cpu().long()  # (B, k)
+                    # [2026-07 추가] 이웃 라벨 자체를 저장한다.
+                    # [왜] topk_idx는 **memory bank 위치**이지 X_train 행 번호가
+                    # 아니다 — memory.update()가 학습 중 셔플된 배치 순서로
+                    # 채우고(tabera.py:442~), 원래 행 번호는 sample_ids에 따로
+                    # 보관된다. 그래서 외부 분석에서 y_train[topk_idx]로 라벨을
+                    # 복원하려 하면 조용히 엉뚱한 값이 나온다(실측: purity
+                    # 재계산이 저장값과 최대 0.875~1.00 차이). 인덱스를 매핑하게
+                    # 하는 대신 라벨을 직접 내보내 그 실수 자체를 불가능하게 한다.
+                    _rb_neighbor_label_chunks.append(_neighbor_labels)
+                    # [2026-07 추가] 이웃의 원본 train 행 번호.
+                    # [왜] topk_idx는 MemoryBank 슬롯 위치이고, 그 순서는 학습 중
+                    # 셔플된 배치 순서로 정해진다(tabera.py:442~). 따라서 **seed가
+                    # 다른 두 모델의 topk_idx를 직접 비교하면 무의미**하다 — 같은
+                    # 번호가 서로 다른 샘플을 가리킨다. memory.sample_ids가 슬롯 →
+                    # 원본 행 번호 매핑을 들고 있으므로, 그걸 통과시킨 값을 저장하면
+                    # seed 간 "같은 이웃을 골랐는가"를 비교할 수 있다.
+                    # (설명 재현성 측정에 필수 — 없으면 아예 계산이 불가능하다.)
+                    _rb_neighbor_sid_chunks.append(
+                        model.memory.sample_ids[_out["topk_idx"]].cpu().long())
                     _same_label = (_neighbor_labels == _batch_y_int.unsqueeze(-1)).float()  # (B, k)
                     _rb_purity_chunks.append(_same_label.mean(dim=-1))            # unweighted: 단순 top-k 중 동일 라벨 비율
                     _rb_weighted_purity_chunks.append((_ew * _same_label).sum(dim=-1))  # evidence_w-weighted: 실제 aggregation에 반영되는 비중까지 고려
@@ -4038,6 +4836,24 @@ def run_single_seed(
                     _rb_sim_bottomk_chunks.append(_out["similarity_bottomk_per_sample"].cpu())
                     _rb_sim_margin_chunks.append(_out["similarity_margin_per_sample"].cpu())
                     _rb_sim_std_chunks.append(_out["similarity_std_per_sample"].cpu())
+                # [추가] value/label/offset 각각의 이웃 간 평균 pairwise cosine —
+                # "attention을 sharpen해도 소용없는가"(value collapse)를 판정.
+                # k<2면 evidence.py가 None을 반환하므로 그때는 안 쌓임.
+                if _out.get("value_pairwise_cos_per_sample") is not None:
+                    _rb_val_pwcos_chunks.append(_out["value_pairwise_cos_per_sample"].cpu())
+                    _rb_lbl_pwcos_chunks.append(_out["label_pairwise_cos_per_sample"].cpu())
+                    if _out.get("offset_pairwise_cos_per_sample") is not None:
+                        _rb_off_pwcos_chunks.append(_out["offset_pairwise_cos_per_sample"].cpu())
+                    _rb_val_disp_chunks.append(_out["value_rel_dispersion_per_sample"].cpu())
+                    _rb_lbl_disp_chunks.append(_out["label_rel_dispersion_per_sample"].cpu())
+                    if _out.get("offset_rel_dispersion_per_sample") is not None:
+                        _rb_off_disp_chunks.append(_out["offset_rel_dispersion_per_sample"].cpu())
+                # [추가] agg_emb 원본 저장 — temperature/metric 개입 전후로
+                # cos(agg_before, agg_after)를 직접 비교하기 위함. "attention이
+                # 변했는데 agg는 그대로"인지를 중간 지표가 아니라 최종 산출물에서
+                # 확인할 수 있어야 원인 사슬(Δattention→Δagg→Δpred)이 닫힌다.
+                if _out.get("agg_emb") is not None:
+                    _rb_agg_emb_chunks.append(_out["agg_emb"].detach().cpu())
                 # [추가, evidence utilization 진단] fusion_mode="residual"일
                 # 때만 의미 있음(β가 스칼라로 존재하는 유일한 모드). q/a는
                 # raw(query_emb/agg_emb, LN 적용 전) — head가 실제로 보는
@@ -4101,6 +4917,262 @@ def run_single_seed(
             n_eff=_rb_n_effs_all,
             top1_weight=_rb_top1_weights_all,
         )
+        # [메타 진단] 이 실행의 memory가 inference-consistent였는가.
+        # refresh를 안 했으면 이 키가 없다 = train-side 지표가
+        # 학습 시점 dropout 스냅샷 기준이라는 뜻.
+        _ms = globals().get("_MEMORY_STALENESS")
+        if _ms:
+            for _k, _v in _ms.items():
+                _rb_savez_kwargs[f"staleness_{_k}"] = np.array([_v])
+        _rb_savez_kwargs["memory_refreshed"] = np.array([1 if args.refresh_on_best else 0])
+
+        # ── [Step 2 진단] head 3-branch 표현 저장 ────────────────
+        # branch_query / branch_context / branch_agg  각 (N, D)
+        # 사후 분석용: CKA, linear probe, conditional probe
+        #   acc(context) vs acc(agg) vs acc(context+agg)
+        #   → context+agg ≈ context 이면 중복(A)
+        #   → context+agg >> context 이면 정보는 있는데 fusion이 못 씀(B)
+        # ⚠ 차원이 커질 수 있어(N×D×3) float16으로 저장한다 —
+        #   CKA/probe는 이 정밀도로 충분하다.
+        try:
+            for _nm, _ch in _rb_branch_chunks.items():
+                if _ch:
+                    _rb_savez_kwargs[f"branch_{_nm}"] = (
+                        torch.cat(_ch, dim=0).numpy().astype(np.float16))
+            # T 사후 스윕용 — values는 (N, k, D)라 크므로 float16
+            for _nm, _ch in _rb_evraw_chunks.items():
+                if _ch:
+                    _rb_savez_kwargs[f"ev_{_nm}"] = (
+                        torch.cat(_ch, dim=0).numpy().astype(np.float16))
+            # ── [Step 2 진단] 표현 다양성 — agg가 centroid 상수로 붕괴했는가 ──
+            # 관측: agg의 effective rank가 1.0~8.8 (query는 23~66),
+            #       조건수 1e8대 → 수치적으로 특이. within/total 분산비 0.01~0.19.
+            # [H] value = label_emb(label_only)라 같은 그룹 안에서 거의 동일한
+            #     벡터를 평균내므로 agg가 centroid identity를 그대로 반영한다.
+            #     `--value_mode default/offset_only`로 offset(query−neighbor)
+            #     성분을 넣으면 query별로 달라져 rank가 회복될 수 있다.
+            # ⚠ 원인이 value인지 candidate set인지 aggregation인지는 아직
+            #   분리되지 않았다. value_mode 비교가 그 분리 실험이다.
+            #
+            # effective rank(엔트로피 기반)와 participation ratio를 함께 잰다 —
+            #   PR = (Σλ)² / Σλ²   "주성분 몇 개가 실제 분산을 설명하는가"
+            # value(집계 전)와 agg(집계 후)를 둘 다 재야
+            # "value가 원래 다양한데 평균이 죽인 것"과
+            # "value 자체가 이미 같은 것"이 갈린다.
+            def _rank_stats(M):
+                M = np.asarray(M, dtype=np.float64)
+                M = M - M.mean(0, keepdims=True)
+                if M.shape[0] < 2:
+                    return {}
+                sv = np.linalg.svd(M, compute_uv=False)
+                sv = sv[sv > 0]
+                if sv.size == 0:
+                    return {}
+                lam = sv ** 2                      # 공분산 고유값
+                p = lam / lam.sum()
+                q = sv / sv.sum()                  # 특이값 기반(비교용)
+                # ⚠ 두 정의를 함께 저장한다. `--branch_information`의
+                #   effective_rank는 **특이값** 기반(eff_rank_sv)이고,
+                #   표준적인 공분산 정의는 **고유값** 기반(eff_rank)이다.
+                #   제곱하면 분포가 뾰족해져 값이 크게 달라진다
+                #   (실측 ds=14 query: 23.7 vs 7.8). 섞어서 비교하면 안 된다.
+                return {
+                    "eff_rank": float(np.exp(-(p * np.log(p)).sum())),
+                    "eff_rank_sv": float(np.exp(-(q * np.log(q)).sum())),
+                    "participation_ratio": float(lam.sum() ** 2 / (lam ** 2).sum()),
+                    "top1_var_ratio": float(p[0]),
+                }
+            try:
+                _rk = {}
+                for _nm in ("query", "context", "agg"):
+                    _k = f"branch_{_nm}"
+                    if _k in _rb_savez_kwargs:
+                        for _m, _v in _rank_stats(_rb_savez_kwargs[_k]).items():
+                            _rk[f"{_nm}_{_m}"] = _v
+                if "ev_val" in _rb_savez_kwargs:
+                    # 집계 전 value — (N*k, D)로 펼쳐서 잰다
+                    _vv = _rb_savez_kwargs["ev_val"]
+                    for _m, _v in _rank_stats(_vv.reshape(-1, _vv.shape[-1])).items():
+                        _rk[f"value_{_m}"] = _v
+                if _rk:
+                    _rb_savez_kwargs["rank_stats_keys"] = np.array(
+                        sorted(_rk.keys()), dtype=object)
+                    _rb_savez_kwargs["rank_stats_vals"] = np.array(
+                        [_rk[k] for k in sorted(_rk.keys())], dtype=np.float64)
+                    print("  [표현 다양성] " + "  ".join(
+                        f"{_n}: eff_rank={_rk.get(_n+'_eff_rank', float('nan')):.2f}"
+                        f"/PR={_rk.get(_n+'_participation_ratio', float('nan')):.2f}"
+                        for _n in ("query", "context", "agg", "value")
+                        if _n + "_eff_rank" in _rk))
+            except Exception as _re:
+                _rb_savez_kwargs["rank_stats_error"] = np.array(
+                    [f"{type(_re).__name__}: {_re}"], dtype=object)
+
+            # 자기검증: 저장된 sim/val로 재계산한 agg가 실제 branch_agg와 같은가.
+            # 안 맞으면 어딘가 빠진 변환이 있다는 뜻이라 T 스윕 결과 전체가 무효다.
+            if ("ev_sim" in _rb_savez_kwargs and "ev_val" in _rb_savez_kwargs
+                    and "branch_agg" in _rb_savez_kwargs):
+                _s = _rb_savez_kwargs["ev_sim"].astype(np.float32)
+                _v = _rb_savez_kwargs["ev_val"].astype(np.float32)
+                _T0 = float(np.mean(_rb_savez_kwargs.get("ev_T", np.array([1.0]))))
+                _w = np.exp((_s - _s.max(1, keepdims=True)) / max(_T0, 1e-8))
+                _w /= _w.sum(1, keepdims=True)
+                _re = np.einsum("bk,bkd->bd", _w, _v)
+                _ref = _rb_savez_kwargs["branch_agg"].astype(np.float32)
+                _rel = float(np.linalg.norm(_re - _ref) / max(np.linalg.norm(_ref), 1e-12))
+                _rb_savez_kwargs["ev_recon_rel_error"] = np.array([_rel])
+                print(f"  [ev raw] agg 재계산 상대오차 = {_rel:.2e}"
+                      + ("" if _rel < 1e-2 else
+                         "   ⚠️ 0.01 초과 — 빠진 변환이 있을 수 있음. T 스윕 결과 신뢰 불가"))
+        except Exception as _be:
+            _rb_savez_kwargs["branch_export_error"] = np.array(
+                [f"{type(_be).__name__}: {_be}"], dtype=object)
+
+        # ── [Step 2 진단] memory staleness — 진단 유효성의 메타 검증 ──
+        # `memory.keys`는 **학습 중 특정 시점에, dropout mask가 걸린 채로**
+        # 계산된 1회성 스냅샷이다(`--refresh_on_best` 기본값 False).
+        # 반면 test query_emb는 최종 frozen weight로 eval 모드에서 계산된다.
+        #
+        #   memory space  q = f_θ_old(x, ε)     noisy manifold
+        #   test   space  q = f_θ_final(x)      deterministic manifold
+        #
+        # 즉 시점 차이만이 아니라 **함수 자체가 다르다.** 이 상태로 train/test를
+        # 비교하면 encoder drift + dropout noise + distribution shift가 섞인다.
+        # `train_assignment`/`sample_groups`도 이 keys에서 나오므로
+        # k-coverage·occupancy 상관·group size 전부 영향을 받는다.
+        #
+        # 여기서는 **덮어쓰지 않고** 현재 weight로 다시 인코딩한 값과 비교만 한다.
+        # 실제 교정은 `--refresh_on_best`가 담당한다.
+        try:
+            import torch.nn.functional as _F
+            _nmem0 = int(model.memory.filled.item())
+            if _nmem0 > 0 and getattr(model, "_feature_store", None) is not None:
+                _was = model.training
+                model.eval()
+                with torch.no_grad():
+                    _dev = model.memory.keys.device
+                    _fresh = []
+                    for _st in range(0, _nmem0, 1024):
+                        _en = min(_st + 1024, _nmem0)
+                        _fresh.append(model.embedder(model._feature_store._store[_st:_en].to(_dev)))
+                    _fresh = torch.cat(_fresh, dim=0).float()
+                    _old = model.memory.keys[:_nmem0].detach().float()
+                    # ① representation drift
+                    _cos = _F.cosine_similarity(_F.normalize(_old, dim=-1),
+                                                _F.normalize(_fresh, dim=-1), dim=-1)
+                    # ② routing drift — cos만으로는 부족하다. 합성 대조에서
+                    #    cos=0.874인데 배정 일치가 51.8%까지 떨어졌다
+                    #    (표현은 비슷해 보여도 배정은 절반이 뒤집힘).
+                    #    centroid는 고정한 채 두 임베딩의 argmax를 비교한다.
+                    _cN0 = _F.normalize(model.prototype_layer.centroid_emb.detach().float(), dim=-1)
+                    _a_old = (_F.normalize(_old, dim=-1) @ _cN0.T).argmax(-1)
+                    _a_new = (_F.normalize(_fresh, dim=-1) @ _cN0.T).argmax(-1)
+                    _agree = (_a_old == _a_new).float().mean()
+                if _was:
+                    model.train()
+                _c = _cos.cpu().numpy()
+                # ③ group consistency — ARI. agreement는 centroid **인덱스**까지
+                #    같아야 하지만, ARI는 **그룹 구조**만 본다.
+                #    합성 대조: 인덱스만 순열하면 agreement 15.4% / ARI 1.0000
+                #    (구조는 동일한데 이름표만 바뀐 것 — 오염이 아니다).
+                #    10%가 실제로 다른 그룹으로 가면 agreement 89.5% / ARI 0.790.
+                #    즉 셋을 함께 봐야 "표현 drift / 배정 drift / 구조 drift"가 갈린다.
+                _ari = float("nan")
+                try:
+                    from sklearn.metrics import adjusted_rand_score as _ARI
+                    _ari = float(_ARI(_a_old.cpu().numpy(), _a_new.cpu().numpy()))
+                except Exception:
+                    pass
+                _rb_savez_kwargs.update(
+                    memory_refresh_cos=_c,
+                    memory_refresh_assign_agreement=np.array([float(_agree)]),
+                    memory_refresh_group_ari=np.array([_ari]),
+                )
+                print(f"  [memory staleness] cos(q_memory, q_refresh) "
+                      f"mean={_c.mean():.4f} std={_c.std():.4f} "
+                      f"p5={np.percentile(_c,5):.4f} p50={np.median(_c):.4f} p95={np.percentile(_c,95):.4f}"
+                      f" | assign agreement={float(_agree)*100:.1f}% | group ARI={_ari:.4f}")
+                if _c.mean() < 0.98 or _ari < 0.95:
+                    print(f"  ⚠️  [memory staleness] memory.keys가 최종 encoder와 어긋남 — "
+                          f"train 쪽 routing 지표(k-coverage, occupancy 상관, group size, "
+                          f"dead centroid 판정)를 그대로 해석하지 말 것. "
+                          f"`--refresh_on_best`로 재실행 권장.")
+        except Exception as _se:
+            _rb_savez_kwargs["memory_staleness_error"] = np.array(
+                [f"{type(_se).__name__}: {_se}"], dtype=object)
+
+        # ── [Step 2 진단] train/test routing geometry ────────────────
+        # 질문: CentroidLayer의 실패가 capacity collapse가 아니라
+        #       representation shift 때문인가?
+        # ds=1489 관측 — centroid k-coverage 94.2%, train 샘플 k-coverage 98.8%
+        #   (capacity 정상)인데 test 샘플 k-coverage는 17.0%.
+        #   train은 65개 centroid에 고르게 퍼지고(Gini 0.20) test는 7개에 몰린다(0.96).
+        #
+        # memory.keys가 train query의 routing 공간 임베딩을 그대로 갖고 있어
+        # **재인코딩 없이** train/test를 동일 공간에서 비교할 수 있다.
+        # 라우팅이 코사인이므로 모든 거리는 정규화 후 계산한다.
+        try:
+            if _rb_query_retr_chunks:
+                import torch.nn.functional as _F
+                _cE = model.prototype_layer.centroid_emb.detach().float()          # (P, D)
+                _cN = _F.normalize(_cE, dim=-1)
+                _nmem = int(model.memory.filled.item())
+                # memory.keys = embedder(raw) = query_emb — 라우팅과 동일 공간
+                _trQ = _F.normalize(model.memory.keys[:_nmem].detach().float(), dim=-1)   # (N_tr, D)
+                _teQ = _F.normalize(torch.cat(_rb_query_retr_chunks, dim=0).to(_cE.device), dim=-1)
+
+                def _geo(Q):
+                    sim = Q @ _cN.T                                   # (n, P) 코사인
+                    top2 = sim.topk(2, dim=-1)
+                    d1 = 1.0 - top2.values[:, 0]                      # 배정 centroid까지 코사인 거리
+                    margin = top2.values[:, 0] - top2.values[:, 1]    # 1등−2등 (가설 C용)
+                    p = torch.softmax(sim * float(model.prototype_layer.routing_scale), dim=-1)
+                    ent = -(p.clamp_min(1e-12) * p.clamp_min(1e-12).log()).sum(-1)
+                    return (d1.cpu().numpy(), margin.cpu().numpy(), ent.cpu().numpy(),
+                            top2.indices[:, 0].cpu().numpy())
+
+                _d_tr, _m_tr, _e_tr, _a_tr = _geo(_trQ)
+                _d_te, _m_te, _e_te, _a_te = _geo(_teQ)
+                _rb_savez_kwargs.update(
+                    # ① assigned centroid distance — test가 centroid manifold 밖으로 갔는가
+                    train_centroid_dist=_d_tr,   test_centroid_dist=_d_te,
+                    # ② second-best margin — confidence가 "1등이 가까워서"인지
+                    #    "나머지가 다 멀어서"인지 구분
+                    train_routing_margin=_m_tr,  test_routing_margin=_m_te,
+                    # ③ routing entropy (softmax(sim·routing_scale) 기준)
+                    train_routing_entropy=_e_tr, test_routing_entropy=_e_te,
+                    # ④ 임베딩 분포 shift — 평균 이동과 분산 비
+                    #    (D차원 전체를 저장하지 않고 요약 통계만)
+                    train_query_mean=_trQ.mean(0).cpu().numpy(),
+                    test_query_mean=_teQ.mean(0).cpu().numpy(),
+                    train_query_std=_trQ.std(0).cpu().numpy(),
+                    test_query_std=_teQ.std(0).cpu().numpy(),
+                    # ⑤ centroid 배치 자체 (P, D) — 사후 분석용
+                    centroid_emb=_cN.cpu().numpy(),
+                )
+                print(f"  [routing geometry] train dist={_d_tr.mean():.4f} test dist={_d_te.mean():.4f}"
+                      f" | margin train={_m_tr.mean():.4f} test={_m_te.mean():.4f}"
+                      f" | mean shift={float((_teQ.mean(0)-_trQ.mean(0)).norm()):.4f}")
+                # ── 자기검증: 여기서 계산한 entropy가 모델이 내놓은
+                # routing_confidence와 산술적으로 양립하는가.
+                # top1 확률 p가 주어지면 entropy 상한은
+                #   H_max = -(p·log p + (1-p)·log((1-p)/(P-1)))
+                # 이다. 관측 entropy가 이 상한을 넘으면 **다른 공간에서
+                # 계산했다는 뜻**이다(과거 query_retr를 잘못 쓴 사례:
+                # top1=0.556인데 entropy 3.911 — 상한 2.53을 초과).
+                _p1 = float(np.mean(_rb_savez_kwargs["routing_confidence"]))
+                _P = int(_cN.shape[0])
+                if 0.0 < _p1 < 1.0 and _P > 1:
+                    _hmax = -(_p1 * np.log(_p1) + (1 - _p1) * np.log((1 - _p1) / (_P - 1)))
+                    if float(_e_te.mean()) > _hmax + 1e-6:
+                        print(f"  ⚠️  [routing geometry] 자기검증 실패 — test entropy "
+                              f"{_e_te.mean():.3f} > 상한 {_hmax:.3f} (routing_confidence={_p1:.3f}). "
+                              f"라우팅과 다른 공간에서 계산됐을 가능성.")
+                        _rb_savez_kwargs["routing_geometry_inconsistent"] = np.array([1])
+        except Exception as _qe:
+            _rb_savez_kwargs["routing_geometry_error"] = np.array(
+                [f"{type(_qe).__name__}: {_qe}"], dtype=object)
+
         if _rb_purity_chunks:
             # [추가, 사용자 요청] retrieval label purity — "무엇을 가져왔는가".
             # purity: top-k 이웃 중 query와 같은 라벨 비율(단순 카운트).
@@ -4111,6 +5183,69 @@ def run_single_seed(
             # 잘 집중하는가"의 지표가 됨). tasktype="regression"이면 label
             # purity 개념이 없어 둘 다 빈 상태로 남음(위 export 루프에서
             # 애초에 append 안 함).
+            _rb_savez_kwargs["neighbor_labels"] = torch.cat(_rb_neighbor_label_chunks, dim=0).numpy()
+            _rb_savez_kwargs["neighbor_sample_ids"] = torch.cat(_rb_neighbor_sid_chunks, dim=0).numpy()
+            # [2026-07] 각 test 샘플이 배정된 centroid 그룹의 train 크기.
+            # 재현성 Jaccard의 해석에 필수 — 그룹이 작으면 서로 다른 두 모델이
+            # 우연히 같은 이웃을 고를 확률이 높아진다. 무작위 null을
+            # E[J] = (k²/G) / (2k − k²/G) 로 계산하려면 G가 있어야 한다.
+            # [2026-07] train 샘플의 그룹 배정 (N_train,) — 값은 centroid id.
+            # [왜] seed 간 설명 재현성을 잴 때, ①(그룹 배정)과 ②(그룹 안 이웃
+            # 선택)의 불안정성이 섞인다. seed마다 test 샘플이 다른 그룹에 가면
+            # 후보 풀 자체가 달라져 ② Jaccard가 "같은 풀" 가정의 NULL보다도
+            # 낮게 나온다(실측: 1489 0.71배 / 46 0.46배 / 1493 0.52배).
+            # 두 seed의 후보 풀 겹침을 직접 계산해야 ②를 분리할 수 있다.
+            # centroid id 자체는 seed 간 임의 번호라 비교 불가 — 풀을 **집합**
+            # 으로 놓고 겹침을 봐야 한다.
+            try:
+                _sg0 = model.prototype_layer.sample_groups
+                if _sg0:
+                    _ta = np.full(int(model.memory.filled.item()), -1, dtype=np.int64)
+                    _sid = model.memory.sample_ids.cpu().numpy()
+                    for _p, _mem in enumerate(_sg0):
+                        for _m in _mem:
+                            if 0 <= _m < len(_sid) and _sid[_m] >= 0:
+                                _ta[int(_sid[_m])] = _p
+                    _rb_savez_kwargs["train_assignment"] = _ta
+            except Exception as _te:
+                _rb_savez_kwargs["train_assignment_error"] = np.array(
+                    [f"{type(_te).__name__}: {_te}"], dtype=object)
+            try:
+                _sg = model.prototype_layer.sample_groups
+                _gsz = np.array([len(_sg[int(c)]) if _sg and int(c) < len(_sg) else -1
+                                 for c in _rb_savez_kwargs["centroid_id"]], dtype=np.int64)
+                _rb_savez_kwargs["group_size"] = _gsz
+            except Exception as _ge:
+                _rb_savez_kwargs["group_size_error"] = np.array(
+                    [f"{type(_ge).__name__}: {_ge}"], dtype=object)
+            # [2026-07] 정합성 지표: 검색된 이웃이 실제로 자기 그룹 안에 있는가.
+            # [왜] group-constrained 검색이 정말 걸렸는지는 값만 봐서는 알 수 없다.
+            # 실제로 --from_saved_state가 memory._cached_groups를 복원하지 않아
+            # 전역 검색으로 동작하던 버그가 있었고(2026-07 수정), purity/margin/
+            # n_eff 계열 진단이 전부 잘못된 전제 위에 있었다. 이 비율이 1.0에서
+            # 크게 벗어나면 그룹 제약이 안 걸린 것이므로 즉시 드러난다.
+            # (그룹 크기 < k 인 샘플은 설계상 cross-group/전역 폴백이므로
+            #  1.0 미만이 정상일 수 있다 — group_size와 함께 읽을 것.)
+            try:
+                _nsi = _rb_savez_kwargs["neighbor_sample_ids"]
+                _ta_chk = _rb_savez_kwargs.get("train_assignment")
+                _cid_chk = _rb_savez_kwargs["centroid_id"]
+                if _ta_chk is not None:
+                    _ratio = np.array([
+                        float(np.mean(_ta_chk[_nsi[i][_nsi[i] >= 0]] == _cid_chk[i]))
+                        if (_nsi[i] >= 0).any() else np.nan
+                        for i in range(len(_cid_chk))])
+                    _rb_savez_kwargs["neighbor_in_group_ratio"] = _ratio
+                    _m = float(np.nanmean(_ratio))
+                    print(f"  [정합성] 검색 이웃이 자기 그룹 안에 있는 비율 = {_m:.3f}")
+                    if _m < 0.9:
+                        print(f"    ⚠️  1.0에서 크게 벗어남 — group-constrained 검색이 "
+                              f"제대로 걸리지 않았을 수 있습니다.\n"
+                              f"       (a) memory._cached_groups 복원 여부, "
+                              f"(b) 그룹 크기 < k 로 인한 폴백을 확인하세요.")
+            except Exception as _ie:
+                _rb_savez_kwargs["in_group_ratio_error"] = np.array(
+                    [f"{type(_ie).__name__}: {_ie}"], dtype=object)
             _rb_savez_kwargs["retrieval_label_purity"] = torch.cat(_rb_purity_chunks, dim=0).numpy()
             _rb_savez_kwargs["retrieval_weighted_label_purity"] = torch.cat(_rb_weighted_purity_chunks, dim=0).numpy()
         if _rb_sim_top1_chunks:
@@ -4118,6 +5253,48 @@ def run_single_seed(
             _rb_savez_kwargs["similarity_bottomk"] = torch.cat(_rb_sim_bottomk_chunks, dim=0).numpy()
             _rb_savez_kwargs["similarity_margin"] = torch.cat(_rb_sim_margin_chunks, dim=0).numpy()
             _rb_savez_kwargs["similarity_std"] = torch.cat(_rb_sim_std_chunks, dim=0).numpy()
+        if _rb_val_pwcos_chunks:
+            # value_pairwise_cos: 1에 가까우면 k개 이웃의 value가 사실상 같은 벡터
+            #   → evidence_w를 아무리 sharpen해도 Σw·v가 안 바뀜(value collapse).
+            # label/offset을 따로 봐야 (a)그룹이 라벨 순수해서인지 (b)T()가 이웃을
+            # 구분 못해서인지 (c)둘 다인지 분리됨.
+            _rb_savez_kwargs["value_pairwise_cos"] = torch.cat(_rb_val_pwcos_chunks, dim=0).numpy()
+            _rb_savez_kwargs["label_pairwise_cos"] = torch.cat(_rb_lbl_pwcos_chunks, dim=0).numpy()
+            if _rb_off_pwcos_chunks:
+                _rb_savez_kwargs["offset_pairwise_cos"] = torch.cat(_rb_off_pwcos_chunks, dim=0).numpy()
+            # rel_dispersion: pairwise cosine이 **방향만** 보는 것을 보완 —
+            # mean_i‖v_i-v̄‖/‖v̄‖로 크기 차이까지 포함한 스케일 무관 퍼짐.
+            # cos이 1에 가까워도 dispersion이 크면 이웃별 차이가 남아 있는 것.
+            _rb_savez_kwargs["value_rel_dispersion"] = torch.cat(_rb_val_disp_chunks, dim=0).numpy()
+            _rb_savez_kwargs["label_rel_dispersion"] = torch.cat(_rb_lbl_disp_chunks, dim=0).numpy()
+            if _rb_off_disp_chunks:
+                _rb_savez_kwargs["offset_rel_dispersion"] = torch.cat(_rb_off_disp_chunks, dim=0).numpy()
+        if _rb_agg_emb_chunks:
+            _rb_savez_kwargs["agg_emb"] = torch.cat(_rb_agg_emb_chunks, dim=0).numpy()
+            # [2026-07, 추가] agg_emb의 between-group / within-group 분산 분해.
+            # [무엇을 재는가] agg_emb가 "샘플마다 다른 표현"인지 "그룹마다 고정된
+            # 조회값"인지를 직접 구분한다. evidence_w가 사실상 균등하고(n_eff/k≈1)
+            # 검색이 centroid 그룹 내로 제한되면, agg는 그룹의 평균에 수렴해
+            # context_emb(centroid 그대로 읽기)와 같은 층위의 정보가 된다.
+            #   ratio → 1 : 그룹 조회에 가까움 (같은 그룹이면 거의 같은 값)
+            #   ratio → 0 : 샘플별로 실제로 다른 값
+            # n_eff/purity/agg_from_query R²와는 다른 축이라 같이 보면 진단이
+            # 선명해진다. 그룹이 1개뿐이면 between이 정의되지 않아 NaN.
+            _rb_A = _rb_savez_kwargs["agg_emb"]
+            _rb_g = _rb_centroid_ids_all
+            _rb_mu = _rb_A.mean(axis=0, keepdims=True)
+            _rb_tot = float(((_rb_A - _rb_mu) ** 2).sum())
+            _rb_btw = 0.0
+            for _c in np.unique(_rb_g):
+                _m = (_rb_g == _c)
+                _rb_btw += float(_m.sum()) * float(((_rb_A[_m].mean(axis=0) - _rb_mu[0]) ** 2).sum())
+            _rb_savez_kwargs["agg_between_var"] = np.float64(_rb_btw)
+            _rb_savez_kwargs["agg_within_var"]  = np.float64(_rb_tot - _rb_btw)
+            _rb_savez_kwargs["agg_between_ratio"] = np.float64(
+                _rb_btw / _rb_tot if (_rb_tot > 0 and len(np.unique(_rb_g)) > 1) else np.nan)
+            print(f"  [agg variance] between/total = {_rb_savez_kwargs['agg_between_ratio']:.3f}  "
+                  f"(1에 가까우면 agg가 그룹 조회에 가까움 = context_emb와 같은 역할, "
+                  f"groups={len(np.unique(_rb_g))})")
         # [추가, evidence utilization 진단 — 분석계획 1번] fusion_mode="residual"
         # 일 때만 채워짐(그 외 모드는 fusion_beta가 None이라 위 루프에서
         # 애초에 안 쌓임). cos_qa/q_norm/a_norm은 raw(LN 적용 전) query_emb/
@@ -4156,7 +5333,7 @@ def run_single_seed(
             _rb_savez_kwargs["error"] = -np.log(np.clip(_rb_p_true, 1e-12, 1.0))  # per-sample logloss
         _rb_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_centroid_retrieval_behavior.npz"
         np.savez(str(_rb_path), **_rb_savez_kwargs)
-        print(f"  [export_centroid_retrieval_behavior] sample_id/centroid_id/routing_confidence/topk_idx/entropy/n_eff/top1_weight"
+        print(f"  [export_centroid_retrieval_behavior] sample_id/centroid_id/routing_confidence/topk_idx/neighbor_labels/neighbor_sample_ids/group_size/entropy/n_eff/top1_weight"
               f"{'/retrieval_label_purity/retrieval_weighted_label_purity' if _rb_purity_chunks else ''}"
               f"{'/similarity_top1/bottomk/margin/std' if _rb_sim_top1_chunks else ''}"
               f"{'/cos_qa/query_emb_norm/agg_emb_norm/beta_agg_ratio/representation_shift_norm' if _rb_cos_qa_chunks else ''}"
@@ -4210,7 +5387,12 @@ def run_single_seed(
         "deterministic": args.deterministic,
         "deterministic_warn_only": args.deterministic_warn_only if args.deterministic else None,
         "use_offset_correction": True,
-        "global_retrieve": False,
+        "retr_proj_mode": args.retr_proj_mode,
+        "detach_retr_grad": args.detach_retr_grad,
+        "snn_lambda": args.snn_lambda,
+        "snn_tau": args.snn_tau,
+        "unif_beta": args.unif_beta,
+        "global_retrieve": args.global_retrieve,
         "use_context_emb": not args.no_context_emb,
         "use_query_emb_in_head": not args.no_query_emb,
         "use_ema_codebook": args.ema_codebook,
@@ -4616,6 +5798,56 @@ def main():
                             "concat 자체가 없어 이 진단은 스킵됨(그땐 fusion_alpha/beta 값 "
                             "자체가 이미 branch별 기여도 지표)."
                         ))
+    parser.add_argument("--global_retrieve", action="store_true",
+                        help=(
+                            "[진단/실험] retrieve()에서 centroid 그룹 제약을 끄고 "
+                            "전체 memory bank에서 전역 KNN 검색. context_emb(설명①)는 "
+                            "그대로 유지되고 evidence_w/agg_emb(설명②)만 영향받음. "
+                            "optimize.py에 이미 있던 플래그인데 reproduce.py에는 없어서 "
+                            "S1 실험이 실행 불가였음(2026-07 추가). "
+                            "⚠ 반드시 `optimize.py --global_retrieve`로 따로 HPO한 study가 "
+                            "있어야 함 — 이 플래그는 study 파일명 태그(..global_retrieve)와 "
+                            "출력 파일명 태그에 모두 반영되므로, 없으면 FileNotFoundError로 "
+                            "즉시 드러난다(조용히 baseline study를 읽는 사고 방지)."))
+    # ── [2026-07, S-1A] retrieval 전용 표현 분기 ──────────────────
+    parser.add_argument("--retr_proj_mode", type=str, default="none",
+                        choices=["none", "linear", "mlp"],
+                        help="retrieval 전용 projection. none=V1과 완전 동일. "
+                             "linear=D→D, mlp=residual 2-layer. "
+                             "identity 초기화라 학습 전에는 셋이 같은 값을 낸다.")
+    parser.add_argument("--detach_retr_grad", action="store_true",
+                        help="retrieval loss의 gradient를 shared encoder로 흘리지 않음. "
+                             "⚠ --snn_lambda와 독립 축이다. λ=0이면 어차피 gradient가 "
+                             "없으므로 이 플래그 유무가 같은 결과여야 하고, 그 일치가 "
+                             "sanity check가 된다.")
+    parser.add_argument("--snn_lambda", type=float, default=0.0,
+                        help="[2026-08 ablation 결과: 기본값 0 유지 권장] "
+                             "ds=14 5 seed, --refresh_on_best 조건에서 "
+                             "snn 0.05 vs 0 비교 — 설계 목표인 rank informativeness는 "
+                             "1.0252 vs 1.0163 (p=0.71)로 **변화 없고**, 예측 성능도 "
+                             "acc/f1/auroc/logloss 전부 유의차 없음(p=0.36~0.84). "
+                             "유일한 유의 효과는 그룹 내 purity(+0.052, p=0.019)인데 "
+                             "이는 그룹 구성에 지배되는 지표라 retrieval 기여를 "
+                             "재지 못한다(gain over random으로는 p=0.53). "
+                             "즉 'retrieval을 별도 목적으로 학습시킨다'가 작동하지 않는다. "
+                             "코드는 다른 데이터셋 재확인용으로 남겨둔다. "
+                             "Soft Nearest Neighbor surrogate 가중치. "
+                             "0이면 SNN이 꺼진다(= projection 층만 추가한 대조군, "
+                             "Phase 0b). projection 복구 실험은 λ>0 + --detach_retr_grad.")
+    parser.add_argument("--snn_tau", type=float, default=0.1,
+                        help="SNN 온도. 낮을수록 강하게 뭉친다 — 너무 낮으면 클래스가 "
+                             "한 점으로 붕괴해 rank 정보가 오히려 사라진다(V1로 회귀).")
+    parser.add_argument("--unif_beta", type=float, default=0.0,
+                        help="uniformity 가중치(붕괴 방지). SNN 단독으로는 붕괴를 "
+                             "감지 못한다 — 합성 검증에서 붕괴 시 SNN=0.0001로 "
+                             "'성공'처럼 보이는데 uniformity만 -2.87→-1.35로 튀었다.")
+    parser.add_argument("--branch_info_shuffles", type=int, default=5,
+                        help="information gain의 null 대조 shuffle 횟수 "
+                             "(0=null 계산 안 함/기존 동작, 3=빠른 디버깅, "
+                             "5=논문 기본, 10=분산 확인)")
+    parser.add_argument("--branch_info_residual_null", action="store_true",
+                        help="query 잔차 셔플 null을 추가로 계산(R-3 보조 진단). "
+                             "기본 결과는 plain shuffle null을 사용.")
     parser.add_argument("--branch_information", action="store_true",
                         help=(
                             "[진단용] --branch_contribution이 'norm(크기)'만 보는 것과 달리, "
@@ -4633,6 +5865,7 @@ def main():
                                  "query_emb_zero", "query_emb_shuffle",
                                  "context_emb_zero", "context_emb_shuffle",
                                  "agg_emb_zero", "agg_emb_shuffle",
+                                 "agg_emb_constant", "agg_emb_centered",
                                  "rank_correlation", "dual_space_faithfulness",
                                  "interaction_check", "centroid_geometry",
                                  "centroid_representativeness", "evidence_compensation",
@@ -4846,7 +6079,9 @@ def main():
                         ))
     parser.add_argument("--value_mode", type=str, default="default",
                         choices=["default", "label_only", "offset_only", "balanced",
-                                 "offset_normalized", "sum_normalized"],
+                                 "offset_normalized", "sum_normalized",
+                                 "neighbor_only", "neighbor_offset",
+                                 "interaction", "interaction_only", "interaction_ln"],
                         help=(
                             "[재개, ablation] AttentionAggregator의 value = "
                             "label_emb + T(query-neighbour) 구성 방식. "
@@ -5020,7 +6255,8 @@ def main():
                             "결과와 정확히 비교하려면 이 플래그로 예전 동작을 켤 것."
                         ))
     parser.add_argument("--fusion_mode", type=str, default="concat",
-                        choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"],
+                        choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta",
+                                 "proto_residual", "proto_query_residual", "proto_only", "proto_only_linear"],
                         help=(
                             "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
                             "6개 데이터셋에 걸친 폭넓은 비교(ablation/trajectory/retrieval-free "
@@ -5423,6 +6659,18 @@ def main():
                         ))
     parser.add_argument("--fusion_beta_override", type=float, default=None,
                         help="fusion_alpha_override와 대칭, agg 쪽(β) 고정값.")
+    parser.add_argument("--learn_evidence_temperature", action="store_true",
+                        help=(
+                            "[2026-07, 신규] evidence softmax의 온도 T를 고정값(1.0) 대신 "
+                            "학습 파라미터로 둔다(softplus로 양수 보장, 초기값은 기존 T와 동일). "
+                            "배경: T=1.0은 HPO 탐색 대상도 아니어서 한 번도 조정된 적이 없었고, "
+                            "관측된 similarity margin(0.03~0.68)에서는 산술적으로 거의 균등분포가 "
+                            "된다(n_eff/k≈1, 10/10). 또 최적 sharpness가 k에 따라 달라지는데"
+                            "(k=4에선 sharp가 +1.4%p 우세, k=48에선 -14.1%p) k는 HPO가 정하고 "
+                            "T는 고정이라 둘이 맞을 이유가 없었다. 학습된 T 값 자체가 진단 "
+                            "지표가 된다 — 1.0 근처에 머물면 '구분할 것이 없어서', 내려가면 "
+                            "'선별을 시작'으로 읽는다."
+                        ))
     parser.add_argument("--disable_retrieval_branch", action="store_true",
                         help=(
                             "[2026-07, 추가] '진짜' retrieval-free baseline(Model 2) — "
@@ -5474,6 +6722,35 @@ def main():
                             "더 완만하게(여러 이웃), T<1이면 더 뾰족하게(소수 이웃에 집중). "
                             "--dropout_override와 같은 패턴 — model_kwargs에 반영, "
                             "--from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
+                        ))
+    parser.add_argument("--inference_evidence_temperature", type=float, default=None,
+                        help=(
+                            "[2026-07, 신규 — 통제 실험용] --from_saved_state로 로드한 "
+                            "모델의 **추론 시점 evidence softmax 온도만** 이 값으로 바꿈"
+                            "(가중치 재학습 없음). --evidence_temperature_override와의 "
+                            "차이가 핵심: 그쪽은 재학습 경로라 encoder까지 다시 학습되므로, "
+                            "agg가 변해도 'attention이 sharpen돼서'인지 '모델이 다르게 "
+                            "학습돼서'인지 분리가 안 된다. 이 플래그는 동일 가중치에서 T만 "
+                            "바꾸므로 --export_centroid_retrieval_behavior의 agg_emb를 "
+                            "baseline(T 그대로)과 비교하면 cos(agg_before, agg_after)가 "
+                            "순수하게 aggregation 효과만 반영한다. "
+                            "권장 사용: 같은 체크포인트에 T=기본값/0.3/0.1/0.03을 각각 적용해 "
+                            "(n_eff/k, cos(agg_before,agg_after), agg_from_query R²)를 비교 — "
+                            "n_eff/k는 내려가는데 agg cosine이 1에 가까우면 'attention은 "
+                            "변했는데 aggregation 결과는 그대로'이므로 병목이 attention이 "
+                            "아니라는 뜻. --from_saved_state 없이 쓰면 무시됨(재학습 경로에서는 "
+                            "--evidence_temperature_override를 쓸 것)."
+                        ))
+    parser.add_argument("--k_override", type=int, default=None,
+                        help=(
+                            "[통제 실험용] best_params의 k(검색 이웃 수)만 이 값으로 "
+                            "덮어쓰고 나머지는 그대로 재학습. --evidence_temperature_override"
+                            "와 짝으로 쓰는 것이 주 용도 — sharp attention이 성능을 "
+                            "떨어뜨릴 때 그 원인이 (a) sharpening 자체인지 (b) k가 큰 채로 "
+                            "소수 이웃만 쓰게 되어 추정 분산이 커진 것인지 분리한다"
+                            "(k=48에서 n_eff≈1.4면 48개 평균 대비 분산이 30배 이상). "
+                            "가중치 shape에 영향을 주므로 --from_saved_state와 같이 쓰면 "
+                            "로드가 깨진다 — 재학습 경로에서만 쓸 것."
                         ))
     parser.add_argument("--embed_dim_override", type=int, default=None,
                         help=(
