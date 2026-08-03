@@ -3037,160 +3037,6 @@ def run_single_seed(
         # 데이터에 상호작용이 실제로 있는지부터 데이터로 확인해야 함. 여기서는
         # interaction(i,j) = |perturb(i,j 동시)| - [|perturb(i)| + |perturb(j)|] 로 정의—
         # 0보다 유의하게 크면 i,j가 예측에 super-additive하게 같이 작동한다는 뜻.)
-        elif args.ablation == "interaction_check":
-            model.eval()
-            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
-            n_features = model.n_features
-
-            n_ic = min(100, X_test.shape[0])
-            _ic_perm = np.random.RandomState(args.seed).permutation(X_test.shape[0])[:n_ic]
-            X_ic = X_test[_ic_perm]
-
-            print(f"\n  Feature Interaction Check (n={n_ic})")
-            print(f"  {'─'*60}")
-            print(f"  '두 feature를 동시에 perturb했을 때의 변화'와 '개별 perturb 변화의")
-            print(f"  합' 사이의 차이로, 상호작용이 실제로 존재하는지 먼저 확인합니다.")
-            print(f"  (SHAP interaction values가 아니라, 모델 구조에 안 얽매이는 직접")
-            print(f"  perturbation 방식 — TabERA처럼 hard-routing 등 불연속을 가진")
-            print(f"  구조에도 안전하게 적용됨.)")
-
-            with torch.no_grad():
-                logits_orig = model(X_ic)["logits"]
-                _target_class = (
-                    logits_orig.argmax(dim=-1).cpu().numpy()
-                    if tasktype == "multiclass" else None
-                )
-
-            def _pick_target_ic(logits: torch.Tensor) -> torch.Tensor:
-                if tasktype == "multiclass":
-                    idx = torch.as_tensor(_target_class, device=logits.device, dtype=torch.long)
-                    return logits[torch.arange(logits.shape[0], device=logits.device), idx]
-                return logits.squeeze(-1)
-
-            with torch.no_grad():
-                train_mean  = X_train.mean(dim=0)
-                orig_target = _pick_target_ic(logits_orig)     # (N,)
-
-                print(f"  [1/3] 개별 Delta 계산 중 (feature {n_features}개)...")
-                delta_1d = np.zeros((n_ic, n_features))
-                for f in range(n_features):
-                    X_m = X_ic.clone()
-                    X_m[:, f] = train_mean[f]
-                    delta_1d[:, f] = (orig_target - _pick_target_ic(model(X_m)["logits"])).abs().cpu().numpy()
-
-            # 상위 K개 Delta-important feature 쌍만 확인 (O(K^2)로 비용 통제)
-            top_k = min(12, n_features)
-            top_feats = np.argsort(-delta_1d.mean(axis=0))[:top_k]
-            n_pairs = top_k * (top_k - 1) // 2
-            print(f"  [2/3] 상위 {top_k}개 feature(O(K^2)={n_pairs}쌍)에 대해 "
-                  f"쌍별 상호작용 계산 중...")
-
-            with torch.no_grad():
-                pair_interactions = []   # [(i, j, mean_abs_interaction), ...]
-                for a in range(top_k):
-                    for b in range(a + 1, top_k):
-                        fi, fj = int(top_feats[a]), int(top_feats[b])
-                        X_pair = X_ic.clone()
-                        X_pair[:, fi] = train_mean[fi]
-                        X_pair[:, fj] = train_mean[fj]
-                        delta_pair = (orig_target - _pick_target_ic(model(X_pair)["logits"])).abs().cpu().numpy()
-                        # super-additive면 양수, sub-additive(중복 신호)면 음수
-                        interaction = delta_pair - (delta_1d[:, fi] + delta_1d[:, fj])
-                        pair_interactions.append((fi, fj, float(np.abs(interaction).mean()),
-                                                   float(interaction.mean())))
-
-            pair_interactions.sort(key=lambda t: -t[2])
-
-            print(f"  [3/3] Random 쌍 대조군 계산 중 (동일 개수, 무작위 feature 쌍)...")
-            rng_ic = np.random.RandomState(args.seed)
-            rand_abs_interactions = []
-            with torch.no_grad():
-                for _ in range(n_pairs):
-                    fi, fj = rng_ic.choice(n_features, size=2, replace=False)
-                    X_pair = X_ic.clone()
-                    X_pair[:, int(fi)] = train_mean[int(fi)]
-                    X_pair[:, int(fj)] = train_mean[int(fj)]
-                    delta_pair = (orig_target - _pick_target_ic(model(X_pair)["logits"])).abs().cpu().numpy()
-                    interaction = delta_pair - (delta_1d[:, int(fi)] + delta_1d[:, int(fj)])
-                    rand_abs_interactions.append(float(np.abs(interaction).mean()))
-
-            top_abs_mean  = float(np.mean([t[2] for t in pair_interactions]))
-            rand_abs_mean = float(np.mean(rand_abs_interactions))
-
-            # [통계적 엄밀성 추가] 기존엔 "top_abs_mean > rand_abs_mean * 1.5"라는
-            # 임의 배수 임계값으로만 판단했음 — rank_correlation처럼 경험적 null
-            # 분포와 p-value로 바꾼다. 다만 random 쌍 자체를 1000번 다시 뽑아
-            # model forward를 또 도는 건 비용이 n_pairs배로 늘어나므로, 이미
-            # 계산해둔 rand_abs_interactions 풀(n_pairs개, 실제 model forward로
-            # 얻은 값)에서 크기 n_pairs로 복원추출(bootstrap)해 "무작위 K쌍의
-            # 평균 |상호작용|"의 null 분포를 근사한다 — rank_correlation의
-            # bootstrap 재표본추출과 같은 원칙(이미 계산된 데이터를 재표본추출해
-            # 추가 forward 비용 없이 분포를 얻음).
-            print(f"  [Null 분포] random 쌍 풀에서 1000회 bootstrap 재표본추출 중...")
-            rand_pool = np.array(rand_abs_interactions)
-            rng_null  = np.random.RandomState(args.seed + 1)
-            n_null_draws = 1000
-            null_means = np.empty(n_null_draws)
-            for r in range(n_null_draws):
-                sample = rng_null.choice(rand_pool, size=len(rand_pool), replace=True)
-                null_means[r] = sample.mean()
-
-            null_mean = float(null_means.mean())
-            null_std  = float(null_means.std())
-            p_vs_null = float((null_means >= top_abs_mean).mean())
-
-            print(f"\n  {'─'*60}")
-            print(f"  Delta-important 상위 {top_k}개 쌍의 |상호작용| 평균: {top_abs_mean:.4f}")
-            print(f"  무작위 feature 쌍의 |상호작용| 평균:              {rand_abs_mean:.4f}")
-            print(f"  Random null 분포 (bootstrap 1000회):              {null_mean:.4f} ± {null_std:.4f}")
-            print(f"  P(random null 평균 ≥ top_abs_mean) = {_fmt_pval(p_vs_null, n_null_draws)}")
-            print(f"  {'─'*60}")
-
-            print(f"\n  [상위 상호작용 5쌍]")
-            print(f"  {'Feature i':<20} {'Feature j':<20} {'|interaction|':>14} {'부호':>6}")
-            print(f"  {'─'*64}")
-            for fi, fj, abs_int, signed_int in pair_interactions[:5]:
-                ni = col_names[fi] if fi < len(col_names) else f"f{fi}"
-                nj = col_names[fj] if fj < len(col_names) else f"f{fj}"
-                sign = "super+" if signed_int > 0 else "sub-"
-                print(f"  {ni:<20} {nj:<20} {abs_int:>14.4f} {sign:>6}")
-
-            print(f"\n  [해석]")
-            if p_vs_null < 0.05:
-                print(f"  ✅ Delta-important feature 쌍에서 상호작용이 무작위 null(p={_fmt_pval(p_vs_null, n_null_draws)})")
-                print(f"    보다 유의하게 큼 ({top_abs_mean:.4f} vs null {null_mean:.4f}±{null_std:.4f}) —")
-                print(f"    이 데이터셋에는 SHAP이 잡아낼 가치가 있는 feature 상호작용이")
-                print(f"    실제로 존재함. rank_correlation에서 SHAP-Delta가 불일치했다면,")
-                print(f"    상호작용 반영 때문일 가능성을 무게 있게 고려할 수 있음.")
-            else:
-                print(f"  ⚠️  Delta-important 쌍의 상호작용이 무작위 null과 유의하게 다르다고")
-                print(f"    말하기 어려움 (p={_fmt_pval(p_vs_null, n_null_draws)}, {top_abs_mean:.4f} vs null "
-                      f"{null_mean:.4f}±{null_std:.4f}). rank_correlation에서 SHAP-Delta 불일치가")
-                print(f"    나온다면, 상호작용보다는 SHAP 추정 자체의 노이즈(--shap_repeats로")
-                print(f"    확인)일 가능성이 더 큼.")
-            print(f"     (주의: 이 null은 random pair 풀 {n_pairs}개의 재표본추출로 근사한 것 —")
-            print(f"      pool 자체가 작으면(top_k가 작은 데이터셋) null 분포도 거칠어질 수 있음.)")
-
-            ic_save = {
-                "top_feats":            [int(f) for f in top_feats],
-                "pair_interactions":    pair_interactions,
-                "top_abs_mean":         top_abs_mean,
-                "rand_abs_mean":        rand_abs_mean,
-                "null_mean":            null_mean,
-                "null_std":             null_std,
-                "p_vs_null":            p_vs_null,
-                "col_names":            col_names,
-                "openml_id":            openml_id,
-                "seed":                 args.seed,
-            }
-            ic_path = (
-                Path(log_dir)
-                / f"data={openml_id}..seed{args.seed}_interaction_check.pkl"
-            )
-            with open(ic_path, "wb") as f:
-                pickle.dump(ic_save, f)
-            print(f"\n  저장: {ic_path}")
-
         # ── centroid_geometry: cosine_similarity_matrix()를 실제로 노출 ──
         # (지금까지 정의만 되고 아무 데서도 안 쓰이던 진단 메서드)
         #
@@ -3589,457 +3435,6 @@ def run_single_seed(
         # 반반으로 섞인 경우. ①(그룹)만 보면 "애매하다"고 하지만, ②는
         # 실제 이웃 개별 샘플을 보여주는 방식이라 이 coarse-graining
         # 문제가 덜할 수 있음 — 이걸 실측으로 확인한다.
-        elif args.ablation == "evidence_compensation":
-            from scipy.stats import mannwhitneyu
-
-            model.eval()
-            P = model.prototype_layer.P
-            sample_groups = model.prototype_layer.sample_groups
-            target_labels = model.prototype_layer.target_labels
-
-            print(f"\n  Evidence Compensation — '①이 흐릿한 곳을 ②가 메워주는가' (P={P})")
-            print(f"  {'─'*60}")
-            print(f"  centroid_representativeness와 같은 기준(purity vs baseline,")
-            print(f"  cohesion은 이 run의 중앙값 기준 이분)으로 centroid를 3종으로 나눔:")
-            print(f"    type A(진짜 문제)  : purity<=baseline, cohesion<=중앙값")
-            print(f"    type B(①만 흐릿함) : purity<=baseline, cohesion>중앙값  ← 여기가 관심 대상")
-            print(f"    normal            : purity>baseline")
-
-            y_train_np = y_train.detach().cpu().numpy()
-            if tasktype in ("multiclass", "binclass"):
-                y_int = np.rint(y_train_np).astype(int)
-                vals, counts = np.unique(y_int, return_counts=True)
-                global_majority_prop = float(counts.max() / counts.sum())
-            else:
-                global_std = float(y_train_np.std())
-
-            print(f"\n  [1/3] centroid별 purity·cohesion 재계산 중...")
-            with torch.no_grad():
-                c_norm = F.normalize(model.prototype_layer.centroid_emb, dim=-1)
-                q_chunks = []
-                _batch = 256
-                for start in range(0, X_train.shape[0], _batch):
-                    q_chunks.append(
-                        F.normalize(model.embedder(X_train[start:start + _batch]), dim=-1).cpu()
-                    )
-                q_all = torch.cat(q_chunks)
-            c_norm_cpu = c_norm.cpu()
-
-            gaps = {}
-            cohesions = {}
-            for p in range(P):
-                grp = sample_groups[p] if sample_groups is not None else None
-                size = len(grp) if grp else 0
-                if size == 0:
-                    continue
-                idx_t = torch.as_tensor(grp, dtype=torch.long)
-                cohesions[p] = float((q_all[idx_t] @ c_norm_cpu[p]).mean())
-
-                tl = target_labels.get(p) if target_labels is not None else None
-                if tl is None:
-                    continue
-                if tl["kind"] == "classification":
-                    gaps[p] = tl["top_prop"] - global_majority_prop
-                else:
-                    y_grp = y_train_np[grp]
-                    group_std = float(np.std(y_grp))
-                    gaps[p] = (1.0 - group_std / (global_std + 1e-8))  # baseline=0
-
-            cohesion_vals = np.array(list(cohesions.values()))
-            cohesion_median = float(np.median(cohesion_vals)) if len(cohesion_vals) else 0.0
-
-            type_of = {}  # centroid_idx -> 'A' | 'B' | 'normal' | None(판단불가)
-            for p in range(P):
-                if p not in cohesions:
-                    continue
-                if p not in gaps:
-                    type_of[p] = None   # 그룹 너무 작아 purity 판단 불가
-                    continue
-                if gaps[p] > 0:
-                    type_of[p] = "normal"
-                elif cohesions[p] > cohesion_median:
-                    type_of[p] = "B"
-                else:
-                    type_of[p] = "A"
-
-            n_a = sum(1 for v in type_of.values() if v == "A")
-            n_b = sum(1 for v in type_of.values() if v == "B")
-            n_normal = sum(1 for v in type_of.values() if v == "normal")
-            print(f"  centroid 분류: type A={n_a}개, type B={n_b}개, normal={n_normal}개")
-
-            if n_b == 0:
-                print(f"\n  ⚠️  type B centroid가 하나도 없어 이 진단을 진행할 수 없습니다")
-                print(f"    (이 데이터셋/모델에서는 'purity 낮지만 cohesion 높은' centroid가")
-                print(f"    발견되지 않음 — centroid_representativeness로 먼저 확인해볼 것).")
-            else:
-                print(f"\n  [2/3] test set forward — ②(evidence_w) 수집 중...")
-                n_test = X_test.shape[0]
-                dominant_list, entropy_list, hard_group_list = [], [], []
-                with torch.no_grad():
-                    for start in range(0, n_test, 256):
-                        X_batch = X_test[start:start + 256]
-                        out_batch = model(X_batch)
-                        evw = out_batch.get("evidence_w")
-                        hg  = out_batch.get("hard_group")
-                        if evw is None or hg is None:
-                            continue
-                        dom = evw.max(dim=-1).values
-                        ent = -(evw * torch.log(evw + 1e-8)).sum(dim=-1)
-                        dominant_list.append(dom.cpu())
-                        entropy_list.append(ent.cpu())
-                        hard_group_list.append(hg.cpu())
-
-                if not dominant_list:
-                    print(f"  ⚠️  evidence_w를 얻을 수 없습니다(fallback 등으로 이웃이 없는 경우일 수 있음).")
-                else:
-                    dominant  = torch.cat(dominant_list).numpy()
-                    entropy   = torch.cat(entropy_list).numpy()
-                    hard_group = torch.cat(hard_group_list).numpy()
-
-                    sample_type = np.array([type_of.get(int(g), None) for g in hard_group])
-
-                    mask_b      = sample_type == "B"
-                    mask_a      = sample_type == "A"
-                    mask_rest_b = ~mask_b  # type B 아닌 전부(A+normal+판단불가)
-                    mask_rest_a = ~mask_a  # type A 아닌 전부(B+normal+판단불가) — 대조군용
-
-                    print(f"\n  [3/3] Mann-Whitney U 검정 중 (test n={n_test})...")
-                    print(f"\n  {'그룹':<12} {'n':>5}  {'dominant_weight':>16}  {'entropy':>10}")
-                    print(f"  {'─'*50}")
-                    for name, mask in [("type B", mask_b), ("type A", mask_a),
-                                        ("나머지(전체)", np.ones_like(mask_b, dtype=bool))]:
-                        if mask.sum() == 0:
-                            print(f"  {name:<12} {'0':>5}  {'-':>16}  {'-':>10}")
-                            continue
-                        print(f"  {name:<12} {int(mask.sum()):>5}  "
-                              f"{dominant[mask].mean():>16.4f}  {entropy[mask].mean():>10.4f}")
-
-                    print(f"\n  [type B vs 나머지] — 핵심 비교")
-                    if mask_b.sum() >= 3 and mask_rest_b.sum() >= 3:
-                        u_dom, p_dom = mannwhitneyu(dominant[mask_b], dominant[mask_rest_b],
-                                                     alternative="greater")
-                        u_ent, p_ent = mannwhitneyu(entropy[mask_b], entropy[mask_rest_b],
-                                                     alternative="less")
-                        print(f"    dominant_weight: type B가 더 큼? Mann-Whitney p={p_dom:.4f}")
-                        print(f"    entropy:         type B가 더 작음(뾰족함)? Mann-Whitney p={p_ent:.4f}")
-                    else:
-                        p_dom = p_ent = None
-                        print(f"    표본 부족(type B n={mask_b.sum()}) — 검정 생략")
-
-                    print(f"\n  [type A vs 나머지] — 대조군 (여기서는 유의하지 않아야 A/B 구분이 의미있음)")
-                    if mask_a.sum() >= 3 and mask_rest_a.sum() >= 3:
-                        u_dom_a, p_dom_a = mannwhitneyu(dominant[mask_a], dominant[mask_rest_a],
-                                                         alternative="greater")
-                        u_ent_a, p_ent_a = mannwhitneyu(entropy[mask_a], entropy[mask_rest_a],
-                                                         alternative="less")
-                        print(f"    dominant_weight: type A가 더 큼? Mann-Whitney p={p_dom_a:.4f}")
-                        print(f"    entropy:         type A가 더 작음(뾰족함)? Mann-Whitney p={p_ent_a:.4f}")
-                    else:
-                        p_dom_a = p_ent_a = None
-                        print(f"    표본 부족(type A n={mask_a.sum()}) — 검정 생략")
-
-                    print(f"\n  [해석]")
-                    b_significant = (p_dom is not None and p_dom < 0.05) or \
-                                     (p_ent is not None and p_ent < 0.05)
-                    a_significant = (p_dom_a is not None and p_dom_a < 0.05) or \
-                                     (p_ent_a is not None and p_ent_a < 0.05)
-                    if b_significant and not a_significant:
-                        print(f"  ✅ type B는 ②가 유의하게 더 결정적이고, type A는 그렇지 않음 —")
-                        print(f"    '①이 흐릿한 곳(순도는 낮지만 일관된 곳)을 ②가 실제로 메워준다'는")
-                        print(f"    가설이 뒷받침됨. ①②를 나눠 설계한 근거가 이 데이터셋에서 실측으로")
-                        print(f"    확인된 것으로 볼 수 있음.")
-                    elif b_significant and a_significant:
-                        print(f"  ⚠️  type A·B 둘 다 ②가 유의하게 결정적임 — ②가 '①이 흐릿한 곳만")
-                        print(f"    선택적으로' 메워준다기보다, 그냥 전반적으로 ①보다 결정적인")
-                        print(f"    경향이 있을 수 있음(①②의 역할 분담이 이 특정 형태로는 뚜렷이")
-                        print(f"    드러나지 않음). 다른 데이터셋에서도 이 패턴이 반복되는지 볼 것.")
-                    else:
-                        print(f"  type B에서 ②가 유의하게 더 결정적이라고 하기 어려움. 표본이 적거나")
-                        print(f"    (n_b={mask_b.sum()}), 이 데이터셋에서는 ①이 흐릿한 곳에서 ②도")
-                        print(f"    같이 흐릿할 수 있음 — 데이터셋마다 다를 수 있는 부분이라 여러")
-                        print(f"    데이터셋에서 반복 확인이 필요함.")
-
-                    ec_save = {
-                        "type_of":        {int(k): v for k, v in type_of.items()},
-                        "n_a": n_a, "n_b": n_b, "n_normal": n_normal,
-                        "dominant_mean_B": float(dominant[mask_b].mean()) if mask_b.sum() else None,
-                        "dominant_mean_A": float(dominant[mask_a].mean()) if mask_a.sum() else None,
-                        "dominant_mean_rest": float(dominant.mean()),
-                        "entropy_mean_B": float(entropy[mask_b].mean()) if mask_b.sum() else None,
-                        "entropy_mean_A": float(entropy[mask_a].mean()) if mask_a.sum() else None,
-                        "p_dom_B": p_dom, "p_ent_B": p_ent,
-                        "p_dom_A": p_dom_a, "p_ent_A": p_ent_a,
-                        "openml_id": openml_id, "seed": args.seed,
-                    }
-                    ec_path = (
-                        Path(log_dir)
-                        / f"data={openml_id}..seed{args.seed}_evidence_compensation.pkl"
-                    )
-                    with open(ec_path, "wb") as f:
-                        pickle.dump(ec_save, f)
-                    print(f"\n  저장: {ec_path}")
-
-        elif args.ablation == "dual_space_faithfulness":
-            model.eval()
-            col_names  = dataset.col_names or [f"f{i}" for i in range(model.n_features)]
-            n_features = model.n_features
-
-            print(f"\n  Dual-Space Faithfulness Analysis")
-            print(f"  {'─'*58}")
-
-            sample_groups = model.prototype_layer.sample_groups
-
-            n_mem = model.memory.filled.item()
-            ref_emb = model.memory.keys[:n_mem].detach().cpu()          # (n_mem, D)
-            ref_raw = (
-                model.feature_store._store[:n_mem].detach().cpu()
-                if model.feature_store is not None else None
-            )                                                            # (n_mem, F)
-
-            cat_cols = list(dataset.X_cat)
-            num_cols = list(dataset.X_num)
-
-            valid_p_all = [p for p in range(model.prototype_layer.P)
-                           if sample_groups and len(sample_groups[p]) >= 2]
-            valid_p = valid_p_all
-            if ref_raw is None:
-                print(f"    ⚠️  model.feature_store가 없어 원본 feature 공간 비교를 할 수 없습니다 —")
-                print(f"       검증 2를 건너뜁니다 (인덱스 정합성 확인만 아래에서 진행).")
-                valid_p = []
-
-            centroid_emb_cpu = model.prototype_layer.centroid_emb.detach().cpu()  # (P, D)
-
-            with torch.no_grad():
-                q_check = F.normalize(ref_emb, dim=-1)
-                c_check = F.normalize(centroid_emb_cpu, dim=-1)
-                assign_check = (q_check @ c_check.T).argmax(dim=-1).numpy()  # (n_mem,)
-
-            match_count, total_count = 0, 0
-            for p in valid_p_all:
-                grp = sample_groups[p]
-                total_count += len(grp)
-                match_count += int((assign_check[grp] == p).sum())
-            chance_rate = 1.0 / model.prototype_layer.P
-
-            print(f"  [사전 검증] sample_groups 인덱스 정합성 확인 (MemoryBank 슬롯 기준)")
-            if total_count == 0:
-                print(f"    ⚠️  검증 가능한 그룹(크기≥2)이 없어 일치율을 계산할 수 없습니다.")
-                index_ok = False
-            else:
-                match_rate = match_count / total_count
-                print(f"    재배정 일치율: {match_rate:.1%}  (무작위 기대치: {chance_rate:.1%})")
-                index_ok = match_rate >= 0.99
-                if not index_ok:
-                    print(f"    ❌ 검증 시점에는 추가 학습이 없어 regroup 지연으로 설명될 수 없습니다 —")
-                    print(f"       sample_groups가 가리키는 소스(MemoryBank/FeatureStore)와 지금")
-                    print(f"       비교에 쓴 소스가 여전히 어긋나 있을 가능성이 높습니다.")
-                    print(f"       아래 검증 2 결과는 재확인 전까지 신뢰할 수 없습니다.")
-                else:
-                    print(f"    ✅ 인덱스 정합성 확인됨 (MemoryBank 슬롯 기준) — 아래 결과를 신뢰할 수 있습니다.")
-
-            if not index_ok:
-                valid_p = []
-
-            # ── [추가] 스토어 간 슬롯 대응 직접 검증 ──────────────────
-            # [배경] 위 검증은 "sample_groups(캐시)가 지금 라우팅과 맞는가"만
-            # 봄 — MemoryBank와 FeatureStore가 애초에 같은 슬롯에 같은
-            # 샘플을 담고 있는지는 통계적 정황에만 의존하고 있었음.
-            #
-            # [갱신] sample_ids(MemoryBank.sample_ids / FeatureStore._sample_ids)
-            # 도입 이후에는 이걸 percentile 비교가 아니라 정확한 등식으로
-            # 확정할 수 있음. sample_ids가 아직 채워지지 않은 구버전
-            # 체크포인트(전부 -1)라면, 예전 방식(무작위 셔플 대비 percentile)
-            # 으로 자동 fallback.
-            print(f"\n  [사전 검증 1.5] 스토어 간 슬롯 대응 확인 (MemoryBank ↔ FeatureStore)")
-            if ref_raw is None or n_mem < 2:
-                print(f"    ⚠️  feature_store가 없거나 데이터가 부족해 이 검증을 건너뜁니다.")
-                store_ok = None
-            else:
-                mem_ids  = model.memory.sample_ids[:n_mem].detach().cpu()
-                feat_ids = model.feature_store._sample_ids[:n_mem].detach().cpu()
-                has_ids  = bool((mem_ids >= 0).any()) and bool((feat_ids >= 0).any())
-
-                if has_ids:
-                    # ── 1.5-a: 인덱스 대응 — 통계 아니라 정확한 등식 ──────
-                    id_match = (mem_ids == feat_ids)
-                    id_match_rate = float(id_match.float().mean())
-                    print(f"    [1.5-a] sample_id 일치율: {id_match_rate:.1%}  "
-                          f"(100%가 아니면 즉시 확정적 버그 — 통계적 여지 없음)")
-                    id_ok = id_match_rate >= 0.999  # 부동소수점 아닌 정수 비교라 사실상 100% 기대
-                    if id_ok:
-                        print(f"    ✅ 두 스토어의 슬롯이 같은 샘플을 가리키는 것으로 확정됨.")
-                    else:
-                        print(f"    ❌ sample_id가 어긋나는 슬롯이 있습니다 — "
-                              f"MemoryBank/FeatureStore가 서로 다른 시점 또는 순서로 "
-                              f"복원됐을 가능성이 높습니다 (예: best_state/feature_store "
-                              f"복원 순서 확인).")
-
-                    # ── 1.5-b: 값 재현성 — refresh_on_best 여부에 따라
-                    # 기대치가 다름. refresh했다면 부동소수점 오차 수준(≈1.0)
-                    # 까지 기대할 수 있고, 안 했다면(기본값) 여전히 dropout
-                    # 노이즈가 섞여 있어 1.0보다 뚜렷이 낮은 게 정상.
-                    n_check   = min(n_mem, 300)
-                    check_idx = torch.randperm(n_mem)[:n_check]
-                    with torch.no_grad():
-                        recomputed = model.embedder(ref_raw[check_idx].to(device)).cpu()
-                    recomputed_n = F.normalize(recomputed, dim=-1)
-                    stored_n     = F.normalize(ref_emb[check_idx], dim=-1)
-                    matched_sim  = (recomputed_n * stored_n).sum(dim=-1)
-                    print(f"    [1.5-b] 재계산 코사인 유사도: "
-                          f"mean={matched_sim.mean():.6f}  min={matched_sim.min():.6f}")
-                    if getattr(args, "refresh_on_best", False):
-                        # refresh 이후엔 거의 정확히 1.0이어야 함 — 부동소수점
-                        # 오차(비결정적 GPU 커널 포함) 감안해 0.999를 기준으로.
-                        value_ok = float(matched_sim.min()) > 0.999
-                        print(f"       (--refresh_on_best 켜짐 → ≈1.0 기대) "
-                              f"{'✅ 재현됨' if value_ok else '❌ 기대에 못 미침 — refresh 로직 확인 필요'}")
-                    else:
-                        print(f"       (--refresh_on_best 꺼짐 → dropout 노이즈로 1.0보다 "
-                              f"뚜렷이 낮은 게 정상. 재현성이 필요하면 --refresh_on_best로 재학습)")
-                    store_ok = id_ok
-                    if not id_ok:
-                        valid_p = []
-                else:
-                    # ── 하위 호환: sample_ids 없는 구버전 체크포인트 → 기존 percentile 방식
-                    print(f"    ⚠️  sample_ids가 없는 체크포인트입니다 — 기존 percentile 기반")
-                    print(f"       방식으로 대신 확인합니다(확정적 증명 아님, 통계적 근사).")
-                    n_check    = min(n_mem, 300)
-                    check_idx  = torch.randperm(n_mem)[:n_check]
-                    with torch.no_grad():
-                        recomputed = model.embedder(ref_raw[check_idx].to(device)).cpu()
-                    recomputed_n = F.normalize(recomputed, dim=-1)
-                    stored_n     = F.normalize(ref_emb[check_idx], dim=-1)
-                    matched_sim  = (recomputed_n * stored_n).sum(dim=-1)
-                    shuffled_idx = torch.randperm(n_check)
-                    shuffled_sim = (recomputed_n * stored_n[shuffled_idx]).sum(dim=-1)
-
-                    print(f"    매칭된 슬롯끼리 코사인 유사도:      "
-                          f"{matched_sim.mean():.4f} ± {matched_sim.std():.4f}")
-                    print(f"    무작위로 섞은 슬롯끼리 코사인 유사도: "
-                          f"{shuffled_sim.mean():.4f} ± {shuffled_sim.std():.4f}")
-                    shuffled_p99 = float(np.percentile(shuffled_sim.numpy(), 99))
-                    matched_median = float(matched_sim.median())
-                    print(f"    셔플 분포의 99th percentile: {shuffled_p99:.4f}  "
-                          f"vs  매칭 중앙값: {matched_median:.4f}")
-                    store_ok = matched_median > shuffled_p99
-                    if store_ok:
-                        print(f"    ✅ 매칭된 슬롯이 무작위 분포의 상위 1%보다도 확실히 유사함")
-                        print(f"       — 두 스토어의 슬롯이 같은 샘플을 가리키는 것으로 확인됨.")
-                    else:
-                        print(f"    ❌ 매칭된 슬롯의 유사도가 무작위로 섞은 분포의 상위 1%")
-                        print(f"       수준을 못 넘습니다 — MemoryBank/FeatureStore 슬롯이")
-                        print(f"       서로 다른 샘플을 가리키고 있을 가능성이 있습니다.")
-                        valid_p = []
-
-            print(f"\n  [검증 2] Between-Group Feature Separation")
-            print(f"  (numeric: One-way ANOVA F-test / categorical: Chi-square 독립성 검정)")
-
-            if valid_p:
-                from scipy.stats import f as f_dist, chi2_contingency
-
-                group_sizes = np.array([len(sample_groups[p]) for p in valid_p])
-                P_valid     = len(valid_p)
-
-                stat_arr  = np.full(n_features, np.nan)
-                p_arr     = np.full(n_features, np.nan)
-                test_type = np.array(["-"] * n_features, dtype=object)
-
-                if num_cols:
-                    group_means_num = np.array([
-                        ref_raw[sample_groups[p]].numpy()[:, num_cols].mean(axis=0)
-                        for p in valid_p
-                    ])                                                    # (P_valid, F_num)
-                    ss_within = np.zeros(len(num_cols))
-                    total_n   = 0
-                    for p in valid_p:
-                        grp_data = ref_raw[sample_groups[p]].numpy()[:, num_cols]
-                        grp_mean = grp_data.mean(axis=0)
-                        ss_within += ((grp_data - grp_mean) ** 2).sum(axis=0)
-                        total_n   += grp_data.shape[0]
-                    df_within = max(total_n - P_valid, 1)
-                    msw       = ss_within / df_within
-
-                    grand_mean = np.average(group_means_num, axis=0, weights=group_sizes)
-                    ssb        = np.sum(group_sizes[:, None] * (group_means_num - grand_mean) ** 2, axis=0)
-                    df_between = max(P_valid - 1, 1)
-                    msb        = ssb / df_between
-
-                    F_stat_num = msb / (msw + 1e-8)
-                    p_num      = f_dist.sf(F_stat_num, df_between, df_within)
-
-                    for j, fi in enumerate(num_cols):
-                        stat_arr[fi]  = F_stat_num[j]
-                        p_arr[fi]     = p_num[j]
-                        test_type[fi] = "F"
-
-                if cat_cols:
-                    for fi in cat_cols:
-                        cats_per_group = [
-                            np.rint(ref_raw[sample_groups[p]].numpy()[:, fi]).astype(int)
-                            for p in valid_p
-                        ]
-                        all_cats = np.unique(np.concatenate(cats_per_group))
-                        table = np.zeros((P_valid, len(all_cats)), dtype=int)
-                        for gi, vals in enumerate(cats_per_group):
-                            for c in vals:
-                                table[gi, np.searchsorted(all_cats, c)] += 1
-                        if table.shape[1] >= 2 and (table.sum(axis=0) > 0).all() and (table.sum(axis=1) > 0).all():
-                            try:
-                                chi2, p, dof, _ = chi2_contingency(table)
-                                stat_arr[fi]  = chi2
-                                p_arr[fi]     = p
-                                test_type[fi] = "χ²"
-                            except ValueError:
-                                pass   # 검정 불가(예: 기대빈도 문제) → NaN 유지
-
-                valid_mask       = ~np.isnan(p_arr)
-                bonferroni_alpha = 0.05 / n_features   # 다중비교 보정 (전체 feature 수 기준)
-                n_significant    = int((p_arr[valid_mask] < bonferroni_alpha).sum())
-
-                neglogp = np.full(n_features, -1.0)
-                neglogp[valid_mask] = -np.log10(np.clip(p_arr[valid_mask], 1e-300, 1.0))
-                top_sep_idx = np.argsort(neglogp)[::-1][:5]
-
-                print(f"  (유효 그룹 {P_valid}개 / numeric {len(num_cols)}개 F-test / "
-                      f"categorical {len(cat_cols)}개 χ²-test, 검정 가능 {int(valid_mask.sum())}/{n_features})")
-                print(f"  {'Feature':<20} {'Test':>6} {'Stat':>10}  {'p-value':>12}")
-                print(f"  {'─'*52}")
-                for fi in top_sep_idx:
-                    fname = col_names[fi] if fi < len(col_names) else f"f{fi}"
-                    if np.isnan(p_arr[fi]):
-                        print(f"  {fname:<20} {'-':>6} {'(검정 불가)':>21}")
-                        continue
-                    sig_mark = "*" if p_arr[fi] < bonferroni_alpha else " "
-                    print(f"  {fname:<20} {test_type[fi]:>6} {stat_arr[fi]:>10.3f}  {p_arr[fi]:>10.4f}{sig_mark}")
-
-                print(f"\n  Bonferroni 보정(α={bonferroni_alpha:.2e}) 후 유의한 feature 수: "
-                      f"{n_significant}/{n_features}")
-                if n_significant > 0:
-                    print(f"  → centroid가 최소 {n_significant}개 feature에서 통계적으로 "
-                          f"유의하게 그룹을 구분함")
-                else:
-                    print(f"  ⚠️  다중비교 보정 후 유의한 feature가 하나도 없음 — "
-                          f"'이 그룹은 X, Y 특성이 다르다'는 설명의 통계적 근거가 약함")
-
-                F_stat, p_values = stat_arr, p_arr   # 저장용 변수명 유지(하위 호환)
-            else:
-                F_stat, p_values, test_type = None, None, None
-
-            dsf_save = {
-                "anova_F_stat":     F_stat.tolist() if F_stat is not None else None,
-                "anova_p_values":   p_values.tolist() if p_values is not None else None,
-                "anova_test_type":  test_type.tolist() if test_type is not None else None,
-                "openml_id":       openml_id,
-                "seed":            args.seed,
-            }
-            dsf_path = (
-                Path(log_dir)
-                / f"data={openml_id}{_save_tag}..seed{args.seed}_dual_space_faithfulness.pkl"
-            )
-            with open(dsf_path, "wb") as f:
-                pickle.dump(dsf_save, f)
-            print(f"\n  저장: {dsf_path}")
-
         # ── dataset_profile: 예측 확신도/fallback 비율 빠른 진단 ──
         elif args.ablation == "dataset_profile":
             model.eval()
@@ -4099,28 +3494,6 @@ def run_single_seed(
             # 평균"을 기준으로 상수/잔차를 가른다. 배치 평균을 쓰면 배치마다
             # 기준이 달라지므로, 먼저 한 번 훑어서 전체 평균을 구해 model에
             # 넣어둔다(=이 진단은 test 통계를 쓰는 사후 분석이라는 뜻).
-            if args.ablation in ("agg_emb_constant", "agg_emb_centered"):
-                with torch.no_grad():
-                    _mu_chunks = []
-                    for _s in range(0, X_test.shape[0], 256):
-                        _o = model(X_test[_s:_s + 256], ablation_mode="none")
-                        if _o.get("agg_emb") is None:
-                            raise RuntimeError(
-                                "agg_emb가 None입니다 — --disable_retrieval_branch "
-                                "같은 모드에서는 이 ablation을 쓸 수 없습니다.")
-                        _mu_chunks.append(_o["agg_emb"].detach())
-                    _agg_all = torch.cat(_mu_chunks, dim=0)
-                    model._ablation_agg_mean = _agg_all.mean(dim=0)
-                    # [정의 일치] analyze_branch_information의 relative_variation과
-                    # 같은 식을 쓴다: 평균을 뺀 편차의 std / ‖mean‖.
-                    # (elementwise std — reproduce.py:589와 동일)
-                    _rel_var = float(
-                        (_agg_all - model._ablation_agg_mean).std()
-                        / model._ablation_agg_mean.norm().clamp_min(1e-12))
-                print(f"  [agg 분해] 평가 세트 전체 agg_emb 평균 계산 완료 — "
-                      f"‖mean‖={float(model._ablation_agg_mean.norm()):.4f}, "
-                      f"relative_variation={_rel_var:.4f} "
-                      f"(작을수록 agg가 샘플과 무관한 상수에 가까움)")
             with torch.no_grad():
                 abl_logits_list = []
                 full_evw_list, abl_evw_list = [], []
@@ -4358,35 +3731,6 @@ def run_single_seed(
                     print(f"    attention이 '누구를 볼지 못 정하는' 상태가 됐다는 뜻 —")
                     print(f"    성능이 덜 떨어진 건 uniform 평균이 이 데이터셋에서")
                     print(f"    우연히 나쁘지 않은 예측이기 때문일 수 있음.")
-            elif args.ablation in ("query_emb_zero", "query_emb_shuffle"):
-                print(f"  → 성능 하락 = '정상 학습된 head가 query_emb 슬롯에 실제로")
-                print(f"    얼마나 의존하는가'의 대가. --no_query_emb(처음부터 빼고")
-                print(f"    재학습 — 학습 붕괴로 확인됨)와는 다른 질문: 이건 재학습 없이")
-                print(f"    이미 학습된 가중치 그대로 이 슬롯 하나만 지워본 것.")
-                print(f"    하락폭이 크면 → head가 이 슬롯에 실제로 크게 의존 (예상대로).")
-                print(f"    하락폭이 작으면 → head가 이 슬롯을 거의 안 쓰면서도 학습")
-                print(f"    자체는 이 슬롯 없이는 불가능했다는 뜻 — 즉 query_emb의 역할이")
-                print(f"    '최종 예측 재료'가 아니라 '학습 중 gradient 경로 안정화'였을")
-                print(f"    가능성. shuffle이 zero보다 분포 이탈이 적어 더 신뢰할 것.")
-            elif args.ablation in ("context_emb_zero", "context_emb_shuffle"):
-                print(f"  → 성능 하락 = '정상 학습된 head가 context_emb(=Explanation①의")
-                print(f"    prototype 신호) 슬롯에 실제로 얼마나 의존하는가'의 대가.")
-                print(f"    하락폭이 query_emb_zero/shuffle보다 훨씬 작으면 → Explanation①이")
-                print(f"    보여주는 'Centroid_X로 배정됨'이라는 서사가 실제 예측 근거로서는")
-                print(f"    약하다는 뜻(그래도 그룹 자체의 존재는 검색 속도/해석에 별도로")
-                print(f"    유효 — 이 실험은 '예측 기여도'만 봄, ②retrieval 마스킹 가치나")
-                print(f"    그룹의 데이터 구조 반영 여부는 안 봄).")
-            elif args.ablation in ("agg_emb_zero", "agg_emb_shuffle"):
-                print(f"  → query_emb는 정상, agg_emb만 섞음 — query_emb_shuffle(정반대 조합,")
-                print(f"    agg_emb는 정상·query_emb만 섞음)과 나란히 놓고 비교할 것.")
-                print(f"    이번 하락폭이 크면 → agg_emb 자체가 예측에 기여(검색이 실제로")
-                print(f"    유용한 정보를 나름). 이번 하락폭이 작으면(query_emb_shuffle의")
-                print(f"    거의 랜덤 수준 붕괴와 대비된다면) → 성능은 사실상 query_emb")
-                print(f"    슬롯 하나가 거의 다 담당하고 있고, agg_emb는 '짝이 맞을 때만")
-                print(f"    의미 있는 보조 신호'이거나 거의 장식적인 슬롯일 가능성.")
-                print(f"    두 실험을 합치면 '짝 어긋남 자체의 대가'와 'agg_emb 단독 정보량'을")
-                print(f"    분리해서 볼 수 있음.")
-
             abl_save = {
                 "ablation_mode":  args.ablation,
                 "full_metrics":   test_metrics,
@@ -5814,30 +5158,6 @@ def main():
                             "일치해야 dataset 분할이 같아짐 — 지금 CLI에 준 값을 "
                             "그대로 쓰므로 저장했을 때와 동일하게 넘길 것."
                         ))
-    parser.add_argument("--freeze_encoder_retrain_head", action="store_true",
-                        help=(
-                            "[통제 실험용] --from_saved_state로 불러온 모델에서 embedder/"
-                            "prototype_layer/ot_selector/context_proj를 전부 얼리고(gradient "
-                            "차단, KMeans++ 재초기화·regroup_update도 건너뜀 — centroid를 "
-                            "완전히 고정) head 계열(head/head_query_ln/head_context_ln/"
-                            "head_agg_ln)만 백지에서(reset_parameters) 다시 학습. linear_probe "
-                            "가 '새 분류기를 새로 학습'해서 context/agg_emb에 정보가 있다는 "
-                            "것만 보여준 것과 달리, 이건 '지금 이 head 구조가 그 정보를 실제로 "
-                            "쓰는 법을 배울 수 있는가'를 직접 검증 — 이렇게 재학습한 head가 "
-                            "원래(공동학습) 모델보다 test 성능이 오르면 원래 학습이 optimization "
-                            "dynamics(query path가 먼저 수렴해 나머지를 밀어냄) 때문에 그 정보를 "
-                            "못 썼다는 뜻이고, 그래도 안 오르면 head 구조 자체("
-                            "concat+MLP)가 구조적으로 그 정보를 못 쓴다는 뜻. "
-                            "--freeze_head_epochs로 재학습 epoch 수 조절. "
-                            "--from_saved_state 없이는 무효과."
-                        ))
-    parser.add_argument("--freeze_head_epochs", type=int, default=50,
-                        help=(
-                            "--freeze_encoder_retrain_head일 때 head만 재학습할 epoch 수. "
-                            "인코더가 고정돼 있어 head 혼자 수렴하는 데 필요한 epoch은 "
-                            "원래 공동학습보다 짧을 수 있음 — 검증 안 된 기본값(50), "
-                            "필요시 조정."
-                        ))
     parser.add_argument("--linear_probe", action="store_true",
                         help=(
                             "[통제 실험용] --from_saved_state로 불러온 모델에서 "
@@ -5894,16 +5214,6 @@ def main():
                             "출력 파일명 태그에 모두 반영되므로, 없으면 FileNotFoundError로 "
                             "즉시 드러난다(조용히 baseline study를 읽는 사고 방지)."))
     # ── [2026-07, S-1A] retrieval 전용 표현 분기 ──────────────────
-    parser.add_argument("--retr_proj_mode", type=str, default="none",
-                        choices=["none", "linear", "mlp"],
-                        help="retrieval 전용 projection. none=V1과 완전 동일. "
-                             "linear=D→D, mlp=residual 2-layer. "
-                             "identity 초기화라 학습 전에는 셋이 같은 값을 낸다.")
-    parser.add_argument("--detach_retr_grad", action="store_true",
-                        help="retrieval loss의 gradient를 shared encoder로 흘리지 않음. "
-                             "[v2에서 제거됨 — retr_proj와 함께 삭제] "
-                             "없으므로 이 플래그 유무가 같은 결과여야 하고, 그 일치가 "
-                             "sanity check가 된다.")
     parser.add_argument("--branch_info_shuffles", type=int, default=5,
                         help="information gain의 null 대조 shuffle 횟수 "
                              "(0=null 계산 안 함/기존 동작, 3=빠른 디버깅, "
@@ -5925,146 +5235,29 @@ def main():
                         ))
     parser.add_argument("--ablation",  type=str, default="none",
                         choices=["none", "random_neighbor", "neighbor_noise",
-                                 "query_emb_zero", "query_emb_shuffle",
-                                 "context_emb_zero", "context_emb_shuffle",
-                                 "agg_emb_zero", "agg_emb_shuffle",
-                                 "agg_emb_constant", "agg_emb_centered",
-                                 "rank_correlation", "dual_space_faithfulness",
-                                 "interaction_check", "centroid_geometry",
-                                 "centroid_representativeness", "evidence_compensation",
-                                 "dataset_profile"],
+                                 "rank_correlation", "centroid_geometry",
+                                 "centroid_representativeness", "dataset_profile"],
                         help=(
-                            "ablation 모드 선택 (학습된 모델에 inference 단계에서 적용):\n"
-                            "  none                  : full model 기준 (기본값)\n"
-                            "  random_neighbor       : nk/labels를 같은 permutation으로\n"
-                            "                         통째로 셔플 — 배치 내 다른 쿼리의 진짜\n"
-                            "                         (real) 이웃 세트로 통째로 교체.\n"
-                            "                         retrieval이 '맞는 이웃'을 찾았는지만\n"
-                            "                         순수하게 검증 (이웃 정보 자체는 real).\n"
-                            "  neighbor_noise        : nk/labels 전부 실제 데이터와 무관한\n"
-                            "                         노이즈/재추출 라벨로 교체. '이웃 정보가\n"
-                            "                         조금이라도 존재하는가' 자체를 검증.\n"
-                            "                         (random_neighbor와 함께 봐야 함 —\n"
-                            "                         이 둘의 성능 하락 차이가 '틀린 이웃'과\n"
-                            "                         '이웃 없음'의 영향을 분리해서 보여줌)\n"
-                            "  query_emb_zero/shuffle : [학습된 모델에 eval 시점만 적용,\n"
-                            "                         재학습 없음] head 입력의 query_emb\n"
-                            "                         슬롯을 0으로 채우거나(zero) 배치 내\n"
-                            "                         셔플(shuffle, permutation importance\n"
-                            "                         방식이라 분포 이탈 효과가 작아 더\n"
-                            "                         신뢰할 만함). '정상 학습된 모델이\n"
-                            "                         query_emb에 실제로 얼마나 의존하는가'를\n"
-                            "                         --no_query_emb(처음부터 빼고 재학습 —\n"
-                            "                         학습 자체가 붕괴하는지만 보여줌)와\n"
-                            "                         별개로 측정.\n"
-                            "  context_emb_zero/shuffle : 위와 대칭, context_emb 슬롯 대상.\n"
-                            "                         query_emb_* 결과와 나란히 놓고 보면\n"
-                            "                         'Explanation①(prototype 배정)이 예측을\n"
-                            "                         얼마나 진짜로 설명하는가'에 대한 직접\n"
-                            "                         증거가 됨.\n"
-                            "  agg_emb_zero/shuffle   : 위와 대칭, agg_emb(검색+attention 집계)\n"
-                            "                         슬롯 대상. query_emb_shuffle이 성능을\n"
-                            "                         무너뜨린 게 'agg_emb 자체가 기여 없음'\n"
-                            "                         때문인지 'query_emb와 agg_emb가 서로\n"
-                            "                         다른 샘플 것으로 짝이 어긋나 더\n"
-                            "                         헷갈리기' 때문인지 구분하기 위함 — 이\n"
-                            "                         모드는 agg_emb만 섞고 query_emb는\n"
-                            "                         그대로 둠(반대 조합).\n"
-                            "  rank_correlation      : ③(SHAP) feature 순위가 Delta(단순\n"
-                            "                         1차 perturbation) 순위와 어느 정도\n"
-                            "                         정합하는지 보는 실험. [주의] Delta는\n"
-                            "                         ground truth가 아니라 low-fidelity\n"
-                            "                         baseline(feature 상호작용을 못 봄) —\n"
-                            "                         '정합도가 낮다'가 곧 'SHAP이 틀렸다'는\n"
-                            "                         뜻이 아님. random null과 SHAP MC 노이즈\n"
-                            "                         까지 같이 봐야 해석 가능.\n"
-                            "  dual_space_faithfulness : sample_groups 인덱스 정합성 +\n"
-                            "                         그룹 분리도(F-test/χ²) 검증\n"
-                            "  interaction_check      : 두 feature를 동시에 perturb했을 때의\n"
-                            "                         변화 vs 개별 perturb 합의 차이로,\n"
-                            "                         '이 데이터셋에 SHAP이 잡아야 할 만큼\n"
-                            "                         유의미한 feature 상호작용이 실제로\n"
-                            "                         있는가'를 rank_correlation과 별개로\n"
-                            "                         직접 확인. rank_correlation에서\n"
-                            "                         SHAP-Delta 불일치가 나왔을 때, 그게\n"
-                            "                         상호작용 때문인지 SHAP 추정 오차\n"
-                            "                         때문인지 구분하는 데 씀.\n"
-                            "  centroid_geometry      : centroid끼리 서로 얼마나 가까운지\n"
-                            "                         (cosine_similarity_matrix()) 확인.\n"
-                            "                         가까운 쌍이 같은 target을 대표하면\n"
-                            "                         (①이 하나의 영역을 여러 centroid로\n"
-                            "                         나눠 대표하는 의도된 설계) 정상,\n"
-                            "                         다른 target을 대표하면 그 경계의\n"
-                            "                         샘플들은 confidence는 낮은데 서사도\n"
-                            "                         갈리는 진짜 애매한 케이스일 수 있음.\n"
-                            "  centroid_representativeness : centroid_geometry가 못 보는 축 —\n"
-                            "                         '이 centroid가 자기한테 배정된 실제\n"
-                            "                         샘플들을 얼마나 잘 대표하는가'를 크기가\n"
-                            "                         아니라 순도(purity)·응집도(cohesion)\n"
-                            "                         기준으로 정렬해서 봄. 큰 centroid도 순도가\n"
-                            "                         높으면 정상(밀집 지역), 작은 centroid도\n"
-                            "                         순도 100%%면 정당한 outlier 그룹 — 문제는\n"
-                            "                         '크지만 순도가 baseline(전역 최다 클래스\n"
-                            "                         비율)과 다를 바 없는' centroid.\n"
-                            "  evidence_compensation  : centroid_representativeness의 'purity\n"
-                            "                         낮음+cohesion 높음'(①이 흐릿한) centroid\n"
-                            "                         소속 샘플들만 모아서, ②(dominant weight/\n"
-                            "                         entropy)가 다른 샘플들보다 유의하게 더\n"
-                            "                         결정적인지 Mann-Whitney U 검정. '①이\n"
-                            "                         흐릿한 곳을 ②가 메워준다'는 ①②를 나눠\n"
-                            "                         설계한 근거를 직접 검증.\n"
-                            "  dataset_profile        : 예측 확신도, fallback 비율 등 빠른\n"
-                            "                         데이터셋 진단(예전엔 IG completeness/\n"
-                            "                         deletion_auc 포함했으나 ③=SHAP 통일로\n"
-                            "                         해당 부분은 제거 — rank_correlation이\n"
-                            "                         그 역할을 대신함)."
-                        ))
-    parser.add_argument("--query_detach_warmup_epochs", type=int, default=0,
-                        help=(
-                            "[v2, Phase 1-1, 진단/개입용] 학습 시작 후 이 값 이하 "
-                            "epoch(1-base, epoch<=N) 동안 head가 보는 query_emb 사본만 "
-                            "detach — embedder는 context_emb/agg_emb 경로로 계속 "
-                            "classification gradient를 받음(detach_context_grad와 "
-                            "대칭 위치, TabERA.forward()의 _query_for_head만 끊음). "
-                            "Phase 0에서 확인된 'epoch 1~2 사이에 query gradient가 "
-                            "급격히 우세해진다'는 관측을 causal intervention으로 "
-                            "검증하기 위함(TabERA_retrieval_failure_analysis.md 참고). "
-                            "0(기본값)이면 항상 off — 기존 동작과 100%% 동일. "
-                            "--query_detach_warmup_steps와 동시에 0이 아니면 안 됨."
-                        ))
-    parser.add_argument("--query_detach_warmup_steps", type=int, default=0,
-                        help=(
-                            "[v2, Phase 1-1] 위와 같으나 epoch 대신 전역 optimizer "
-                            "step(배치) 기준. Phase 0의 배치 단위 로그에서 collapse가 "
-                            "epoch 1 안(약 20~140 배치 사이)에 대부분 끝나는 게 "
-                            "확인돼서, 데이터셋마다 epoch당 배치 수가 다르면 epoch "
-                            "기준이 너무 거칠 수 있음 — 작은 데이터셋은 epoch=1이 "
-                            "몇 배치 안 될 수 있음. 0(기본값)이면 항상 off. "
-                            "--query_detach_warmup_epochs와 동시에 0이 아니면 안 됨."
-                        ))
-    parser.add_argument("--detach_context_grad", action="store_true",
-                        help=(
-                            "[진단용] context_emb는 head 입력으로 그대로 전달하되, "
-                            "그쪽에서 오는 gradient만 centroid_emb로 안 흐르게 끊음 "
-                            "(commitment_loss는 원래도 detach라 영향 없음, diversity_loss "
-                            "gradient는 그대로 흐름). 'task_loss와 diversity_loss가 "
-                            "centroid_emb를 두고 서로 다른 방향으로 당기며 충돌하고 있는지' "
-                            "검증용."
-                        ))
-    parser.add_argument("--no_query_emb", action="store_true",
-                        help=(
-                            "[진단용] head 입력에서 query_emb(양자화 안 된 원본 임베더 출력)를 "
-                            "제외. --global_retrieve/--no_context_emb(과거 검증 완료)와 대칭인 "
-                            "새 ablation — 지금까지 query_emb가 head에서 빠진 조합은 한 번도 "
-                            "테스트된 적이 없었음. --no_context_emb와 반대로 켜면(둘 다 켜면 "
-                            "agg_emb만 남는 극단 케이스도 가능, 경고 출력됨) head가 순수 "
-                            "quantized 신호(context_emb)만으로 예측하는 vanilla VQ-VAE식 "
-                            "bottleneck에 가까워짐. 목적: (a) query_emb의 raw 값이 최종 성능에 "
-                            "실제로 얼마나 기여하는지, (b) 그 기여도가 클수록 Explanation①이 "
-                            "예측을 얼마나 '진짜로' 설명하는지에 대한 신뢰도가 낮아진다는 "
-                            "역상관 관계를 실측하기 위함. --detach_context_grad와 함께 쓰면 "
-                            "'context_emb의 값 자체 vs gradient 경로' 중 어느 쪽이 더 "
-                            "중요한지도 나눠서 볼 수 있음."
+                            "ablation 모드 (학습된 모델에 inference 단계에서 적용):\n"
+                            "  none                        : full model 기준 (기본값)\n"
+                            "  random_neighbor             : 같은 centroid 대신 무작위 이웃 —\n"
+                            "                                'prototype grouping이 의미 있는\n"
+                            "                                 검색 제한인가'\n"
+                            "  neighbor_noise              : 이웃 임베딩을 노이즈로 대체 —\n"
+                            "                                'neighbor identity가 중요한가'\n"
+                            "  rank_correlation            : 검색 순위와 각종 기준의 상관 —\n"
+                            "                                Level 1(local ordering)과 직결\n"
+                            "  centroid_geometry           : prototype space가 어떻게 형성되는가\n"
+                            "  centroid_representativeness : prototype이 실제 data manifold를\n"
+                            "                                대표하는가 (설명 가능성)\n"
+                            "  dataset_profile             : 모델이 아니라 데이터 분석 도구\n"
+                            "\n"
+                            "[v2에서 제거된 모드] agg_emb_zero/shuffle/constant/centered,\n"
+                            "  context_emb_zero/shuffle, query_emb_zero/shuffle,\n"
+                            "  dual_space_faithfulness, interaction_check,\n"
+                            "  evidence_compensation — 전부 head([query, context, agg])\n"
+                            "  구조를 검증하던 실험이다. v2는 head(context) 하나이므로\n"
+                            "  실행 자체가 무의미하다. 과거 결과는 git 이력 참조."
                         ))
     parser.add_argument("--use_context_emb", action="store_true",
                         help=(
@@ -6072,15 +5265,6 @@ def main():
                             "기본값(v1 복원)이라 이 플래그는 더 이상 아무 효과가 없음(줘도 "
                             "안전 — 어차피 기본 동작). context_emb를 head에서 빼려면(v2식) "
                             "--no_context_emb를 쓸 것."
-                        ))
-    parser.add_argument("--no_context_emb", action="store_true",
-                        help=(
-                            "[2026-07, 되돌림 — 다시 실제 동작하는 플래그] fusion_mode와 같은 "
-                            "이유로 use_context_emb 기본값을 True(v1, [query‖context‖agg])로 "
-                            "되돌리면서, 이 플래그가 다시 원래 의미('head 입력에서 context_emb를 "
-                            "제외')를 함 — --no_query_emb와 대칭. fusion_mode='residual'과 같이 "
-                            "쓰면 z=LN(q)+β·LN(a)(context 항 자체가 빠짐). --use_context_emb는 "
-                            "이제 기본 동작과 같아서 아무 효과 없는 하위호환 플래그."
                         ))
     parser.add_argument("--ema_codebook", action="store_true",
                         help=(
@@ -6102,43 +5286,6 @@ def main():
                             "van den Oord et al. 2017 Appendix, VQ-VAE-2/Jukebox/SoundStream "
                             "공통. 이 프로젝트 데이터로 검증된 값 아님, 스윕 대상). "
                             "--ema_codebook 없이는 무효과."
-                        ))
-    parser.add_argument("--blockwise_layernorm", action="store_true",
-                        help=(
-                            "[구조 변경] head 입력을 [query‖context‖agg] 하나로 묶어 "
-                            "nn.LayerNorm(_head_in) 하나로 정규화하던 기존 방식 대신, "
-                            "블록마다 따로 LayerNorm을 건 뒤 concat. 동기: context_emb/"
-                            "agg_emb_shuffle ablation에서 acc/auroc는 안 흔들리는데 "
-                            "logloss만 폭증하는 게 확인됨(routing/retrieval에 딸린 두 "
-                            "슬롯의 값이 흔들릴 때 결합 LayerNorm 통계를 통해 query_emb "
-                            "쪽 정규화까지 흔든다는 뜻) — 학습 중에도 dead-centroid 재초기화 "
-                            "등으로 이 두 슬롯이 흔들릴 때마다 같은 경로로 embedder gradient에 "
-                            "노이즈가 새어들었을 가능성. 기존 체크포인트는 head[0]이 단일 "
-                            "LayerNorm이라 이 플래그 없이 저장된 --from_saved_state와는 "
-                            "구조가 달라 호환 안 됨(옵트인 기본 False로 하위 호환 유지)."
-                        ))
-    parser.add_argument("--head_branch_l2norm", action="store_true",
-                        help=(
-                            "[v1.1, 신규] head 입력 직전(concat 전) query/context/agg 각 "
-                            "branch를 sample-wise unit-L2-norm으로 정규화. 기본값 False "
-                            "(기존과 100%% 동일 — 하위호환). 동기: --linear_probe 실측 "
-                            "(1043/31)에서 concat(q+c+a)가 최고 단일 branch보다도 낮게 "
-                            "나오는 현상이 branch별 L2-normalize만으로 상당 부분(1043)~ "
-                            "거의 완전히(31) 회복됨을 확인 — StandardScaler(LayerNorm과 "
-                            "유사한 차원별 z-score)는 오히려 31에서 더 악화시켜서 '차원별 "
-                            "분산'이 아니라 'branch 전체 크기(norm) 격차'가 관련 있다는 "
-                            "쪽을 가리킴. 다만 그건 probe(사후 선형 분류기) 수준 관찰이라 "
-                            "이 플래그로 실제 end-to-end 재학습 시 정확도가 따라오는지 "
-                            "확인하는 게 목적 — 'L2 정규화가 도움이 된다'와 'scale "
-                            "imbalance가 원인이다'는 다른 주장이므로 여기서 검증. "
-                            "--blockwise_layernorm과 같이 쓰면(권장 안 함, 원 probe와 "
-                            "다른 조합) LN 적용 후 L2-normalize가 걸림 — 원 probe를 "
-                            "정확히 재현하려면 --blockwise_layernorm 없이 이것만 켤 것. "
-                            "켜져 있으면 head[0]의 global LayerNorm(_head_in)이 자동으로 "
-                            "빠짐(안 그러면 그 LN이 branch별 unit-norm을 다시 지움 — "
-                            "스모크 테스트로 확인된 문제라 tabera.py에서 자동 처리됨). "
-                            "기존 체크포인트와 head 구조가 달라 --from_saved_state 호환 "
-                            "안 됨(blockwise_layernorm과 같은 성격)."
                         ))
     parser.add_argument("--value_mode", type=str, default="default",
                         choices=["default", "label_only", "offset_only", "balanced",
@@ -6249,13 +5396,6 @@ def main():
                             "'single-vector pooling이 병목인가'이지 'Aggregator vs "
                             "Head 전체 문제'의 완전한 답은 아님."
                         ))
-    parser.add_argument("--interaction_n_heads", type=int, default=2,
-                        help=(
-                            "--neighbor_interaction_mode가 'attn' 또는 "
-                            "'interaction_free_baseline'일 때만 의미 있음 — "
-                            "NeighborInteractionBlock/NeighborInteractionFreeBaseline의 "
-                            "multi-head attention head 수."
-                        ))
     parser.add_argument("--aggregator_mode", type=str, default="pooling",
                         choices=["pooling", "cross_attention"],
                         help=(
@@ -6276,31 +5416,6 @@ def main():
                             "(v1은 head가 agg_emb를 안 써서 descriptive claim으로만 "
                             "제한해야 했음 — evidence.py의 HeadCrossAttention.explain_evidence "
                             "docstring 참고)."
-                        ))
-    parser.add_argument("--head_attn_alpha_override", type=float, default=None,
-                        help=(
-                            "--aggregator_mode cross_attention일 때만 의미 있음. "
-                            "HeadCrossAttention의 residual scale alpha를 학습 대신 이 "
-                            "값으로 고정. 0.0을 주면 updated_query=query_emb가 되어 "
-                            "retrieval 분기를 완전히 끈 necessity baseline이 재현됨 "
-                            "(파라미터 수는 그대로 두고 정보 흐름만 차단 — "
-                            "fusion_alpha_override=0과 같은 성격의 검증)."
-                        ))
-    parser.add_argument("--head_neighbor_source", type=str, default="real",
-                        choices=["real", "learned_const", "shuffled"],
-                        help=(
-                            "--aggregator_mode cross_attention일 때만 의미 있음. "
-                            "'real'(기본값): 실제 검색된 이웃. 'learned_const': K/V를 "
-                            "검색 결과 대신 학습 가능한 상수 토큰(k개)으로 완전히 대체 — "
-                            "attention 모듈 파라미터 수는 'real'과 100%% 동일, 늘어나는 "
-                            "건 상수 토큰 자체뿐. 'shuffled': 매 forward마다(학습 중 포함) "
-                            "배치 내에서 K/V를 무작위로 섞음 — learned_const와 달리 매 "
-                            "배치 다른 real 이웃 벡터 분포는 보되 '이 query와 이 이웃의 "
-                            "실제 대응'만 학습 내내 원천적으로 차단. 셋 다 attention 모듈 "
-                            "파라미터 수는 동일 — '실제 검색 결과 없이도 cross-attention "
-                            "형태/capacity만으로 좋아지는가'를 서로 다른 각도로 격리하는 "
-                            "capacity-only 대조군(재학습 필요 — 처음부터 이 모드로 학습해야 "
-                            "의미 있음, post-hoc 전환 아님)."
                         ))
     parser.add_argument("--allow_self_retrieval", action="store_true",
                         help=(
@@ -6389,25 +5504,6 @@ def main():
                             "재현한 것에 불과). meta.pkl에 샘플별 (centroid_id, β) 쌍을 "
                             "저장해서 사후 분석 가능."
                         ))
-    parser.add_argument("--fusion_gate_temperature", type=float, default=1.0,
-                        help=(
-                            "[v2, Phase 2 후속, 진단/개입용] fusion_mode='gated_sum' 전용. "
-                            "g = softmax(gate_logits / T). 동기: gated_sum 3-seed 실험"
-                            "(adult/1590)에서 T=1(기본)이 epoch 14~22 사이 entropy→0으로 "
-                            "완전 collapse(seed마다 다른 단일 branch로 winner-take-all — "
-                            "seed1/2는 query=1, seed3는 agg=1). 대조 실험(합성 데이터, "
-                            "toy 신호)으로 이 collapse가 초기화 시점엔 없고(균등 상태로 "
-                            "시작) 실제 예측 신호가 있을 때만 학습 중 progressive하게 "
-                            "진행됨을 확인 — gate MLP 자체의 구조적 편향이 아니라 softmax "
-                            "의 winner-take-all positive-feedback 학습 동역학(무작위 라벨 "
-                            "대조군은 40 step 내내 collapse 없음). T>1로 올리면 같은 "
-                            "logit 차이에도 확률분포가 덜 뾰족해짐(T→∞는 균등, T=1.0은 "
-                            "기존과 100%% 동일 — 하위호환). 목적은 '이게 최종 해법이다'가 "
-                            "아니라 'collapse를 억제하면 necessity가 살아나는가?'를 값싸게 "
-                            "먼저 검증하는 것(entropy_regularization/load_balancing/"
-                            "Gumbel-softmax보다 구현이 훨씬 단순해서 우선). fusion_mode!="
-                            "'gated_sum'이면 무의미(모델 생성 시 ValueError)."
-                        ))
     parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum", "concat", "onehot"],
                         help=(
                             "categorical embedding 결합 방식. 'onehot'(기본값, 채택 확정)은 "
@@ -6472,37 +5568,6 @@ def main():
                              "TabR 논문 권장 탐색 범위: LogUniform[0.01, 100.0]).")
     parser.add_argument("--plr_out_dim", type=int, default=8,
                         help="num_embedding=plr_lite일 때 컬럼당 최종 출력 차원 (기본 8).")
-    parser.add_argument("--confidence_scaling", action="store_true",
-                        help=(
-                            "[진단용] head에 들어가는 context_emb에 assignment "
-                            "confidence(top1_confidence — 실제 라우팅 soft에서 선택된 "
-                            "centroid의 확률, STE의 routing_probs와 달리 샘플마다 실제로 "
-                            "다름)를 곱함. 라우팅/검색 자체는 안 건드리고 head가 받는 "
-                            "신호의 크기만 조절 — 'context_emb norm이 지금(M=1, "
-                            "unit-norm centroid 그대로라 샘플 간 변동 0.3%% 수준)처럼 "
-                            "정보가 없는 상태를 의도적으로 깨서, 애매한 배정은 head가 "
-                            "덜 신뢰하게 만들 수 있는가'를 검증. --confidence_scaling_"
-                            "detach와 조합해 Variant A(gradient 있음)/B(없음) 비교 가능. "
-                            "부작용 가능성: 애매한 샘플(confidence 낮음)은 gradient도 "
-                            "같이 작아짐(Variant A에서만) — 학습이 오히려 불안정해질 수 "
-                            "있어 검증 안 된 개입."
-                        ))
-    parser.add_argument("--confidence_scaling_detach", action="store_true",
-                        help=(
-                            "--confidence_scaling과 함께 쓸 때만 의미 있음(Variant B). "
-                            "confidence 값 자체는 곱하되 그 경로로 gradient는 안 흐르게 "
-                            "detach — '크기 조절 효과'와 'gradient 흐름 변화'를 분리해서 "
-                            "보기 위함."
-                        ))
-    parser.add_argument("--context_projection", action="store_true",
-                        help=(
-                            "[구조 조정] context_emb를 head로 보내기 전 학습 가능한 "
-                            "Linear를 하나 거치게 함. detach_context_grad와 달리 "
-                            "gradient가 여전히 centroid_emb까지 도달함. optimize.py "
-                            "--context_projection으로 학습한 study가 있으면 그 "
-                            "best_params를 쓰는 게 이상적이지만, 없으면 기존 study "
-                            "best_params 위에 이 구조만 얹어 1회 재학습(별도 study 불필요)."
-                        ))
     parser.add_argument("--loss_commitment_override", type=float, default=None,
                         help=(
                             "[통제 실험용] best_params의 loss_commitment 값을 이 값으로 "
@@ -6631,99 +5696,6 @@ def main():
                             "도 같이 저장. fusion_mode≠'residual'이면 β가 정의되지 않아 "
                             "이 5개 필드는 저장되지 않음(콘솔에 안내 출력)."
                         ))
-    parser.add_argument("--log_fusion_trajectory", action="store_true",
-                        help=(
-                            "[진단용] fusion_mode=residual일 때 α/β와 branch norm"
-                            "(||LN(q)||/||LN(c)||/||LN(a)||)을 epoch마다 기록"
-                            "(meta.pkl의 fusion_trajectory_history). 지금까지는 최종값만 "
-                            "있어서 '처음부터 거의 안 움직였다'와 '오르내리다 지금 값에 "
-                            "안착했다'를 구분 못 했음. norm까지 같이 봐야 'α≈1'이라는 "
-                            "숫자 자체가 실제 기여량과 비례하는지 판단 가능 "
-                            "(||LN(q)‖≫||αLN(c)||면 α가 1이어도 사실상 안 쓰는 것과 같음)."
-                        ))
-    parser.add_argument("--log_centroid_label_mi_trajectory", action="store_true",
-                        help=(
-                            "[2026-07, 신규] I(C;Y)/H(Y) — centroid 배정이 label을 "
-                            "얼마나 설명하는가 — 를 epoch마다 검증 세트 기준으로 기록"
-                            "(meta.pkl의 centroid_label_mi_history). 새 지표가 아니라 "
-                            "--export_centroid_retrieval_behavior 분석에서 이미 검증한 "
-                            "지표(cross-dataset corr(I(C;Y)/H(Y), AUROC)≈0.92)를 최종값 "
-                            "하나가 아니라 학습 중 궤적으로 보기 위함 — 'prototype이 "
-                            "label-aware partition으로 조직되는 과정'을 직접 보여줄 수 "
-                            "있는지 확인. embedder+prototype_layer만 거치는 가벼운 "
-                            "추가 forward(retrieve/aggregate/head 불필요). "
-                            "tasktype=regression이면 label이 연속값이라 무의미 — 그 "
-                            "경우 항상 빈 리스트로 남음(에러는 안 남)."
-                        ))
-    parser.add_argument("--log_shuffle_ablation_trajectory", action="store_true",
-                        help=(
-                            "[2026-07, 신규] 'retrieval은 optimization scaffold(학습 중엔 "
-                            "query representation 형성에 기여하지만, 추론 시점엔 query "
-                            "자체가 이미 충분해져서 agg 의존도가 낮다)' 가설 검증용. "
-                            "inference-time --ablation query_emb_shuffle/agg_emb_shuffle과 "
-                            "정확히 같은 조작(model.forward()의 ablation_mode 그대로 재사용, "
-                            "새 model 코드 없음)을 검증 세트에 대해 epoch마다"
-                            "(--regroup_log_every 간격) 반복해서 accuracy delta를 기록"
-                            "(meta.pkl의 shuffle_ablation_trajectory_history). "
-                            "--log_branch_gradients의 agg_grad_share가 학습 내내 "
-                            "20~40%%를 유지해도, 이 델타가 학습 후반으로 갈수록 0에 "
-                            "가까워진다면 — '학습에는 쓰이지만 추론엔 덜 쓰인다'는 "
-                            "가설이 직접 뒷받침됨. retrieve/aggregate/head까지 다 거치는 "
-                            "forward를 3회(none/query_emb_shuffle/agg_emb_shuffle) 반복하므로 "
-                            "log_centroid_label_mi_trajectory보다 비쌈 — 매 epoch 대신 "
-                            "--regroup_log_every 간격으로만 계산. tasktype=regression이면 "
-                            "accuracy 개념이 없어 빈 리스트로 남음."
-                        ))
-    parser.add_argument("--log_representation_drift_trajectory", action="store_true",
-                        help=(
-                            "[2026-07, 신규/수정] 'encoder가 agg가 주던 방향을 query "
-                            "representation 안으로 점점 흡수(internalize)한다'는 가설 "
-                            "검증용. --log_shuffle_ablation_trajectory가 retrieval "
-                            "contribution이 '감소한다'는 건 보여주지만 '왜' 감소하는지는 "
-                            "간접 증거였음 — 이건 representation 자체의 이동을 직접 잼. "
-                            "고정 anchor(X_val 앞 256개, 매 epoch 동일 샘플)에 대해 첫 "
-                            "로깅 epoch의 query_emb/agg_emb/centroid_id를 스냅샷으로 "
-                            "저장해두고, 이후 epoch마다 같은 배치를 다시 흘려서 그 대비 "
-                            "query_drift_from_epoch0(‖q_t-q_0‖, 얼마나 움직였는가), "
-                            "cos_drift_vs_agg0(cos(q_t-q_0, a_0) — 핵심 지표, 움직인 "
-                            "'방향'이 초기 retrieval 방향과 같은가. a_t를 '정답'처럼 쓰면 "
-                            "a_t 자체도 매 epoch retrieval이 바뀌며 계속 움직여서 애매해지므로 "
-                            "a_0를 고정 기준점으로 쓴 cosine으로 설계), "
-                            "cos_query_t_vs_agg0(cos(q_t, a_0) — 최종 query가 초기 retrieval을 "
-                            "닮아가는가), cos_query_agg_raw(cos(q_t, a_t), pre-LN/raw), "
-                            "cos_query_agg_post_ln(cos(LN(q_t), LN(a_t)) — 같은 epoch·배치), "
-                            "cos_query_agg_post_linear(cos(h_q, h_a), h_q=W@LN(q_t)+b, "
-                            "h_a=β·W@LN(a_t) — head 첫 Linear를 지난 뒤. 세 값을 나란히 보면 "
-                            "raw에서는 안 보이던 방향성이 LN에서 생기는지, 아니면 그 뒤 Linear "
-                            "weight까지 가야 벌어지는지 구분됨 — 이전엔 이 비교를 서로 다른 두 "
-                            "실행(--log_fusion_trajectory 따로)을 --deterministic 재현성에 기대어 "
-                            "겹쳐봤는데, 이제 한 실행 안에서 동시에 나옴. fusion_mode≠residual이면 "
-                            "post_ln/post_linear는 None), "
-                            "[2026-07, 추가] query_norm_raw/agg_norm_raw/query_norm_post_ln/"
-                            "agg_norm_post_ln/hq_norm_post_linear/ha_norm_post_linear — cosine은 "
-                            "방향만 보고 크기(head가 실제로 받는 신호 magnitude)는 안 보므로, "
-                            "각 단계의 ‖·‖도 같이 기록(특히 hq_norm/ha_norm_post_linear는 head가 "
-                            "각 branch에서 실제로 받는 projection 크기 — 이게 학습 초반에 이미 "
-                            "안정화되는지, cosine 안정화 시점과 같은지 다른지 비교할 것). "
-                            "centroid_stability_vs_epoch0(같은 centroid로 배정된 비율)를 기록"
-                            "(meta.pkl의 representation_drift_history). "
-                            "embedder+prototype+retrieve+aggregate까지 다 거치는 forward라 "
-                            "X_val 전체가 아니라 고정 256개 subset만 씀 — "
-                            "--regroup_log_every 간격으로만 계산. tasktype=regression이면 "
-                            "빈 리스트로 남음."
-                        ))
-    parser.add_argument("--fusion_alpha_override", type=float, default=None,
-                        help=(
-                            "[구조 변경] fusion_mode=residual에서 α를 학습 가능한 "
-                            "파라미터 대신 이 값으로 고정(register_buffer, "
-                            "requires_grad=False). '학습이 α≈1을 선택했다'와 "
-                            "'α=1로 고정해도 비슷한 성능이 나온다'는 다른 주장 — "
-                            "{0, 0.5, 1, 2} 등으로 스윕해서 causal하게 확인하기 위함. "
-                            "fusion_mode!=residual이거나 --no_context_emb와 같이 쓰면 "
-                            "TabERA 생성자가 ValueError."
-                        ))
-    parser.add_argument("--fusion_beta_override", type=float, default=None,
-                        help="fusion_alpha_override와 대칭, agg 쪽(β) 고정값.")
     parser.add_argument("--learn_evidence_temperature", action="store_true",
                         help=(
                             "[2026-07, 신규] evidence softmax의 온도 T를 고정값(1.0) 대신 "
@@ -6757,23 +5729,6 @@ def main():
                             "retrieval 있는 구조 기준 study를 재사용(k/n_prototypes 등은 이 "
                             "모드에서 안 쓰이므로 무의미하지만 해는 없음) — study_pkl_tag에 "
                             "'..no_retrieval' 태그가 붙어 기존 study와 안 섞임."
-                        ))
-    parser.add_argument("--evidence_metric_override", type=str, default=None,
-                        choices=["euclidean", "cosine", "cosine_scaled"],
-                        help=(
-                            "[통제 실험용] AttentionAggregator의 evidence_w 유사도 공간. "
-                            "기본(None)이면 model_kwargs의 evidence_metric(보통 'euclidean', "
-                            "기존과 동일)을 그대로 씀. 'euclidean'은 -‖q-k‖²(raw, 정규화 "
-                            "안 됨) — jasmine 실측: query_emb norm이 학습 중 커지면서(최대 "
-                            "89배) evidence_w가 사실상 1-NN으로 붕괴, evidence_temperature "
-                            "스윕(0.5~10)으로도 해결 안 됨(고정 스칼라로는 계속 커지는 norm을 "
-                            "못 따라잡음). 'cosine'은 q,k를 CentroidLayer 라우팅과 동일하게 "
-                            "정규화 후 2·cos(q,k) — norm 자체가 계산에서 빠져 이 collapse "
-                            "메커니즘을 원천 제거. 'cosine_scaled'는 여기에 hyperspherical "
-                            "sharpness scale(√2·log(k-1), routing_scale과 같은 원리를 evidence "
-                            "후보 개수 k에 독립 적용 — routing_scale 값 자체를 재사용하는 "
-                            "건 아님)을 곱함. --dropout_override와 같은 패턴 — model_kwargs에 "
-                            "반영, --from_saved_state와 같이 쓰면 재학습을 안 하므로 무효과."
                         ))
     parser.add_argument("--evidence_temperature_override", type=float, default=None,
                         help=(
@@ -6899,8 +5854,16 @@ def main():
                             "위치에 놓이는지를 결정. 0으로 주면 노이즈 없이 anchor를 그대로 "
                             "복제. model_kwargs에 반영 — --from_saved_state와는 같이 못 씀."
                         ))
-    parser.add_argument("--refresh_on_best", action="store_true",
+    parser.add_argument("--refresh_on_best", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help=(
+                            "[v2 기본값 True — 끄려면 --no-refresh_on_best] "
+                            "⚠ 이 플래그를 끄면 retrieval 관련 진단이 **전부 무효**가 된다. "
+                            "학습 중 저장된 memory.keys는 dropout이 걸린 옛 시점 임베딩이라 "
+                            "최종 가중치로 인코딩한 test query와 다른 함수다. 실측 그룹 구조 "
+                            "일치도(ARI): ds=14 0.518 / ds=46 0.067 / ds=1489 0.006 → "
+                            "refresh 후 1.000. 이 설정을 빠뜨려 diversity/routing 관련 "
+                            "결론이 대거 무효화된 전례가 있어 기본값을 True로 뒀다. "
                             "[설명가능성/재현성] best_state(및 feature_store) 복원 직후, "
                             "memory.keys를 raw feature(feature_store._store)로부터 현재 "
                             "(frozen) 가중치로 다시 인코딩해 덮어쓴다. 학습 중 저장된 값은 "
@@ -6948,6 +5911,51 @@ def main():
                             "많은 데이터셋에서는 그만큼 배로 느려지므로 필요할 때만 켤 것."
                         ))
     args = parser.parse_args()
+
+    # ── [Step A, v2 정리] 폐기된 옵션의 기본값 주입 ────────────────
+    # 아래 항목은 v2에서 폐기 확정되어 **CLI에서 제거**했다. 다만 코드
+    # 곳곳(96개소)이 args.<이름>을 참조하므로, 그 참조를 전부 지우는 대신
+    # 폐기 시점의 기본값을 주입한다. 실행 경로는 항상 이 값을 타므로
+    # 해당 기능은 사실상 죽은 코드가 되고, CLI 표면적만 줄어든다.
+    #
+    # ⚠ 이후 실제 코드 제거(Step B)에서 이 블록도 함께 사라져야 한다.
+    #   지금 지우지 않는 이유는 fusion_alpha/beta가 supervised.py 학습
+    #   루프까지 80회 참조되어 있어 한 번에 건드리면 위험하기 때문이다.
+    _V2_DEPRECATED_DEFAULTS = {
+        # retrieval projection — 7지표 전부 null (TABERA_V2_DESIGN.md §2-8)
+        "retr_proj_mode": "none",
+        "detach_retr_grad": False,
+        # fusion variants — v1 중간 실험. 결과표에 없음
+        "fusion_alpha_override": None,
+        "fusion_beta_override": None,
+        "fusion_gate_temperature": 1.0,
+        # head 실험 — 결과표에 없음
+        "blockwise_layernorm": False,
+        "head_branch_l2norm": False,
+        "confidence_scaling": False,
+        "confidence_scaling_detach": False,
+        "context_projection": "none",
+        "head_attn_alpha_override": None,
+        "head_neighbor_source": "memory",
+        "interaction_n_heads": 1,
+        # trajectory 로깅 — 미사용
+        "log_fusion_trajectory": False,
+        "log_centroid_label_mi_trajectory": False,
+        "log_shuffle_ablation_trajectory": False,
+        "log_representation_drift_trajectory": False,
+        # v1 잔여 — head 입력 구성 실험
+        "no_query_emb": False,
+        "no_context_emb": False,
+        "detach_context_grad": False,
+        "query_detach_warmup_epochs": 0,
+        "query_detach_warmup_steps": 0,
+        "freeze_encoder_retrain_head": False,
+        "freeze_head_epochs": 0,
+        "evidence_metric_override": None,
+    }
+    for _k, _v in _V2_DEPRECATED_DEFAULTS.items():
+        if not hasattr(args, _k):
+            setattr(args, _k, _v)
 
     # [2026-07, 되돌림] use_context_emb=True가 다시 기본값(v1 복원) — 기존 여러
     # 곳에 흩어진 "not args.no_context_emb" 사용처를 하나하나 안 고치고, 여기서
