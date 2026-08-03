@@ -45,6 +45,23 @@ parser.add_argument("--no_offset_correction", action="store_true",
                         "아니라 이 실행 전체에 고정 적용되는 구조 선택임 "
                         "(HPO 노이즈와 ablation 신호를 분리하기 위함)."
                     ))
+# ── [2026-07, S-1A] retrieval 전용 표현 분기 ──────────────────────
+# [주의] 이 인자들은 study_pkl_tag에 반영되어 **study 파일이 분리된다.**
+# 반영을 빠뜨리면 reproduce.py가 baseline study를 읽어와, "retrieval 전용
+# 표현인데 그것 없이 튜닝된 하이퍼파라미터"로 학습하게 된다 —
+# --global_retrieve에서 실제로 겪은 사고이며 에러 없이 조용히 틀린다.
+parser.add_argument("--retr_proj_mode", type=str, default="none",
+                    choices=["none", "linear", "mlp"],
+                    help=(
+                        "retrieval 전용 projection. none=V1과 완전 동일. "
+                        "linear=D→D, mlp=residual 2-layer. identity 초기화라 "
+                        "학습 전에는 셋이 같은 값을 낸다."))
+parser.add_argument("--detach_retr_grad", action="store_true",
+                    help=(
+                        "retrieval loss의 gradient를 shared encoder로 흘리지 않음. "
+                        "[v2에서 제거됨] "
+                        "없으므로 이 플래그 유무가 같은 결과여야 하고, 그 일치가 "
+                        "sanity check가 된다."))
 parser.add_argument("--global_retrieve", action="store_true",
                     help=(
                         "[진단용] retrieve()에서 centroid 그룹 제약을 끄고 "
@@ -75,8 +92,11 @@ parser.add_argument("--context_projection", action="store_true",
                         "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
                         "centroid_x/confidence) 계산에는 관여하지 않음."
                     ))
-parser.add_argument("--fusion_mode", type=str, default="concat",
-                    choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"],
+parser.add_argument("--fusion_mode", type=str, default="proto_only_linear",
+                    choices=["concat", "residual", "gated_sum", "anchor_gate",
+                             "context_gated_beta", "proto_residual",
+                             "proto_query_residual", "proto_only", "proto_only_linear",
+                             "query_only_linear", "proto_residual_query"],
                     help=(
                         "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
                         "폭넓은 비교 실험(6개 데이터셋)에서도 concat 대비 일관된 우위를 "
@@ -195,6 +215,7 @@ if not os.path.exists(savepath):
 
 _ablation_tag = study_pkl_tag(
     no_offset_correction=args.no_offset_correction,
+    retr_proj_mode=args.retr_proj_mode,
     global_retrieve=args.global_retrieve,
     detach_context_grad=args.detach_context_grad,
     context_projection=args.context_projection,
@@ -244,6 +265,9 @@ if train:
     print(f"  Trials  : {completed_trials_count} done / {args.n_trials} total  ({remaining_trials} remaining)")
     if args.no_offset_correction:
         print(f"  Ablation: T(query-neighbour) offset correction OFF (value=label_emb only)")
+    if args.retr_proj_mode != "none":
+        print(f"  [S-1A] retrieval 전용 표현: retr_proj={args.retr_proj_mode}, "
+              f"detach_retr_grad={args.detach_retr_grad}")
     if args.global_retrieve:
         print(f"  Diagnostic: retrieve() group-constraint OFF (global KNN, context_emb unaffected)")
     if args.detach_context_grad:
@@ -292,7 +316,8 @@ if train:
     def objective(trial):
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id, metric=args.metric,
-                                        num_embedding=args.num_embedding)
+                                        num_embedding=args.num_embedding,
+                                        fusion_mode=args.fusion_mode)
         # sqrt(N) 기반 n_prototypes override (가설 ② 복잡도 개선)
         params["n_prototypes"] = n_proto_default
         trial.set_user_attr("n_prototypes_actual", n_proto_default)
@@ -319,6 +344,8 @@ if train:
             # 오프셋 보정을 켜고 끔. Optuna 탐색 대상이 아니라 이 실행 전체에
             # 고정 적용 (기본값 True = 기존 TabR 방식 그대로).
             use_offset_correction=not args.no_offset_correction,
+            retr_proj_mode=args.retr_proj_mode,
+            detach_retr_grad=args.detach_retr_grad,
             global_retrieve=args.global_retrieve,
             detach_context_grad=args.detach_context_grad,
             use_context_projection=args.context_projection,
