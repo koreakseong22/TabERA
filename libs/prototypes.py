@@ -515,6 +515,32 @@ class CentroidLayer(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # ── [Step 1-4] 안정성 진단용 상태 ─────────────────────
+        # EMA / codebook loss가 겨냥하는 failure(centroid drift)가 TabERA에
+        # 실제 존재하는지 진단하기 위한 관측 변수. regroup_update()가 매 에폭
+        # 갱신하고, 결과는 반환 dict → supervised.regroup_history → meta.pkl.
+        #
+        # ⚠ register_buffer를 쓰지 않는다(의도적).
+        #   buffer로 등록하면 state_dict에 새 키가 생겨 기존 체크포인트의
+        #   --from_saved_state가 load_state_dict(strict=True)에서 깨진다.
+        #   진단용 상태는 저장할 필요도 없다. 대가는 체크포인트를 로드해
+        #   재개할 때 첫 에폭의 drift가 nan이 되는 것뿐(정상 동작).
+        self._diag_prev_centroid = None    # (P, D)  직전 에폭 종료 시점 centroid
+        self._diag_prev_assign   = None    # (N,)    직전 에폭 배정
+        self._diag_prev_active   = None    # (P,)    bool
+        self._diag_prev_sizes    = None    # (P,)    long
+        self._diag_reinit_mask   = None    # (P,)    bool, 직전 에폭에 reinit됨
+
+        # ── [Step 1-4] dead_reinit 자체를 평가하기 위한 이력 ──────
+        # dead_reinit은 retrieval 성능을 직접 올리는 장치가 아니라
+        # "죽은 centroid를 다시 사용되게 만드는" 장치다.
+        # ⚠ 평가 기준은 "오래 살아있는가"(VQ 관점)가 아니라
+        #   "재초기화 이후 실제로 배정을 받고 쓸 만한 cluster를 형성하는가"다.
+        #   TabERA에서 centroid의 목적은 retrieval partition이므로.
+        self._diag_reinit_total  = None    # (P,) long  누적 재초기화 횟수
+        self._diag_since_reinit  = None    # (P,) long  마지막 재초기화 후 경과 에폭
+                                           #            (-1 = 재초기화된 적 없음)
+
     # ─────────────────────────────────────────────────────────
     # 초기화: 훈련 데이터로 centroid 설정
     # ─────────────────────────────────────────────────────────
@@ -733,6 +759,21 @@ class CentroidLayer(nn.Module):
             new_groups[p] = mask_cpu.tolist()
             sizes[p] = len(new_groups[p])
 
+        # ── [Step 1-4] 안정성 진단: 스냅샷만 여기서 ──────────────
+        # centroid_emb를 "이번 에폭 학습 직후 / reinit 직전" 시점에 잡아둔다.
+        # 실제 지표 계산은 함수 끝(reinit 및 sizes 재계산 이후)에서 한다 —
+        # reinit이 일어나면 아래에서 sample_groups/sizes가 통째로 다시
+        # 계산되므로, 여기서 size 기반 지표를 만들면 반환되는 active_ratio
+        # 등과 서로 다른 시점의 값이 되어버린다.
+        _diag_cur_centroid = self.centroid_emb.detach().clone()
+        _reinit_jumps: List[float] = []
+        _reinit_mask_now = torch.zeros(P, dtype=torch.bool,
+                                       device=self.centroid_emb.device)
+        _dev = self.centroid_emb.device
+        if self._diag_reinit_total is None or self._diag_reinit_total.numel() != P:
+            self._diag_reinit_total = torch.zeros(P, dtype=torch.long, device=_dev)
+            self._diag_since_reinit = torch.full((P,), -1, dtype=torch.long, device=_dev)
+
         # [수정] sample_groups(=KNN 검색 범위로 실제 쓰이는 캐시) 발행만
         # warmup 동안 미룬다 — 예전엔 이 함수 전체가 조기 반환돼서 아래
         # dead-centroid reinit까지 같이 꺼져 있었는데(사용자 지적), reinit은
@@ -774,6 +815,13 @@ class CentroidLayer(nn.Module):
                         anchor  = X_emb[src_idx].float()
                         noise   = torch.randn_like(anchor) * self.dead_reinit_noise_scale * anchor.norm().clamp(min=1e-6)
                         new_vec = F.normalize(anchor + noise, dim=-1)
+                        # [Step 1-4] reinit 점프량 기록 — drift와 분리해야
+                        # EMA/codebook이 겨냥하는 신호가 묻히지 않는다.
+                        _reinit_jumps.append(float(torch.norm(
+                            new_vec.to(self.centroid_emb.dtype)
+                            - self.centroid_emb.data[p]
+                        )))
+                        _reinit_mask_now[p] = True
                         self.centroid_emb.data[p] = new_vec.to(self.centroid_emb.dtype)
                         self.dead_streak[p] = 0
                         n_reinit += 1
@@ -817,12 +865,153 @@ class CentroidLayer(nn.Module):
                 sizes[p] = len(new_groups[p])
             self.sample_groups = new_groups
 
+        # ── [Step 1-4] 안정성 지표 계산 (reinit·sizes 재계산 이후) ──
+        # drift는 "얼마나 움직였나"가 아니라 "수렴하는가"로 정의한다.
+        #   정상   ΔC: 0.8 → 0.5 → 0.3 → 0.15 → 0.07   (수렴)
+        #   drift  ΔC: 0.7 → 0.6 → 0.8 → 0.5  → 0.7    (계속 흔들림)
+        # 스칼라 하나가 아니라 에폭별 궤적으로 기록하고 추세를 본다.
+        # centroid가 움직이는 것 자체는 failure가 아니다 — 학습 초반에는
+        # 당연히 움직인다. failure는 "안정화되지 못하는 것"이다.
+        #
+        # reinit 이동은 drift가 아니다 — dead_reinit은 정의상 centroid를 멀리
+        # 던지므로(실측 매 에폭 평균 2.7개) 섞이면 신호가 묻힌다. 그래서
+        #   - _diag_prev_centroid 는 "reinit 이후"(에폭 종료 시점) 값을 저장
+        #   - _diag_cur_centroid  는 "학습 직후 / reinit 직전" 값
+        # 로 잡는다. 이러면 reinit된 centroid의 다음 에폭 이동량이
+        # "새 자리에서 정착하는 이동"이 되어 점프가 섞이지 않는다.
+        #
+        # centroid_emb는 항상 단위벡터로 유지되므로(supervised.py가 매
+        # optimizer step 후 재투영) L2 거리는 코사인 거리와 단조 관계다.
+        _diag: Dict[str, float] = {}
+        _sizes_t = torch.tensor(sizes, device=self.centroid_emb.device,
+                                dtype=torch.long)
+        _active = _sizes_t > 0
+
+        if self._diag_prev_centroid is not None:
+            _step = torch.norm(_diag_cur_centroid - self._diag_prev_centroid, dim=-1)
+            _rm = self._diag_reinit_mask
+            if _rm is None or _rm.numel() != P:
+                _rm = torch.zeros_like(_active)
+            _sel = _active & (~_rm)            # 살아있고 + 직전에 reinit 안 됨
+            if bool(_sel.any()):
+                _diag["drift_mean"] = float(_step[_sel].mean())
+                _diag["drift_max"]  = float(_step[_sel].max())
+            if bool(_rm.any()):
+                # 직전 에폭에 재초기화된 centroid가 자리 잡는 이동 (별도 지표)
+                _diag["drift_settle_mean"] = float(_step[_rm].mean())
+        else:
+            # 첫 에폭 또는 체크포인트 재개 직후 (plain 속성이라 복원 안 됨)
+            _diag["drift_mean"] = float("nan")
+
+        # assignment 변경률 — centroid가 조금만 움직여도 배정이 뒤집힐 수
+        # 있으므로 이동량과 함께 봐야 의미가 있다.
+        #
+        # ⚠ 이 값 하나만으로 "centroid가 불안정하다"고 읽으면 안 된다.
+        #   regroup에 들어오는 X_emb는 매 에폭 재인코딩된 MemoryBank keys라
+        #   배정 변화에는 두 원인이 섞여 있다:
+        #     (a) centroid가 움직여서   (b) 임베딩 자체가 움직여서
+        #   아래 assign_change_centroid_only가 (a)만 분리한다 —
+        #   같은 임베딩을 직전 centroid와 현재 centroid로 각각 배정해 비교.
+        #   전체 변화율에서 이 값을 빼면 대략 (b)의 몫이 된다.
+        _assign_final = (assignments_final if (n_reinit > 0 and not in_warmup)
+                         else assignments_cpu)
+        if (self._diag_prev_assign is not None
+                and self._diag_prev_assign.numel() == _assign_final.numel()):
+            _diag["assign_change_rate"] = float(
+                (_assign_final != self._diag_prev_assign).float().mean()
+            )
+        if self._diag_prev_centroid is not None:
+            with torch.no_grad():
+                _q = F.normalize(X_emb.float(), dim=-1)
+                _a_prev = (_q @ F.normalize(self._diag_prev_centroid.float(), dim=-1).T).argmax(-1)
+                _a_cur  = (_q @ F.normalize(self.centroid_emb.detach().float(), dim=-1).T).argmax(-1)
+                _diag["assign_change_centroid_only"] = float((_a_prev != _a_cur).float().mean())
+
+        # active_delta — 개수가 같아도 구성이 바뀌었는지.
+        # (24 → 24 인데 A,B가 죽고 C,D가 새로 생긴 경우를 구분한다.
+        #  active_centroids만 보면 이 둘이 똑같아 보인다.)
+        if self._diag_prev_active is not None and self._diag_prev_active.numel() == P:
+            _diag["active_delta"] = int((_active ^ self._diag_prev_active).sum())
+            _diag["active_died"]  = int((self._diag_prev_active & (~_active)).sum())
+            _diag["active_born"]  = int(((~self._diag_prev_active) & _active).sum())
+
+        # size shock — 살아있는 채로 일어나는 대규모 재편(20 → 2 등).
+        # active_delta는 죽고 사는 것만 잡으므로 이 지표로만 보인다.
+        if self._diag_prev_sizes is not None and self._diag_prev_sizes.numel() == P:
+            _delta = (_sizes_t - self._diag_prev_sizes).abs()
+            _base  = torch.clamp(self._diag_prev_sizes, min=1)
+            _shock = (_delta >= 5) & (_delta.float() / _base.float() >= 0.5)
+            _diag["size_shock_count"] = int(_shock.sum())
+            _diag["size_shock_ids"]   = _shock.nonzero(as_tuple=True)[0].tolist()
+
+        if _reinit_jumps:
+            _diag["reinit_jump_mean"] = float(sum(_reinit_jumps) / len(_reinit_jumps))
+            _diag["reinit_jump_max"]  = float(max(_reinit_jumps))
+
+        # ── dead_reinit 평가 지표 ────────────────────────────────
+        # ⚠ 평가 기준은 "오래 살아있는가"가 아니다. 그건 VQ-VAE의 관점이다
+        #   (거기선 codebook이 유일한 정보 경로라 죽으면 모델이 망가진다).
+        #   TabERA에서 centroid의 목적은 retrieval하기 좋은 partition을
+        #   만드는 것이므로, 기준도 거기 맞춰야 한다:
+        #
+        #     Case A  20 epoch 생존, cluster size 1  → 오래 살아도 쓸모없음
+        #     Case B  3 epoch마다 reinit, 매번 희귀 영역을 잘 대표
+        #             → 분포 변화에 적응하는 것일 수 있음. 문제가 아님
+        #
+        #   Jukebox/SoundStream의 목적도 "오래 살아라"가 아니라
+        #   "사용되는 code가 되라"였다. 그래서 주 지표는 배정을 받는지다.
+        #
+        # 주 지표: 재초기화된 centroid가 실제로 assignment를 받는가
+        # 참고 지표: survival / repeat — 판정 기준이 아니라 Case B 식별용
+        _prev_since = self._diag_since_reinit.clone()
+        _ever = _prev_since >= 0
+        self._diag_since_reinit = torch.where(_ever, _prev_since + 1, _prev_since)
+        if bool(_reinit_mask_now.any()):
+            self._diag_since_reinit[_reinit_mask_now] = 0
+            self._diag_reinit_total[_reinit_mask_now] += 1
+
+        _tot = self._diag_reinit_total
+        if bool((_tot > 0).any()):
+            _re = _tot > 0                      # 한 번이라도 재초기화된 centroid
+
+            # [주] 배정을 받는가 — dead_reinit의 목적에 직접 대응
+            _diag["reinit_assigned_rate"] = float((_re & _active).sum() / _re.sum())
+            _diag["reinit_dead_now"]      = int((_re & (~_active)).sum())
+
+            # [주] 형성된 cluster가 retrieval에 쓸 수 있는 크기인가.
+            #      k는 여기서 모르므로 크기 분포를 그대로 내보내고 판정은 밖에서.
+            _diag["reinit_size_mean"]   = float(_sizes_t[_re].float().mean())
+            _diag["reinit_size_median"] = float(_sizes_t[_re].float().median())
+            _diag["reinit_size_max"]    = int(_sizes_t[_re].max())
+            # 비교 기준: 재초기화된 적 없는 살아있는 centroid의 크기
+            _never = (~_re) & _active
+            if bool(_never.any()):
+                _diag["never_reinit_size_mean"] = float(_sizes_t[_never].float().mean())
+
+            # [참고] 판정 기준 아님 — Case B(짧게 살지만 잘 대표) 식별용
+            _diag["reinit_repeat_rate"] = float((_tot >= 2).sum() / _re.sum())
+            _diag["reinit_max_count"]   = int(_tot.max())
+            _alive_re = _re & _active
+            if bool(_alive_re.any()):
+                _diag["reinit_age_mean"] = float(
+                    self._diag_since_reinit[_alive_re].float().mean())
+
+        # 다음 에폭용 상태 갱신 — centroid는 "reinit 이후"(최종) 값을 저장
+        self._diag_prev_centroid = self.centroid_emb.detach().clone()
+        self._diag_prev_assign   = _assign_final.clone()
+        self._diag_prev_active   = _active.clone()
+        self._diag_prev_sizes    = _sizes_t.clone()
+        self._diag_reinit_mask   = _reinit_mask_now
+
         if in_warmup:
             # sample_groups는 발행 안 했지만 reinit_count는 warmup 중에도
             # 실제로 일어난 값을 그대로 보고 — 로그로 "warmup 중 몇 개가
             # 이미 구제됐는지" 볼 수 있게 한다.
+            # [Step 1-4] _diag도 함께 반환 — warmup 중에도 centroid는
+            # 움직이므로, 이 구간을 비우면 "수렴하는가" 판정의 앞부분이
+            # 통째로 사라진다.
             return {"active_ratio": 0.0, "min_cluster_size": 0,
-                    "max_cluster_size": 0, "reinit_count": n_reinit}
+                    "max_cluster_size": 0, "reinit_count": n_reinit, **_diag}
 
         # 통계
         n_assigned = sum(1 for s in sizes if s > 0)
@@ -834,6 +1023,7 @@ class CentroidLayer(nn.Module):
             "reinit_count":     n_reinit,
             "min_cluster_size": int(min(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
             "max_cluster_size": int(max(s for s in sizes if s > 0)) if any(s > 0 for s in sizes) else 0,
+            **_diag,
         }
 
     # ─────────────────────────────────────────────────────────
