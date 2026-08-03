@@ -46,6 +46,14 @@ optimize.py/reproduce.py 둘 다 이 값을 직접 import해서 쓰고, 각자
 # AdaCos fixed-scale 공식 (Zhang et al. 2019, CVPR)
 # ─────────────────────────────────────────────────────────────
 
+# ── [v2] k 탐색 제외 대상 ────────────────────────────────────────
+# retrieval이 예측 경로 밖인 fusion_mode에서는 k가 HPO objective에
+# 영향을 주지 않는다. 아래 모드에서는 k를 고정한다.
+_K_UNTUNED_MODES = ("proto_only", "proto_only_linear",
+                    "query_only_linear", "proto_residual_query")
+DEFAULT_K_NO_TUNE = 8
+
+
 def adacos_fixed_scale(n_prototypes: int) -> float:
     """centroid routing softmax의 scale factor를 탐색 대신 공식으로 계산.
 
@@ -98,6 +106,9 @@ def study_pkl_tag(
     use_context_emb: bool = True,  # [2026-07, 추가] fusion_mode='residual'일 때만
         # 의미 있음(query+β·agg만 쓸지, context도 head에 넣을지). True(기본값)면
         # 태그 없음 — 하위 호환.
+    # [2026-07, S-1A] retrieval 전용 표현 분기. study를 분리해야 baseline
+    # 하이퍼파라미터로 조용히 학습되는 사고를 막는다(--global_retrieve 때 겪음).
+    retr_proj_mode: str = "none",
     disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜" retrieval-free
         # baseline(Model 2, TabERA.__init__ 참고). False(기본값)면 태그 없음 —
         # 하위 호환. [교훈] fusion_mode를 "기본값=태그 없음"으로 짰다가 v2 freeze
@@ -140,6 +151,7 @@ def study_pkl_tag(
     맞춰줘야 함 — 이게 오히려 안전한 방향).
     """
     return ("..no_offset" if no_offset_correction else "") \
+         + (f"..retrproj_{retr_proj_mode}" if retr_proj_mode != "none" else "") \
         + ("..global_retrieve" if global_retrieve else "") \
         + ("..detach_ctx" if detach_context_grad else "") \
         + ("..ctx_proj" if context_projection else "") \
@@ -187,6 +199,10 @@ def get_search_space(
                                    # optimize.py는 항상 args.num_embedding을 명시적으로
                                    # 넘기므로 실제 파이프라인 동작엔 영향 없음 — 이 함수를
                                    # 직접 호출하는 경우(테스트/노트북 등)를 위한 방어적 기본값.
+    fusion_mode: str = "proto_only_linear",  # [v2] k 탐색 여부를 결정한다.
+                                   # retrieval이 예측 경로 밖인 모드에서는 k를 고정
+                                   # (_K_UNTUNED_MODES 참고). optimize.py가
+                                   # args.fusion_mode를 명시적으로 넘겨야 한다.
 ) -> dict:
     """
     Optuna Trial로부터 TabHERA 하이퍼파라미터를 샘플링합니다.
@@ -218,7 +234,15 @@ def get_search_space(
         # 재검증 필요 — 특히 이제 fusion_mode=residual+no_context_emb를
         # HPO 시점부터 직접 탐색하므로(아래 참고), k의 중요도도 이
         # architecture 기준으로 다시 봐야 함.
-        "k":               trial.suggest_categorical("k", [4, 8, 16, 32, 48, 64]),
+        # ⚠ [v2] retrieval이 예측 경로 밖인 모드에서는 k가 **예측에 영향을 주지
+        #   않는다** — logits가 context_emb(또는 query_emb)만으로 계산되므로
+        #   HPO objective가 k에 반응하지 않는다. 탐색하면 무작위 선택이 되어
+        #   탐색 예산만 낭비한다.
+        #   k는 Stage 2(설명용 이웃 개수)의 configuration이며, 필요하면
+        #   Level 1 지표(lo_spearman_mean 등)로 별도 선택한다.
+        #   기본값 8 — LLM 입력 길이를 고려한 값(4는 부족, 16은 과다).
+        "k": (DEFAULT_K_NO_TUNE if fusion_mode in _K_UNTUNED_MODES
+              else trial.suggest_categorical("k", [4, 8, 16, 32, 48, 64])),
         # [원복 — 2026-07] embedder_layers를 [2,4] → [1,4]로 되돌림.
         # 좁혔던 근거({1:2, 2:1, 3:9, 4:10} 분포, 아래 원래 주석)가 이후
         # 재검토 결과 두 가지 문제가 있었음:
@@ -252,7 +276,14 @@ def get_search_space(
         #       off-diagonal mean=0.172로 centroid 분리 불충분 확인.
         #       top1-top2 logit gap=0.020으로 confidence flat 심화.
         #       하한을 5e-2로 올려 최소한의 centroid 분리도 보장.
-        "loss_diversity":  trial.suggest_float("loss_diversity",  5e-2, 5e-1, log=True),
+        # ⚠ [v2] diversity loss는 **비활성화**되었다.
+        #   fresh 조건(--refresh_on_best) 재검증에서 retrieval 지표
+        #   (rank_info / fallback / gain)와 예측 성능 모두 유의차가 없었다.
+        #   코드는 CentroidLayer 최소화 실험(Phase 1)을 위해 남겨두되
+        #   탐색 공간에서는 제외한다.
+        #   Disabled and excluded from optimization search.
+        #   Retained only for backward compatibility.
+        "loss_diversity":  0.0,
 
         # [수정] loss_commitment 하한: 1e-4 → 1e-2
         # 근거: colic(id=25) seed=1에서 loss_diversity=0.466, loss_commitment=0.0019으로
@@ -345,12 +376,19 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         # fresh params 딕셔너리)에는 k=16이 있지만, reproduce.py가 나중에
         # study.best_params를 다시 읽어올 때는 k가 아예 없어서
         # KeyError가 남 — .get()으로 같은 고정값(16)을 fallback으로 사용.
-        "k":               params.get("k", 16),
+        # ⚠ [v2] retrieval이 예측 경로 밖인 fusion_mode에서는 get_search_space가
+        #   k를 suggest하지 않으므로 best_params에 키가 없다. 그 경우
+        #   DEFAULT_K_NO_TUNE(8)을 쓴다 — 학습 시점의 값과 일치해야 한다.
+        #   (구버전 study 호환을 위해 키가 있으면 그 값을 그대로 쓴다.)
+        "k":               params.get("k", DEFAULT_K_NO_TUNE),
         "embedder_layers": params["embedder_layers"],
         "dropout":         params["dropout"],
         "n_output":        n_output,
         "loss_weights": {
-            "diversity":   params["loss_diversity"],
+            # ⚠ [v2] diversity는 탐색 공간에서 제외됐으므로 신규 study의
+            #   best_params에는 이 키가 없다. 0.0으로 fallback한다
+            #   (탐색에서 제외 = 비활성화와 같은 의미).
+            "diversity":   params.get("loss_diversity", 0.0),
             "commitment":  params["loss_commitment"],
             # .get() — codebook_loss 추가 이전에 저장된 구버전 study의
             # best_params에는 이 키가 없음 (그런 경우 codebook_loss 자체가
