@@ -2009,7 +2009,6 @@ def run_single_seed(
         print(f"  [train_seed={train_seed}] 학습 초기화/배치 순서 seed (데이터 분할은 --seed={args.seed} 그대로)")
 
     _save_tag = (f"..retrproj_{args.retr_proj_mode}" if args.retr_proj_mode != "none" else "") \
-              + (f"..snn{args.snn_lambda:g}" if args.snn_lambda else "") \
               + ("..detachretr" if args.detach_retr_grad else "") \
               + ("..global_retrieve" if args.global_retrieve else "") \
               + ("..detach_ctx" if args.detach_context_grad else "") \
@@ -2057,6 +2056,9 @@ def run_single_seed(
                  else (f"..evM_{args.evidence_metric}" if args.evidence_metric != "euclidean" else "")) \
               + (f"..bs{args.batch_size_override}" if args.batch_size_override is not None else "") \
               + (f"..rwe{args.regroup_warmup_epochs_override}" if args.regroup_warmup_epochs_override is not None else "") \
+              + ("..nodr" if args.disable_dead_reinit else "") \
+              + (f"..cb{args.loss_codebook_override:g}" if args.loss_codebook_override is not None else "") \
+              + (f"..cm{args.loss_commitment_override:g}" if args.loss_commitment_override is not None else "") \
               + (f"..drp{args.dead_reinit_patience_override}" if args.dead_reinit_patience_override is not None else "") \
               + (f"..drn{args.dead_reinit_noise_scale_override:g}" if args.dead_reinit_noise_scale_override is not None else "") \
               + (f"..trainseed{train_seed}" if train_seed != args.seed else "") \
@@ -2098,8 +2100,8 @@ def run_single_seed(
         # ablation을 돌려도 meta에는 retr_proj_mode='none'(기본값)이 남는다.
         # 이 때문에 정상 결과를 "잘못된 체크포인트"로 오판한 사례가 있었다.
         _key_cfg = {k: model_kwargs.get(k) for k in
-                    ("retr_proj_mode", "detach_retr_grad", "snn_lambda", "snn_tau",
-                     "unif_beta", "global_retrieve", "disable_retrieval_branch",
+                    ("retr_proj_mode", "detach_retr_grad",
+                     "global_retrieve", "disable_retrieval_branch",
                      "value_mode", "use_offset_correction", "k", "embed_dim",
                      "n_prototypes", "fusion_mode")
                     if k in model_kwargs}
@@ -2350,6 +2352,12 @@ def run_single_seed(
             print(f"  [--regroup_warmup_epochs_override] regroup_warmup_epochs: "
                   f"{_old_warmup} → {args.regroup_warmup_epochs_override} "
                   f"(나머지 파라미터는 best_params 그대로)")
+        if args.disable_dead_reinit:
+            # patience를 학습 epoch 수보다 크게 두면 재초기화가 한 번도
+            # 발생하지 않는다 — 별도 분기 추가 없이 완전 OFF를 만든다.
+            model_kwargs["dead_reinit_patience"] = 10 ** 9
+            print(f"  [--disable_dead_reinit] dead_reinit 비활성화 "
+                  f"(patience=1e9 — 재초기화 이벤트 없음)")
         if args.dead_reinit_patience_override is not None:
             _old_patience = model_kwargs.get("dead_reinit_patience", 5)
             model_kwargs["dead_reinit_patience"] = args.dead_reinit_patience_override
@@ -2374,9 +2382,6 @@ def run_single_seed(
             use_offset_correction=(args.value_mode != "label_only"),
             retr_proj_mode=args.retr_proj_mode,
             detach_retr_grad=args.detach_retr_grad,
-            snn_lambda=args.snn_lambda,
-            snn_tau=args.snn_tau,
-            unif_beta=args.unif_beta,
             global_retrieve=args.global_retrieve,
             use_context_emb=not args.no_context_emb,
             use_query_emb_in_head=not args.no_query_emb,
@@ -5131,6 +5136,88 @@ def run_single_seed(
                     return (d1.cpu().numpy(), margin.cpu().numpy(), ent.cpu().numpy(),
                             top2.indices[:, 0].cpu().numpy())
 
+                # ── [Level 1] local ordering — neighborhood preservation ──
+                # [정의] Local ordering is the preservation of meaningful
+                #   neighborhood structure within each retrieval partition.
+                #   Raw-feature neighborhood preservation is **one measurable
+                #   proxy**, not the definition itself — TabERA의 임베딩은
+                #   예측을 위해 학습된 표현이므로 raw 유클리드 거리를 반드시
+                #   보존해야 할 이유는 없다(범주형 임베딩, 비선형 표현 등).
+                #
+                # [왜 필요한가] 지금까지 retrieval 평가는 전부 label 축이었다
+                #   (gain over random / rank_info / purity). Stage 1이
+                #   classification을 거의 완성하므로, label 축으로 재면
+                #   추가 정보가 0이 나오는 것이 자연스럽다.
+                #   Level 1은 **label을 쓰지 않고** 순서 자체를 평가한다.
+                #
+                # 측정: 같은 centroid 그룹 안에서
+                #   raw feature 거리 순위  vs  임베딩 거리 순위
+                #   → Spearman 상관, Recall@k (raw 기준 top-k를 임베딩이 몇 개 찾나)
+                #
+                # ⚠ Stage 1(proto_only)은 label loss만 쓴다. 그런데도 raw
+                #   geometry가 유지되면 흥미로운 결과이고, 붕괴하면
+                #   "local ordering이 실제로 사라졌다"고 말할 수 있다.
+                try:
+                    _fs = getattr(model, "_feature_store", None)
+                    if _fs is not None and _nmem > 0:
+                        _raw = _fs._store[:_nmem].detach().float().to(_cE.device)
+                        _asg = _trQ @ _cN.T
+                        _asg = _asg.argmax(-1).cpu().numpy()
+                        _sp, _rc, _ng = [], [], 0
+                        _kk = min(int(getattr(model, "k", 16)), 16)
+                        for _c in np.unique(_asg):
+                            _idx = np.where(_asg == _c)[0]
+                            if len(_idx) < _kk + 2:
+                                continue
+                            if len(_idx) > 400:      # 비용 상한
+                                _idx = _idx[:400]
+                            _ii = torch.as_tensor(_idx, device=_cE.device)
+                            _R = _raw[_ii]
+                            _E = _trQ[_ii]
+                            _dR = torch.cdist(_R, _R)
+                            _dE = 1.0 - (_E @ _E.T)          # 임베딩은 코사인 기준
+                            _n = len(_idx)
+                            _eye = torch.eye(_n, device=_cE.device, dtype=torch.bool)
+                            _dR = _dR.masked_fill(_eye, float("inf"))
+                            _dE = _dE.masked_fill(_eye, float("inf"))
+                            # Spearman: 각 행의 거리 순위 상관
+                            _rR = _dR.argsort(-1).argsort(-1).float()
+                            _rE = _dE.argsort(-1).argsort(-1).float()
+                            _rRc = _rR - _rR.mean(-1, keepdim=True)
+                            _rEc = _rE - _rE.mean(-1, keepdim=True)
+                            _num = (_rRc * _rEc).sum(-1)
+                            _den = (_rRc.norm(dim=-1) * _rEc.norm(dim=-1)).clamp_min(1e-12)
+                            _sp.append(float((_num / _den).mean()))
+                            # Recall@k: raw 기준 top-k 중 임베딩 top-k에 몇 개
+                            _tR = _dR.topk(_kk, dim=-1, largest=False).indices
+                            _tE = _dE.topk(_kk, dim=-1, largest=False).indices
+                            _hit = (_tR.unsqueeze(-1) == _tE.unsqueeze(1)).any(-1).float().mean()
+                            _rc.append(float(_hit))
+                            _ng += 1
+                        if _sp:
+                            _rb_savez_kwargs.update(
+                                lo_spearman_mean=np.array([float(np.mean(_sp))]),
+                                lo_recall_at_k_mean=np.array([float(np.mean(_rc))]),
+                                lo_n_groups=np.array([_ng]),
+                                lo_spearman_per_group=np.array(_sp, dtype=np.float64),
+                                lo_recall_per_group=np.array(_rc, dtype=np.float64),
+                            )
+                            print(f"  [local ordering] raw-vs-embedding  "
+                                  f"Spearman={np.mean(_sp):.4f}  "
+                                  f"Recall@{_kk}={np.mean(_rc):.4f}  "
+                                  f"(groups={_ng})")
+                            # ⚠ 절대값 해석 기준 (합성 대조, n=120, D=16, k=8):
+                            #     항등 사상 + 유클리드 측정   Spearman 1.000 / Recall 1.000
+                            #     항등 사상 + **코사인** 측정  Spearman 0.767 / Recall 0.639
+                            #     무관(랜덤)                  Spearman 0.016 / Recall 0.072
+                            #   TabERA의 라우팅·검색이 코사인이므로 여기서도 코사인을
+                            #   쓰지만, 코사인은 norm 정보를 버리므로 **상한이 1.0이 아니다.**
+                            #   0.77 근처면 사실상 완전 보존, 0.1 이하면 붕괴로 읽는다.
+                            #   조건 간 **상대 비교**(concat vs proto_only)가 주 용도다.
+                except Exception as _le:
+                    _rb_savez_kwargs["local_ordering_error"] = np.array(
+                        [f"{type(_le).__name__}: {_le}"], dtype=object)
+
                 _d_tr, _m_tr, _e_tr, _a_tr = _geo(_trQ)
                 _d_te, _m_te, _e_te, _a_te = _geo(_teQ)
                 _rb_savez_kwargs.update(
@@ -5389,9 +5476,6 @@ def run_single_seed(
         "use_offset_correction": True,
         "retr_proj_mode": args.retr_proj_mode,
         "detach_retr_grad": args.detach_retr_grad,
-        "snn_lambda": args.snn_lambda,
-        "snn_tau": args.snn_tau,
-        "unif_beta": args.unif_beta,
         "global_retrieve": args.global_retrieve,
         "use_context_emb": not args.no_context_emb,
         "use_query_emb_in_head": not args.no_query_emb,
@@ -5817,30 +5901,9 @@ def main():
                              "identity 초기화라 학습 전에는 셋이 같은 값을 낸다.")
     parser.add_argument("--detach_retr_grad", action="store_true",
                         help="retrieval loss의 gradient를 shared encoder로 흘리지 않음. "
-                             "⚠ --snn_lambda와 독립 축이다. λ=0이면 어차피 gradient가 "
+                             "[v2에서 제거됨 — retr_proj와 함께 삭제] "
                              "없으므로 이 플래그 유무가 같은 결과여야 하고, 그 일치가 "
                              "sanity check가 된다.")
-    parser.add_argument("--snn_lambda", type=float, default=0.0,
-                        help="[2026-08 ablation 결과: 기본값 0 유지 권장] "
-                             "ds=14 5 seed, --refresh_on_best 조건에서 "
-                             "snn 0.05 vs 0 비교 — 설계 목표인 rank informativeness는 "
-                             "1.0252 vs 1.0163 (p=0.71)로 **변화 없고**, 예측 성능도 "
-                             "acc/f1/auroc/logloss 전부 유의차 없음(p=0.36~0.84). "
-                             "유일한 유의 효과는 그룹 내 purity(+0.052, p=0.019)인데 "
-                             "이는 그룹 구성에 지배되는 지표라 retrieval 기여를 "
-                             "재지 못한다(gain over random으로는 p=0.53). "
-                             "즉 'retrieval을 별도 목적으로 학습시킨다'가 작동하지 않는다. "
-                             "코드는 다른 데이터셋 재확인용으로 남겨둔다. "
-                             "Soft Nearest Neighbor surrogate 가중치. "
-                             "0이면 SNN이 꺼진다(= projection 층만 추가한 대조군, "
-                             "Phase 0b). projection 복구 실험은 λ>0 + --detach_retr_grad.")
-    parser.add_argument("--snn_tau", type=float, default=0.1,
-                        help="SNN 온도. 낮을수록 강하게 뭉친다 — 너무 낮으면 클래스가 "
-                             "한 점으로 붕괴해 rank 정보가 오히려 사라진다(V1로 회귀).")
-    parser.add_argument("--unif_beta", type=float, default=0.0,
-                        help="uniformity 가중치(붕괴 방지). SNN 단독으로는 붕괴를 "
-                             "감지 못한다 — 합성 검증에서 붕괴 시 SNN=0.0001로 "
-                             "'성공'처럼 보이는데 uniformity만 -2.87→-1.35로 튀었다.")
     parser.add_argument("--branch_info_shuffles", type=int, default=5,
                         help="information gain의 null 대조 shuffle 횟수 "
                              "(0=null 계산 안 함/기존 동작, 3=빠른 디버깅, "
@@ -6254,9 +6317,11 @@ def main():
                             "상태에서도 아직 미반영(exclusion 적용 안 됨) — 재현 목적으로 예전 "
                             "결과와 정확히 비교하려면 이 플래그로 예전 동작을 켤 것."
                         ))
-    parser.add_argument("--fusion_mode", type=str, default="concat",
+    parser.add_argument("--fusion_mode", type=str, default="proto_only_linear",
                         choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta",
-                                 "proto_residual", "proto_query_residual", "proto_only", "proto_only_linear"],
+                                 "proto_residual", "proto_query_residual", "proto_only",
+                                 "proto_only_linear", "query_only_linear",
+                                 "proto_residual_query"],
                         help=(
                             "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
                             "6개 데이터셋에 걸친 폭넓은 비교(ablation/trajectory/retrieval-free "
@@ -6801,6 +6866,17 @@ def main():
                             "--dropout_override와 같은 패턴 — model_kwargs에 반영(모델 구조 "
                             "파라미터이므로 --from_saved_state와는 같이 못 씀, 이미 만들어진 "
                             "모델의 CentroidLayer 설정은 재학습 없이 못 바꿈)."
+                        ))
+    parser.add_argument("--disable_dead_reinit", action="store_true",
+                        help=(
+                            "[통제 실험용, Phase 1] dead_reinit을 완전히 끈다. "
+                            "patience_override를 크게 주는 것과 달리 재초기화 이벤트가 "
+                            "아예 발생하지 않는다. "
+                            "⚠ 질문이 바뀌었다 — 'collapse를 막는가'가 아니라 "
+                            "'CE가 못 벗어나는 local minimum을 escape시키는가'다. "
+                            "proto_only_linear에서는 CE 자체가 collapse 압력을 만든다"
+                            "(같은 centroid의 모든 샘플이 같은 예측을 받으므로). "
+                            "실측: ds=1489에서 concat 활성 6/65 → proto_only 52/65."
                         ))
     parser.add_argument("--dead_reinit_patience_override", type=int, default=None,
                         help=(
