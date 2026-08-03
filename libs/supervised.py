@@ -864,14 +864,18 @@ class TabERAWrapper:
                     _active_ratio_history.append(regroup_stats.get("active_ratio", 0.0))
 
                     self.final_regroup_stats = dict(regroup_stats)
-                    self.regroup_history.append({
-                        "epoch": float(epoch),
-                        "active_ratio": float(regroup_stats.get("active_ratio", 0.0)),
-                        "active_centroids": float(regroup_stats.get("active_centroids", 0.0)),
-                        "pruned_this_epoch": float(regroup_stats.get("pruned_this_epoch", 0.0)),
-                        "min_cluster_size": float(regroup_stats.get("min_cluster_size", 0.0)),
-                        "max_cluster_size": float(regroup_stats.get("max_cluster_size", 0.0)),
-                    })
+                    # ⚠ [수정] 고정 키 6개만 담으면 regroup_update가 새로 반환하는
+                    #   진단이 **조용히 유실된다.** 실제로 reinit_count와 drift 계열
+                    #   진단이 이렇게 사라져 dead_reinit 발동 여부조차 확인할 수
+                    #   없었다(같은 유형의 유실이 evidence_stats / retr_diag에서도
+                    #   발생했다). 스칼라 키는 전부 자동으로 담는다.
+                    _rec = {"epoch": float(epoch)}
+                    for _k, _v in regroup_stats.items():
+                        if isinstance(_v, bool):
+                            _rec[_k] = float(_v)
+                        elif isinstance(_v, (int, float)):
+                            _rec[_k] = float(_v)
+                    self.regroup_history.append(_rec)
 
                     # ── retrieve()의 하이브리드 임계값을 실제 GPU 여유 메모리
                     # 기준으로 매 epoch 갱신 (근거 없는 고정 상수 대신).
