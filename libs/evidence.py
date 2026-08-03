@@ -360,6 +360,7 @@ class AttentionAggregator(nn.Module):
                  use_offset_correction: bool = True,
                  tasktype: str = "regression", n_classes: Optional[int] = None,
                  evidence_temperature: float = 1.0,
+                 learn_evidence_temperature: bool = False,
                  evidence_metric: str = "euclidean",
                  value_mode: str = "default",
                  neighbor_interaction_mode: Optional[str] = None,  # [v2, 추가]
@@ -431,8 +432,30 @@ class AttentionAggregator(nn.Module):
         self.k = k
         self.use_offset_correction = use_offset_correction
         self.tasktype = tasktype
-        self.evidence_temperature = evidence_temperature
-        if value_mode not in ("default", "offset_only", "balanced", "offset_normalized", "sum_normalized"):
+        # [2026-07] learn_evidence_temperature=True면 T를 학습 파라미터로 둥다.
+        # [배경] 기본값 T=1.0은 HPO 탐색 대상도 아니어서 한 번도 조정된 적이 없었다.
+        # 그런데 관측된 similarity margin이 0.03~0.68이라 softmax(sim/1.0)은
+        # 산술적으로 거의 균등분포가 된다(n_eff/k≈1, 10/10 데이터셋).
+        # 또 최적 sharpness가 k에 따라 다르다는 증거도 있다(k=4에선 sharp가
+        # +1.4%p 우세, k=48에선 -14.1%p). k는 HPO가 정하고 T는 고정이니 둘이
+        # 맞을 이유가 없다 — 모델이 직접 찾게 하는 것이 이 옵션의 목적.
+        # softplus로 T>0을 보장하고, log_evidence_temperature=0으로 초기화하면
+        # softplus(0)=0.693이므로 오프셋을 두어 시작값이 정확히 evidence_temperature
+        # 와 같게 맞췄다(기존 실험과 동일 출발점).
+        self.learn_evidence_temperature = learn_evidence_temperature
+        if learn_evidence_temperature:
+            import math as _math
+            _t0 = float(evidence_temperature)
+            # softplus(x)=t0 를 만족하는 x = log(exp(t0)-1)
+            _x0 = _math.log(_math.expm1(_t0)) if _t0 < 20 else _t0
+            self.log_evidence_temperature = nn.Parameter(torch.tensor(float(_x0)))
+            self.evidence_temperature = _t0   # 참고용 스칼라(실제 사용은 property)
+        else:
+            self.evidence_temperature = evidence_temperature
+        if value_mode not in ("default", "offset_only", "balanced", "offset_normalized",
+                              "sum_normalized", "neighbor_only", "neighbor_offset",
+                              "interaction", "interaction_only",
+                              "interaction_ln"):
             raise ValueError(
                 f"value_mode은 'default'/'offset_only'/'balanced'/'offset_normalized'/"
                 f"'sum_normalized' 중 하나: {value_mode}"
@@ -493,6 +516,76 @@ class AttentionAggregator(nn.Module):
             )
         else:
             self.T = None
+
+        # ── [V2] Evidence Constructor ────────────────────────────────
+        # [배경] 지금까지의 value는 전부 **집계 대상 자체**를 바꾸는 시도였다:
+        #   label_only     그룹 라벨 요약        auroc 0.9799 (기준)
+        #   offset_only    T(q − n_i)           차이 항 하나만
+        #   neighbor_only  n_i (이웃 표현 자체)  auroc 0.9767 (−0.0032, p=0.01) ← 유의하게 악화
+        # 즉 "무엇을 retrieval 하는가"는 여러 번 바꿔봤으나 효과가 없었다.
+        #
+        # [가설] 필요한 것은 이웃의 **표현**이 아니라 query–neighbor **관계**다.
+        #   retrieve → (query와 비교) → reason → evidence
+        # 현재는 가운데 두 단계가 없고 바로 평균을 낸다.
+        #
+        # v_i = n_i + MLP([q, n_i, n_i−q, |n_i−q|, q⊙n_i])
+        #
+        # ⚠ residual 형태를 쓴다. MLP가 0을 출력하면 `neighbor_only`와 동일해져
+        #   학습 초기에 알려진 동작에서 출발한다(최적화가 쉽고, 실패해도
+        #   기존보다 나쁘지 않은 하한이 있다).
+        # ⚠ |n−q|는 부호 없는 거리 성분 — n−q만 쓰면 방향만 남아
+        #   "얼마나 먼가"가 표현되지 않는다.
+        # ⚠ q⊙n은 곱 상호작용 — 합/차만으로는 표현 못 하는 항이다.
+        #   `offset_only`가 실패한 이유 중 하나가 이것일 수 있다(합성 검증에서
+        #   offset의 이웃 간 pairwise cos가 +0.47로 가장 높았다 — 모든 이웃이
+        #   q라는 공통 성분을 공유해 방향이 몰린다).
+        #
+        # ⚠ state_dict에 키가 추가되므로, 이 모듈이 없는 기존 체크포인트를
+        #   strict=True로 로드하면 깨진다. value_mode='interaction'일 때만 생성.
+        self.evidence_constructor = None
+        if value_mode in ("interaction", "interaction_only", "interaction_ln"):
+            d_in = embed_dim * 5
+            d_hid = embed_dim * 2
+            self.evidence_constructor = nn.Sequential(
+                nn.Linear(d_in, d_hid),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_hid, embed_dim, bias=False),
+            )
+            # ⚠ zero-init은 `interaction`(α 없음)에서만 쓴다.
+            #   `interaction_ln`은 r = tanh(α)·LN(raw)인데, MLP를 zero-init하면
+            #     raw = 0  →  ∂loss/∂α = <grad, LN(raw)> = 0  →  α 고정
+            #     α = 0    →  ∂loss/∂raw 에 α가 곱해짐        →  MLP도 고정
+            #   서로가 서로를 0으로 묶는 **데드락**이 된다.
+            #   실측: 5 seed 전부 α=0, ‖raw‖=0으로 학습 내내 정지.
+            #   → α 게이트가 있으면 MLP는 일반 초기화를 쓴다. α=0이 이미
+            #     "시작 시 v=n" 안전장치를 제공하므로 zero-init이 불필요하다.
+            if value_mode == "interaction":
+                nn.init.zeros_(self.evidence_constructor[-1].weight)
+
+        # ── residual 안정화 (value_mode='interaction_ln') ─────────────
+        #   v = n + α · LN(r)
+        #
+        # [배경] `interaction`(제어 없는 residual) 실측:
+        #   proj비 0.109 / perp비 0.994  → residual의 99%가 n에 **직교**.
+        #     즉 MLP는 neighbor amplifier가 아니라 실제로 새 방향을 만든다.
+        #   그런데 ‖r‖이 19 → 4,953으로 40배 폭주하고 seed 간 100배 편차.
+        #   → 실패 원인은 **표현력 부족이 아니라 크기 제어 실패**다.
+        #
+        # ⚠ `LayerNorm(n + r)`을 쓰면 안 된다 — neighbor의 절대 크기와
+        #   evidence의 "강도"까지 함께 정규화해버린다. 지금 문제는
+        #   **방향은 맞고 크기만 틀린 것**이므로 residual만 정규화한다.
+        #
+        # α는 스칼라 파라미터, tanh로 감싸 |α| < 1을 보장하고 0에서 시작한다.
+        # → 학습 초기 v = n (neighbor_only와 동일), residual 폭주는 구조적으로 불가.
+        self.ec_residual_ln = None
+        self.ec_residual_alpha = None
+        if value_mode == "interaction_ln":
+            self.ec_residual_ln = nn.LayerNorm(embed_dim)
+            # ⚠ α=0으로 시작하면 ∂loss/∂raw 에 tanh(0)=0이 곱해져 MLP gradient가
+            #   0이 된다. 작은 양수에서 시작해 양방향 gradient를 살린다.
+            #   tanh(0.1) ≈ 0.0997 이므로 residual 초기 기여는 ‖n‖의 10% 이하다.
+            self.ec_residual_alpha = nn.Parameter(torch.full((1,), 0.1))
 
         self.dropout = nn.Dropout(dropout)
 
@@ -614,7 +707,12 @@ class AttentionAggregator(nn.Module):
             # geometry. std로 이 둘을 구분.
             evidence_diag["similarity_std_per_sample"] = similarities.detach().std(dim=-1)  # (B,)
 
-        evidence_w = F.softmax(similarities / self.evidence_temperature, dim=-1)    # (B, k)
+        # [2026-07] 학습 모드면 softplus로 양수 보장된 T를 쓴다.
+        _T = (F.softplus(self.log_evidence_temperature)
+              if self.learn_evidence_temperature else self.evidence_temperature)
+        evidence_w = F.softmax(similarities / _T, dim=-1)    # (B, k)
+        if self.learn_evidence_temperature:
+            evidence_diag["evidence_temperature_value"] = float(_T.detach())
 
         # dropout은 softmax 직후 적용.
         evidence_w = self.dropout(evidence_w)
@@ -623,7 +721,134 @@ class AttentionAggregator(nn.Module):
         #    (use_offset_correction=False면 T() 항 없이 label_emb만 사용 — "label_only" ablation)
         label_emb = self._encode_labels(neighbour_labels)      # (B, k, D)
 
-        if self.use_offset_correction:
+        # ── [V2 재설계] neighbor 표현을 value로 쓰는 모드 ────────────
+        # [배경] 현재 value는 label_emb(또는 +offset)이라 agg가
+        #   "이 그룹에 어떤 label이 많은가"만 전달한다. 그런데 centroid
+        #   배정도 query의 함수이므로 context_emb가 이미 같은 것을 말한다
+        #   (실측: agg←context R² 0.75~0.97, agg의 query 대비 gain ≈ 0).
+        #   즉 retrieval이 **local evidence extractor**가 아니라
+        #   **centroid-conditioned label summary extractor**로 작동하고 있다.
+        #
+        # nk = 이웃의 key 임베딩(= 그 이웃의 query_emb, retrieval과 같은 공간).
+        #   이걸 value로 쓰면 agg가 "주변 실제 샘플들이 어떤 표현인가"를
+        #   담게 되어, label 축이 아니라 **manifold 기하** 축이 된다.
+        #
+        #   neighbor_only    values = nk                  이웃의 절대 표현
+        #   neighbor_offset  values = nk + T(q − nk)      절대 + query 상대
+        #
+        # ⚠ 차원은 D로 유지한다(concat 아님) — agg_emb가 head의 branch
+        #   슬라이스 폭과 맞아야 하므로. cat([nk, offset])은 2D가 되어
+        #   head 구조까지 바꿔야 한다(별도 실험).
+        # ⚠ 이것도 여전히 query의 결정론적 함수다. 목적은 "새 정보 추가"가
+        #   아니라 **query가 표현하기 어려운 local structure를 명시적으로
+        #   제공하는 inductive bias**다.
+        # ⚠ offset_term은 아래 분기에서만 정의된다 — 진단 코드가
+        #   use_offset_correction만 보고 참조하면 UnboundLocalError가 난다
+        #   (neighbor_only는 use_offset_correction=True인데 T()를 안 씀).
+        #   여기서 None으로 초기화하고, 진단은 `is not None`으로 판정한다.
+        offset_term = None
+        if self.value_mode == "interaction_only":
+            # v_i = MLP([q, n_i, n_i−q, |n_i−q|, q⊙n_i])   ← residual 없음
+            # [배경] `interaction`(residual)에서 MLP가 새 방향을 만들지 않고
+            #   neighbor를 rescale하는 데 그칠 수 있다(ec_r_proj_ratio로 확인).
+            #   residual 형태는 "n을 그대로 복사"가 가능해서 그 지름길이 있다.
+            #   이 모드는 n을 보존하지 않으므로 **query–neighbor 관계를
+            #   표현하지 않으면 아무것도 못 만든다.**
+            # ⚠ 대신 zero-init 안전장치가 없어 학습 초기가 불안정할 수 있다.
+            _q = query_emb.unsqueeze(1).expand_as(nk)
+            _d = nk - _q
+            values = self.evidence_constructor(
+                torch.cat([_q, nk, _d, _d.abs(), _q * nk], dim=-1))
+        elif self.value_mode == "interaction_ln":
+            # v_i = n_i + α · LN(MLP([q, n_i, n_i−q, |n_i−q|, q⊙n_i]))
+            _q = query_emb.unsqueeze(1).expand_as(nk)
+            _d = nk - _q
+            _raw = self.evidence_constructor(
+                torch.cat([_q, nk, _d, _d.abs(), _q * nk], dim=-1))
+            _alpha = torch.tanh(self.ec_residual_alpha)
+            _r = _alpha * self.ec_residual_ln(_raw)
+            values = nk + _r
+            with torch.no_grad():
+                _rn = _r.norm(dim=-1)
+                _nn = nk.norm(dim=-1).clamp_min(1e-8)
+                _nhat = nk / _nn.unsqueeze(-1)
+                _proj = (_r * _nhat).sum(-1)
+                _perp = (_r - _proj.unsqueeze(-1) * _nhat).norm(dim=-1)
+                _rd = _rn.clamp_min(1e-8)
+                evidence_diag["ec_residual_norm_mean"] = float(_rn.mean())
+                evidence_diag["ec_residual_norm_std"]  = float(_rn.std())
+                evidence_diag["ec_residual_rel_mean"]  = float((_rn / _nn).mean())
+                evidence_diag["ec_cos_value_neighbor"] = float(
+                    F.cosine_similarity(values, nk, dim=-1).mean())
+                evidence_diag["ec_r_proj_ratio"] = float((_proj.abs() / _rd).mean())
+                evidence_diag["ec_r_perp_ratio"] = float((_perp / _rd).mean())
+                evidence_diag["ec_cos_r_neighbor"] = float(
+                    F.cosine_similarity(_r, nk, dim=-1).mean())
+                evidence_diag["ec_cos_r_query"] = float(
+                    F.cosine_similarity(_r, _q, dim=-1).mean())
+                evidence_diag["ec_alpha"] = float(_alpha)
+                evidence_diag["ec_raw_norm_mean"] = float(_raw.norm(dim=-1).mean())
+        elif self.value_mode == "interaction":
+            # v_i = n_i + MLP([q, n_i, n_i−q, |n_i−q|, q⊙n_i])
+            _q = query_emb.unsqueeze(1).expand_as(nk)          # (B, k, D)
+            _d = nk - _q
+            _feat = torch.cat([_q, nk, _d, _d.abs(), _q * nk], dim=-1)   # (B, k, 5D)
+            _r = self.evidence_constructor(_feat)              # (B, k, D) residual
+            values = nk + _r
+            # ── Evidence Constructor 진단 ──────────────────────────
+            # ⚠ 이 두 지표는 **게이트**다. ‖r‖ ≈ 0이면 MLP가 neighbor_only에서
+            #   전혀 움직이지 않았다는 뜻이고, 그러면 성능·구조 지표를 해석할
+            #   근거가 없다(zero-init residual이라 시작점이 정확히 0이다).
+            #
+            #   ‖r‖ ≈ 0            MLP가 안 배움 → 나머지 해석 무의미
+            #   ‖r‖ 큰데 성능 그대로  배우긴 했으나 유용한 evidence가 아님
+            #   ‖r‖ 크고 성능/구조 개선  Evidence Constructor 작동
+            #
+            # cos(v_i, n_i)는 "이웃 표현을 얼마나 재해석했는가"다.
+            #   시작 1.0 → 학습이 진행되며 감소하면 재구성이 일어난 것.
+            # ⚠ ‖r‖은 스케일 의존이므로 ‖r‖/‖n‖(상대값)도 함께 남긴다 —
+            #   절대값만으로는 데이터셋/embed_dim 간 비교가 안 된다.
+            with torch.no_grad():
+                _rn = _r.norm(dim=-1)                          # (B, k)
+                _nn = nk.norm(dim=-1).clamp_min(1e-8)
+                evidence_diag["ec_residual_norm_mean"] = float(_rn.mean())
+                evidence_diag["ec_residual_norm_std"]  = float(_rn.std())
+                evidence_diag["ec_residual_rel_mean"]  = float((_rn / _nn).mean())
+                evidence_diag["ec_cos_value_neighbor"] = float(
+                    F.cosine_similarity(values, nk, dim=-1).mean())
+                # ── residual 분해 — "scaling인가 새 방향인가" ──────────
+                # ⚠ cos(v, n)만 보면 오해할 수 있다. v = n + r 에서 ‖n‖이 크면
+                #   r이 새 방향이어도 cos(v,n)은 1에 가깝게 나온다.
+                #   따라서 **r 자체**를 n 방향과 직교 방향으로 분해해야 한다.
+                #
+                #   r = proj_n(r) + perp(r)
+                #     proj 비중 ≈ 1  →  r ≈ c·n. MLP가 interaction이 아니라
+                #                        **neighbor amplifier**를 배운 것
+                #     perp 비중 큼   →  실제로 새 방향을 만들고 있음
+                #
+                # cos(r, q)도 같이 본다 — query 방향으로만 몰리면
+                # (offset_only에서 관측된 문제) 이웃별 구별이 사라진다.
+                _nhat = nk / _nn.unsqueeze(-1)
+                _proj = (_r * _nhat).sum(-1)                    # (B, k) 부호 있는 투영
+                _perp = (_r - _proj.unsqueeze(-1) * _nhat).norm(dim=-1)
+                _rd = _rn.clamp_min(1e-8)
+                evidence_diag["ec_r_proj_ratio"] = float((_proj.abs() / _rd).mean())
+                evidence_diag["ec_r_perp_ratio"] = float((_perp / _rd).mean())
+                evidence_diag["ec_cos_r_neighbor"] = float(
+                    F.cosine_similarity(_r, nk, dim=-1).mean())
+                evidence_diag["ec_cos_r_query"] = float(
+                    F.cosine_similarity(_r, _q, dim=-1).mean())
+        elif self.value_mode in ("neighbor_only", "neighbor_offset"):
+            if self.value_mode == "neighbor_only":
+                values = nk
+            else:
+                if not self.use_offset_correction:
+                    raise RuntimeError(
+                        "value_mode='neighbor_offset'은 use_offset_correction=True가 "
+                        "필요합니다(T()가 있어야 함).")
+                offset_term = self.T(query_emb.unsqueeze(1) - nk)
+                values = nk + offset_term
+        elif self.use_offset_correction:
             offset_term = self.T(query_emb.unsqueeze(1) - nk)
             if self.value_mode == "offset_only":
                 values = offset_term
@@ -638,12 +863,88 @@ class AttentionAggregator(nn.Module):
         else:
             values = label_emb
 
+        # [2026-07, 추가] value 구성요소별 이웃 간 다양성 진단 —
+        # "attention이 uniform이다"(n_eff/k≈1)를 고쳐도 aggregation 결과가
+        # 바뀌지 않을 수 있다는 가설(value collapse) 검증용. 각 샘플의 k개
+        # 이웃 벡터끼리의 평균 pairwise cosine을 label_emb / offset_term /
+        # values 각각에 대해 따로 잼 — 이 셋을 분리해야
+        #   (a) label_emb만 붕괴  → 그룹이 라벨 순수해서 생기는 문제
+        #   (b) offset_term만 붕괴 → T(query-neighbour)가 이웃을 구분 못하는 문제
+        #   (c) 둘 다 붕괴        → retrieval 후보 자체가 동질적
+        # 를 구분할 수 있다. 값이 1에 가까우면 k개 이웃이 사실상 같은 벡터라,
+        # evidence_w를 아무리 sharpen해도 Σw·v가 거의 안 변한다는 뜻.
+        # no_grad + 순수 forward 통계라 학습에 영향 없음.
+        with torch.no_grad():
+            def _mean_pairwise_cos(x: torch.Tensor) -> Optional[torch.Tensor]:
+                """x: (B, k, D) → (B,) 샘플별 k개 벡터 간 평균 pairwise cosine
+                (대각 제외). k<2면 정의되지 않아 None."""
+                _k = x.shape[1]
+                if _k < 2:
+                    return None
+                _xn = F.normalize(x.detach(), dim=-1)
+                _gram = torch.bmm(_xn, _xn.transpose(1, 2))          # (B, k, k)
+                _off = _gram.sum(dim=(1, 2)) - _gram.diagonal(dim1=1, dim2=2).sum(dim=1)
+                return _off / (_k * (_k - 1))
+
+            def _rel_dispersion(x: torch.Tensor) -> Optional[torch.Tensor]:
+                """x: (B, k, D) → (B,) 평균벡터 대비 상대적 퍼짐
+                    mean_i ‖v_i - v̄‖ / ‖v̄‖
+                [왜 pairwise cosine만으로는 부족한가] cosine은 **방향만** 본다.
+                value = label_emb + T(query - neighbour)에서 T() 항은 모든 이웃에
+                대해 query라는 공통 성분을 갖기 때문에, query 성분이 크면 k개
+                벡터가 전부 비슷한 방향을 향해 pairwise cosine이 1에 가까워진다 —
+                그래도 크기나 특정 좌표에서는 이웃별 차이가 남아 있을 수 있고,
+                head는 그 차이를 쓸 수 있다. 이 지표는 크기 차이까지 포함해
+                "실제로 얼마나 퍼져 있는가"를 스케일 무관하게 잰다.
+                (0에 가까우면 k개가 사실상 같은 벡터, 1이면 평균 크기만큼 퍼짐)"""
+                _k = x.shape[1]
+                if _k < 2:
+                    return None
+                _x = x.detach()
+                _mean = _x.mean(dim=1, keepdim=True)                  # (B, 1, D)
+                _num = (_x - _mean).norm(dim=-1).mean(dim=1)          # (B,)
+                _den = _mean.squeeze(1).norm(dim=-1).clamp_min(1e-12)  # (B,)
+                return _num / _den
+
+            evidence_diag["value_pairwise_cos_per_sample"] = _mean_pairwise_cos(values)
+            evidence_diag["label_pairwise_cos_per_sample"] = _mean_pairwise_cos(label_emb)
+            evidence_diag["offset_pairwise_cos_per_sample"] = (
+                _mean_pairwise_cos(offset_term) if offset_term is not None else None
+            )
+            evidence_diag["value_rel_dispersion_per_sample"] = _rel_dispersion(values)
+            evidence_diag["label_rel_dispersion_per_sample"] = _rel_dispersion(label_emb)
+            evidence_diag["offset_rel_dispersion_per_sample"] = (
+                _rel_dispersion(offset_term) if offset_term is not None else None
+            )
+
         # [v2, 추가] pooling(evidence_w 가중합) 전에 이웃 간 상호작용/
         # 대조군 변환 적용. evidence_w는 위에서 이미 계산 완료 —
         # 이 블록과 무관. neighbor_interaction_mode=None이면 values는
         # 그대로 통과(기존 v1과 수치적으로 100% 동일 — 스모크 테스트 확인).
         if self.neighbor_interaction is not None:
             values = self.neighbor_interaction(values)
+
+        # ── [Step 2 진단] T 사후 스윕용 원본 ──────────────────
+        # agg_emb = Σ evidence_w_i · value_i 이므로, similarities와 (최종)
+        # values가 있으면 재학습 없이 임의의 T에 대해
+        #   agg(T) = softmax(similarities/T) @ values
+        # 를 **정확히** 계산할 수 있다(근사 아님).
+        # ⚠ 반드시 neighbor_interaction 적용 **후**의 values를 저장해야
+        #   재계산 결과가 실제 agg_emb와 일치한다.
+        # 이것으로 오프라인에서 훑을 수 있는 것:
+        #   · within-centroid variance(T)  ← "T를 낮추면 agg가 centroid 평균에서
+        #                                     벗어나는가" — 이후 가설들의 전제
+        #   · CCA(query, agg(T)) / Δlogloss(T)
+        # ⚠ 이는 "추론 시 T만 바꾼 것"이라 "T를 바꿔 학습한 것"과는 다르다.
+        evidence_diag["similarities_raw"] = similarities.detach()   # (B, k)
+        evidence_diag["values_raw"]       = values.detach()         # (B, k, D)
+        evidence_diag["evidence_w_raw"]   = evidence_w.detach()     # (B, k)
+        # ⚠ 0차원 스칼라면 export 쪽 torch.cat(dim=0)이 실패한다 —
+        #   배치 크기만큼 펼쳐 (B,)로 내보낸다.
+        _T_val = float(_T.detach()) if torch.is_tensor(_T) else float(_T)
+        evidence_diag["evidence_T"] = torch.full(
+            (similarities.shape[0],), _T_val,
+            device=similarities.device, dtype=torch.float32)
 
         # 3. 가중합 → head 입력
         agg_emb = (evidence_w.unsqueeze(1) @ values).squeeze(1)  # (B, D)
@@ -731,3 +1032,88 @@ class AttentionAggregator(nn.Module):
                 "entropy":         float(-(w * np.log(w + 1e-8)).sum()),
             })
         return out
+
+# ─────────────────────────────────────────────────────────────
+# [2026-07, S-1A] Retrieval objective — candidate surrogate
+# ─────────────────────────────────────────────────────────────
+
+def soft_nearest_neighbor_loss(
+    z: torch.Tensor,               # (B, D) query_retr (정규화 전)
+    labels: torch.Tensor,          # (B,)
+    group: "Optional[torch.Tensor]" = None,   # (B,) hard_assignment
+    tau: float = 0.1,
+) -> torch.Tensor:
+    """
+    Soft Nearest Neighbor loss — "가까울수록 같은 라벨일 확률이 높게".
+
+    [왜 이것인가]
+    최종 평가 목표는 rank informativeness(= acc(1위 이웃)/acc(평균 이웃))인데,
+    그것은 순서 통계량이라 미분 가능한 학습 목표가 아니다. SNN은 "거리에 따른
+    라벨 일치 확률의 감쇠"를 최적화하므로 목표와 형태가 가장 가깝다.
+    ⚠ **등가는 아니다.** SNN은 확률 밀도, rank informativeness는 순서 통계량이다.
+    문서·논문에서 끝까지 "candidate surrogate"로 표기하고, 학습 중 두 값의
+    궤적을 함께 기록해 대응이 실제로 성립하는지 확인해야 한다.
+
+    [왜 group 안에서만 계산하는가]
+    전역으로 계산하면 단순 클래스 분리 문제로 퇴화한다. 그건 CE가 이미 잘 하는
+    일이고(실측 그룹 purity 0.89~0.94), 그 방향으로 더 밀면 오히려 그룹 내부
+    순위 정보가 사라진다(purity ↑ ⇒ rank informativeness ↓ 가 4/4에서 관찰됨).
+    retrieval이 실제로 쓰는 후보 풀 = centroid 그룹이므로 그 안에서만 잰다.
+
+    [붕괴 위험]
+    tau가 너무 낮거나 오래 학습하면 클래스가 한 점으로 뭉쳐 purity=1,
+    rank informativeness=1.00(평탄)이 된다 — V1과 같은 실패로 되돌아간다.
+    uniformity_loss를 함께 쓰고, 학습 중 within-class variance를 감시할 것.
+    """
+    B = z.shape[0]
+    if B < 3:
+        return z.sum() * 0.0
+    dev = z.device
+    zn = torch.nn.functional.normalize(z, dim=-1)
+    sim = (zn @ zn.T) / max(tau, 1e-6)                       # (B, B)
+
+    eye = torch.eye(B, dtype=torch.bool, device=dev)
+    same_label = labels.view(-1, 1) == labels.view(1, -1)
+    if group is not None:
+        same_group = group.view(-1, 1) == group.view(1, -1)
+    else:
+        same_group = torch.ones_like(eye)
+
+    mask_all = same_group & ~eye                              # 분모
+    mask_pos = mask_all & same_label                          # 분자
+    valid = mask_pos.any(dim=-1) & mask_all.any(dim=-1)
+    if not bool(valid.any()):
+        return z.sum() * 0.0
+
+    NEG = torch.finfo(sim.dtype).min / 4
+    log_den = torch.logsumexp(sim.masked_fill(~mask_all, NEG), dim=-1)
+    log_num = torch.logsumexp(sim.masked_fill(~mask_pos, NEG), dim=-1)
+    return -(log_num - log_den)[valid].mean()
+
+
+def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
+    """
+    Wang & Isola(2020) 스타일 uniformity — 표현이 구 위에 퍼지도록 유지.
+    SNN 단독으로는 클래스가 한 점으로 붕괴할 수 있어 그 반대 압력을 준다.
+    """
+    if z.shape[0] < 2:
+        return z.sum() * 0.0
+    zn = torch.nn.functional.normalize(z, dim=-1)
+    sq = torch.cdist(zn, zn).pow(2)
+    iu = torch.triu_indices(zn.shape[0], zn.shape[0], offset=1)
+    return sq[iu[0], iu[1]].mul(-t).exp().mean().clamp_min(1e-12).log()
+
+
+def retrieval_space_diag(query_pred: torch.Tensor, query_retr: torch.Tensor) -> dict:
+    """분기 거리 진단 — 분리가 실제로 일어났는가(§3.5)."""
+    with torch.no_grad():
+        a = torch.nn.functional.normalize(query_pred.float(), dim=-1)
+        b = torch.nn.functional.normalize(query_retr.float(), dim=-1)
+        cos = float((a * b).sum(-1).mean()) if a.shape == b.shape else float("nan")
+        # linear CKA (회전·스케일 불변) — 차원이 달라도 계산 가능
+        X = query_pred.float() - query_pred.float().mean(0)
+        Y = query_retr.float() - query_retr.float().mean(0)
+        xy = float((X.T @ Y).pow(2).sum())
+        xx = float((X.T @ X).pow(2).sum()); yy = float((Y.T @ Y).pow(2).sum())
+        cka = xy / max((xx * yy) ** 0.5, 1e-12)
+    return {"cos_pred_retr": cos, "cka_pred_retr": cka}
