@@ -1072,7 +1072,9 @@ class TabERA(nn.Module):
         n_features: int,
         embed_dim: int = 128,
         n_prototypes: int = 8,
-        k: int = 16,
+        k: int = 8,    # [v2 확정] explanation budget — 예측에 영향 없음.
+                       # retrieval이 예측 경로 밖이므로 HPO objective가 k에
+                       # 반응하지 않는다(search_space.DEFAULT_K_NO_TUNE와 일치).
         prototype_labels: Optional[List[str]] = None,
         n_output: int = 1,
         memory_size: int = 10_000,
@@ -1302,7 +1304,7 @@ class TabERA(nn.Module):
         # ── [2026-07, S-1A] retrieval 전용 표현 분기 ──────────────
         # retr_proj_mode: "none"(V1과 완전 동일) / "linear"(D→D) / "mlp"(residual)
         # detach_retr_grad: shared로 retrieval gradient를 흘릴지.
-        #   ⚠ snn_lambda와 **독립 인자**다. λ=0이면 어차피 gradient가 없으므로
+        #   ⚠ [v2에서 snn_lambda/unif_beta는 제거됨 — retr_proj와 함께 삭제]
         #     detach 유무가 같은 결과여야 하고, 그 일치가 sanity check가 된다.
         #     λ를 detach 스위치로 겸용하면 이 검증을 잃는다.
         retr_proj_mode: str = "none",
@@ -2330,45 +2332,6 @@ class TabERA(nn.Module):
             # query_emb만 섞었음), "agg_emb 단독의 기여도"와 "짝 어긋남의
             # 대가"를 분리해서 볼 수 있음.
             _agg_for_head = agg_emb
-            if ablation_mode == "agg_emb_zero":
-                _agg_for_head = torch.zeros_like(agg_emb)
-            elif ablation_mode == "agg_emb_shuffle":
-                _perm = torch.randperm(agg_emb.shape[0], device=agg_emb.device)
-                _agg_for_head = agg_emb[_perm]
-            elif ablation_mode in ("agg_emb_constant", "agg_emb_centered"):
-                # [2026-07 추가] agg_emb = (샘플 무관 상수 성분) + (샘플별 잔차)
-                # 로 분해해서 어느 쪽이 예측에 쓰이는지 가른다.
-                #
-                # [왜] agg_emb는 head 입력 크기의 15~38%를 차지하는데
-                # relative_variation이 0.03~0.25로 작다 — 즉 크기는 큰데 샘플이
-                # 바뀌어도 거의 같은 벡터다. 그렇다면 head가 쓰는 건 정보가
-                # 아니라 상수 오프셋(bias)일 수 있고, 그러면 "추론 시점에
-                # 제거하면 logit이 통째로 이동해 나빠지지만, 재학습하면 head의
-                # bias 파라미터가 흡수해서 아무 손해가 없다"는 관찰(M1 vs M2
-                # 0/8 비유의)이 자연스럽게 설명된다. 다만 이건 아직 "bias처럼
-                # 보인다"까지이고 "bias다"는 증명이 아니어서, 두 성분을 실제로
-                # 분리해 봐야 한다.
-                #
-                #   agg_emb_constant : 잔차 제거, 상수만 남김 (agg ← mean)
-                #       → 거의 안 나빠지면 "잔차는 안 쓰인다"
-                #   agg_emb_centered : 상수 제거, 잔차만 남김 (agg ← agg - mean)
-                #       → 크게 나빠지면 "상수 성분이 지배적"
-                #   두 결과를 agg_emb_zero(둘 다 제거)와 나란히 놓고 본다.
-                #
-                # 평균 벡터는 배치가 아니라 **평가 세트 전체**에서 미리 계산해
-                # model._ablation_agg_mean에 넣어줘야 한다 — 배치 평균을 쓰면
-                # 배치마다 기준이 달라져 "상수 성분"의 정의가 흔들린다.
-                _mu = getattr(self, "_ablation_agg_mean", None)
-                if _mu is None:
-                    raise RuntimeError(
-                        f"ablation_mode='{ablation_mode}'는 model._ablation_agg_mean"
-                        f"(평가 세트 전체의 agg_emb 평균, shape (D,))을 미리 설정해야 "
-                        f"합니다. reproduce.py가 ablation 평가 루프 직전에 채웁니다.")
-                _mu = _mu.to(device=agg_emb.device, dtype=agg_emb.dtype).reshape(1, -1)
-                if ablation_mode == "agg_emb_constant":
-                    _agg_for_head = _mu.expand_as(agg_emb).clone()
-                else:
-                    _agg_for_head = agg_emb - _mu
             if self._per_branch_ln:
                 _agg_for_head = self.head_agg_ln(_agg_for_head)
             if self.head_branch_l2norm:
