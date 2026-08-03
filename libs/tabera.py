@@ -1141,7 +1141,7 @@ class TabERA(nn.Module):
             # 원 probe 실험 그대로 재현하려면 이것만 켜고 blockwise_layernorm은
             # 기본값(False) 유지 권장. 둘 다 켜면 LN 적용 후 L2-normalize(아래
             # forward() 참고) — 그 조합 자체는 검증 안 된 추가 실험임.
-        fusion_mode: str = "concat",   # [2026-07, 되돌림] 세션 초반에 "v2 최종
+        fusion_mode: str = "proto_only_linear",   # [v2 확정] logits = W · context_emb
             # architecture"로 residual을 잠시 기본값으로 바꿨었으나, 이후 진행된
             # 훨씬 넓은 범위의 실험(6개 데이터셋, concat/residual 양쪽 ablation·
             # trajectory·retrieval-free baseline 비교)에서도 "어느 쪽이 일관되게
@@ -1307,9 +1307,6 @@ class TabERA(nn.Module):
         #     λ를 detach 스위치로 겸용하면 이 검증을 잃는다.
         retr_proj_mode: str = "none",
         detach_retr_grad: bool = False,
-        snn_lambda: float = 0.0,      # retrieval surrogate 가중치
-        snn_tau: float = 0.1,         # SNN 온도
-        unif_beta: float = 0.0,       # uniformity(붕괴 방지) 가중치
         disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜"
             # retrieval-free baseline(Model 2)용. fusion_beta_override=0.0 +
             # loss_*_override=0.0 조합(β=0으로 agg를 fusion에서만 차단)은
@@ -1420,7 +1417,8 @@ class TabERA(nn.Module):
         if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate",
                                "context_gated_beta", "proto_residual",
                                "proto_query_residual", "proto_only",
-                               "proto_only_linear"):
+                               "proto_only_linear", "query_only_linear",
+                               "proto_residual_query"):
             raise ValueError(f"fusion_mode은 'concat'/'residual'/'gated_sum'/'anchor_gate'/'context_gated_beta' 중 하나여야 합니다: {fusion_mode}")
         if fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") and not use_query_emb_in_head:
             raise ValueError(
@@ -1453,9 +1451,6 @@ class TabERA(nn.Module):
         # 기존 체크포인트 하위 호환 유지)
         self.retr_proj_mode    = retr_proj_mode
         self.detach_retr_grad  = detach_retr_grad
-        self.snn_lambda        = snn_lambda
-        self.snn_tau           = snn_tau
-        self.unif_beta         = unif_beta
         self.embedder = TabularEmbedder(
             n_features, embed_dim, embedder_layers, dropout,
             cat_col_idx=cat_col_idx, num_col_idx=num_col_idx,
@@ -1737,6 +1732,40 @@ class TabERA(nn.Module):
                     nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
                     nn.Linear(embed_dim, n_output),
                 )
+            elif fusion_mode == "query_only_linear":
+                # ── [Phase 0.5 조건 A] logits = W · query_emb ─────────────
+                # centroid는 **존재하고 학습되지만** 예측 경로를 우회한다.
+                #
+                # ⚠ `--disable_retrieval_branch`와 다르다. 그쪽은 centroid
+                #   자체를 안 만들고 STE도 없어 **encoder dynamics가 달라진다**.
+                #   A/B/E를 같은 backbone에서 비교하려면 centroid·assignment·
+                #   retrieval을 모두 유지한 채 head 입력만 바꿔야 한다.
+                #
+                # 질문: prototype이 prediction의 sufficient statistic인가,
+                #       아니면 anchor만 되어도 되는가?
+                #   A (이 모드)  logits = W · q          prototype 우회
+                #   B            logits = W · c          prototype = sufficient statistic
+                #   E            logits = W·c + λ·W·q    prototype = anchor + residual
+                self.query_head = nn.Linear(embed_dim, n_output)
+                self.head = None
+            elif fusion_mode == "proto_residual_query":
+                # ── [Phase 0.5 조건 E] logits = W_c·c + λ·W_q·q ───────────
+                # VQ 계열의 residual 구조와 같은 형태다(RQ-VAE, VQ-VAE-2의
+                # multi-scale). B는 "코드 하나로 충분", E는 "코드 + residual".
+                #
+                # ⚠ λ 자체는 해석 지표가 **아니다** — W_c와 W_q의 norm과 곱해져야
+                #   의미가 생긴다. 예: (context norm 10, query norm 1, λ=0.5)와
+                #   (context norm 1, query norm 10, λ=0.05)는 같은 상태다.
+                #   따라서 **contribution ratio**를 주 지표로 본다.
+                #
+                # ⚠ W_q를 zero-init하면 λ gradient가 0이 되어 데드락이다
+                #   (interaction_ln 전례). 일반 초기화 + λ 초기값 0.1.
+                self.proto_head = nn.Linear(embed_dim, n_output)
+                self.query_head = nn.Linear(embed_dim, n_output)
+                # softplus(-2.25) ≈ 0.1 — 초기에는 context가 예측을 담당하고
+                # query는 보정만 하도록 시작한다.
+                self.pq_lambda_raw = nn.Parameter(torch.tensor([-2.25]))
+                self.head = None
             elif fusion_mode == "proto_only_linear":
                 # ── [V2 Stage 1 대조] logits = W · context_emb ────────────
                 # proto_only의 MLP head를 **단일 Linear**로 바꾼 것.
@@ -1912,7 +1941,8 @@ class TabERA(nn.Module):
             #   log_branch_gradients)은 이 모드에서 의미가 없고, 대신
             #   logit decomposition(pr_* 지표)이 직접적인 ground truth다.
             if fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear"):
+                               "proto_only_linear", "query_only_linear",
+                               "proto_residual_query"):
                 self._head_first_linear = None
             else:
                 self._head_first_linear = self.head[0] if (blockwise_layernorm or head_branch_l2norm or fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta")) else self.head[1]
@@ -2122,7 +2152,39 @@ class TabERA(nn.Module):
                 )
                 neighbour_labels = label_pool[rand_pos]
 
-            if self.aggregator_mode == "cross_attention":
+            # ── [v2] AttentionAggregator 비활성 ──────────────────────
+            # prediction 경로에 continuous neighbor aggregation이 있으면 안 된다.
+            # Phase 0.5의 E 조건이 그것을 보였다 — discrete bottleneck과
+            # continuous 경로가 공존하면 optimizer는 continuous shortcut으로
+            # 간다(query contribution 98.6%, proto acc 0.55). agg_emb를
+            # head에 넣으면 같은 일이 더 심하게 일어난다.
+            #
+            # ⚠ "계산은 하되 안 쓴다"로 두지 않는다 — GPU 메모리·forward
+            #   graph 복잡도·ablation 해석 혼란·논문 architecture 그림 불일치를
+            #   전부 유발한다. reviewer가 "왜 있는데 안 쓰나"를 묻게 된다.
+            #
+            # AttentionAggregator는 prediction component가 아니라
+            # **explanation component**다 (v3 Stage 3):
+            #     neighbors → Aggregator → evidence representation → LLM
+            # 그 위치에서는 prediction과 무관하므로 shortcut 문제가 없고,
+            # 평가 축도 explanation quality가 된다.
+            _V2_NO_AGG = self.fusion_mode in (
+                "proto_only", "proto_only_linear",
+                "query_only_linear", "proto_residual_query",
+            )
+            if _V2_NO_AGG:
+                # agg_emb를 만들지 않는다. 아래 fusion 코드가 참조하지 않도록
+                # zeros로 두되(shape 호환), head 입력에는 들어가지 않는다
+                # (proto 계열 분기는 context_emb/query_emb만 사용).
+                agg_emb = torch.zeros_like(query_emb)
+                # ⚠ evidence_diag는 빈 dict — 아래에서 .get()으로 접근하므로
+                #   None이면 AttributeError. evidence_w는 균등 가중치로 둔다
+                #   (진단 코드가 shape를 가정하는 경우 대비).
+                evidence_w = torch.full(
+                    (nk.shape[0], nk.shape[1]), 1.0 / nk.shape[1],
+                    device=nk.device, dtype=nk.dtype)
+                evidence_diag = {}
+            elif self.aggregator_mode == "cross_attention":
                 # [v2] AttentionAggregator 대신 head 내부 cross-attention.
                 # updated_query가 agg_emb 자리를 대체 — 아래 기존 fusion/
                 # ablation 코드는 전혀 안 바뀜(agg_emb라는 이름의 텐서가
@@ -2497,7 +2559,8 @@ class TabERA(nn.Module):
                     _head_gate_entropy_mean = float(_be.mean().item())
                     _agg_beta_per_sample = _beta_d.clone()
             elif self.fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear"):
+                               "proto_only_linear", "query_only_linear",
+                               "proto_residual_query"):
                 # 이 모드는 combined를 쓰지 않는다(z_proto + Δz로 직접 계산).
                 combined = _parts[0]
             else:
@@ -2511,7 +2574,49 @@ class TabERA(nn.Module):
                 if self.fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") else None
             )
             _proto_residual_diag = None   # proto_residual 전용 진단 (아래에서 채움)
-            if self.fusion_mode in ("proto_only", "proto_only_linear"):
+            if self.fusion_mode == "query_only_linear":
+                # [Phase 0.5 A] centroid는 계산되지만 예측에 쓰이지 않는다.
+                logits = self.query_head(query_emb)
+                with torch.no_grad():
+                    _pr_diag = {"pq_unique_logits": float(
+                        len(torch.unique(logits.round(decimals=4), dim=0)))}
+                    if labels is not None:
+                        _pr_diag["pr_final_acc"] = float(
+                            (logits.argmax(-1) == labels).float().mean())
+                    _proto_residual_diag = _pr_diag
+            elif self.fusion_mode == "proto_residual_query":
+                # [Phase 0.5 E] z = W_c·c + λ·W_q·q
+                z_proto = self.proto_head(context_emb)
+                z_query = self.query_head(query_emb)
+                _lam = F.softplus(self.pq_lambda_raw)
+                logits = z_proto + _lam * z_query
+                with torch.no_grad():
+                    # ── contribution ratio가 주 지표 ────────────────────
+                    #   λ 단독으로는 해석 불가(위 __init__ 주석 참조).
+                    _cn = z_proto.norm(dim=-1)
+                    _qn = (_lam * z_query).norm(dim=-1)
+                    _pr_diag = {
+                        "pq_lambda": float(_lam),
+                        "pq_context_logit_norm": float(_cn.mean()),
+                        "pq_query_logit_norm": float(_qn.mean()),
+                        "pq_query_ratio": float(
+                            (_qn / (_cn + _qn).clamp_min(1e-8)).mean()),
+                        # 양자화가 얼마나 풀렸는가 — B에서 test 200개가
+                        # 고유 예측 26.6개로 압축됐다. auroc 회복의 직접 원인.
+                        "pq_unique_logits": float(
+                            len(torch.unique(logits.round(decimals=4), dim=0))),
+                        "pq_changed_rate": float(
+                            (logits.argmax(-1) != z_proto.argmax(-1)).float().mean()),
+                    }
+                    if labels is not None:
+                        _pc = (z_proto.argmax(-1) == labels)
+                        _fc = (logits.argmax(-1) == labels)
+                        _pr_diag["pr_proto_acc"] = float(_pc.float().mean())
+                        _pr_diag["pr_final_acc"] = float(_fc.float().mean())
+                        _pr_diag["pr_fixed_rate"] = float((~_pc & _fc).float().mean())
+                        _pr_diag["pr_broke_rate"] = float((_pc & ~_fc).float().mean())
+                    _proto_residual_diag = _pr_diag
+            elif self.fusion_mode in ("proto_only", "proto_only_linear"):
                 # [V2 Stage 1] retrieval/query 모두 예측 경로 밖.
                 logits = self.proto_head(context_emb)
                 with torch.no_grad():
@@ -2769,18 +2874,12 @@ class TabERA(nn.Module):
         # S-1A에서 hard_assignment는 query_emb(예측 공간) 기준이고 z는
         # query_retr(검색 공간)이다 — 그 조합이 곧 "그룹은 예측 공간,
         # 이웃은 검색 공간"이라는 S-1A의 정의다.
-        if self.training and labels is not None and (self.snn_lambda > 0 or self.unif_beta > 0):
-            from libs.evidence import soft_nearest_neighbor_loss, uniformity_loss
-            _lab = labels.long() if labels.dtype != torch.long else labels
-            if self.snn_lambda > 0:
-                _snn = soft_nearest_neighbor_loss(
-                    query_retr, _lab, group=hard_assignment, tau=self.snn_tau)
-                aux_loss = aux_loss + self.snn_lambda * _snn
-                _retr_diag["snn"] = float(_snn.detach())
-            if self.unif_beta > 0:
-                _u = uniformity_loss(query_retr)
-                aux_loss = aux_loss + self.unif_beta * _u
-                _retr_diag["uniformity"] = float(_u.detach())
+        # [v2] SNN(soft nearest neighbor) / uniformity 손실은 제거되었다.
+        #   두 손실은 retrieval projection(retr_proj)을 학습시키기 위해 도입됐으나
+        #   설계 목표인 rank informativeness를 개선하지 못했고(1.0252 vs 1.0163,
+        #   p=0.71) 예측 성능에도 영향이 없었다(4지표 전부 null).
+        #   retr_proj 자체가 제거되면서 함께 제거했다.
+        #   자세한 근거: RETRIEVAL_ABLATION.md §11, TABERA_V2_DESIGN.md §2-8.
 
         out = {
             "logits":      logits,
