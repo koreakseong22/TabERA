@@ -1207,6 +1207,7 @@ class TabERA(nn.Module):
             # 값 자체는 쓰되 그 경로로 gradient는 안 흐름 (Variant B).
             # use_confidence_scaling=False면 무효과.
         evidence_temperature: float = 1.0,   # [진단용, 추가] AttentionAggregator의
+        learn_evidence_temperature: bool = False,  # [2026-07] T를 학습 파라미터로(evidence.py 참고)
             # evidence_w = softmax(-‖q-k‖² / evidence_temperature). 기본값 1.0 =
             # 기존과 동일(하위 호환). jasmine/credit-g 실측: 학습 초반부터
             # entropy가 ln(k) 대비 크게 낮고(사실상 1-NN 붕괴) 학습 중 더 낮아짐 —
@@ -1298,6 +1299,17 @@ class TabERA(nn.Module):
                                             # 런타임 계측 플래그라 model_kwargs/
                                             # _save_tag/--from_saved_state 하위
                                             # 호환 체계에는 안 태움.
+        # ── [2026-07, S-1A] retrieval 전용 표현 분기 ──────────────
+        # retr_proj_mode: "none"(V1과 완전 동일) / "linear"(D→D) / "mlp"(residual)
+        # detach_retr_grad: shared로 retrieval gradient를 흘릴지.
+        #   ⚠ snn_lambda와 **독립 인자**다. λ=0이면 어차피 gradient가 없으므로
+        #     detach 유무가 같은 결과여야 하고, 그 일치가 sanity check가 된다.
+        #     λ를 detach 스위치로 겸용하면 이 검증을 잃는다.
+        retr_proj_mode: str = "none",
+        detach_retr_grad: bool = False,
+        snn_lambda: float = 0.0,      # retrieval surrogate 가중치
+        snn_tau: float = 0.1,         # SNN 온도
+        unif_beta: float = 0.0,       # uniformity(붕괴 방지) 가중치
         disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜"
             # retrieval-free baseline(Model 2)용. fusion_beta_override=0.0 +
             # loss_*_override=0.0 조합(β=0으로 agg를 fusion에서만 차단)은
@@ -1317,9 +1329,19 @@ class TabERA(nn.Module):
     ) -> None:
         super().__init__()
         self.disable_retrieval_branch = disable_retrieval_branch
-        if disable_retrieval_branch and not (fusion_mode == "residual" and aggregator_mode == "pooling"):
+        # ⚠ proto_residual은 retrieval이 예측 경로의 필수 구성요소다
+        #   (Δz = evidence_head(attn(query, neighbors))). retrieval을 끄면
+        #   Δz를 만들 수 없으므로 두 옵션은 양립 불가다.
+        if disable_retrieval_branch and fusion_mode == "proto_residual":
+            raise ValueError(
+                "--disable_retrieval_branch와 fusion_mode='proto_residual'은 함께 쓸 수 없습니다 "
+                "— 이 모드에서 retrieval은 선택적 feature가 아니라 logit correction "
+                "경로 자체입니다. prototype-only baseline을 원하면 "
+                "pr_proto_acc 진단을 보세요(같은 실행에서 z_proto 단독 정확도가 나옵니다)."
+            )
+        if disable_retrieval_branch and not (fusion_mode in ("residual", "concat") and aggregator_mode == "pooling"):
             raise NotImplementedError(
-                "disable_retrieval_branch=True는 fusion_mode='residual' + "
+                "disable_retrieval_branch=True는 fusion_mode='residual'/'concat' + "
                 "aggregator_mode='pooling' 조합만 지원합니다 (현재: "
                 f"fusion_mode={fusion_mode!r}, aggregator_mode={aggregator_mode!r})."
             )
@@ -1395,7 +1417,10 @@ class TabERA(nn.Module):
         self.use_context_projection = use_context_projection
         self.use_confidence_scaling = use_confidence_scaling
         self.confidence_scaling_detach = confidence_scaling_detach
-        if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta"):
+        if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate",
+                               "context_gated_beta", "proto_residual",
+                               "proto_query_residual", "proto_only",
+                               "proto_only_linear"):
             raise ValueError(f"fusion_mode은 'concat'/'residual'/'gated_sum'/'anchor_gate'/'context_gated_beta' 중 하나여야 합니다: {fusion_mode}")
         if fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") and not use_query_emb_in_head:
             raise ValueError(
@@ -1426,6 +1451,11 @@ class TabERA(nn.Module):
         # cat_col_idx가 주어지면 categorical feature를 nn.Embedding으로
         # 처리 (① 후보 검증 결과 반영 — 안 주면 이전과 100% 동일 동작,
         # 기존 체크포인트 하위 호환 유지)
+        self.retr_proj_mode    = retr_proj_mode
+        self.detach_retr_grad  = detach_retr_grad
+        self.snn_lambda        = snn_lambda
+        self.snn_tau           = snn_tau
+        self.unif_beta         = unif_beta
         self.embedder = TabularEmbedder(
             n_features, embed_dim, embedder_layers, dropout,
             cat_col_idx=cat_col_idx, num_col_idx=num_col_idx,
@@ -1438,6 +1468,30 @@ class TabERA(nn.Module):
         )
 
         # ── CentroidLayer (Dual-Space Prototype) ────────
+        # ── [S-1A] retrieval 전용 projection ────────────────────
+        # [초기화] identity에 가깝게 시작한다. 처음부터 다른 공간이면 이후
+        # 변화가 "SNN loss 효과"인지 "무작위 projection 효과"인지 섞인다.
+        # identity 출발이어야 분기 거리(CKA/cos) 궤적이 곧 loss가 만든 변화량.
+        if retr_proj_mode == "none":
+            self.retr_proj = None
+        elif retr_proj_mode == "linear":
+            self.retr_proj = nn.Linear(embed_dim, embed_dim)
+            with torch.no_grad():
+                self.retr_proj.weight.copy_(torch.eye(embed_dim))
+                self.retr_proj.bias.zero_()
+        elif retr_proj_mode == "mlp":
+            # residual 형태(forward 참고): query_retr = h + MLP(h).
+            # 마지막 층 zero-init이면 시작 시 정확히 identity.
+            self.retr_proj = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim))
+            with torch.no_grad():
+                self.retr_proj[0].weight.copy_(torch.eye(embed_dim))
+                self.retr_proj[0].bias.zero_()
+                self.retr_proj[2].weight.zero_(); self.retr_proj[2].bias.zero_()
+        else:
+            raise ValueError(f"retr_proj_mode는 'none'/'linear'/'mlp' 중 하나: {retr_proj_mode!r}")
+
         self.prototype_layer = CentroidLayer(
             n_prototypes=n_prototypes,
             embed_dim=embed_dim,
@@ -1481,6 +1535,7 @@ class TabERA(nn.Module):
                 tasktype=tasktype,
                 n_classes=self._n_classes_for_labels,
                 evidence_temperature=evidence_temperature,
+                learn_evidence_temperature=learn_evidence_temperature,
                 evidence_metric=evidence_metric,
                 value_mode=value_mode,
                 neighbor_interaction_mode=neighbor_interaction_mode,
@@ -1527,10 +1582,26 @@ class TabERA(nn.Module):
         # query_emb를 아예 제외 (head 입력 차원도 그만큼 줄어듦 — T()처럼
         # "안 쓰는 파라미터가 남아있는" 상태가 아니라 진짜로 없앤 상태로
         # 비교하기 위함). agg_emb는 항상 포함(최소 1개는 남음).
-        _n_head_parts = int(use_query_emb_in_head) + int(use_context_emb) + 1
-        if _n_head_parts == 1:
-            print("  ⚠️  use_query_emb_in_head=False, use_context_emb=False — "
-                  "head가 agg_emb만 보고 예측합니다(진단용 극단 케이스).")
+        # [2026-07, 추가] disable_retrieval_branch=True + fusion_mode="concat"이면
+        # context_emb/agg_emb 둘 다 forward()에서 애초에 안 만들어지므로(early-exit),
+        # head도 처음부터 query 전용 크기(embed_dim)로 지어야 함 — 나머지 두 슬롯을
+        # 0으로 채워 넣는 게 아니라(그러면 residual 초기 버전의 LN(0)=β OOD 문제와
+        # 같은 함정을 다시 만듦), 애초에 그 슬롯 자체를 없앰. use_context_emb 인자
+        # 값과 무관하게 여기서 강제로 덮어씀 — "retrieval을 껐다"는 게 "context_emb도
+        # 같이 안 만든다"는 뜻이기 때문(context_emb도 prototype routing의 산물).
+        if disable_retrieval_branch and fusion_mode == "concat":
+            if not use_query_emb_in_head:
+                raise NotImplementedError(
+                    "disable_retrieval_branch=True + fusion_mode='concat'에서는 "
+                    "use_query_emb_in_head=False를 지원하지 않습니다 — query만 "
+                    "남는 구조인데 그 query조차 빼면 head 입력이 없습니다."
+                )
+            _n_head_parts = 1
+        else:
+            _n_head_parts = int(use_query_emb_in_head) + int(use_context_emb) + 1
+            if _n_head_parts == 1:
+                print("  ⚠️  use_query_emb_in_head=False, use_context_emb=False — "
+                      "head가 agg_emb만 보고 예측합니다(진단용 극단 케이스).")
         _head_in = embed_dim * _n_head_parts
 
         # [추가] blockwise_layernorm=False(기본)면 기존과 완전히 동일 —
@@ -1666,6 +1737,143 @@ class TabERA(nn.Module):
                     nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
                     nn.Linear(embed_dim, n_output),
                 )
+            elif fusion_mode == "proto_only_linear":
+                # ── [V2 Stage 1 대조] logits = W · context_emb ────────────
+                # proto_only의 MLP head를 **단일 Linear**로 바꾼 것.
+                #
+                # [질문] centroid 자체가 이미 class-discriminative한가,
+                #        아니면 그 위에 비선형 판별기가 필요한가?
+                #   Linear ≈ MLP  →  centroid가 이미 선형 분리 가능한 표현
+                #   Linear <  MLP  →  prototype은 충분하되 비선형 판별기 필요
+                #
+                # ⚠ 사후 linear probe(고정 표현, 0.672)와 다르다 —
+                #   여기서는 centroid_emb도 end-to-end로 함께 학습된다.
+                #   즉 "표현이 고정일 때 선형 분리 가능한가"가 아니라
+                #   "선형 head로 학습하면 centroid가 그렇게 배치되는가"를 묻는다.
+                self.proto_head = nn.Linear(embed_dim, n_output)
+                self.head = None
+            elif fusion_mode == "proto_only":
+                # ── [V2 Stage 1] logits = proto_head(context) ─────────────
+                # retrieval도 query도 예측 경로에 없다.
+                # "centroid가 예측을 담당한다"는 v2의 전제를 직접 검증한다.
+                #
+                # ⚠ query_emb를 head에 넣지 않는다 — 넣으면 v1 concat과 같아진다.
+                # ⚠ retrieval은 계산은 되지만(설명용) logits에 개입하지 않는다.
+                #
+                # 기준: no retrieval 0.821 / concat 0.814 (ds=14 test acc).
+                #   여기 근접하지 못하면 v2 구조 자체가 성립하지 않는다.
+                #   (context 단독 linear probe는 0.672였으나, proto_head가
+                #    학습되면 train 0.914까지 갔다 — 상한은 더 높을 수 있다.)
+                self.proto_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+                self.head = None
+            elif fusion_mode == "proto_query_residual":
+                # ── [V2 control] z = z_proto(context) + Δz(query) ──────────
+                # `proto_residual`의 **필수 대조군**. 구조는 동일하되
+                # Δz를 이웃이 아니라 **query에서** 만든다.
+                #
+                # [왜 필요한가] proto_residual이 실패했을 때 두 원인이 섞인다:
+                #   A) retrieval evidence가 부족하다
+                #   B) query를 classifier 경로에서 뺀 것 자체가 손해다
+                # 이 대조군이 B를 분리한다.
+                #
+                #   proto_only            centroid만                (pr_proto_acc로 관측)
+                #   proto_query_residual  query correction          ← 이 모드
+                #   proto_residual        neighbor correction
+                #
+                # 해석:
+                #   query ≈ retrieval  →  retrieval 불필요(query가 다 함)
+                #   query <  retrieval →  retrieval이 더 나은 correction 제공 (성공)
+                #   query >  retrieval →  retrieval이 query보다 못함
+                self.proto_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+                self.evidence_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+                nn.init.zeros_(self.evidence_head[-1].weight)
+                nn.init.zeros_(self.evidence_head[-1].bias)
+                self.ev_delta_beta_raw = nn.Parameter(torch.full((1,), 0.5413))
+                self.head = None
+            elif fusion_mode == "proto_residual":
+                # ── [V2] Prototype prediction + retrieval correction ──────
+                #   z = W_proto(context)  +  Δz(query as selector, neighbors as source)
+                #
+                # [배경] concat head([q, c, a])에서는 optimizer가 a에 붙는 가중치를
+                #   0으로 보내면 retrieval을 완전히 무시할 수 있다. 실제로
+                #   value 5종 / weighting(T) / aggregation을 모두 바꿔봤으나
+                #   전부 baseline과 유의차가 없었고, interaction_ln에서는 모델이
+                #   α를 0.079 → 0.053으로 **스스로 낮췄다**.
+                #   → 문제는 retrieval **내부**가 아니라 **역할(role)**이다.
+                #
+                # [설계] retrieval을 "선택적 feature"가 아니라
+                #   **prediction correction operator**로 만든다.
+                #   z_proto는 context만 본다 — query를 넣으면 다시
+                #   "query classifier + optional retrieval"이 되어 concat 실패를
+                #   그대로 재현한다.
+                #
+                # [query의 역할] selector로만 제한한다.
+                #   Q = W_q(query), K/V = neighbors  →  query는 **무엇을 읽을지**만
+                #   정하고 값은 전부 이웃에서 나온다. `f([query, neighbors])`처럼
+                #   자유 입력으로 주면 f(query)로 수렴할 수 있다.
+                #
+                # ⚠ 2b-1의 cross-attention 실패(acc 0.636)와 다른 점: 그때는
+                #   attention 결과가 context_emb 자리의 **optional feature**였다.
+                #   여기서는 **logit correction**이라 무시하면 z_proto만 남아
+                #   성능이 prototype-only 수준으로 떨어진다 — 무시할 유인이 없다.
+                #
+                # ⚠ Δz에 크기 제한을 두지 않는다. interaction_ln에서 α 게이트가
+                #   오히려 모델에게 "안 쓰기"라는 쉬운 선택지를 준 전례가 있고,
+                #   여기서는 Δz가 곧 클래스 보정량이라 스케일 자체가 의미를 갖는다.
+                self.proto_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+                self.ev_q = nn.Linear(embed_dim, embed_dim)
+                self.ev_k = nn.Linear(embed_dim, embed_dim)
+                self.ev_v = nn.Linear(embed_dim, embed_dim)
+                # ⚠ attention은 **cosine + temperature**로 계산한다.
+                #   q·k/√D를 쓰면 안 된다 — 실측에서 query_norm이 5.5 → 1,500으로
+                #   폭주해 q·k/√64 ≈ 261,917이 되고 softmax가 완전 포화한다
+                #   (pr_att_entropy = 0.0000, 3 seed 전부 → 실효 이웃 1개).
+                #   이는 evidence_w가 euclidean 시절 겪었던 것과 같은 실패다.
+                # ⚠ τ가 너무 작아도 one-hot이 된다 — cosine 범위가 [-1,1]이므로
+                #   최대 logit 차이가 2/τ이고, 이것이 ln k(=2.77 at k=16)를 크게
+                #   넘으면 다시 포화한다. τ=0.3이면 최대차 6.7로 적정.
+                #   log 파라미터로 두어 항상 양수이고 학습 가능하게 한다.
+                #   clamp는 [0.05, 2.0]으로 넉넉히 — 너무 좁으면 모델이
+                #   적정 sharpness를 못 찾는다.
+                self.ev_log_tau = nn.Parameter(torch.log(torch.tensor(0.3)))
+                # ⚠ Δz 크기 제한 — tanh로 방향은 유지하고 magnitude만 제한한다.
+                #   제한이 없으면 ‖Δz‖/‖z_proto‖가 145배까지 가서 z_proto 학습을
+                #   방해한다(실측: seed 3의 pr_proto_acc = 0.106 = 우연 수준).
+                #   ⚠ interaction_ln의 α 게이트와는 다르다. α는 retrieval 경로를
+                #   **끄는 스위치**였지만(α→0이면 경로 소멸), 여기서는 출력 크기만
+                #   제한한다 — β→0으로 가도 z_proto만 남아 성능이 떨어지므로
+                #   그 방향으로 갈 유인이 없다.
+                # ⚠ β는 softplus로 **양수만** 허용한다. tanh가 방향을,
+                #   β가 전체 스케일을 담당하는 분리 구조다. z_proto의 크기가
+                #   학습 중 변하므로 고정 스케일(=1)이면 ‖Δz‖/‖z_proto‖ 비율이
+                #   통제되지 않는다.
+                #   softplus(0.5413) ≈ 1.0 이므로 초기값은 기존과 동일하다.
+                self.ev_delta_beta_raw = nn.Parameter(torch.full((1,), 0.5413))
+                self.evidence_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(embed_dim, n_output),
+                )
+                # ⚠ 마지막 층을 0으로 초기화 → 학습 시작 시 logits = z_proto.
+                #   랜덤 Δz로 시작하면 optimizer가 "retrieval이 prototype을
+                #   망가뜨린다"를 먼저 학습해 Δz를 억제하는 방향으로 간다
+                #   (interaction_ln에서 α가 0.079 → 0.053으로 내려간 것과 같은 구도).
+                # ⚠ interaction_ln과 달리 데드락이 없다 — α 같은 곱셈 게이트가
+                #   없으므로 ∂loss/∂W가 0이 아니다(bias·앞단 층으로 gradient가 흐름).
+                nn.init.zeros_(self.evidence_head[-1].weight)
+                nn.init.zeros_(self.evidence_head[-1].bias)
+                self.head = None      # 이 모드는 통합 head를 쓰지 않는다
             elif blockwise_layernorm or head_branch_l2norm:
                 # [수정] head_branch_l2norm=True면 global LayerNorm(_head_in)을
                 # 건너뜀 — 그 LN이 concat된 벡터 전체를 다시 joint하게
@@ -1697,17 +1905,35 @@ class TabERA(nn.Module):
             # 이미 "브랜치별 기여"의 직접적이고 더 해석 가능한 지표이므로
             # _head_block_slices는 빈 채로 둔다(log_branch_gradients의 weight-norm
             # 진단은 concat 계열 모드 전용).
-            self._head_first_linear = self.head[0] if (blockwise_layernorm or head_branch_l2norm or fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta")) else self.head[1]
+            # ⚠ proto_residual은 통합 head가 없다(self.head is None) —
+            #   z = proto_head(context) + evidence_head(attn)로 직접 계산하므로
+            #   "head 첫 Linear"라는 개념 자체가 없다. branch slice 진단
+            #   (_head_block_slices 기반: branch_contribution / Jacobian /
+            #   log_branch_gradients)은 이 모드에서 의미가 없고, 대신
+            #   logit decomposition(pr_* 지표)이 직접적인 ground truth다.
+            if fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
+                               "proto_only_linear"):
+                self._head_first_linear = None
+            else:
+                self._head_first_linear = self.head[0] if (blockwise_layernorm or head_branch_l2norm or fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta")) else self.head[1]
             self._head_block_slices: Dict[str, Tuple[int, int]] = {}
             if fusion_mode == "concat":
-                _off = 0
-                if use_query_emb_in_head:
-                    self._head_block_slices["query"] = (_off, _off + embed_dim)
-                    _off += embed_dim
-                if use_context_emb:
-                    self._head_block_slices["context"] = (_off, _off + embed_dim)
-                    _off += embed_dim
-                self._head_block_slices["agg"] = (_off, _off + embed_dim)
+                if disable_retrieval_branch:
+                    # [2026-07, 추가] context_emb/agg_emb 둘 다 안 만들어지므로
+                    # (head도 embed_dim 크기로 지어짐, 위 _n_head_parts 참고) query
+                    # 슬라이스 하나만 존재 — agg를 무조건 추가하던 기존 로직을 그대로
+                    # 쓰면 실제 head 입력 크기를 벗어나는 슬라이스가 생겨 branch_
+                    # contribution류 진단이 인덱스 에러를 낸다.
+                    self._head_block_slices["query"] = (0, embed_dim)
+                else:
+                    _off = 0
+                    if use_query_emb_in_head:
+                        self._head_block_slices["query"] = (_off, _off + embed_dim)
+                        _off += embed_dim
+                    if use_context_emb:
+                        self._head_block_slices["context"] = (_off, _off + embed_dim)
+                        _off += embed_dim
+                    self._head_block_slices["agg"] = (_off, _off + embed_dim)
 
             self.head_v2 = None
         else:  # "cross_attention"
@@ -1749,17 +1975,31 @@ class TabERA(nn.Module):
         ablation_mode: str = "none",              # ablation 모드 (학습 시 "none" 유지)
     ) -> Dict[str, torch.Tensor]:
         # 1. 임베딩
-        query_emb = self.embedder(X)               # (B, D)
+        query_emb = self.embedder(X)               # (B, D)  = shared = query_pred
 
-        # [2026-07, 추가] disable_retrieval_branch=True — "진짜" retrieval-free
+        # [S-1A] retrieval 전용 표현. mode="none"이면 query_emb를 그대로 쓰므로
+        # V1과 수치가 완전히 동일하다(Phase 0 회귀 테스트의 근거).
+        if self.retr_proj is None:
+            query_retr = query_emb
+        else:
+            _h = query_emb.detach() if self.detach_retr_grad else query_emb
+            query_retr = (_h + self.retr_proj(_h)) if self.retr_proj_mode == "mlp" \
+                         else self.retr_proj(_h)
+
+        # [2026-07, 추가/확장] disable_retrieval_branch=True — "진짜" retrieval-free
         # baseline(Model 2). prototype_layer/memory.retrieve/aggregator를
         # 아예 호출하지 않고 곧바로 head로 감 — STE routing의 backward까지
         # 포함해 retrieval 관련 gradient가 query_emb encoder 쪽으로 전혀
-        # 안 흐름(생성자에서 fusion_mode="residual"+aggregator_mode="pooling"
-        # 조합만 허용하도록 이미 검증됨). head_query_ln은 원래도 query 단독
-        # branch에 쓰이던 것 그대로 재사용(agg가 없으니 z=LN(q) 자체가 head
-        # 입력) — head의 파라미터/입력 차원은 평소와 완전히 동일, retrieval을
-        # "0으로 채워서 더하는" 게 아니라 그 항 자체가 없는 것.
+        # 안 흐름(생성자에서 fusion_mode="residual"/"concat"+aggregator_mode=
+        # "pooling" 조합만 허용하도록 이미 검증됨). 아래 로직은 fusion_mode를
+        # 직접 분기하지 않는다 — self.head_query_ln/self._per_branch_ln/
+        # self.head가 이미 __init__에서 fusion_mode별로 올바르게 구성돼 있고
+        # (residual: 항상 per-branch LN 있음. concat: 기본은 head[0]의 단일
+        # LayerNorm이 그 역할을 대신하므로 _per_branch_ln=False), disable_
+        # retrieval_branch=True일 때 head 자체가 embed_dim(query 전용) 크기로
+        # 지어지므로(생성자 참고) 이 블록은 그 구성을 그대로 재사용하기만
+        # 하면 됨 — retrieval을 "0으로 채워서 더하는" 게 아니라 그 항 자체가
+        # 처음부터 없는 것(head 파라미터 자체가 그만큼 작음).
         if self.disable_retrieval_branch:
             _z_no_retrieval = self.head_query_ln(query_emb) if self._per_branch_ln else query_emb
             if getattr(self, "head_branch_l2norm", False):
@@ -1771,6 +2011,8 @@ class TabERA(nn.Module):
                 "routing": None, "centroid_id": None, "hard_group": None,
                 "routing_confidence": None, "evidence_w": None, "evidence_diag": None,
                 "topk_idx": None, "agg_emb": None, "query_emb": query_emb,
+
+                "query_retr": query_emb,
                 "context_emb": None, "ablation_mode": ablation_mode,
                 "fusion_alpha": None, "fusion_beta": None,
                 "head_gate_mean": {}, "head_gate_var": {}, "head_gate_entropy_mean": None,
@@ -1778,6 +2020,10 @@ class TabERA(nn.Module):
                 "agg_beta_per_sample": None,
                 "similarity_top1_per_sample": None, "similarity_bottomk_per_sample": None,
                 "similarity_margin_per_sample": None, "similarity_std_per_sample": None,
+                "value_pairwise_cos_per_sample": None, "label_pairwise_cos_per_sample": None,
+                "offset_pairwise_cos_per_sample": None,
+                "value_rel_dispersion_per_sample": None, "label_rel_dispersion_per_sample": None,
+                "offset_rel_dispersion_per_sample": None,
                 "head_query_norm_mean": float(_z_no_retrieval.detach().norm(dim=-1).mean().item()),
                 "head_context_norm_mean": None, "head_agg_norm_mean": None,
                 "head_combined_norm_mean": float(_z_no_retrieval.detach().norm(dim=-1).mean().item()),
@@ -1802,11 +2048,17 @@ class TabERA(nn.Module):
         _similarity_bottomk_per_sample = None
         _similarity_margin_per_sample = None
         _similarity_std_per_sample = None
+        _value_pairwise_cos_per_sample = None
+        _label_pairwise_cos_per_sample = None
+        _offset_pairwise_cos_per_sample = None
+        _value_rel_dispersion_per_sample = None
+        _label_rel_dispersion_per_sample = None
+        _offset_rel_dispersion_per_sample = None
 
         # 3. KNN 검색 + Attention 집계
         if self.memory.filled.item() >= self.k:
             nk, neighbour_labels, topk_idx = self.memory.retrieve(
-                query_emb, self.k,
+                query_retr, self.k,      # [S-1A] 검색은 retrieval 공간에서
                 # [진단용] global_retrieve=True면 그룹 무시하고 전체 검색.
                 # context_emb(위 2번)는 hard_assignment와 무관하게 이미
                 # 정상 계산됨 — 설명①은 그대로, 검색만 전역으로 바뀜.
@@ -1881,12 +2133,12 @@ class TabERA(nn.Module):
                 # 진짜 이웃에 의존하는가", 후자는 "다른 브랜치와 이 값의
                 # 대응이 중요한가").
                 agg_emb, evidence_w, evidence_diag = self.head_cross_attn(
-                    query_emb, nk, neighbour_labels,
+                    query_retr, nk, neighbour_labels,   # [S-1A]
                     shuffle_neighbors=(ablation_mode == "shuffle_neighbors"),
                 )
             else:
                 agg_emb, evidence_w, evidence_diag = self.ot_selector(
-                    query_emb, nk, neighbour_labels
+                    query_retr, nk, neighbour_labels   # [S-1A]
                 )
                 # [Local Retriever 진단] similarity geometry — evidence.py가
                 # 항상 계산해서 evidence_diag에 넣어둠(새 모듈 아님).
@@ -1894,6 +2146,12 @@ class TabERA(nn.Module):
                 _similarity_bottomk_per_sample = evidence_diag.get("similarity_bottomk_per_sample")
                 _similarity_margin_per_sample = evidence_diag.get("similarity_margin_per_sample")
                 _similarity_std_per_sample = evidence_diag.get("similarity_std_per_sample")
+                _value_pairwise_cos_per_sample = evidence_diag.get("value_pairwise_cos_per_sample")
+                _label_pairwise_cos_per_sample = evidence_diag.get("label_pairwise_cos_per_sample")
+                _offset_pairwise_cos_per_sample = evidence_diag.get("offset_pairwise_cos_per_sample")
+                _value_rel_dispersion_per_sample = evidence_diag.get("value_rel_dispersion_per_sample")
+                _label_rel_dispersion_per_sample = evidence_diag.get("label_rel_dispersion_per_sample")
+                _offset_rel_dispersion_per_sample = evidence_diag.get("offset_rel_dispersion_per_sample")
 
         else:
             # Memory 미충족 fallback
@@ -2015,6 +2273,40 @@ class TabERA(nn.Module):
             elif ablation_mode == "agg_emb_shuffle":
                 _perm = torch.randperm(agg_emb.shape[0], device=agg_emb.device)
                 _agg_for_head = agg_emb[_perm]
+            elif ablation_mode in ("agg_emb_constant", "agg_emb_centered"):
+                # [2026-07 추가] agg_emb = (샘플 무관 상수 성분) + (샘플별 잔차)
+                # 로 분해해서 어느 쪽이 예측에 쓰이는지 가른다.
+                #
+                # [왜] agg_emb는 head 입력 크기의 15~38%를 차지하는데
+                # relative_variation이 0.03~0.25로 작다 — 즉 크기는 큰데 샘플이
+                # 바뀌어도 거의 같은 벡터다. 그렇다면 head가 쓰는 건 정보가
+                # 아니라 상수 오프셋(bias)일 수 있고, 그러면 "추론 시점에
+                # 제거하면 logit이 통째로 이동해 나빠지지만, 재학습하면 head의
+                # bias 파라미터가 흡수해서 아무 손해가 없다"는 관찰(M1 vs M2
+                # 0/8 비유의)이 자연스럽게 설명된다. 다만 이건 아직 "bias처럼
+                # 보인다"까지이고 "bias다"는 증명이 아니어서, 두 성분을 실제로
+                # 분리해 봐야 한다.
+                #
+                #   agg_emb_constant : 잔차 제거, 상수만 남김 (agg ← mean)
+                #       → 거의 안 나빠지면 "잔차는 안 쓰인다"
+                #   agg_emb_centered : 상수 제거, 잔차만 남김 (agg ← agg - mean)
+                #       → 크게 나빠지면 "상수 성분이 지배적"
+                #   두 결과를 agg_emb_zero(둘 다 제거)와 나란히 놓고 본다.
+                #
+                # 평균 벡터는 배치가 아니라 **평가 세트 전체**에서 미리 계산해
+                # model._ablation_agg_mean에 넣어줘야 한다 — 배치 평균을 쓰면
+                # 배치마다 기준이 달라져 "상수 성분"의 정의가 흔들린다.
+                _mu = getattr(self, "_ablation_agg_mean", None)
+                if _mu is None:
+                    raise RuntimeError(
+                        f"ablation_mode='{ablation_mode}'는 model._ablation_agg_mean"
+                        f"(평가 세트 전체의 agg_emb 평균, shape (D,))을 미리 설정해야 "
+                        f"합니다. reproduce.py가 ablation 평가 루프 직전에 채웁니다.")
+                _mu = _mu.to(device=agg_emb.device, dtype=agg_emb.dtype).reshape(1, -1)
+                if ablation_mode == "agg_emb_constant":
+                    _agg_for_head = _mu.expand_as(agg_emb).clone()
+                else:
+                    _agg_for_head = agg_emb - _mu
             if self._per_branch_ln:
                 _agg_for_head = self.head_agg_ln(_agg_for_head)
             if self.head_branch_l2norm:
@@ -2204,6 +2496,10 @@ class TabERA(nn.Module):
                     _be = -(_g * _g.log() + (1 - _g) * (1 - _g).log())
                     _head_gate_entropy_mean = float(_be.mean().item())
                     _agg_beta_per_sample = _beta_d.clone()
+            elif self.fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
+                               "proto_only_linear"):
+                # 이 모드는 combined를 쓰지 않는다(z_proto + Δz로 직접 계산).
+                combined = _parts[0]
             else:
                 combined = torch.cat(_parts, dim=-1)
             # [진단용, 추가] ‖q+αc+βa‖ 배치 평균 — 벡터 합의 norm은 개별 norm의
@@ -2214,7 +2510,156 @@ class TabERA(nn.Module):
                 float(combined.detach().norm(dim=-1).mean().item())
                 if self.fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") else None
             )
-            logits = self.head(combined)
+            _proto_residual_diag = None   # proto_residual 전용 진단 (아래에서 채움)
+            if self.fusion_mode in ("proto_only", "proto_only_linear"):
+                # [V2 Stage 1] retrieval/query 모두 예측 경로 밖.
+                logits = self.proto_head(context_emb)
+                with torch.no_grad():
+                    _pr_diag = {"pr_proto_logit_norm": float(logits.norm(dim=-1).mean())}
+                    if labels is not None:
+                        _pr_diag["pr_proto_acc"] = float(
+                            (logits.argmax(-1) == labels).float().mean())
+                        _pr_diag["pr_final_acc"] = _pr_diag["pr_proto_acc"]
+                    _proto_residual_diag = _pr_diag
+            elif self.fusion_mode == "proto_query_residual":
+                # [control] Δz를 이웃이 아니라 query에서 만든다 — retrieval 실패와
+                # "query를 classifier에서 뺀 손해"를 분리하기 위한 대조군.
+                z_proto = self.proto_head(context_emb)
+                # ⚠ proto_residual과 **동일한** tanh 제한을 적용한다 —
+                #   대조군이 성립하려면 Δz의 생성 방식만 다르고
+                #   나머지 조건은 같아야 한다.
+                delta_z = torch.tanh(self.evidence_head(query_emb)) * F.softplus(self.ev_delta_beta_raw)
+                logits = z_proto + delta_z
+                with torch.no_grad():
+                    _pz = z_proto.norm(dim=-1).clamp_min(1e-8)
+                    _pr_diag = {
+                        "pr_delta_ratio": float((delta_z.norm(dim=-1) / _pz).mean()),
+                        "pr_changed_rate": float(
+                            (logits.argmax(-1) != z_proto.argmax(-1)).float().mean()),
+                        "pr_proto_logit_norm": float(_pz.mean()),
+                        "pr_delta_beta": float(F.softplus(self.ev_delta_beta_raw)),
+                        # 대조군에도 동일 진단 — Δz의 성격을 같은 자로 비교한다.
+                        "pr_cos_delta_proto": float(
+                            F.cosine_similarity(delta_z, z_proto, dim=-1).mean()),
+                    }
+                    if labels is not None:
+                        _pc = (z_proto.argmax(-1) == labels)
+                        _fc = (logits.argmax(-1) == labels)
+                        _pr_diag["pr_proto_acc"] = float(_pc.float().mean())
+                        _pr_diag["pr_final_acc"] = float(_fc.float().mean())
+                        _pr_diag["pr_fixed_rate"] = float((~_pc & _fc).float().mean())
+                        _pr_diag["pr_broke_rate"] = float((_pc & ~_fc).float().mean())
+                        _tgt = (F.one_hot(labels, z_proto.shape[-1]).float()
+                                - torch.softmax(z_proto, dim=-1))
+                        _pr_diag["pr_delta_align"] = float(
+                            F.cosine_similarity(delta_z, _tgt, dim=-1).mean())
+                    _proto_residual_diag = _pr_diag
+            elif self.fusion_mode == "proto_residual":
+                # ── [V2] z = z_proto(context) + Δz(query→neighbors) ────────
+                # z_proto : centroid-level prior — "이 영역은 보통 class k다"
+                # Δz      : local correction    — "이 샘플 주변 사례를 보면 다르다"
+                #
+                # query는 selector로만 쓴다(Q). 값은 전부 이웃(K, V)에서 나오므로
+                # 이웃이 없으면 Δz를 만들 수 없다 — concat head처럼 "가중치 0으로
+                # 무시"하는 회피 경로가 구조적으로 존재하지 않는다.
+                z_proto = self.proto_head(context_emb)                      # (B, C)
+                # ⚠ memory warmup 중(memory.filled < k)에는 nk가 정의되지 않는다.
+                #   그 배치는 Δz=0으로 두고 z_proto만 쓴다 — agg_emb가
+                #   zeros_like(query_emb)로 처리되는 것과 같은 규약.
+                _nk_ok = locals().get("nk") is not None
+                if _nk_ok:
+                    _q = F.normalize(self.ev_q(query_emb), dim=-1).unsqueeze(1)
+                    _k = F.normalize(self.ev_k(nk), dim=-1)                 # (B, k, D)
+                    _v = self.ev_v(nk)
+                    _tau = self.ev_log_tau.exp().clamp(0.05, 2.0)
+                    _att = torch.softmax((_q * _k).sum(-1) / _tau, dim=-1)  # (B, k)
+                    _ev = (_att.unsqueeze(-1) * _v).sum(1)                  # (B, D)
+                    delta_z = torch.tanh(self.evidence_head(_ev)) * F.softplus(self.ev_delta_beta_raw)
+                else:
+                    delta_z = torch.zeros_like(z_proto)
+                logits = z_proto + delta_z
+                # ── 진단: logit decomposition이 곧 ground truth ────────────
+                # slice별 기여(_head_block_slices)보다 직접적이다 —
+                # "prototype이 무엇이라 했고 retrieval이 얼마나 바꿨는가"가
+                # 그대로 관측된다.
+                # ── 진단: logit decomposition이 곧 ground truth ────────────
+                # slice별 기여(_head_block_slices)보다 직접적이다 —
+                # "prototype이 무엇이라 했고 retrieval이 얼마나 바꿨는가"가
+                # 그대로 관측된다.
+                # ⚠ warmup 배치(nk 없음)는 Δz=0이므로 진단하지 않는다.
+                if _nk_ok:
+                    with torch.no_grad():
+                        _pz = z_proto.norm(dim=-1).clamp_min(1e-8)
+                        _pr_diag = {
+                            "pr_delta_ratio": float((delta_z.norm(dim=-1) / _pz).mean()),
+                            "pr_changed_rate": float(
+                                (logits.argmax(-1) != z_proto.argmax(-1)).float().mean()),
+                            "pr_att_entropy": float(
+                                -(_att.clamp_min(1e-12) * _att.clamp_min(1e-12).log()).sum(-1).mean()),
+                            "pr_proto_logit_norm": float(_pz.mean()),
+                            "pr_tau": float(_tau),
+                            "pr_delta_beta": float(F.softplus(self.ev_delta_beta_raw)),
+                            # cos(Δz, z_proto) — Δz가 prototype을 어떻게 수정하는가.
+                            #   +1  단순 증폭 (prototype을 강화만 함)
+                            #    0  독립적 correction
+                            #   −1  prototype을 뒤집는 방향
+                            # fixed_rate와 함께 보면 수정의 성격이 드러난다.
+                            "pr_cos_delta_proto": float(
+                                F.cosine_similarity(delta_z, z_proto, dim=-1).mean()),
+                        }
+                        # ② permutation gap — Δz가 정말 이웃에 의존하는가.
+                        #   배치 안에서 이웃 집합을 섞어 Δz를 다시 계산한다.
+                        #   gap ≈ 0 이면 Δz = g(query)로 수렴한 것 —
+                        #   "이웃을 0으로 만들면 bias가 된다"보다 강한 검증이다
+                        #   (합성 대조: V=0일 때 ‖Δz‖=0.302로 0이 아닌데 gap=0).
+                        _perm = torch.randperm(nk.shape[0], device=nk.device)
+                        _kp = F.normalize(self.ev_k(nk[_perm]), dim=-1)
+                        _vp = self.ev_v(nk[_perm])
+                        _ap = torch.softmax((_q * _kp).sum(-1) / _tau, dim=-1)
+                        _dzp = torch.tanh(
+                            self.evidence_head((_ap.unsqueeze(-1) * _vp).sum(1))
+                        ) * F.softplus(self.ev_delta_beta_raw)
+                        _pr_diag["pr_perm_gap"] = float(
+                            (delta_z - _dzp).norm(dim=-1).mean())
+                        _pr_diag["pr_perm_gap_rel"] = float(
+                            ((delta_z - _dzp).norm(dim=-1)
+                             / delta_z.norm(dim=-1).clamp_min(1e-8)).mean())
+                        # zero-neighbor: 이웃을 0으로 만들면 Δz가 얼마나 남는가.
+                        #   shuffle gap = "이웃 정체(어느 샘플인가)를 쓰는가"
+                        #   zero  gap   = "이웃 값 자체가 Δz에 들어가는가"
+                        # ⚠ 이 구조에서는 두 지표가 대체로 함께 움직인다
+                        #   (V가 이웃을 보면 둘 다 >0). 분리 효과는 제한적이나,
+                        #   합성 대조에서 **‖Δz‖만으로는 못 잡는 경우**가 확인됐다:
+                        #   V의 weight를 0으로 두고 bias만 남기면
+                        #   ‖Δz‖=0.377(정상 0.354보다 큼)인데 두 gap 모두 0.
+                        #   → 크기가 아니라 gap을 게이트로 써야 한다.
+                        _z0 = torch.zeros_like(nk)
+                        _a0 = torch.softmax(
+                            (_q * F.normalize(self.ev_k(_z0), dim=-1)).sum(-1) / _tau, dim=-1)
+                        _dz0 = torch.tanh(
+                            self.evidence_head((_a0.unsqueeze(-1) * self.ev_v(_z0)).sum(1))
+                        ) * F.softplus(self.ev_delta_beta_raw)
+                        _pr_diag["pr_zero_gap_rel"] = float(
+                            ((delta_z - _dz0).norm(dim=-1)
+                             / delta_z.norm(dim=-1).clamp_min(1e-8)).mean())
+                        if labels is not None:
+                            _pc = (z_proto.argmax(-1) == labels)
+                            _fc = (logits.argmax(-1) == labels)
+                            _pr_diag["pr_proto_acc"] = float(_pc.float().mean())
+                            _pr_diag["pr_final_acc"] = float(_fc.float().mean())
+                            # retrieval이 옳은 방향으로 고쳤는가
+                            _pr_diag["pr_fixed_rate"] = float((~_pc & _fc).float().mean())
+                            _pr_diag["pr_broke_rate"] = float((_pc & ~_fc).float().mean())
+                            # ③ 방향 정합도 — ‖Δz‖(크기)보다 중요하다.
+                            #   목표 방향 = onehot(y) − softmax(z_proto)
+                            #   +1에 가까울수록 옳은 방향, 음수면 반대로 밀고 있음.
+                            _tgt = (F.one_hot(labels, z_proto.shape[-1]).float()
+                                    - torch.softmax(z_proto, dim=-1))
+                            _pr_diag["pr_delta_align"] = float(
+                                F.cosine_similarity(delta_z, _tgt, dim=-1).mean())
+                        _proto_residual_diag = _pr_diag
+            else:
+                logits = self.head(combined)
         else:
             # [v2] retrieval branch가 updated_query(=agg_emb 변수명 그대로
             # 재사용 중이지만 개념은 "agg_emb 대체"가 아니라 "retrieval
@@ -2257,7 +2702,9 @@ class TabERA(nn.Module):
 
         # 5. 메모리 업데이트 (학습 시)
         if self.training and labels is not None:
-            self.memory.update(query_emb.detach(), labels.float(), sample_ids)
+            # [S-1A] MemoryBank key도 retrieval 공간이어야 한다. 안 바꾸면 query는
+            # retr 공간, 이웃은 pred 공간이 되어 코사인 자체가 무의미해진다.
+            self.memory.update(query_retr.detach(), labels.float(), sample_ids)
             if self._feature_store is not None:
                 self._feature_store.update(X, sample_ids)
 
@@ -2271,6 +2718,15 @@ class TabERA(nn.Module):
 
         # 6. 보조 손실
         aux_loss = torch.tensor(0.0, device=X.device)
+        _retr_diag = {}
+        # proto_residual 진단은 logits 계산 시점(위)에서 만들어지므로
+        # 여기서 병합한다 — _retr_diag가 그보다 뒤에 정의되기 때문.
+        # ⚠ _proto_residual_diag는 특정 분기에서만 정의되므로 locals()로 확인.
+        #   (evidence.py에서 정의 전 참조로 UnboundLocalError를 두 번 냈다)
+        _retr_diag.update(locals().get('_proto_residual_diag') or {})
+        _aux_terms = {}   # [Step 1-4] gradient probe용 항별 손실 (graph 유지)
+
+
         if self.training:
             if self.prototype_layer.use_ema_codebook:
                 # [중요] EMA를 쓰면 diversity_loss/codebook_loss 둘 다 뺀다.
@@ -2285,19 +2741,54 @@ class TabERA(nn.Module):
                     self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
                 )
             else:
+                # [Step 1-4] gradient probe용으로 항별로 따로 계산해 보관.
+                # 합산 결과는 기존과 완전히 동일하다(같은 항을 같은 가중치로
+                # 더할 뿐). _aux_terms는 graph가 붙은 텐서라 supervised.py가
+                # loss.backward() 전에 autograd.grad로 경로별 기여를 잴 수 있다.
+                _t_div = self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
+                _t_com = self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
+                _t_cod = self.loss_weights.get("codebook", 0.0) * self.prototype_layer.codebook_loss(query_emb, hard_assignment)
+                _aux_terms = {"diversity": _t_div, "commitment": _t_com, "codebook": _t_cod}
                 aux_loss = (
-                    self.loss_weights["diversity"]  * self.prototype_layer.diversity_loss()
-                    + self.loss_weights["commitment"] * self.prototype_layer.commitment_loss(query_emb, hard_assignment)
+                    _t_div
+                    + _t_com
                     # [추가] codebook_loss — commitment_loss와 방향만 반대인 짝.
                     # .get()으로 하위 호환: 옛 체크포인트의 loss_weights에는
                     # "codebook" 키가 없어 --from_saved_state 로드 시 이 항은
                     # 0으로 처리됨(codebook_loss 자체가 아예 없던 상태와 동일).
-                    + self.loss_weights.get("codebook", 0.0) * self.prototype_layer.codebook_loss(query_emb, hard_assignment)
+                    + _t_cod
                 )
+
+        # ── [S-1A] retrieval surrogate ───────────────────────────
+        # ⚠ 반드시 위의 aux_loss **재할당**(commitment/codebook/diversity)이
+        #   끝난 뒤에 더한다. 그 블록들이 `aux_loss = (...)` 형태라 앞에 두면
+        #   조용히 덮어써진다(실측으로 확인된 버그).
+        # [주의] SNN 마스크는 **centroid 그룹** 안에서만 잡는다. 전역이면 단순
+        # 클래스 분리 문제로 퇴화하고, 그건 CE가 이미 잘 하는 방향이라(그룹
+        # purity 0.89~0.94) 오히려 그룹 내부 순위 정보를 더 없앤다.
+        # S-1A에서 hard_assignment는 query_emb(예측 공간) 기준이고 z는
+        # query_retr(검색 공간)이다 — 그 조합이 곧 "그룹은 예측 공간,
+        # 이웃은 검색 공간"이라는 S-1A의 정의다.
+        if self.training and labels is not None and (self.snn_lambda > 0 or self.unif_beta > 0):
+            from libs.evidence import soft_nearest_neighbor_loss, uniformity_loss
+            _lab = labels.long() if labels.dtype != torch.long else labels
+            if self.snn_lambda > 0:
+                _snn = soft_nearest_neighbor_loss(
+                    query_retr, _lab, group=hard_assignment, tau=self.snn_tau)
+                aux_loss = aux_loss + self.snn_lambda * _snn
+                _retr_diag["snn"] = float(_snn.detach())
+            if self.unif_beta > 0:
+                _u = uniformity_loss(query_retr)
+                aux_loss = aux_loss + self.unif_beta * _u
+                _retr_diag["uniformity"] = float(_u.detach())
 
         out = {
             "logits":      logits,
             "aux_loss":    aux_loss,
+            # [Step 1-4] 항별 손실 (graph 유지) — supervised.py가 backward 전에
+            # autograd.grad로 centroid_emb에 대한 경로별 gradient를 잰다.
+            # 학습 외 경로에서는 빈 dict.
+            "aux_terms":   _aux_terms,
             "routing":     routing_probs,
             # [추가, v2 Phase 2 후속] 샘플별 hard centroid 할당 — 지금까지 내부
             # 계산(prototype_layer 반환값)만 되고 out dict엔 없었음. centroid별
@@ -2323,6 +2814,10 @@ class TabERA(nn.Module):
             # detach_context_grad·ablation_mode가 적용된 뒤)과는 다를 수 있음 —
             # probe는 "이 표현 자체에 정보가 있는가"를 보는 거라 원본을 쓰는 게 맞음.
             "query_emb":   query_emb,
+            # [S-1A] retrieval 전용 표현. mode="none"이면 query_emb와 동일 객체.
+            # 진단(§3.5: CKA/cos, 세 지점 rank informativeness)에 필요.
+            "query_retr":  query_retr,
+            "retr_diag":   _retr_diag,
             "context_emb": context_emb,
             "ablation_mode": ablation_mode,
             # [추가, 진단용] fusion_mode="residual"일 때 학습된 α(context 가중치)/
@@ -2366,6 +2861,12 @@ class TabERA(nn.Module):
             "similarity_bottomk_per_sample": _similarity_bottomk_per_sample,
             "similarity_margin_per_sample": _similarity_margin_per_sample,
             "similarity_std_per_sample": _similarity_std_per_sample,
+            "value_pairwise_cos_per_sample": _value_pairwise_cos_per_sample,
+            "label_pairwise_cos_per_sample": _label_pairwise_cos_per_sample,
+            "offset_pairwise_cos_per_sample": _offset_pairwise_cos_per_sample,
+            "value_rel_dispersion_per_sample": _value_rel_dispersion_per_sample,
+            "label_rel_dispersion_per_sample": _label_rel_dispersion_per_sample,
+            "offset_rel_dispersion_per_sample": _offset_rel_dispersion_per_sample,
             # [추가] ||LN(q)||, ||LN(c)||, ||LN(a)|| 배치 평균 — fusion_mode와
             # 무관하게 항상 계산됨(concat 모드에서도 self._per_branch_ln이면
             # 의미 있음). residual 모드가 아니면 branch별 LN을 안 켰을 수
