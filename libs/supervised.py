@@ -348,13 +348,31 @@ class TabERAWrapper:
             if (fs is not None and self.cat_cols is not None
                     and self.num_cols is not None and self.col_names is not None):
                 x_regroup = fs._store[:n_mem].to(self.device)
-                self.model.prototype_layer.group_labels = label_all_groups(
-                    x_regroup.detach().cpu().numpy(),
-                    self.model.prototype_layer.sample_groups,
-                    self.cat_cols, self.num_cols, self.col_names,
-                    cat_category_names=self.cat_category_names,
-                    quantile_transformer=self.quantile_transformer,
-                )
+                _xn = x_regroup.detach().cpu().numpy()
+                # [가드] feature_store의 열 수와 cat_cols/num_cols 인덱스가
+                # 어긋나면 IndexError로 죽는다(실측: index 5 out of bounds for
+                # size 5). group_labels는 **설명 텍스트용**이라 진단/평가를
+                # 중단시킬 이유가 없다 — 범위 밖 인덱스는 건너뛰고 경고만 낸다.
+                _w = _xn.shape[1]
+                _cat = [i for i in (self.cat_cols or []) if 0 <= i < _w]
+                _num = [i for i in (self.num_cols or []) if 0 <= i < _w]
+                _dropped = (len(self.cat_cols or []) - len(_cat)) + \
+                           (len(self.num_cols or []) - len(_num))
+                if _dropped:
+                    tqdm.write(
+                        f"  ⚠️  [resync] feature_store 열 수({_w})를 벗어나는 "
+                        f"feature 인덱스 {_dropped}개를 건너뜁니다 — group_labels "
+                        f"(설명 텍스트)만 불완전해지고 수치 결과에는 영향 없습니다. "
+                        f"체크포인트와 --openml_id가 서로 다른 데이터셋일 가능성을 "
+                        f"확인하세요.")
+                if _cat or _num:
+                    self.model.prototype_layer.group_labels = label_all_groups(
+                        _xn,
+                        self.model.prototype_layer.sample_groups,
+                        _cat, _num, self.col_names,
+                        cat_category_names=self.cat_category_names,
+                        quantile_transformer=self.quantile_transformer,
+                    )
             y_regroup = self.model.memory.labels[:n_mem]
             self.model.prototype_layer.target_labels = label_groups_by_target(
                 y_regroup.detach().cpu().numpy(),
@@ -544,6 +562,10 @@ class TabERAWrapper:
             # vs "query/key norm이 커지는가"(normalization 문제) 구분용.
             # evidence_diag가 None인 배치(memory warmup fallback)는 자동 제외.
             _evidence_qnorm_sum = 0.0
+            _evidence_extra_sums = {}   # [수정] 하드코딩 외 스칼라 진단 자동 누적
+            _retr_extra_sums = {}       # [V2] out['retr_diag'] 자동 누적 (pr_* 등)
+            _retr_extra_counts = {}
+            _evidence_extra_counts = {} # 키별 등장 횟수 (모드마다 있는 키가 다름)
             _evidence_knorm_sum = 0.0
             _evidence_dist_mean_sum = 0.0
             _evidence_dist_std_sum  = 0.0
@@ -687,6 +709,15 @@ class TabERAWrapper:
                     _evidence_dominant_sum += _dominant
                     _evidence_batches += 1
 
+                    # [V2] proto_residual 계열의 logit decomposition 진단.
+                    # out["retr_diag"]로 반환되지만 지금까지 아무도 받지 않아
+                    # 조용히 버려지고 있었다(regroup_history / ec_*에 이어 세 번째).
+                    _rd = out.get("retr_diag")
+                    if _rd:
+                        for _rk, _rv in _rd.items():
+                            if isinstance(_rv, (int, float)) and not isinstance(_rv, bool):
+                                _retr_extra_sums[_rk] = _retr_extra_sums.get(_rk, 0.0) + float(_rv)
+                                _retr_extra_counts[_rk] = _retr_extra_counts.get(_rk, 0) + 1
                     _diag = out.get("evidence_diag")
                     if _diag is not None:
                         _evidence_qnorm_sum     += _diag["query_norm"]
@@ -694,6 +725,24 @@ class TabERAWrapper:
                         _evidence_dist_mean_sum += _diag["distance_mean"]
                         _evidence_dist_std_sum  += _diag["distance_std"]
                         _evidence_diag_batches  += 1
+                        # [수정] 고정 4개 키만 담으면 새로 추가된 진단이
+                        # **조용히 버려진다**(regroup_history에서 같은 문제를
+                        # 겪었다 — Evidence Constructor의 ec_* 지표가 실제로
+                        # 유실됐다). 스칼라 키는 전부 자동으로 누적한다.
+                        # ⚠ 키마다 **등장 횟수를 따로 센다.** 어떤 진단은
+                        #   특정 value_mode에서만 존재하는데(ec_*는 interaction
+                        #   전용), 분모로 _evidence_diag_batches(전체 배치)를
+                        #   쓰면 값이 과소평가된다. 실측에서 proj²+perp²가
+                        #   1이어야 하는데 0.0017이 나온 원인이 이것이었다.
+                        for _dk, _dv in _diag.items():
+                            if _dk in ("query_norm", "key_norm",
+                                       "distance_mean", "distance_std"):
+                                continue
+                            if isinstance(_dv, (int, float)):
+                                _evidence_extra_sums[_dk] = \
+                                    _evidence_extra_sums.get(_dk, 0.0) + float(_dv)
+                                _evidence_extra_counts[_dk] = \
+                                    _evidence_extra_counts.get(_dk, 0) + 1
 
                     # [진단용, 추가] self-retrieval — 값이 None인 배치(memory
                     # warmup fallback, 또는 sample_ids 미전달)는 자연스럽게 제외
@@ -997,6 +1046,14 @@ class TabERAWrapper:
                     "dominant_weight": _evidence_dominant_sum / _evidence_batches,
                 }
                 if _evidence_diag_batches > 0:
+                    for _rk, _rv in _retr_extra_sums.items():
+                        _c = _retr_extra_counts.get(_rk, 0)
+                        if _c > 0:
+                            ev_record[_rk] = _rv / _c
+                    for _dk, _dv in _evidence_extra_sums.items():
+                        _c = _evidence_extra_counts.get(_dk, 0)
+                        if _c > 0:
+                            ev_record[_dk] = _dv / _c
                     ev_record["query_norm"]    = _evidence_qnorm_sum / _evidence_diag_batches
                     ev_record["key_norm"]      = _evidence_knorm_sum / _evidence_diag_batches
                     ev_record["distance_mean"] = _evidence_dist_mean_sum / _evidence_diag_batches
