@@ -412,18 +412,27 @@ class TabERAWrapper:
         # 단일 비용으로 확인됨 (파라미터 텐서별로 개별 커널을 발사하기 때문).
         # fused=True는 전체 업데이트를 커널 1개로 묶어 처리 (CUDA + PyTorch 2.0+).
         # 일부 dtype/파라미터 구성에서 미지원일 수 있어 실패 시 foreach로 폴백.
+        # ⚠ β/γ(proto_dev의 residual 계수)는 weight decay에서 뺀다.
+        #   σ(β_raw) 형태라 β_raw를 0으로 누르면 β가 0.5로 끌려간다 —
+        #   "필요한 만큼만 쓴다"는 설계 의도와 정반대다.
+        #   BatchNorm/bias를 decay에서 빼는 것과 같은 이유다.
+        _no_decay, _decay = [], []
+        for _n, _p in self.model.named_parameters():
+            if not _p.requires_grad:
+                continue
+            (_no_decay if _n.endswith(("beta_raw", "gamma_raw")) else _decay).append(_p)
+        _pg = [{"params": _decay, "weight_decay": self.params["weight_decay"]},
+               {"params": _no_decay, "weight_decay": 0.0}]
         try:
             optimizer = torch.optim.AdamW(
-                self.model.parameters(),
+                _pg,
                 lr=self.params["lr"],
-                weight_decay=self.params["weight_decay"],
                 fused=(self.device.startswith("cuda")),
             )
         except (RuntimeError, TypeError):
             optimizer = torch.optim.AdamW(
-                self.model.parameters(),
+                _pg,
                 lr=self.params["lr"],
-                weight_decay=self.params["weight_decay"],
                 foreach=True,
             )
         scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
