@@ -1390,3 +1390,114 @@ class CentroidLayer(nn.Module):
                 line += f"  [{vals}]"
             lines.append(line)
         return "\n".join(lines)
+
+class ResidualCentroidLayer(nn.Module):
+    """[v3] 2단계 residual 양자화의 stage 2.
+
+    stage 1(CentroidLayer)이 cosine 공간에서 coarse code를 정하면,
+    잔차 r = q − sg(c1) 을 **euclidean 공간에서** 다시 양자화한다.
+
+    ⚠ stage 1과 거리 함수가 다른 이유:
+      stage 1은 방향만 보면 되므로 cosine + 단위구 재투영을 쓴다.
+      잔차 공간에서는 **크기도 정보**다 — 같은 방향이어도 ‖r‖=0.01인
+      샘플과 ‖r‖=1.2인 샘플은 cell 안에서 다른 위치를 뜻한다.
+      c2를 정규화하면 그 차이가 지워진다.
+
+    ⚠ 초기화는 residual 분포에 대한 KMeans++로 한다. 랜덤 초기화는
+      ‖r‖ ≪ ‖q‖ 라는 스케일 차이와 맞지 않아 초기부터 dead code가
+      대량 발생한다.
+    """
+
+    def __init__(
+        self,
+        n_prototypes: int,
+        embed_dim: int,
+        dead_reinit_patience: int = 5,
+        dead_reinit_noise_scale: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.n_prototypes = n_prototypes
+        self.embed_dim    = embed_dim
+        self.dead_reinit_patience    = dead_reinit_patience
+        self.dead_reinit_noise_scale = dead_reinit_noise_scale
+
+        # ⚠ 단위구에 두지 않는다(위 docstring 참고). 초기값은
+        #   initialize_from_residual()이 덮어쓰므로 작은 랜덤으로 시작.
+        self.centroid_emb = nn.Parameter(torch.randn(n_prototypes, embed_dim) * 0.01)
+
+        self.register_buffer("_dead_streak",
+                             torch.zeros(n_prototypes, dtype=torch.long))
+        self._last_counts = None
+
+    # ─────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def initialize_from_residual(self, residual: torch.Tensor) -> None:
+        """잔차 분포에 대한 KMeans++ 시딩."""
+        R = residual.detach().float()
+        N = R.shape[0]
+        P = min(self.n_prototypes, N)
+        idx = [int(torch.randint(0, N, (1,)).item())]
+        d2 = ((R - R[idx[0]]) ** 2).sum(-1)
+        for _ in range(1, P):
+            prob = d2.clamp_min(0)
+            if float(prob.sum()) <= 0:
+                nxt = int(torch.randint(0, N, (1,)).item())
+            else:
+                nxt = int(torch.multinomial(prob / prob.sum(), 1).item())
+            idx.append(nxt)
+            d2 = torch.minimum(d2, ((R - R[nxt]) ** 2).sum(-1))
+        sel = R[torch.tensor(idx, device=R.device)]
+        if P < self.n_prototypes:   # 표본이 모자라면 나머지는 잡음으로
+            pad = sel.mean(0, keepdim=True) + 0.01 * torch.randn(
+                self.n_prototypes - P, self.embed_dim, device=R.device)
+            sel = torch.cat([sel, pad], 0)
+        self.centroid_emb.data.copy_(sel.to(self.centroid_emb.dtype))
+
+    # ─────────────────────────────────────────────────────────
+    def forward(self, residual: torch.Tensor):
+        """잔차를 양자화한다.
+
+        Returns
+        ───────
+        c2        : (B, D)  선택된 residual code (STE 통과)
+        hard      : (B,)    코드 인덱스
+        """
+        # euclidean 거리 — ‖r − c‖²  (정규화 없음)
+        d2 = torch.cdist(residual, self.centroid_emb) ** 2       # (B, P)
+        hard = d2.argmin(-1)                                      # (B,)
+        # ⚠ STE: forward는 hard, backward는 soft.
+        #   부호를 뒤집어 "가까울수록 큰 값"으로 만든 뒤 softmax.
+        soft = torch.softmax(-d2, dim=-1)
+        probs = soft + (F.one_hot(hard, self.n_prototypes).to(soft.dtype)
+                        - soft).detach()
+        c2 = probs @ self.centroid_emb
+        with torch.no_grad():
+            self._last_counts = torch.bincount(
+                hard, minlength=self.n_prototypes)
+        return c2, hard
+
+    # ─────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def dead_reinit_update(self, residual: torch.Tensor) -> int:
+        """배정이 0인 코드를 잔차 표본으로 되살린다.
+
+        ⚠ stage 1과 같은 원리(균등 랜덤 + 노이즈, Jukebox 방식)이나
+          **단위구 재투영을 하지 않는다** — 잔차 공간에서는 크기가 정보다.
+        """
+        if self._last_counts is None:
+            return 0
+        dead = self._last_counts == 0
+        self._dead_streak[dead] += 1
+        self._dead_streak[~dead] = 0
+        fire = self._dead_streak >= self.dead_reinit_patience
+        n = int(fire.sum())
+        if n == 0:
+            return 0
+        R = residual.detach().float()
+        for p_ in torch.nonzero(fire).flatten().tolist():
+            anchor = R[int(torch.randint(0, R.shape[0], (1,)).item())]
+            noise = torch.randn_like(anchor) * self.dead_reinit_noise_scale \
+                    * anchor.norm().clamp_min(1e-6)
+            self.centroid_emb.data[p_] = anchor + noise
+            self._dead_streak[p_] = 0
+        return n
