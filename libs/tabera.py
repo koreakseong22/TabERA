@@ -1323,7 +1323,6 @@ class TabERA(nn.Module):
         nbr_tau: float = 0.1,                # InfoNCE 온도
         nbr_neg_margin: int = 50,            # negative에서 제외할 raw 이웃 수
                                              # (raw 거리 상위 이만큼은 negative로 안 씀)
-        centroid_topo_lambda: float = 0.0,   # [v3] centroid topology loss 가중치
                                              # 0이면 완전히 꺼짐(기본값 = v2 동작)
         retr_proj_mode: str = "none",
         detach_retr_grad: bool = False,
@@ -1503,7 +1502,6 @@ class TabERA(nn.Module):
         #   --from_saved_state(strict=True)가 구버전 체크포인트에서 깨진다.
         self._nbr_graph = None       # (N_train, nbr_k) long
         self._nbr_far   = None       # (N_train, nbr_neg_margin) long — 제외 대상
-        self.centroid_topo_lambda = centroid_topo_lambda
         self.retr_proj_mode    = retr_proj_mode
         self.detach_retr_grad  = detach_retr_grad
         self.embedder = TabularEmbedder(
@@ -2111,6 +2109,11 @@ class TabERA(nn.Module):
         """에폭 시작 시 호출 — 그 에폭 첫 배치에서만 RVQ 진단을 계산한다."""
         self._rvq_diag_done = False
 
+    # ⚠ 프로세스 수준 캐시. HPO는 같은 X_train으로 100 trial을 돌리므로
+    #   그래프를 매번 다시 만들 이유가 없다. 키는 (내용 해시, k, margin)이라
+    #   데이터가 바뀌면 자동으로 새로 계산된다 — 결과는 캐시 없을 때와 동일하다.
+    _NBR_CACHE: Dict[Tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
+
     def set_nbr_graph(self, X_train: torch.Tensor) -> None:
         """raw feature 공간의 kNN graph를 미리 계산해 둔다 (학습 전 1회).
 
@@ -2123,6 +2126,16 @@ class TabERA(nn.Module):
             return
         with torch.no_grad():
             _X = X_train.detach().float()
+            # 내용 기반 키 — shape만 쓰면 같은 크기의 다른 데이터셋이 충돌한다.
+            _key = (
+                tuple(_X.shape),
+                float(_X.sum()), float(_X[0].sum()), float(_X[-1].sum()),
+                int(self.nbr_k), int(self.nbr_neg_margin),
+            )
+            _hit = TabERA._NBR_CACHE.get(_key)
+            if _hit is not None:
+                self._nbr_graph, self._nbr_far = _hit
+                return
             _mu, _sd = _X.mean(0, keepdim=True), _X.std(0, keepdim=True).clamp_min(1e-6)
             _Z = (_X - _mu) / _sd
             _N = _Z.shape[0]
@@ -2142,6 +2155,10 @@ class TabERA(nn.Module):
                 del _blk
             self._nbr_graph = torch.cat(_g, 0)
             self._nbr_far   = torch.cat(_fr, 0)
+            TabERA._NBR_CACHE[_key] = (self._nbr_graph, self._nbr_far)
+            # 데이터셋을 여러 개 순회할 때 무한정 쌓이지 않도록 제한.
+            if len(TabERA._NBR_CACHE) > 4:
+                TabERA._NBR_CACHE.pop(next(iter(TabERA._NBR_CACHE)))
             print(f"  [L_nbr] raw kNN graph 생성: N={_N}, k={_kk}, "
                   f"neg_margin={_mm}")
 
@@ -3321,7 +3338,7 @@ class TabERA(nn.Module):
                     + _t_cod
                 )
 
-        # ⚠ 이 두 손실(L_nbr / topology)은 **반드시 위의 aux_loss 재할당**
+        # ⚠ L_nbr은 **반드시 위의 aux_loss 재할당**
         #   (commitment/codebook/diversity)이 끝난 뒤에 더해야 한다.
         #   그 블록들이 `aux_loss = (...)` 형태라 앞에 두면 조용히 덮어써진다.
         #   실제로 그렇게 넣었다가 λ sweep 전 구간에서 nbr_loss가 8.04(=log(256),
@@ -3387,45 +3404,6 @@ class TabERA(nn.Module):
                                 (_pos_sim * self.nbr_tau)[_valid].mean()),
                         }
 
-        # ── [v3] centroid topology loss ────────────────────────────────
-        # prototype 간 **배치 관계**를 raw feature manifold와 맞춘다.
-        # CE는 "각 prototype이 어느 클래스인가"를 정하고, 이 손실은
-        # "prototype들이 서로 어떻게 놓이는가"만 조정한다 — 서로 다른 축이다.
-        #
-        # ⚠ 목적은 CE를 이기는 것이 **아니다**. CE가 유도하는 class-aligned
-        #   partition에 retrieval-friendly local geometry를 regularizer로
-        #   주입하는 것이다. purity가 무너질 정도로 커지면 실패다.
-        _topo_diag = None
-        if (self.training and self.centroid_topo_lambda > 0
-                and hard_assignment is not None):
-            _xr = X.detach().float()
-            _asg = hard_assignment.detach()
-            _P = self.prototype_layer.centroid_emb.shape[0]
-            # prototype별 raw feature 평균 (배치 내)
-            _mu = torch.zeros(_P, _xr.shape[1], device=_xr.device, dtype=_xr.dtype)
-            _cnt = torch.zeros(_P, device=_xr.device, dtype=_xr.dtype)
-            _mu.index_add_(0, _asg, _xr)
-            _cnt.index_add_(0, _asg, torch.ones_like(_asg, dtype=_xr.dtype))
-            _act = _cnt >= 2          # 최소 2개는 있어야 평균이 의미 있음
-            if int(_act.sum()) >= 3:  # prototype 3개 미만이면 관계 자체가 없음
-                _mu_n = F.normalize(_mu[_act] / _cnt[_act].unsqueeze(-1), dim=-1)
-                _ce_n = F.normalize(
-                    self.prototype_layer.centroid_emb[_act], dim=-1)
-                _S_mu = _mu_n @ _mu_n.T          # raw feature 기준 관계 (상수)
-                _S_ce = _ce_n @ _ce_n.T          # centroid 기준 관계 (학습됨)
-                # 대각은 양쪽 모두 1이므로 제외 — 정보가 없다
-                _n_act = _S_mu.shape[0]
-                _off = ~torch.eye(_n_act, dtype=torch.bool, device=_S_mu.device)
-                _topo = (_S_mu[_off] - _S_ce[_off]).pow(2).mean()
-                aux_loss = aux_loss + self.centroid_topo_lambda * _topo
-                with torch.no_grad():
-                    _topo_diag = {
-                        "topo_loss": float(_topo),
-                        "topo_n_active": float(_n_act),
-                        # 두 관계 행렬이 얼마나 어긋나 있는가 (상관)
-                        "topo_corr": float(torch.corrcoef(torch.stack([
-                            _S_mu[_off], _S_ce[_off]]))[0, 1]),
-                    }
         # ⚠ 진단 dict를 이름으로 하나씩 병합하면, 블록 순서를 바꿀 때마다
         #   "생성보다 병합이 앞"이 되어 조용히 사라진다(실제로 두 번 발생:
         #   aux_loss 재할당 뒤로 옮기면서 _nbr_diag/_topo_diag가 통째로 유실).

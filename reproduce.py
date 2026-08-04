@@ -2057,7 +2057,6 @@ def run_single_seed(
               + (f"..bs{args.batch_size_override}" if args.batch_size_override is not None else "") \
               + (f"..rwe{args.regroup_warmup_epochs_override}" if args.regroup_warmup_epochs_override is not None else "") \
               + ("..nodr" if args.disable_dead_reinit else "") \
-              + (f"..topo{args.centroid_topo_lambda:g}" if args.centroid_topo_lambda > 0 else "") \
               + (f"..nbr{args.nbr_lambda:g}" if args.nbr_lambda > 0 else "") \
               + ("..rvq" if args.residual_vq else "") \
               + (f"..cb{args.loss_codebook_override:g}" if args.loss_codebook_override is not None else "") \
@@ -2369,10 +2368,6 @@ def run_single_seed(
             print(f"  [--nbr_lambda] L_nbr = {args.nbr_lambda:g} "
                   f"(k={args.nbr_k}, tau={args.nbr_tau:g}, "
                   f"neg_margin={args.nbr_neg_margin})")
-        if args.centroid_topo_lambda > 0:
-            model_kwargs["centroid_topo_lambda"] = args.centroid_topo_lambda
-            print(f"  [--centroid_topo_lambda] centroid topology loss "
-                  f"= {args.centroid_topo_lambda:g}")
         if args.disable_dead_reinit:
             # patience를 학습 epoch 수보다 크게 두면 재초기화가 한 번도
             # 발생하지 않는다 — 별도 분기 추가 없이 완전 OFF를 만든다.
@@ -2516,7 +2511,24 @@ def run_single_seed(
     wrapper._data_id = args.openml_id
     if _saved_state is not None:
         # ── 재학습 생략, 저장된 상태 그대로 복원 ──────────────
-        model.load_state_dict(_saved_state["state_dict"])
+        # ⚠ v2 체크포인트(proto_head)를 v3 모델(dev_head, dev_beta_raw)에
+        #   strict=True로 로드하면 즉시 실패한다. 그렇다고 strict=False로
+        #   그냥 넘기면 오타나 실제 불일치까지 조용히 통과해 "실행은 되는데
+        #   가중치가 안 들어간" 상태를 만든다 — 더 위험하다.
+        #   그래서 **의도된 missing만** 허용하고 나머지는 즉시 실패시킨다.
+        _ALLOWED_MISSING = ("dev_head.", "dev_beta_raw", "dev_gamma_raw",
+                            "prototype_layer_2.")
+        _miss, _unexp = model.load_state_dict(
+            _saved_state["state_dict"], strict=False)
+        _bad = [k for k in _miss if not k.startswith(_ALLOWED_MISSING)]
+        if _bad or _unexp:
+            raise RuntimeError(
+                f"체크포인트 불일치 — 예상 못 한 missing {_bad[:5]}, "
+                f"unexpected {list(_unexp)[:5]}. 저장 시점과 현재 모델 구조가 "
+                f"다릅니다(fusion_mode/residual_vq 설정 확인).")
+        if _miss:
+            print(f"  [--from_saved_state] v3 신규 파라미터 {len(_miss)}개는 "
+                  f"초기값 사용: {[k for k in _miss][:3]}...")
         # [2026-07, 추가] --inference_evidence_temperature — 로드된 가중치는
         # 그대로 두고 **추론 시점의 softmax 온도만** 바꾼다.
         # [왜 별도 플래그가 필요한가] --evidence_temperature_override는 재학습
@@ -5941,19 +5953,6 @@ def main():
                             "negative에서 제외할 raw 이웃 수. tabular은 raw 근접 ≈ "
                             "같은 클래스인 경우가 많아, 배치 negative에 이웃이 섞이면 "
                             "같은 neighborhood를 서로 밀어내는 충돌이 생긴다."
-                        ))
-    parser.add_argument("--centroid_topo_lambda", type=float, default=0.0,
-                        help=(
-                            "[v3 Phase 1] centroid topology loss 가중치. "
-                            "L_topo = ||Sim(mu_x) - Sim(centroid_emb)||^2 로 "
-                            "prototype 간 **배치 관계**를 raw feature manifold와 맞춘다. "
-                            "배정(누가 어느 그룹)은 CE가 정하고 건드리지 않는다 — "
-                            "raw feature / assignment 모두 detach하고 centroid_emb에만 "
-                            "gradient가 흐른다. "
-                            "⚠ 목적은 CE를 이기는 것이 아니라 regularizer다. "
-                            "purity가 무너질 만큼 크면 실패다(그냥 retrieval 모델이 됨). "
-                            "sweep 권장: 0 / 0.001 / 0.005 / 0.01 / 0.05 / 0.1. "
-                            "판정은 accuracy 유지 + Level 1(lo_*) 개선 여부로 한다."
                         ))
     parser.add_argument("--disable_dead_reinit", action="store_true",
                         help=(
