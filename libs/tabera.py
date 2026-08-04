@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from libs.prototypes   import CentroidLayer
+from libs.prototypes import CentroidLayer, ResidualCentroidLayer
 from libs.evidence     import AttentionAggregator, HeadCrossAttention
 
 
@@ -1307,6 +1307,15 @@ class TabERA(nn.Module):
         #   ⚠ [v2에서 snn_lambda/unif_beta는 제거됨 — retr_proj와 함께 삭제]
         #     detach 유무가 같은 결과여야 하고, 그 일치가 sanity check가 된다.
         #     λ를 detach 스위치로 겸용하면 이 검증을 잃는다.
+        residual_vq: bool = False,           # [v3] 2단계 residual 양자화
+        residual_vq_size: Optional[int] = None,   # P2. None이면 P1과 동일
+        nbr_lambda: float = 0.0,             # [v3] L_nbr 가중치 (encoder에 직접)
+        nbr_k: int = 10,                     # raw feature kNN에서 positive 후보 수
+        nbr_tau: float = 0.1,                # InfoNCE 온도
+        nbr_neg_margin: int = 50,            # negative에서 제외할 raw 이웃 수
+                                             # (raw 거리 상위 이만큼은 negative로 안 씀)
+        centroid_topo_lambda: float = 0.0,   # [v3] centroid topology loss 가중치
+                                             # 0이면 완전히 꺼짐(기본값 = v2 동작)
         retr_proj_mode: str = "none",
         detach_retr_grad: bool = False,
         disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜"
@@ -1419,7 +1428,7 @@ class TabERA(nn.Module):
         if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate",
                                "context_gated_beta", "proto_residual",
                                "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
                                "proto_residual_query"):
             raise ValueError(f"fusion_mode은 'concat'/'residual'/'gated_sum'/'anchor_gate'/'context_gated_beta' 중 하나여야 합니다: {fusion_mode}")
         if fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") and not use_query_emb_in_head:
@@ -1451,6 +1460,41 @@ class TabERA(nn.Module):
         # cat_col_idx가 주어지면 categorical feature를 nn.Embedding으로
         # 처리 (① 후보 검증 결과 반영 — 안 주면 이전과 100% 동일 동작,
         # 기존 체크포인트 하위 호환 유지)
+        # ── [v3] Residual VQ (stage 2) ──────────────────────────────
+        # v2는 f(x) = W·c_{k(x)} 라 **최대 P개의 서로 다른 예측**만 가능하다.
+        # 실측(ds=14): test 200개 → 고유 예측 31개. Voronoi 상한 0.852의
+        # 97.3%에 이미 도달했고 auroc 손실은 동점이 114% 설명한다.
+        # 즉 병목은 학습이 아니라 함수 형태의 표현력이다.
+        #
+        # ⚠ continuous residual(E 조건)로 풀면 안 된다 — λ를 작게 둬도
+        #   optimizer가 ‖W_q‖를 24배 키워 우회하고 prototype이 무력화된다
+        #   (query 기여 98.6%, prototype 단독 정확도 0.914 → 0.553).
+        #   두 항 모두 discrete여야 "무제한 정보" 경쟁자가 없다.
+        self.residual_vq = residual_vq
+        # 진단은 **에폭당 1회**만 계산한다.
+        # ⚠ 고정 주기(N배치마다)는 에폭 경계와 어긋나 어떤 에폭은 기록이
+        #   아예 없을 수 있다. supervised.py가 에폭 시작 시
+        #   reset_rvq_diag()를 부르면 그 에폭 첫 배치에서만 계산된다.
+        self._rvq_diag_done = False
+        self.prototype_layer_2 = None
+        if residual_vq:
+            _P2 = residual_vq_size or n_prototypes
+            self.prototype_layer_2 = ResidualCentroidLayer(
+                n_prototypes=_P2,
+                embed_dim=embed_dim,
+                dead_reinit_patience=dead_reinit_patience,
+                dead_reinit_noise_scale=dead_reinit_noise_scale,
+            )
+        self.nbr_lambda        = nbr_lambda
+        self.nbr_k             = nbr_k
+        self.nbr_tau           = nbr_tau
+        self.nbr_neg_margin    = nbr_neg_margin
+        # raw feature kNN graph — set_nbr_graph()로 학습 전에 주입한다.
+        # ⚠ register_buffer를 쓰지 않는다: state_dict에 들어가면
+        #   --from_saved_state(strict=True)가 구버전 체크포인트에서 깨진다.
+        self._nbr_graph = None       # (N_train, nbr_k) long
+        self._nbr_far   = None       # (N_train, nbr_neg_margin) long — 제외 대상
+        self.centroid_topo_lambda = centroid_topo_lambda
         self.retr_proj_mode    = retr_proj_mode
         self.detach_retr_grad  = detach_retr_grad
         self.embedder = TabularEmbedder(
@@ -1750,6 +1794,32 @@ class TabERA(nn.Module):
                 #   E            logits = W·c + λ·W·q    prototype = anchor + residual
                 self.query_head = nn.Linear(embed_dim, n_output)
                 self.head = None
+            elif fusion_mode == "proto_dev_agg":
+                # ── h = c + β·normalize(q−c) + γ·normalize(agg−c) ─────
+                # ⚠ W 공유가 핵심이다. v1은 branch별 가중치가 따로라
+                #   query가 지배했다. 여기서는 β/γ만이 손잡이다.
+                self.dev_head = nn.Linear(embed_dim, n_output)
+                self.dev_beta_raw = nn.Parameter(torch.tensor([-2.197]))   # σ≈0.1
+                # γ는 더 작게 시작한다 — prototype identity가 이미 확립돼 있고,
+                # neighbor evidence는 보조 역할이어야 한다.
+                self.dev_gamma_raw = nn.Parameter(torch.tensor([-2.944]))  # σ≈0.05
+                self.head = None
+            elif fusion_mode == "proto_dev":
+                # ── h = c + β·normalize(q − c),  logits = W·h ──────────
+                # ⚠ W를 **공유**한다. E 조건(W_c·c + λ·W_q·q)은 두 행렬이
+                #   따로라 ‖W_q‖를 24배 키워 λ 제약을 우회했다.
+                #   여기서는 W를 키우면 c 쪽도 같이 커져 그 경로가 없다.
+                #
+                # ⚠ RVQ와도 다르다. RVQ는 r을 **다시 양자화**해 c2를 만들었고
+                #   c2가 판별 정보를 못 배웠다(Fisher가 c1의 1~3%).
+                #   여기서는 r을 압축하지 않고 작은 보정항으로 직접 쓴다.
+                #
+                # ⚠ normalize: RVQ 1차 시도에서 ‖r‖≈8, ‖c‖=1이라 c가 묻혀
+                #   stage1이 붕괴했다(acc 0.805→0.343). 방향만 쓰고 크기는 β가 통제.
+                self.dev_head = nn.Linear(embed_dim, n_output)
+                # σ(-2.197) ≈ 0.1
+                self.dev_beta_raw = nn.Parameter(torch.tensor([-2.197]))
+                self.head = None
             elif fusion_mode == "proto_residual_query":
                 # ── [Phase 0.5 조건 E] logits = W_c·c + λ·W_q·q ───────────
                 # VQ 계열의 residual 구조와 같은 형태다(RQ-VAE, VQ-VAE-2의
@@ -1943,7 +2013,7 @@ class TabERA(nn.Module):
             #   log_branch_gradients)은 이 모드에서 의미가 없고, 대신
             #   logit decomposition(pr_* 지표)이 직접적인 ground truth다.
             if fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
                                "proto_residual_query"):
                 self._head_first_linear = None
             else:
@@ -1996,6 +2066,65 @@ class TabERA(nn.Module):
             self.fusion_beta = None
 
     # ── Forward ────────────────────────────────────────
+
+    @staticmethod
+    def _hard_pred(logits: torch.Tensor) -> torch.Tensor:
+        """logits → 예측 클래스.
+
+        ⚠ 이진 분류는 logits가 (N,1)이라 argmax가 항상 0이다 —
+          그대로 쓰면 accuracy 진단이 전부 무의미해진다.
+          실측: ds=31/41143/934가 (N,1), ds=14/54는 (N,C).
+        """
+        if logits.dim() == 1 or logits.shape[-1] == 1:
+            return (logits.reshape(-1) > 0).long()
+        return logits.argmax(-1)
+
+    @staticmethod
+    def _cond_entropy(idx: torch.Tensor, nbins: int,
+                      y: torch.Tensor, C: int) -> float:
+        """H(y | idx) — 그룹 크기로 가중 평균.
+
+        ⚠ 루프 대신 bincount 하나로 계산한다. idx*C+y로 2D 히스토그램을
+          1D로 펴서 한 번에 세는 방식 — 배치당 24ms를 1ms로 줄인다.
+        """
+        N = y.shape[0]
+        # ⚠ labels가 float일 수 있다 — 이진 분류에서 BCE용으로 float으로
+        #   저장되는 경로가 있다. bincount는 정수만 받으므로 명시 변환.
+        y = y.long()
+        idx = idx.long()
+        cnt = torch.bincount(idx * C + y, minlength=nbins * C).float().view(nbins, C)
+        n = cnt.sum(-1)
+        p = cnt / n.clamp_min(1).unsqueeze(-1)
+        lg = torch.where(p > 0, p.log2(), torch.zeros_like(p))
+        return float(((-(p * lg).sum(-1)) * (n / N)).sum())
+
+    def reset_rvq_diag(self) -> None:
+        """에폭 시작 시 호출 — 그 에폭 첫 배치에서만 RVQ 진단을 계산한다."""
+        self._rvq_diag_done = False
+
+    def set_nbr_graph(self, X_train: torch.Tensor) -> None:
+        """raw feature 공간의 kNN graph를 미리 계산해 둔다 (학습 전 1회).
+
+        ⚠ FeatureStore는 학습 중 채워지므로 첫 epoch에 쓸 수 없다.
+          offline이어야 seed 간 결과 비교도 가능하다.
+        ⚠ 표준화 후 유클리드 거리를 쓴다 — raw feature는 스케일이 제각각이라
+          그대로 쓰면 큰 스케일 컬럼이 이웃 관계를 지배한다.
+        """
+        if self.nbr_lambda <= 0:
+            return
+        with torch.no_grad():
+            _X = X_train.detach().float()
+            _mu, _sd = _X.mean(0, keepdim=True), _X.std(0, keepdim=True).clamp_min(1e-6)
+            _Z = (_X - _mu) / _sd
+            _N = _Z.shape[0]
+            _kk = min(self.nbr_k, _N - 1)
+            _mm = min(self.nbr_neg_margin, _N - 1)
+            _D = torch.cdist(_Z, _Z)
+            _D.fill_diagonal_(float("inf"))
+            self._nbr_graph = _D.topk(_kk, dim=-1, largest=False).indices.cpu()
+            self._nbr_far   = _D.topk(_mm, dim=-1, largest=False).indices.cpu()
+            print(f"  [L_nbr] raw kNN graph 생성: N={_N}, k={_kk}, "
+                  f"neg_margin={_mm}")
 
     def forward(
         self,
@@ -2070,6 +2199,48 @@ class TabERA(nn.Module):
         # ①의 group_confidence 표시와 confidence scaling(옵션) 양쪽에 씀.
         context_emb, hard_assignment, routing_probs, _, _, top1_confidence = \
             self.prototype_layer(query_emb)
+
+        # ── [v3] Residual VQ (stage 2) ──────────────────────────────────
+        #   r = q − sg(c1)  →  quantize  →  context = c1 + c2
+        #
+        # ⚠ sg(c1): stop-gradient가 없으면 stage 2의 loss가 c1으로 흘러
+        #   두 단계가 얽히고, "stage 2가 기여했는가"를 분리할 수 없다.
+        #   q에는 gradient가 흐른다 — encoder는 두 단계 모두에서 학습된다.
+        #
+        # ⚠ α 가중치를 두지 않는다(context = c1 + c2). α가 있으면
+        #   성능 변화가 "코드북 증가 때문인지 가중치 조절 때문인지"
+        #   분리되지 않는다. RVQ 표준도 단순 합이다.
+        _rvq_c2 = None
+        _rvq_hard2 = None
+        _rvq_residual = None
+        if self.residual_vq and self.prototype_layer_2 is not None:
+            # ⚠ residual 계산에만 정규화된 query를 쓴다(B안).
+            #   q 전체를 정규화하면(A안) query head/retrieval/aggregator까지
+            #   바뀌어 v2 비교가 깨진다 — RVQ 검증이 아니라 encoder 변경 실험이 된다.
+            #
+            # ⚠ 이 정규화가 필요한 이유: 1차 시도에서 stage1이 붕괴했다.
+            #   ‖c1‖=1(단위구)인데 ‖r‖≈8이라 context = c1+c2 가 사실상 c2가 되고,
+            #   optimizer가 stage1을 버렸다(active 35/40 → 10/40, acc 0.805 → 0.343).
+            #   q̂와 c1이 모두 단위벡터면 ‖r‖ ≤ 2로 자연히 제한된다.
+            #
+            # ⚠ stage1 routing에는 영향이 없다 — 이미 cosine이라
+            #   argmax(normalize(q)·c) = argmax(q·c) 이다.
+            #
+            # ⚠ 단, ‖c2‖ ≤ 2는 **초기화 시점의 보장**일 뿐이다. C2는 이후
+            #   gradient로 자유롭게 움직이므로 rvq_c2_over_c1_norm 진단으로
+            #   학습 중 다시 벌어지는지 감시해야 한다.
+            _q_norm = F.normalize(query_emb, dim=-1)
+            _rvq_residual = _q_norm - context_emb.detach()
+            _rvq_c2, _rvq_hard2 = self.prototype_layer_2(_rvq_residual)
+            _context_stage1 = context_emb        # 진단용 보관
+            context_emb = context_emb + _rvq_c2
+            # ⚠ test 시점 Δ 계산에 필요하므로 **진단 주기와 무관하게** 만든다.
+            #   proto_head는 단일 Linear라 비용이 무시할 수준이다.
+            if self.fusion_mode in ("proto_only", "proto_only_linear"):
+                with torch.no_grad():
+                    _rvq_logits_c1 = self.proto_head(_context_stage1)
+            if self.training:
+                self.prototype_layer_2.dead_reinit_update(_rvq_residual)
 
         # [Local Retriever 진단] similarity geometry — evidence.py가 항상
         # 계산하므로(새 모듈 아님) aggregator 호출 이전에 미리 초기화(cross_
@@ -2173,6 +2344,9 @@ class TabERA(nn.Module):
             _V2_NO_AGG = self.fusion_mode in (
                 "proto_only", "proto_only_linear",
                 "query_only_linear", "proto_residual_query",
+                # ⚠ proto_dev는 agg를 쓰지 않으므로 여기 포함.
+                #   proto_dev_agg는 **제외** — 그 모드가 agg_emb를 쓴다.
+                "proto_dev",
             )
             if _V2_NO_AGG:
                 # agg_emb를 만들지 않는다. 아래 fusion 코드가 참조하지 않도록
@@ -2185,7 +2359,14 @@ class TabERA(nn.Module):
                 evidence_w = torch.full(
                     (nk.shape[0], nk.shape[1]), 1.0 / nk.shape[1],
                     device=nk.device, dtype=nk.dtype)
-                evidence_diag = {}
+                # ⚠ 빈 dict다(None이 아님) — 아래 코드가 .get()으로 접근하므로
+                #   None이면 AttributeError. 다만 `is not None` 체크만 하는
+                #   코드는 이걸 통과시키므로, 키를 직접 읽는 쪽은 `in`으로
+                #   확인해야 한다(supervised.py의 query_norm이 그렇게 터졌다).
+                # ⚠ evidence_w는 균등값이다. aggregator를 안 쓰므로 의미 있는
+                #   가중치가 아니며, 이 값으로 계산된 entropy/n_eff 진단은
+                #   해석하면 안 된다.
+                evidence_diag = {"agg_disabled_v2": 1.0}
             elif self.aggregator_mode == "cross_attention":
                 # [v2] AttentionAggregator 대신 head 내부 cross-attention.
                 # updated_query가 agg_emb 자리를 대체 — 아래 기존 fusion/
@@ -2522,7 +2703,7 @@ class TabERA(nn.Module):
                     _head_gate_entropy_mean = float(_be.mean().item())
                     _agg_beta_per_sample = _beta_d.clone()
             elif self.fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
                                "proto_residual_query"):
                 # 이 모드는 combined를 쓰지 않는다(z_proto + Δz로 직접 계산).
                 combined = _parts[0]
@@ -2543,10 +2724,89 @@ class TabERA(nn.Module):
                 with torch.no_grad():
                     _pr_diag = {"pq_unique_logits": float(
                         len(torch.unique(logits.round(decimals=4), dim=0)))}
-                    if labels is not None:
+                    if labels is not None and self.tasktype != "regression":
                         _pr_diag["pr_final_acc"] = float(
-                            (logits.argmax(-1) == labels).float().mean())
+                            (self._hard_pred(logits) == labels.long()).float().mean())
                     _proto_residual_diag = _pr_diag
+            elif self.fusion_mode == "proto_dev_agg":
+                _beta = torch.sigmoid(self.dev_beta_raw)
+                _gamma = torch.sigmoid(self.dev_gamma_raw)
+                _dev_q = F.normalize(query_emb - context_emb, dim=-1)
+                _dev_a = F.normalize(agg_emb - context_emb, dim=-1)
+                _h = context_emb + _beta * _dev_q + _gamma * _dev_a
+                logits = self.dev_head(_h)
+                with torch.no_grad():
+                    _lg_c = self.dev_head(context_emb)
+                    _lg_q = self.dev_head(context_emb + _beta * _dev_q)
+                    _cn = context_emb.norm(dim=-1).mean().clamp_min(1e-8)
+                    _pr_diag = {
+                        "dev_beta": float(_beta),
+                        "dev_gamma": float(_gamma),
+                        # ⚠ γ 값만으로는 부족하다 — ‖q−c‖와 ‖agg−c‖ 크기가
+                        #   달라 실제 기여가 뒤집힐 수 있다.
+                        "dev_R_proto": float(
+                            (_beta * _dev_q).norm(dim=-1).mean() / _cn),
+                        "dev_R_agg": float(
+                            (_gamma * _dev_a).norm(dim=-1).mean() / _cn),
+                        "dev_unique_logits": float(
+                            len(torch.unique(logits.round(decimals=4), dim=0))),
+                        # ⚠ proto_dev에서 0.6% 미만이었다. 5%를 넘으면
+                        #   v1 방향으로 이동한 것으로 본다.
+                        "dev_changed_rate": float(
+                            (self._hard_pred(logits)
+                             != self._hard_pred(_lg_c)).float().mean()),
+                        # agg만의 순수 기여 (q residual 적용 후 대비)
+                        "dev_agg_changed": float(
+                            (self._hard_pred(logits)
+                             != self._hard_pred(_lg_q)).float().mean()),
+                    }
+                    if labels is not None and self.tasktype != "regression":
+                        _yl = labels.long()
+                        _pr_diag["dev_acc_c"] = float(
+                            (self._hard_pred(_lg_c) == _yl).float().mean())
+                        _pr_diag["dev_acc_q"] = float(
+                            (self._hard_pred(_lg_q) == _yl).float().mean())
+                        _pr_diag["dev_acc_full"] = float(
+                            (self._hard_pred(logits) == _yl).float().mean())
+                        _pr_diag["dev_delta_acc"] = (
+                            _pr_diag["dev_acc_full"] - _pr_diag["dev_acc_c"])
+                        _pr_diag["dev_delta_acc_agg"] = (
+                            _pr_diag["dev_acc_full"] - _pr_diag["dev_acc_q"])
+                    _proto_residual_diag = _pr_diag
+                    _dev_logits_c = _lg_c
+            elif self.fusion_mode == "proto_dev":
+                _beta = torch.sigmoid(self.dev_beta_raw)
+                _dev = query_emb - context_emb
+                _dev_n = F.normalize(_dev, dim=-1)
+                _h = context_emb + _beta * _dev_n
+                logits = self.dev_head(_h)
+                with torch.no_grad():
+                    _lg_c = self.dev_head(context_emb)     # prototype만
+                    _pr_diag = {
+                        "dev_beta": float(_beta),
+                        # ⚠ 주 판정 지표. E에서 query 기여가 0.986까지 갔다.
+                        #   여기서 0.9를 넘으면 같은 실패다.
+                        "dev_residual_ratio": float(
+                            (_beta * _dev_n).norm(dim=-1).mean()
+                            / context_emb.norm(dim=-1).mean().clamp_min(1e-8)),
+                        "dev_raw_norm": float(_dev.norm(dim=-1).mean()),
+                        "dev_unique_logits": float(
+                            len(torch.unique(logits.round(decimals=4), dim=0))),
+                        "dev_unique_logits_c": float(
+                            len(torch.unique(_lg_c.round(decimals=4), dim=0))),
+                        "dev_changed_rate": float(
+                            (self._hard_pred(logits)
+                             != self._hard_pred(_lg_c)).float().mean()),
+                    }
+                    if labels is not None and self.tasktype != "regression":
+                        _pr_diag["dev_acc_c"] = float(
+                            (self._hard_pred(_lg_c) == labels.long()).float().mean())
+                        _pr_diag["dev_acc_full"] = float(
+                            (self._hard_pred(logits) == labels.long()).float().mean())
+                        _pr_diag["dev_delta_acc"] = (
+                            _pr_diag["dev_acc_full"] - _pr_diag["dev_acc_c"])
+                    _proto_residual_diag = _pr_diag
+                    _dev_logits_c = _lg_c
             elif self.fusion_mode == "proto_residual_query":
                 # [Phase 0.5 E] z = W_c·c + λ·W_q·q
                 z_proto = self.proto_head(context_emb)
@@ -2571,9 +2831,9 @@ class TabERA(nn.Module):
                         "pq_changed_rate": float(
                             (logits.argmax(-1) != z_proto.argmax(-1)).float().mean()),
                     }
-                    if labels is not None:
-                        _pc = (z_proto.argmax(-1) == labels)
-                        _fc = (logits.argmax(-1) == labels)
+                    if labels is not None and self.tasktype != "regression":
+                        _pc = (self._hard_pred(z_proto) == labels.long())
+                        _fc = (self._hard_pred(logits) == labels.long())
                         _pr_diag["pr_proto_acc"] = float(_pc.float().mean())
                         _pr_diag["pr_final_acc"] = float(_fc.float().mean())
                         _pr_diag["pr_fixed_rate"] = float((~_pc & _fc).float().mean())
@@ -2584,10 +2844,224 @@ class TabERA(nn.Module):
                 logits = self.proto_head(context_emb)
                 with torch.no_grad():
                     _pr_diag = {"pr_proto_logit_norm": float(logits.norm(dim=-1).mean())}
-                    if labels is not None:
+                    if labels is not None and self.tasktype != "regression":
                         _pr_diag["pr_proto_acc"] = float(
-                            (logits.argmax(-1) == labels).float().mean())
+                            (self._hard_pred(logits) == labels.long()).float().mean())
                         _pr_diag["pr_final_acc"] = _pr_diag["pr_proto_acc"]
+                    # ── [v3] RVQ 진단 ──────────────────────────────────
+                    # 새 실패 모드는 "경쟁"이 아니라 **code allocation**이다:
+                    #   stage2 dead      c2가 죽어 context ≈ c1
+                    #   stage2 noise     c2는 다양하나 예측에 무관
+                    #   stage1 collapse  c1이 정보를 안 담고 c2가 전부
+                    # H(c2|c1)만으로는 못 가른다 — c1만으로 계산한 예측과
+                    # ⚠ 진단은 **에폭당 1회**만 계산한다. 기존 중첩 루프는
+                    #   배치당 24ms였고(float() 호출마다 GPU 동기화),
+                    #   벡터화로 1ms까지 줄였지만 매 배치 돌 이유는 없다.
+                    if (self.residual_vq and _rvq_hard2 is not None
+                            and not self._rvq_diag_done):
+                        self._rvq_diag_done = True
+                        _lg1 = self.proto_head(_context_stage1)
+                        _u1 = len(torch.unique(_lg1.round(decimals=4), dim=0))
+                        _P2 = self.prototype_layer_2.n_prototypes
+                        _cnt2 = torch.bincount(_rvq_hard2, minlength=_P2).float()
+                        # ── 코드 다양성 ─────────────────────────────────────
+                        # ⚠ 전부 벡터화. 기존 중첩 루프는 배치당 24ms였고, 각 루프의
+                        #   float() 호출이 GPU 동기화를 유발했다 → 1ms로 축소.
+                        _B = hard_assignment.shape[0]
+                        # ⚠ 이진은 logits가 (N,1)이라 shape로는 클래스 수를 못 얻는다.
+                        _C = max(int(logits.shape[-1]),
+                                 int(labels.max()) + 1 if labels is not None else 2)
+                        _pair = hard_assignment.long() * _P2 + _rvq_hard2.long()
+                        _uniq, _inv = torch.unique(_pair, return_inverse=True)
+                        # H(c2|c1) = H(c1,c2) − H(c1)
+                        _cp = torch.bincount(_pair, minlength=1).float()
+                        _cp = _cp[_cp > 0] / _B
+                        _h_pair = float(-(_cp * _cp.log2()).sum())
+                        _c1c = torch.bincount(hard_assignment, minlength=1).float()
+                        _c1c = _c1c[_c1c > 0] / _B
+                        _h_c1 = float(-(_c1c * _c1c.log2()).sum())
+                        _hc = _h_pair - _h_c1
+                        
+                        _pr_diag.update({
+                            "rvq_stage2_active": float((_cnt2 > 0).float().mean()),
+                            "rvq_H_c2_given_c1": _hc,
+                            "rvq_Neff_c2_given_c1": float(2.0 ** _hc),
+                            "rvq_unique_pairs": float(len(_uniq)),
+                            "rvq_unique_pred_c1": float(_u1),
+                            "rvq_unique_pred_c12": float(
+                                len(torch.unique(logits.round(decimals=4), dim=0))),
+                            "rvq_residual_norm": float(_rvq_residual.norm(dim=-1).mean()),
+                            # ⚠ stage2가 residual을 **실제로 설명하는가**. ‖r−c2‖ < ‖r‖ 이어야
+                            #   양자화가 의미 있다. 고차원에서는 절대값이 작으므로(D=64,P=40에서
+                            #   KMeans 수준도 0.013) c2=0일 때의 0과 비교하고 추세를 본다.
+                            "rvq_residual_after": float((_rvq_residual - _rvq_c2).norm(dim=-1).mean()),
+                            "rvq_residual_explained": float(
+                                1.0 - (_rvq_residual - _rvq_c2).norm(dim=-1).mean()
+                                / _rvq_residual.norm(dim=-1).mean().clamp_min(1e-8)),
+                            # ⚠ 1차 실패(stage1 붕괴)의 직접 원인. ‖c1‖=1인데 ‖c2‖≈8이면
+                            #   context ≈ c2가 된다. q 정규화로 초기값은 ≤2로 제한되나
+                            #   C2는 학습 중 자유롭게 움직이므로 계속 감시해야 한다.
+                            "rvq_norm_c1": float(_context_stage1.norm(dim=-1).mean()),
+                            "rvq_norm_c2": float(_rvq_c2.norm(dim=-1).mean()),
+                            "rvq_c2_over_c1_norm": float(
+                                _rvq_c2.norm(dim=-1).mean()
+                                / _context_stage1.norm(dim=-1).mean().clamp_min(1e-8)),
+                        })
+                        # ── confidence refinement 가설 검증 ──────────────────
+                        # I(c2;y|c1) ≈ 0 인데 auroc/logloss가 개선된다면, c2는
+                        # "argmax를 바꾸는 클래스 정보"가 아니라 **같은 클래스 안의
+                        # 확신도를 세분화**하는 코드일 수 있다. I(c2;y|c1)은 argmax
+                        # 정보만 잡으므로 그 역할을 원리적으로 못 본다.
+                        #
+                        # ⚠ eta²도 표본 부족으로 위로 크게 편향된다(합성 검증: c2와
+                        #   완전 무관해도 0.90, 완전 종속 1.00). 그룹 내 셔플 null을
+                        #   빼야 한다 — I_corrected와 같은 방식.
+                        with torch.no_grad():
+                            _prob = torch.softmax(logits, dim=-1)
+                            _conf_vals = {"conf": _prob.max(-1).values,
+                                          "ent": -(_prob * (_prob + 1e-12).log()).sum(-1)}
+                        
+                            def _eta2(_h2v, _val):
+                                _pr = hard_assignment.long() * _P2 + _h2v.long()
+                                _v1 = _v12 = 0.0
+                                for _k in torch.unique(hard_assignment):
+                                    _m = hard_assignment == _k
+                                    if int(_m.sum()) < 2:
+                                        continue
+                                    _v1 += float(_m.float().mean()) * float(_val[_m].var(unbiased=False))
+                                for _u in torch.unique(_pr):
+                                    _m = _pr == _u
+                                    if int(_m.sum()) < 2:
+                                        continue
+                                    _v12 += float(_m.float().mean()) * float(_val[_m].var(unbiased=False))
+                                return 1.0 - _v12 / _v1 if _v1 > 1e-12 else 0.0
+                        
+                            _NE = 3
+                            _ord_e = torch.argsort(hard_assignment, stable=True)
+                            for _nm, _val in _conf_vals.items():
+                                _raw = _eta2(_rvq_hard2, _val)
+                                _nul = 0.0
+                                for _s in range(_NE):
+                                    _g = torch.Generator(device="cpu").manual_seed(100 + _s)
+                                    _rd = torch.rand(hard_assignment.shape[0],
+                                                     generator=_g).to(hard_assignment.device)
+                                    _h2e = torch.empty_like(_rvq_hard2)
+                                    _h2e[_ord_e] = _rvq_hard2[torch.argsort(
+                                        hard_assignment.float() * 2.0 + _rd)]
+                                    _nul += _eta2(_h2e, _val) / _NE
+                                _pr_diag[f"rvq_eta2_{_nm}_raw"] = _raw
+                                _pr_diag[f"rvq_eta2_{_nm}"] = _raw - _nul
+                        
+                        # ⚠ 회귀에서는 아래 진단이 전부 무의미하다 — accuracy/엔트로피는
+                        #   이산 라벨을 전제하고, labels.long()으로 자르면 연속값이 망가진다.
+                        #   (bincount도 정수 라벨이 아니면 깨진다.)
+                        if labels is not None and self.tasktype != "regression":
+                            _a1 = float((self._hard_pred(_lg1) == labels.long()).float().mean())
+                            _pr_diag["rvq_acc_c1"] = _a1
+                            _pr_diag["rvq_delta_acc"] = _pr_diag.get("pr_final_acc", _a1) - _a1
+                            _pr_diag["rvq_changed_rate"] = float(
+                                (self._hard_pred(logits) != self._hard_pred(_lg1)).float().mean())
+                            # ── I(c2;y|c1) = H(y|c1) − H(y|c1,c2) ──────────────
+                            # ⚠ H(c2|c1)은 "다양한가"만 본다. "쓸모 있게 다양한가"는
+                            #   라벨과의 관계가 필요하다.
+                            _hy_c1 = self._cond_entropy(hard_assignment.long(),
+                                                        int(hard_assignment.max()) + 1, labels, _C)
+                            _hy_c1c2 = self._cond_entropy(_inv, len(_uniq), labels, _C)
+                            _pr_diag["rvq_H_y_given_c1"] = _hy_c1
+                            _pr_diag["rvq_H_y_given_c1c2"] = _hy_c1c2
+                            _pr_diag["rvq_I_c2_y_given_c1"] = _hy_c1 - _hy_c1c2
+                            # ⚠ 위 I는 **위로 크게 편향**된다. (c1,c2) 셀에 1~2개만 들어가면
+                            #   H(y|c1,c2)가 인위적으로 0이 된다. 합성 검증: c2가 라벨과 완전히
+                            #   무관해도 raw I = 2.05 (완전 정보일 때 2.18).
+                            #   → c1 그룹 **안에서만** c2를 섞은 null을 빼야 한다.
+                            #     그러면 H(c2|c1) 구조는 유지되고 라벨 관계만 끊긴다.
+                            #     보정 후: 무작위 0.014, 완전 정보 0.499.
+                            _null = 0.0
+                            _NS = 3
+                            _ord1 = torch.argsort(hard_assignment, stable=True)
+                            for _s in range(_NS):
+                                _g = torch.Generator(device="cpu").manual_seed(_s)
+                                _rnd = torch.rand(_B, generator=_g).to(hard_assignment.device)
+                                # c1로 묶고 그 안에서만 무작위 정렬 → 그룹 내 순열
+                                _key = hard_assignment.float() * 2.0 + _rnd
+                                _h2s = torch.empty_like(_rvq_hard2)
+                                _h2s[_ord1] = _rvq_hard2[torch.argsort(_key)]
+                                _pr2 = hard_assignment.long() * _P2 + _h2s.long()
+                                _u2, _iv2 = torch.unique(_pr2, return_inverse=True)
+                                _null += (_hy_c1 - self._cond_entropy(
+                                    _iv2, len(_u2), labels, _C)) / _NS
+                            _pr_diag["rvq_I_null"] = _null
+                            _pr_diag["rvq_I_corrected"] = (_hy_c1 - _hy_c1c2) - _null
+                            
+                            # ── c2가 "어떤 방향"을 배웠는가 ────────────────────
+                            # gradient는 정상이고(grad_c2 = c1의 73%) 코드북도 움직이는데
+                            # (Δc2 > Δc1) I ≈ 0이다 → 학습은 하는데 판별과 무관한 방향이다.
+                            # 그걸 직접 확인한다.
+                            #
+                            # ① Fisher ratio: c2 임베딩의 클래스 분리도
+                            #    between/within 이 작으면 c2 공간이 라벨과 무관하게 펼쳐진 것.
+                            _c2v = _rvq_c2
+                            _gm = _c2v.mean(0, keepdim=True)
+                            _sw = 0.0
+                            _sb = 0.0
+                            for _cc in torch.unique(labels):
+                                _mc = labels == _cc
+                                if int(_mc.sum()) < 2:
+                                    continue
+                                _cm = _c2v[_mc].mean(0, keepdim=True)
+                                _sw += float(((_c2v[_mc] - _cm) ** 2).sum())
+                                _sb += float(int(_mc.sum()) * ((_cm - _gm) ** 2).sum())
+                            _pr_diag["rvq_fisher_c2"] = float(_sb / max(_sw, 1e-12))
+                            # 대조군: c1은 같은 지표에서 얼마인가 (c1은 판별적이어야 정상)
+                            _c1v = _context_stage1
+                            _gm1 = _c1v.mean(0, keepdim=True)
+                            _sw1 = _sb1 = 0.0
+                            for _cc in torch.unique(labels):
+                                _mc = labels == _cc
+                                if int(_mc.sum()) < 2:
+                                    continue
+                                _cm = _c1v[_mc].mean(0, keepdim=True)
+                                _sw1 += float(((_c1v[_mc] - _cm) ** 2).sum())
+                                _sb1 += float(int(_mc.sum()) * ((_cm - _gm1) ** 2).sum())
+                            _pr_diag["rvq_fisher_c1"] = float(_sb1 / max(_sw1, 1e-12))
+                            
+                            # ② head가 c2를 같은 방향으로 뭉개는가
+                            #    ‖W·c2‖의 분산이 작으면 서로 다른 c2가 비슷한 logit이 된다.
+                            #    ds=31에서 코드 조합 95개인데 test 고유 예측이 12개였던 현상.
+                            _wc2 = self.proto_head(_rvq_c2) - self.proto_head.bias
+                            _pr_diag["rvq_Wc2_norm"] = float(_wc2.norm(dim=-1).mean())
+                            _pr_diag["rvq_Wc2_spread"] = float(
+                                _wc2.std(dim=0).mean() / _wc2.norm(dim=-1).mean().clamp_min(1e-8))
+                            _wc1 = self.proto_head(_context_stage1) - self.proto_head.bias
+                            _pr_diag["rvq_Wc1_norm"] = float(_wc1.norm(dim=-1).mean())
+                            _pr_diag["rvq_Wc2_over_Wc1"] = float(
+                                _wc2.norm(dim=-1).mean() / _wc1.norm(dim=-1).mean().clamp_min(1e-8))
+                            # ③ 프로토타입별 엔트로피 감소 — 평균만 보면 놓친다.
+                            #    일부 그룹에서만 c2가 작동할 수 있다.
+                            _red = []
+                            for _k in torch.unique(hard_assignment):
+                                _m = hard_assignment == _k
+                                if int(_m.sum()) < 8:
+                                    continue
+                                _yc = torch.bincount(labels[_m].long(), minlength=_C).float()
+                                _pk = _yc / _yc.sum(); _pk = _pk[_pk > 0]
+                                _h_before = float(-(_pk * _pk.log2()).sum())
+                                _h_after = 0.0
+                                for _k2 in torch.unique(_rvq_hard2[_m]):
+                                    _m2 = _m & (_rvq_hard2 == _k2)
+                                    _w2 = float(_m2.sum()) / float(_m.sum())
+                                    _yc2 = torch.bincount(labels[_m2].long(), minlength=_C).float()
+                                    _p2k = _yc2 / _yc2.sum().clamp_min(1); _p2k = _p2k[_p2k > 0]
+                                    _h_after += _w2 * float(-(_p2k * _p2k.log2()).sum())
+                                if _h_before > 1e-6:
+                                    _red.append((_h_before - _h_after) / _h_before)
+                            if _red:
+                                _rt = torch.tensor(_red)
+                                _pr_diag["rvq_ent_reduce_mean"] = float(_rt.mean())
+                                _pr_diag["rvq_ent_reduce_max"] = float(_rt.max())
+                                # ⚠ 이 값도 표본 부족으로 위로 편향된다 — I_null과 같은 문제.
+                                #   절대값이 아니라 데이터셋/조건 간 비교로만 쓴다.
+                                _pr_diag["rvq_ent_reduce_frac"] = float((_rt > 0.1).float().mean())
                     _proto_residual_diag = _pr_diag
             elif self.fusion_mode == "proto_query_residual":
                 # [control] Δz를 이웃이 아니라 query에서 만든다 — retrieval 실패와
@@ -2610,9 +3084,9 @@ class TabERA(nn.Module):
                         "pr_cos_delta_proto": float(
                             F.cosine_similarity(delta_z, z_proto, dim=-1).mean()),
                     }
-                    if labels is not None:
-                        _pc = (z_proto.argmax(-1) == labels)
-                        _fc = (logits.argmax(-1) == labels)
+                    if labels is not None and self.tasktype != "regression":
+                        _pc = (self._hard_pred(z_proto) == labels.long())
+                        _fc = (self._hard_pred(logits) == labels.long())
                         _pr_diag["pr_proto_acc"] = float(_pc.float().mean())
                         _pr_diag["pr_final_acc"] = float(_fc.float().mean())
                         _pr_diag["pr_fixed_rate"] = float((~_pc & _fc).float().mean())
@@ -2710,9 +3184,9 @@ class TabERA(nn.Module):
                         _pr_diag["pr_zero_gap_rel"] = float(
                             ((delta_z - _dz0).norm(dim=-1)
                              / delta_z.norm(dim=-1).clamp_min(1e-8)).mean())
-                        if labels is not None:
-                            _pc = (z_proto.argmax(-1) == labels)
-                            _fc = (logits.argmax(-1) == labels)
+                        if labels is not None and self.tasktype != "regression":
+                            _pc = (self._hard_pred(z_proto) == labels.long())
+                            _fc = (self._hard_pred(logits) == labels.long())
                             _pr_diag["pr_proto_acc"] = float(_pc.float().mean())
                             _pr_diag["pr_final_acc"] = float(_fc.float().mean())
                             # retrieval이 옳은 방향으로 고쳤는가
@@ -2786,12 +3260,13 @@ class TabERA(nn.Module):
 
         # 6. 보조 손실
         aux_loss = torch.tensor(0.0, device=X.device)
+
         _retr_diag = {}
         # proto_residual 진단은 logits 계산 시점(위)에서 만들어지므로
         # 여기서 병합한다 — _retr_diag가 그보다 뒤에 정의되기 때문.
         # ⚠ _proto_residual_diag는 특정 분기에서만 정의되므로 locals()로 확인.
         #   (evidence.py에서 정의 전 참조로 UnboundLocalError를 두 번 냈다)
-        _retr_diag.update(locals().get('_proto_residual_diag') or {})
+        # (아래 자동 수집이 _proto_residual_diag도 함께 처리한다)
         _aux_terms = {}   # [Step 1-4] gradient probe용 항별 손실 (graph 유지)
 
 
@@ -2826,6 +3301,120 @@ class TabERA(nn.Module):
                     # 0으로 처리됨(codebook_loss 자체가 아예 없던 상태와 동일).
                     + _t_cod
                 )
+
+        # ⚠ 이 두 손실(L_nbr / topology)은 **반드시 위의 aux_loss 재할당**
+        #   (commitment/codebook/diversity)이 끝난 뒤에 더해야 한다.
+        #   그 블록들이 `aux_loss = (...)` 형태라 앞에 두면 조용히 덮어써진다.
+        #   실제로 그렇게 넣었다가 λ sweep 전 구간에서 nbr_loss가 8.04(=log(256),
+        #   완전 무작위)로 고정되고 λ 0.001~0.05가 소수점까지 동일한 결과를 냈다.
+        # ── [v3] L_nbr — raw feature 이웃 구조를 encoder에 보존 ─────────
+        # anchor   = query_emb[i]
+        # positive = query_emb[j],  j ∈ raw kNN(i)        ← prototype 무관
+        # negative = 배치 내 나머지 중 raw 거리가 **먼** 샘플만
+        #
+        # ⚠ negative에서 raw 이웃을 제외해야 한다. tabular은 "raw 가까움 ≈
+        #   같은 클래스"인 경우가 많아, 배치 negative에 이웃이 섞이면
+        #   같은 neighborhood를 서로 밀어내는 충돌이 생긴다.
+        #
+        # ⚠ centroid/assignment를 전혀 쓰지 않는다 — encoder만 규제해야
+        #   "representation을 바꾼 효과"가 깨끗이 분리된다.
+        _nbr_diag = None
+        if (self.training and self.nbr_lambda > 0
+                and self._nbr_graph is not None and sample_ids is not None):
+            _sid = sample_ids.detach().cpu()
+            _B = query_emb.shape[0]
+            _pos_pool = self._nbr_graph[_sid]              # (B, k) 전역 인덱스
+            # 배치 안에 있는 이웃만 positive로 쓸 수 있다
+            _sid_dev = sample_ids.detach()
+            _in_batch = (_pos_pool.unsqueeze(-1)
+                         == _sid.view(1, 1, -1)).any(-1)   # (B, k)
+            _has_pos = _in_batch.any(-1)
+            if int(_has_pos.sum()) >= 2:
+                # 각 anchor의 첫 번째 in-batch 이웃을 positive로
+                _first = _in_batch.float().argmax(-1)
+                _pos_gid = _pos_pool[torch.arange(_B), _first]   # (B,) 전역 id
+                # 전역 id → 배치 위치
+                _lut = {int(v): i for i, v in enumerate(_sid.tolist())}
+                _pos_loc = torch.tensor(
+                    [_lut.get(int(g), 0) for g in _pos_gid.tolist()],
+                    device=query_emb.device)
+                # negative 마스크: 자기 자신과 raw 근방(nbr_far)은 제외
+                _far = self._nbr_far[_sid]                       # (B, m)
+                _excl = (_sid.view(-1, 1) == _sid.view(1, -1))   # 자기 자신
+                _excl |= (_far.unsqueeze(-1)
+                          == _sid.view(1, 1, -1)).any(1)         # raw 근방
+                _excl = _excl.to(query_emb.device)
+
+                _z = F.normalize(query_emb, dim=-1)
+                _sim = (_z @ _z.T) / self.nbr_tau                # (B, B)
+                _sim = _sim.masked_fill(_excl, float("-inf"))
+                # positive는 마스크에서 되살린다(근방이라 제외됐을 것)
+                _ar = torch.arange(_B, device=query_emb.device)
+                _pos_sim = (_z[_ar] * _z[_pos_loc]).sum(-1) / self.nbr_tau
+                _logits = torch.cat([_pos_sim.unsqueeze(-1), _sim], dim=-1)
+                _valid = _has_pos.to(query_emb.device) & torch.isfinite(
+                    _logits[:, 1:]).any(-1)
+                if int(_valid.sum()) >= 2:
+                    _lnbr = F.cross_entropy(
+                        _logits[_valid],
+                        torch.zeros(int(_valid.sum()), dtype=torch.long,
+                                    device=query_emb.device))
+                    aux_loss = aux_loss + self.nbr_lambda * _lnbr
+                    with torch.no_grad():
+                        _nbr_diag = {
+                            "nbr_loss": float(_lnbr),
+                            "nbr_valid_frac": float(_valid.float().mean()),
+                            "nbr_pos_sim": float(
+                                (_pos_sim * self.nbr_tau)[_valid].mean()),
+                        }
+
+        # ── [v3] centroid topology loss ────────────────────────────────
+        # prototype 간 **배치 관계**를 raw feature manifold와 맞춘다.
+        # CE는 "각 prototype이 어느 클래스인가"를 정하고, 이 손실은
+        # "prototype들이 서로 어떻게 놓이는가"만 조정한다 — 서로 다른 축이다.
+        #
+        # ⚠ 목적은 CE를 이기는 것이 **아니다**. CE가 유도하는 class-aligned
+        #   partition에 retrieval-friendly local geometry를 regularizer로
+        #   주입하는 것이다. purity가 무너질 정도로 커지면 실패다.
+        _topo_diag = None
+        if (self.training and self.centroid_topo_lambda > 0
+                and hard_assignment is not None):
+            _xr = X.detach().float()
+            _asg = hard_assignment.detach()
+            _P = self.prototype_layer.centroid_emb.shape[0]
+            # prototype별 raw feature 평균 (배치 내)
+            _mu = torch.zeros(_P, _xr.shape[1], device=_xr.device, dtype=_xr.dtype)
+            _cnt = torch.zeros(_P, device=_xr.device, dtype=_xr.dtype)
+            _mu.index_add_(0, _asg, _xr)
+            _cnt.index_add_(0, _asg, torch.ones_like(_asg, dtype=_xr.dtype))
+            _act = _cnt >= 2          # 최소 2개는 있어야 평균이 의미 있음
+            if int(_act.sum()) >= 3:  # prototype 3개 미만이면 관계 자체가 없음
+                _mu_n = F.normalize(_mu[_act] / _cnt[_act].unsqueeze(-1), dim=-1)
+                _ce_n = F.normalize(
+                    self.prototype_layer.centroid_emb[_act], dim=-1)
+                _S_mu = _mu_n @ _mu_n.T          # raw feature 기준 관계 (상수)
+                _S_ce = _ce_n @ _ce_n.T          # centroid 기준 관계 (학습됨)
+                # 대각은 양쪽 모두 1이므로 제외 — 정보가 없다
+                _n_act = _S_mu.shape[0]
+                _off = ~torch.eye(_n_act, dtype=torch.bool, device=_S_mu.device)
+                _topo = (_S_mu[_off] - _S_ce[_off]).pow(2).mean()
+                aux_loss = aux_loss + self.centroid_topo_lambda * _topo
+                with torch.no_grad():
+                    _topo_diag = {
+                        "topo_loss": float(_topo),
+                        "topo_n_active": float(_n_act),
+                        # 두 관계 행렬이 얼마나 어긋나 있는가 (상관)
+                        "topo_corr": float(torch.corrcoef(torch.stack([
+                            _S_mu[_off], _S_ce[_off]]))[0, 1]),
+                    }
+        # ⚠ 진단 dict를 이름으로 하나씩 병합하면, 블록 순서를 바꿀 때마다
+        #   "생성보다 병합이 앞"이 되어 조용히 사라진다(실제로 두 번 발생:
+        #   aux_loss 재할당 뒤로 옮기면서 _nbr_diag/_topo_diag가 통째로 유실).
+        #   locals()에서 `_*_diag` 패턴을 **전부** 자동 수집한다.
+        for _dn, _dv in list(locals().items()):
+            if (_dn.endswith("_diag") and _dn.startswith("_")
+                    and _dn != "_retr_diag" and isinstance(_dv, dict)):
+                _retr_diag.update(_dv)
 
         # ── [S-1A] retrieval surrogate ───────────────────────────
         # ⚠ 반드시 위의 aux_loss **재할당**(commitment/codebook/diversity)이
@@ -2880,6 +3469,9 @@ class TabERA(nn.Module):
             # 진단(§3.5: CKA/cos, 세 지점 rank informativeness)에 필요.
             "query_retr":  query_retr,
             "retr_diag":   _retr_diag,
+            # [v3] c1만으로 계산한 logits — test 시점 Δacc/Δauroc 계산용.
+            #   forward 진단은 train 배치 기준이라 일반화 기여를 못 본다.
+            "rvq_logits_c1": locals().get("_rvq_logits_c1"),
             "context_emb": context_emb,
             "ablation_mode": ablation_mode,
             # [추가, 진단용] fusion_mode="residual"일 때 학습된 α(context 가중치)/
