@@ -440,6 +440,19 @@ class TabERAWrapper:
                 self.model.prototype_layer.initialize_from_data(
                     init_emb, init_x, y_labels=init_y
                 )
+                # [v3] stage2 코드북을 **잔차 분포**로 KMeans++ 시딩.
+                #   랜덤 초기화는 ||r|| << ||q|| 라는 스케일 차이와 맞지 않아
+                #   초기부터 dead code가 대량 발생한다(합성 검증: 랜덤 ||c2||
+                #   0.079 vs ||r|| 8.06 — 100배 차이).
+                if getattr(self.model, "residual_vq", False) and \
+                        self.model.prototype_layer_2 is not None:
+                    with torch.no_grad():
+                        _c1, _h1, *_ = self.model.prototype_layer(init_emb)
+                        # ⚠ forward와 **같은 정의**여야 한다 —
+                        #   forward는 normalize(q) − c1 을 쓴다.
+                        #   다르면 초기 코드북이 실제 잔차 분포와 어긋난다.
+                        _res = torch.nn.functional.normalize(init_emb, dim=-1) - _c1
+                    self.model.prototype_layer_2.initialize_from_residual(_res)
 
         # [진단용, 추가] 순수 초기화 상태(학습 0 step) evidence entropy 측정.
         # 목적: epoch 1(이미 몇 스텝 학습된 상태)의 낮은 entropy가 "학습이
@@ -526,6 +539,19 @@ class TabERAWrapper:
         )
 
         for epoch in pbar:
+            # [v3] RVQ 진단을 이 에폭의 첫 배치에서만 계산하도록 초기화.
+            #   진단은 벡터화 후에도 배치당 ~1ms이고, 에폭 단위로만 읽히므로
+            #   매 배치 계산할 이유가 없다.
+            _rvq_g1_sum = _rvq_g2_sum = 0.0
+            _rvq_g_batches = 0
+            # 에폭 시작 시점 코드북 스냅샷 — 에폭 동안의 실제 이동량 측정용.
+            _rvq_c1_before = _rvq_c2_before = None
+            if getattr(self.model, "residual_vq", False):
+                with torch.no_grad():
+                    _rvq_c1_before = self.model.prototype_layer.centroid_emb.detach().clone()
+                    _rvq_c2_before = self.model.prototype_layer_2.centroid_emb.detach().clone()
+            if hasattr(self.model, "reset_rvq_diag"):
+                self.model.reset_rvq_diag()
             # ── 학습 ──────────────────────────────────────
             self.model.train()
             # [v2, Phase 1-1] epoch 기준 query detach warmup — epoch 전체에서
@@ -719,12 +745,17 @@ class TabERAWrapper:
                                 _retr_extra_sums[_rk] = _retr_extra_sums.get(_rk, 0.0) + float(_rv)
                                 _retr_extra_counts[_rk] = _retr_extra_counts.get(_rk, 0) + 1
                     _diag = out.get("evidence_diag")
-                    if _diag is not None:
-                        _evidence_qnorm_sum     += _diag["query_norm"]
-                        _evidence_knorm_sum     += _diag["key_norm"]
-                        _evidence_dist_mean_sum += _diag["distance_mean"]
-                        _evidence_dist_std_sum  += _diag["distance_std"]
-                        _evidence_diag_batches  += 1
+                    # ⚠ [v2] AttentionAggregator가 비활성인 fusion_mode에서는
+                    #   evidence_diag가 **빈 dict**다(None이 아니다 — 아래에서
+                    #   .get()을 쓰는 코드가 있어 None이면 AttributeError).
+                    #   `is not None`만으로는 통과하므로 키 접근이 KeyError를 낸다.
+                    if _diag:
+                        if "query_norm" in _diag:
+                            _evidence_qnorm_sum     += _diag["query_norm"]
+                            _evidence_knorm_sum     += _diag["key_norm"]
+                            _evidence_dist_mean_sum += _diag["distance_mean"]
+                            _evidence_dist_std_sum  += _diag["distance_std"]
+                            _evidence_diag_batches  += 1
                         # [수정] 고정 4개 키만 담으면 새로 추가된 진단이
                         # **조용히 버려진다**(regroup_history에서 같은 문제를
                         # 겪었다 — Evidence Constructor의 ec_* 지표가 실제로
@@ -758,6 +789,22 @@ class TabERAWrapper:
 
                 loss = task_loss + out["aux_loss"]
                 loss.backward()
+
+                # [v3 진단] 두 코드북의 gradient 크기 비교.
+                #   c2가 아무것도 못 배우는 원인을 셋으로 가른다:
+                #     ① gradient가 c2까지 안 옴        → grad_c2 ≈ 0
+                #     ② gradient는 오는데 업데이트 안 됨 → grad_c2 > 0, delta_c2 ≈ 0
+                #     ③ 업데이트는 되는데 표현이 안 됨   → 둘 다 정상인데 I ≈ 0
+                #   ⚠ clip_grad_norm_/step() 전에 읽어야 한다 — 그 이후엔
+                #     다음 zero_grad()가 지운다.
+                if getattr(self.model, "residual_vq", False):
+                    _c1p = self.model.prototype_layer.centroid_emb
+                    _c2p = self.model.prototype_layer_2.centroid_emb
+                    if _c1p.grad is not None:
+                        _rvq_g1_sum += float(_c1p.grad.norm())
+                    if _c2p.grad is not None:
+                        _rvq_g2_sum += float(_c2p.grad.norm())
+                    _rvq_g_batches += 1
 
                 # [진단용, 추가] log_fusion_trajectory — fusion_alpha/beta.grad를
                 # clip_grad_norm_/optimizer.step() 전에 읽음(그 이후엔 다음
@@ -1049,11 +1096,31 @@ class TabERAWrapper:
                     # 이웃을 보는가" — entropy보다 직관적(entropy=0.05 → n_eff≈1.05명).
                     "dominant_weight": _evidence_dominant_sum / _evidence_batches,
                 }
+                # ⚠ retr_diag(pr_*/rvq_*)와 evidence_diag(ec_*)는 **독립**이다.
+                #   aggregator가 비활성인 v2 fusion_mode에서는 evidence_diag가 비어
+                #   _evidence_diag_batches가 0이 되는데, 같은 조건 안에 두면 retr_diag까지
+                #   통째로 버려진다(실제로 rvq_* 진단이 두 번 유실됐다).
+                for _rk, _rv in _retr_extra_sums.items():
+                    _c = _retr_extra_counts.get(_rk, 0)
+                    if _c > 0:
+                        ev_record[_rk] = _rv / _c
+                # [v3] 두 코드북의 gradient / 실제 이동량.
+                #   gradient가 오는데 안 움직이면 ②, 둘 다 정상인데 I≈0이면 ③.
+                if _rvq_g_batches > 0:
+                    ev_record["rvq_grad_c1"] = _rvq_g1_sum / _rvq_g_batches
+                    ev_record["rvq_grad_c2"] = _rvq_g2_sum / _rvq_g_batches
+                    ev_record["rvq_grad_ratio"] = (
+                        (_rvq_g2_sum / max(_rvq_g1_sum, 1e-12)))
+                if _rvq_c1_before is not None:
+                    with torch.no_grad():
+                        _d1 = float((self.model.prototype_layer.centroid_emb
+                                     - _rvq_c1_before).norm())
+                        _d2 = float((self.model.prototype_layer_2.centroid_emb
+                                     - _rvq_c2_before).norm())
+                    ev_record["rvq_delta_c1"] = _d1
+                    ev_record["rvq_delta_c2"] = _d2
+                    ev_record["rvq_delta_ratio"] = _d2 / max(_d1, 1e-12)
                 if _evidence_diag_batches > 0:
-                    for _rk, _rv in _retr_extra_sums.items():
-                        _c = _retr_extra_counts.get(_rk, 0)
-                        if _c > 0:
-                            ev_record[_rk] = _rv / _c
                     for _dk, _dv in _evidence_extra_sums.items():
                         _c = _evidence_extra_counts.get(_dk, 0)
                         if _c > 0:
