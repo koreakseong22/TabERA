@@ -5512,7 +5512,7 @@ def main():
                             "상태에서도 아직 미반영(exclusion 적용 안 됨) — 재현 목적으로 예전 "
                             "결과와 정확히 비교하려면 이 플래그로 예전 동작을 켤 것."
                         ))
-    parser.add_argument("--fusion_mode", type=str, default="proto_only_linear",
+    parser.add_argument("--fusion_mode", type=str, default="proto_dev",
                         choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta",
                                  "proto_residual", "proto_query_residual", "proto_only",
                                  "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
@@ -5919,7 +5919,7 @@ def main():
                         ))
     parser.add_argument("--residual_vq_size", type=int, default=None,
                         help="stage2 코드북 크기 P2. 미지정이면 P1과 동일(√N).")
-    parser.add_argument("--nbr_lambda", type=float, default=0.0,
+    parser.add_argument("--nbr_lambda", type=float, default=0.005,
                         help=(
                             "[v3] L_nbr 가중치 — raw feature 이웃 구조를 encoder에 "
                             "보존시키는 contrastive loss. positive는 raw kNN(prototype "
