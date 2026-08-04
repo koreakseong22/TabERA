@@ -2057,6 +2057,9 @@ def run_single_seed(
               + (f"..bs{args.batch_size_override}" if args.batch_size_override is not None else "") \
               + (f"..rwe{args.regroup_warmup_epochs_override}" if args.regroup_warmup_epochs_override is not None else "") \
               + ("..nodr" if args.disable_dead_reinit else "") \
+              + (f"..topo{args.centroid_topo_lambda:g}" if args.centroid_topo_lambda > 0 else "") \
+              + (f"..nbr{args.nbr_lambda:g}" if args.nbr_lambda > 0 else "") \
+              + ("..rvq" if args.residual_vq else "") \
               + (f"..cb{args.loss_codebook_override:g}" if args.loss_codebook_override is not None else "") \
               + (f"..cm{args.loss_commitment_override:g}" if args.loss_commitment_override is not None else "") \
               + (f"..drp{args.dead_reinit_patience_override}" if args.dead_reinit_patience_override is not None else "") \
@@ -2352,6 +2355,24 @@ def run_single_seed(
             print(f"  [--regroup_warmup_epochs_override] regroup_warmup_epochs: "
                   f"{_old_warmup} → {args.regroup_warmup_epochs_override} "
                   f"(나머지 파라미터는 best_params 그대로)")
+        if args.residual_vq:
+            model_kwargs["residual_vq"] = True
+            if args.residual_vq_size is not None:
+                model_kwargs["residual_vq_size"] = args.residual_vq_size
+            print(f"  [--residual_vq] 2단계 residual VQ 활성 "
+                  f"(P2={args.residual_vq_size or 'P1과 동일'})")
+        if args.nbr_lambda > 0:
+            model_kwargs["nbr_lambda"]     = args.nbr_lambda
+            model_kwargs["nbr_k"]          = args.nbr_k
+            model_kwargs["nbr_tau"]        = args.nbr_tau
+            model_kwargs["nbr_neg_margin"] = args.nbr_neg_margin
+            print(f"  [--nbr_lambda] L_nbr = {args.nbr_lambda:g} "
+                  f"(k={args.nbr_k}, tau={args.nbr_tau:g}, "
+                  f"neg_margin={args.nbr_neg_margin})")
+        if args.centroid_topo_lambda > 0:
+            model_kwargs["centroid_topo_lambda"] = args.centroid_topo_lambda
+            print(f"  [--centroid_topo_lambda] centroid topology loss "
+                  f"= {args.centroid_topo_lambda:g}")
         if args.disable_dead_reinit:
             # patience를 학습 epoch 수보다 크게 두면 재초기화가 한 번도
             # 발생하지 않는다 — 별도 분기 추가 없이 완전 OFF를 만든다.
@@ -2464,6 +2485,10 @@ def run_single_seed(
     )
 
     model = TabERA(**model_kwargs, column_names=dataset.col_names)
+    # [v3] L_nbr용 raw feature kNN graph — 학습 전 1회 계산.
+    #   FeatureStore는 학습 중 채워지므로 첫 epoch에 못 쓴다. offline이어야
+    #   seed 간 결과 비교도 가능하다. nbr_lambda=0이면 내부에서 즉시 반환.
+    model.set_nbr_graph(X_train)
 
     # ── 학습 (--from_saved_state면 건너뛰고 바로 복원) ───────
     wrapper = TabERAWrapper(
@@ -4014,6 +4039,7 @@ def run_single_seed(
     # 발생. run_calibration_analysis()와 같은 패턴으로 배치 처리하도록 수정.
     _pred_batch_size = 512
     _logits_chunks = []
+    _rvq_logits_c1_chunks = []   # [v3] c1만의 logits — test 시점 Δ 계산용
     # [추가, v2 Phase 2] fusion_mode="gated_sum"이면 이 루프에서 이미 도는
     # forward pass의 out["head_gate_*"]를 배치 크기 가중평균으로 같이
     # 누적 — 별도 forward pass를 새로 만들 필요 없음. concat/residual
@@ -4073,6 +4099,8 @@ def run_single_seed(
         for _start in range(0, len(X_test), _pred_batch_size):
             _out = model(X_test[_start:_start + _pred_batch_size])
             _logits_chunks.append(_out["logits"].cpu())
+            if _out.get("rvq_logits_c1") is not None:
+                _rvq_logits_c1_chunks.append(_out["rvq_logits_c1"].cpu())
             if args.fusion_mode in ("gated_sum", "anchor_gate", "context_gated_beta") and _out.get("head_gate_mean"):
                 _bsz = min(_pred_batch_size, len(X_test) - _start)
                 for _name, _val in _out["head_gate_mean"].items():
@@ -4638,6 +4666,17 @@ def run_single_seed(
                             if 0 <= _m < len(_sid) and _sid[_m] >= 0:
                                 _ta[int(_sid[_m])] = _p
                     _rb_savez_kwargs["train_assignment"] = _ta
+                    # ⚠ train 라벨도 함께 저장한다. 없으면 centroid purity/Voronoi 상한을
+                    #   neighbor_labels로 역추정해야 하는데, 그건 **검색된 이웃만** 담고
+                    #   있어 train의 절반 정도만 복원된다(실측 ds=54: 676개 중 360개, 53%).
+                    #   그 표본으로 다수결을 추정하면 상한이 실제 accuracy보다 낮게 나오는
+                    #   불가능한 결과가 나온다.
+                    try:
+                        _rb_savez_kwargs["y_train"] = (
+                            y_train.detach().cpu().numpy() if torch.is_tensor(y_train)
+                            else np.asarray(y_train))
+                    except Exception:
+                        pass
             except Exception as _te:
                 _rb_savez_kwargs["train_assignment_error"] = np.array(
                     [f"{type(_te).__name__}: {_te}"], dtype=object)
@@ -4786,12 +4825,53 @@ def run_single_seed(
         _final_gate_stats["logit_mean"] = {k: v / _gate_n_samples for k, v in _gate_logit_mean_sum.items()}
         _final_gate_stats["logit_gap"] = _gate_logit_gap_sum / _gate_n_samples
 
+    # ── [v3] test 시점 Δ (c1만 vs c1+c2) ────────────────────────────
+    # forward 진단은 train 배치 기준이라 **일반화 기여를 못 본다.**
+    # train에서 Δacc < 0인데 test 성능이 오르면 "c2가 정보를 더한 것"이
+    # 아니라 "노이즈로 과적합을 줄인 것"일 수 있다 — 둘은 다른 결론이다.
+    _rvq_test = {}
+    if _rvq_logits_c1_chunks:
+        _lg1_test = torch.cat(_rvq_logits_c1_chunks, dim=0).numpy()
+        with torch.no_grad():
+            # ⚠ y_test가 CUDA면 device가 어긋난다 — 같은 디바이스로 맞춘다.
+            _lg1_t = torch.from_numpy(_lg1_test)
+            if torch.is_tensor(y_test):
+                _lg1_t = _lg1_t.to(y_test.device)
+            _p1, _pr1 = get_preds_and_probs(_lg1_t, tasktype)
+        # ⚠ 회귀는 y_std로 역스케일 후 계산해야 test_metrics와 단위가 맞는다.
+        if tasktype == "regression":
+            _m1 = calculate_metric(y_test * y_std, _p1 * y_std, None, tasktype, "test")
+        else:
+            _m1 = calculate_metric(y_test, _p1, _pr1, tasktype, "test")
+        for _k, _v in _m1.items():
+            _rvq_test[f"c1only_{_k}"] = _v
+            if _k in test_metrics:
+                _rvq_test[f"delta_{_k}"] = test_metrics[_k] - _v
+        # ⚠ changed_rate와 함께 봐야 한다:
+        #   changed 낮고 Δ≈0  → head가 c2를 거의 안 씀
+        #   changed 높고 Δ≈0  → c2를 쓰지만 방향이 틀림
+        # ⚠ preds_test는 CUDA 텐서일 수 있다 — numpy 변환 전에 cpu()를 거친다.
+        def _to_np(_t):
+            return (_t.detach().cpu().numpy() if torch.is_tensor(_t)
+                    else np.asarray(_t))
+        _rvq_test["changed_rate"] = float(
+            (_to_np(preds_test).ravel() != _to_np(_p1).ravel()).mean())
+        _rvq_test["unique_pred_c1"] = float(
+            len(np.unique(np.round(_lg1_test, 5), axis=0)))
+        _rvq_test["unique_pred_c1c2"] = float(
+            len(np.unique(np.round(logits, 5), axis=0)))
+        print(f"  [v3 test Δ] acc {_m1.get('acc_test', float('nan')):.4f} → "
+              f"{test_metrics.get('acc_test', float('nan')):.4f}  "
+              f"(Δ{_rvq_test.get('delta_acc_test', float('nan')):+.4f}, "
+              f"changed {_rvq_test['changed_rate']:.3f})")
+
     meta = {
         "openml_id":   openml_id,
         "tasktype":    tasktype,
         "best_params": best_params,
         "val_metrics": val_metrics,
         "test_metrics":test_metrics,
+        "rvq_test_delta": _rvq_test,
         "seed":        args.seed,
         "train_seed":  train_seed,
         # [추가] optimize.py의 HPO trial들은 이미 trial.set_user_attr()로
@@ -5435,7 +5515,7 @@ def main():
     parser.add_argument("--fusion_mode", type=str, default="proto_only_linear",
                         choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta",
                                  "proto_residual", "proto_query_residual", "proto_only",
-                                 "proto_only_linear", "query_only_linear",
+                                 "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
                                  "proto_residual_query"],
                         help=(
                             "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
@@ -5822,6 +5902,59 @@ def main():
                             "파라미터이므로 --from_saved_state와는 같이 못 씀, 이미 만들어진 "
                             "모델의 CentroidLayer 설정은 재학습 없이 못 바꿈)."
                         ))
+    parser.add_argument("--residual_vq", action="store_true",
+                        help=(
+                            "[v3] 2단계 residual 양자화. context = c1 + c2 이고 "
+                            "c2는 잔차 r = q - sg(c1)을 euclidean으로 양자화한 코드다. "
+                            "⚠ v2는 f(x) = W·c_k 라 최대 P개의 서로 다른 예측만 "
+                            "가능하다(ds=14: test 200개 → 고유 예측 31개). Voronoi "
+                            "accuracy 상한 0.852의 97.3%에 이미 도달했고 auroc 손실은 "
+                            "동점이 114% 설명한다 — 병목은 학습이 아니라 표현력이다. "
+                            "⚠ continuous residual(E 조건)로 풀면 안 된다: lambda를 "
+                            "작게 둬도 optimizer가 ||W_q||를 24배 키워 우회하고 "
+                            "prototype이 무력화된다(query 기여 98.6%). 두 항 모두 "
+                            "discrete여야 무제한 정보 경쟁자가 없다. "
+                            "판정: rvq_H_c2_given_c1 > 0 (게이트), rvq_delta_acc, "
+                            "rvq_unique_pred_c12 증가, auroc 회복."
+                        ))
+    parser.add_argument("--residual_vq_size", type=int, default=None,
+                        help="stage2 코드북 크기 P2. 미지정이면 P1과 동일(√N).")
+    parser.add_argument("--nbr_lambda", type=float, default=0.0,
+                        help=(
+                            "[v3] L_nbr 가중치 — raw feature 이웃 구조를 encoder에 "
+                            "보존시키는 contrastive loss. positive는 raw kNN(prototype "
+                            "무관), negative는 raw 거리가 먼 샘플만 쓴다. "
+                            "⚠ centroid/assignment를 전혀 쓰지 않는다 — encoder만 "
+                            "규제해야 'representation을 바꾼 효과'가 분리된다. "
+                            "⚠ snn(제거됨)과 다르다: snn은 positive가 같은 라벨이라 "
+                            "CE와 같은 방향이었고, L_nbr은 raw 이웃이라 직교한다. "
+                            "sweep 권장: 0 / 0.001 / 0.005 / 0.01 / 0.05 / 0.1 "
+                            "(InfoNCE는 log(batch)≈3~5 스케일이라 CE보다 크다). "
+                            "판정: kNN recall·Level 1 상승 + accuracy 유지."
+                        ))
+    parser.add_argument("--nbr_k", type=int, default=10,
+                        help="L_nbr의 raw kNN positive 후보 수")
+    parser.add_argument("--nbr_tau", type=float, default=0.1,
+                        help="L_nbr InfoNCE 온도")
+    parser.add_argument("--nbr_neg_margin", type=int, default=50,
+                        help=(
+                            "negative에서 제외할 raw 이웃 수. tabular은 raw 근접 ≈ "
+                            "같은 클래스인 경우가 많아, 배치 negative에 이웃이 섞이면 "
+                            "같은 neighborhood를 서로 밀어내는 충돌이 생긴다."
+                        ))
+    parser.add_argument("--centroid_topo_lambda", type=float, default=0.0,
+                        help=(
+                            "[v3 Phase 1] centroid topology loss 가중치. "
+                            "L_topo = ||Sim(mu_x) - Sim(centroid_emb)||^2 로 "
+                            "prototype 간 **배치 관계**를 raw feature manifold와 맞춘다. "
+                            "배정(누가 어느 그룹)은 CE가 정하고 건드리지 않는다 — "
+                            "raw feature / assignment 모두 detach하고 centroid_emb에만 "
+                            "gradient가 흐른다. "
+                            "⚠ 목적은 CE를 이기는 것이 아니라 regularizer다. "
+                            "purity가 무너질 만큼 크면 실패다(그냥 retrieval 모델이 됨). "
+                            "sweep 권장: 0 / 0.001 / 0.005 / 0.01 / 0.05 / 0.1. "
+                            "판정은 accuracy 유지 + Level 1(lo_*) 개선 여부로 한다."
+                        ))
     parser.add_argument("--disable_dead_reinit", action="store_true",
                         help=(
                             "[통제 실험용, Phase 1] dead_reinit을 완전히 끈다. "
@@ -5934,10 +6067,10 @@ def main():
         "head_branch_l2norm": False,
         "confidence_scaling": False,
         "confidence_scaling_detach": False,
-        "context_projection": "none",
+        "context_projection": False,
         "head_attn_alpha_override": None,
-        "head_neighbor_source": "memory",
-        "interaction_n_heads": 1,
+        "head_neighbor_source": "real",
+        "interaction_n_heads": 2,
         # trajectory 로깅 — 미사용
         "log_fusion_trajectory": False,
         "log_centroid_label_mi_trajectory": False,
@@ -5950,7 +6083,7 @@ def main():
         "query_detach_warmup_epochs": 0,
         "query_detach_warmup_steps": 0,
         "freeze_encoder_retrain_head": False,
-        "freeze_head_epochs": 0,
+        "freeze_head_epochs": 50,   # ⚠ freeze_encoder_retrain_head=False면 미사용
         "evidence_metric_override": None,
     }
     for _k, _v in _V2_DEPRECATED_DEFAULTS.items():
