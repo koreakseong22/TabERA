@@ -92,11 +92,11 @@ parser.add_argument("--context_projection", action="store_true",
                         "절충안. raw centroid_emb를 쓰는 설명①(hard_assignment/ "
                         "centroid_x/confidence) 계산에는 관여하지 않음."
                     ))
-parser.add_argument("--fusion_mode", type=str, default="proto_only_linear",
+parser.add_argument("--fusion_mode", type=str, default="proto_dev",
                     choices=["concat", "residual", "gated_sum", "anchor_gate",
                              "context_gated_beta", "proto_residual",
                              "proto_query_residual", "proto_only", "proto_only_linear",
-                             "query_only_linear", "proto_residual_query"],
+                             "query_only_linear", "proto_dev", "proto_dev_agg", "proto_residual_query"],
                     help=(
                         "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
                         "폭넓은 비교 실험(6개 데이터셋)에서도 concat 대비 일관된 우위를 "
