@@ -18,8 +18,21 @@ import optuna
 # HPO ↔ reproduce 학습 스케줄 단일 소스
 # ─────────────────────────────────────────────────────────────
 
-HPO_TRAINING_SCHEDULE = {"epochs": 200, "patience": 30}
-"""optimize.py의 각 HPO trial과 reproduce.py의 최종 재현 학습이 반드시
+HPO_TRAINING_SCHEDULE = {"epochs": 100, "patience": 20}
+"""[2026-08 변경] 200/30 → 100/20 — MultiTab benchmark(Lee et al.)와
+학습 예산을 맞추기 위함. 같은 조건이어야 baseline 대비 성능 차이가
+스케줄 차이로 오염되지 않는다.
+
+⚠ 이는 **원래 값으로 되돌리는 것**이다 — 아래 [배경]에 있듯 예전에
+optimize.py가 100/20을 하드코딩하고 있었고, 단일 소스로 묶으면서
+reproduce.py 쪽 기본값(200/30)을 채택했었다.
+
+⚠ ds=14 실측: 200/30 조건에서도 실제로는 72 epoch에 종료됐다 — 작은
+데이터셋은 이미 early stopping이 걸려 있어 영향이 작다. 큰 데이터셋에서는
+학습이 잘릴 수 있으므로, 이전 결과와 비교할 때 스케줄이 다르다는 점을
+반드시 명시해야 한다.
+
+optimize.py의 각 HPO trial과 reproduce.py의 최종 재현 학습이 반드시
 같은 epochs/patience를 쓰도록 강제하는 단일 소스.
 
 [배경] 예전엔 optimize.py에 epochs=100/patience=20이 하드코딩돼 있고,
@@ -50,7 +63,7 @@ optimize.py/reproduce.py 둘 다 이 값을 직접 import해서 쓰고, 각자
 # retrieval이 예측 경로 밖인 fusion_mode에서는 k가 HPO objective에
 # 영향을 주지 않는다. 아래 모드에서는 k를 고정한다.
 _K_UNTUNED_MODES = ("proto_only", "proto_only_linear",
-                    "query_only_linear", "proto_residual_query")
+                    "query_only_linear", "proto_dev", "proto_dev_agg", "proto_residual_query")
 DEFAULT_K_NO_TUNE = 8
 
 
@@ -199,7 +212,7 @@ def get_search_space(
                                    # optimize.py는 항상 args.num_embedding을 명시적으로
                                    # 넘기므로 실제 파이프라인 동작엔 영향 없음 — 이 함수를
                                    # 직접 호출하는 경우(테스트/노트북 등)를 위한 방어적 기본값.
-    fusion_mode: str = "proto_only_linear",  # [v2] k 탐색 여부를 결정한다.
+    fusion_mode: str = "proto_dev",  # [v2] k 탐색 여부를 결정한다.
                                    # retrieval이 예측 경로 밖인 모드에서는 k를 고정
                                    # (_K_UNTUNED_MODES 참고). optimize.py가
                                    # args.fusion_mode를 명시적으로 넘겨야 한다.
