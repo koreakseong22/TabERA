@@ -107,6 +107,14 @@ parser.add_argument("--fusion_mode", type=str, default="proto_dev",
                         "규칙으로 저장된 옛날 study 파일은 새 태그 규칙과 파일명이 달라지므로 "
                         "리네임이 필요할 수 있음(레포 마이그레이션 스크립트 참고)."
                     ))
+parser.add_argument("--nbr_lambda", type=float, default=0.005,
+                    help=(
+                        "[v3 확정] L_nbr 가중치. ⚠ reproduce.py와 반드시 같아야 한다 — "
+                        "HPO가 L_nbr 없는 조건에서 HP를 찾고 재현에서만 켜면, 서로 다른 "
+                        "아키텍처를 기준으로 최적화한 셈이 된다."
+                    ))
+parser.add_argument("--nbr_k", type=int, default=10,
+                    help="L_nbr의 raw kNN positive 후보 수")
 parser.add_argument("--use_context_emb", action="store_true",
                     help=(
                         "[2026-07, deprecated — 하위호환용] use_context_emb=True가 다시 "
@@ -351,6 +359,10 @@ if train:
             use_context_projection=args.context_projection,
             evidence_metric=args.evidence_metric,
             fusion_mode=args.fusion_mode,
+            # [v3] L_nbr — reproduce.py와 같은 값이어야 HPO가 같은
+            #   아키텍처를 기준으로 탐색한다.
+            nbr_lambda=args.nbr_lambda,
+            nbr_k=args.nbr_k,
             disable_retrieval_branch=args.disable_retrieval_branch,
             use_context_emb=args.use_context_emb,
             # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
@@ -380,6 +392,10 @@ if train:
         wrapper = TabERAWrapper(model, params, tasktype,
                                   device=str(device), **HPO_TRAINING_SCHEDULE)
         wrapper._data_id = args.openml_id   # 에폭 tqdm에 data_id 표시
+        # [v3] L_nbr용 raw feature kNN graph. nbr_lambda=0이면 즉시 반환한다.
+        #   ⚠ 없으면 _nbr_graph가 None이라 L_nbr이 조용히 계산되지 않는다.
+        #   프로세스 캐시가 있어 trial마다 다시 만들지 않는다.
+        model.set_nbr_graph(X_train)
         wrapper.fit(X_train, y_train, X_val, y_val)
 
         # ── 평가: logits 1회 계산 → preds/probs 동시 추출 ──────
