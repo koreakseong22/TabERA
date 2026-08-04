@@ -1143,7 +1143,12 @@ class TabERA(nn.Module):
             # 원 probe 실험 그대로 재현하려면 이것만 켜고 blockwise_layernorm은
             # 기본값(False) 유지 권장. 둘 다 켜면 LN 적용 후 L2-normalize(아래
             # forward() 참고) — 그 조합 자체는 검증 안 된 추가 실험임.
-        fusion_mode: str = "proto_only_linear",   # [v2 확정] logits = W · context_emb
+        fusion_mode: str = "proto_dev",          # [v3 확정] h = c + β·normalize(q−c)
+                                                 # W 공유가 핵심 — branch별 가중치를
+                                                 # 따로 두면(E 조건) ‖W_q‖가 24배 커져
+                                                 # prototype이 무력화된다.
+                                                 # auroc 9/9 개선(p=0.004),
+                                                 # argmax 99.4% 보존.
             # architecture"로 residual을 잠시 기본값으로 바꿨었으나, 이후 진행된
             # 훨씬 넓은 범위의 실험(6개 데이터셋, concat/residual 양쪽 ablation·
             # trajectory·retrieval-free baseline 비교)에서도 "어느 쪽이 일관되게
@@ -1309,7 +1314,11 @@ class TabERA(nn.Module):
         #     λ를 detach 스위치로 겸용하면 이 검증을 잃는다.
         residual_vq: bool = False,           # [v3] 2단계 residual 양자화
         residual_vq_size: Optional[int] = None,   # P2. None이면 P1과 동일
-        nbr_lambda: float = 0.0,             # [v3] L_nbr 가중치 (encoder에 직접)
+        nbr_lambda: float = 0.005,           # [v3 확정] L_nbr 가중치.
+                                             # raw feature 이웃 구조를 encoder에 보존.
+                                             # acc 7/9 개선(p=0.039), 순위 13→7위.
+                                             # ⚠ prototype 전용 효과다 —
+                                             # query_only_linear에서는 +0.002로 사라진다.
         nbr_k: int = 10,                     # raw feature kNN에서 positive 후보 수
         nbr_tau: float = 0.1,                # InfoNCE 온도
         nbr_neg_margin: int = 50,            # negative에서 제외할 raw 이웃 수
@@ -2119,10 +2128,20 @@ class TabERA(nn.Module):
             _N = _Z.shape[0]
             _kk = min(self.nbr_k, _N - 1)
             _mm = min(self.nbr_neg_margin, _N - 1)
-            _D = torch.cdist(_Z, _Z)
-            _D.fill_diagonal_(float("inf"))
-            self._nbr_graph = _D.topk(_kk, dim=-1, largest=False).indices.cpu()
-            self._nbr_far   = _D.topk(_mm, dim=-1, largest=False).indices.cpu()
+            # ⚠ N×N 거리 행렬은 N=10000이면 100M 원소(400MB)다.
+            #   nbr_lambda가 기본 활성이므로 큰 데이터셋에서도 안전해야 한다.
+            #   행 단위 청크로 나눠 topk만 남긴다.
+            _CH = max(1, min(2048, int(2e8 // max(_N, 1))))
+            _g, _fr = [], []
+            for _st in range(0, _N, _CH):
+                _blk = torch.cdist(_Z[_st:_st + _CH], _Z)
+                for _r in range(_blk.shape[0]):
+                    _blk[_r, _st + _r] = float("inf")     # 자기 자신 제외
+                _g.append(_blk.topk(_kk, dim=-1, largest=False).indices.cpu())
+                _fr.append(_blk.topk(_mm, dim=-1, largest=False).indices.cpu())
+                del _blk
+            self._nbr_graph = torch.cat(_g, 0)
+            self._nbr_far   = torch.cat(_fr, 0)
             print(f"  [L_nbr] raw kNN graph 생성: N={_N}, k={_kk}, "
                   f"neg_margin={_mm}")
 
