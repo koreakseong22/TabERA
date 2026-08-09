@@ -65,6 +65,9 @@ optimize.py/reproduce.py 둘 다 이 값을 직접 import해서 쓰고, 각자
 _K_UNTUNED_MODES = ("proto_only", "proto_only_linear",
                     "query_only_linear", "proto_dev", "proto_dev_agg", "proto_residual_query")
 DEFAULT_K_NO_TUNE = 8
+# k 탐색 후보. optimize.py의 n_prototypes 상한(N/k) 계산이 같은 목록을
+# 봐야 하므로 상수로 둔다 — 두 곳에 하드코딩하면 한쪽만 바뀔 수 있다.
+SEARCHED_K_CHOICES = [4, 8, 16, 32, 48, 64]
 
 
 def adacos_fixed_scale(n_prototypes: int) -> float:
@@ -123,6 +126,25 @@ def study_pkl_tag(
     # 하이퍼파라미터로 조용히 학습되는 사고를 막는다(--global_retrieve 때 겪음).
     retr_proj_mode: str = "none",
     disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜" retrieval-free
+    n_prototypes: "int | None" = None,       # [2026-08, 추가] 아래 설명 참고
+    # [2026-08, 추가] 학습 결과를 바꾸는데 태그에 없던 것들. 기본값이면
+    # 아무것도 안 붙으므로 기존 study 파일명이 그대로 유지된다.
+    # [조건 A/O 실험] centroid 갱신 방식과 dead reinit 은 구조 변경이므로
+    # study 를 분리한다 — gradient 조건에서 튜닝한 HP 를 EMA 에 쓰면
+    # "centroid 갱신 방식" 이 아니라 "갱신 방식 + HP 부적합" 비교가 된다.
+    gradient_codebook: bool = False,
+    no_commitment: bool = False,
+    disable_dead_reinit: bool = False,
+    # ⚠ 기본이 0 이다(L_nbr 제거). 0 이 아닐 때만 태그에 붙는다.
+    nbr_lambda: float = 0.0,
+    # ⚠ nbr_k 는 이제 libs/tabera.py 의 모듈 상수(NBR_K)다. 호출부가 넘기지
+    #   않으므로 항상 기본값이고 태그에 아무것도 안 붙는다. 인자를 남겨둔
+    #   것은 하위호환 때문이다 — 상수를 바꾸면 그건 코드 버전 변경이고
+    #   freeze_check.py 가 잡는다.
+    nbr_k: int = 10,
+    num_bins: int = 8,
+    cat_embed_dim: int = 16,
+    detach_retr_grad: bool = False,
         # baseline(Model 2, TabERA.__init__ 참고). False(기본값)면 태그 없음 —
         # 하위 호환. [교훈] fusion_mode를 "기본값=태그 없음"으로 짰다가 v2 freeze
         # 이후 기본값이 바뀌면서 옛날 study 파일과 충돌한 사고가 있었음(위 참고) —
@@ -163,7 +185,36 @@ def study_pkl_tag(
     가리키려면 두 스크립트에 같은 --fusion_mode/--no_context_emb를 명시적으로
     맞춰줘야 함 — 이게 오히려 안전한 방향).
     """
-    return ("..no_offset" if no_offset_correction else "") \
+    # [2026-08 추가] n_prototypes
+    # ⚠ P는 일반 하이퍼파라미터가 아니라 **구조 변수**다. logits ≈ W·c 이고
+    #   c는 P개 값만 취하므로 P가 곧 prototype 항의 클래스 표현 용량이고,
+    #   동시에 |G_p| = N/P 가 retrieval 지역성을 정한다.
+    # ⚠ 그런데 예전 태그에는 P가 없어서, **P만 다른 실험이 같은 study
+    #   파일을 공유했다.** ds=1493에서 P=35 study가 P=100 실행에 덮여
+    #   사라진 사례가 실제로 있었다(trial 번호가 0부터 새로 시작).
+    #   재현성 문제이므로 태그에 넣는다.
+    # ⚠ 하위호환: n_prototypes=None(미지정)이면 예전과 같은 이름이 나온다.
+    #   기존 study 재개가 깨지지 않는다. 호출부는 P를 알게 된 시점부터
+    #   넘기고, 파일이 없으면 legacy 이름으로 폴백한다.
+    # ⚠ nbr_lambda / nbr_k / num_bins / cat_embed_dim / detach_retr_grad 는
+    #   학습 결과를 바꾸는데 예전 태그에 없었다. 특히 nbr_lambda 는 L_nbr
+    #   가중치라 v2(0)와 v3(0.005)가 **같은 study 파일을 공유**한다 —
+    #   한쪽이 다른 쪽을 덮어쓰면 재현이 불가능해진다. n_prototypes 에서
+    #   실제로 그 사고가 있었다(ds=1493, P=35 study가 P=100 실행에 사라짐).
+    # ⚠ 기본값과 같으면 아무것도 붙이지 않는다 — 기존 study 파일명이 그대로
+    #   유지되어 재개가 안 깨진다. 비대칭이지만 하위호환이 우선이다.
+    # ⚠ [2026-08 기본값 전환] centroid 갱신이 gradient → EMA 로, L_nbr 이
+    #   0.005 → 0 으로 바뀌었다. 그런데 두 변화가 모두 "기본값" 이라 태그가
+    #   안 붙고, **옛 v3 study 와 같은 파일명이 된다.**
+    #   구조가 다른 두 모델이 같은 study 를 쓰면 안 되므로 모델 버전을 넣는다.
+    #   (n_prototypes 때 같은 사고가 실제로 있었다 — ds=1493 의 P=35 study 가
+    #    P=100 실행에 사라졌다.)
+    # ⚠ 모델 버전 태그. 기본값이 바뀔 때마다 올린다 — 안 그러면 구조가 다른
+    #   모델이 같은 study 를 재개해서 오염된다.
+    #     v3ema   EMA prototype memory + L_nbr 제거 (2026-08)
+    #     v3ema2  + commitment 제거 (§10)
+    return "..v3ema2" \
+        + ("..no_offset" if no_offset_correction else "") \
          + (f"..retrproj_{retr_proj_mode}" if retr_proj_mode != "none" else "") \
         + ("..global_retrieve" if global_retrieve else "") \
         + ("..detach_ctx" if detach_context_grad else "") \
@@ -175,7 +226,16 @@ def study_pkl_tag(
         + (f"..evM_{evidence_metric}" if evidence_metric != "euclidean" else "") \
         + f"..fusion_{fusion_mode}" \
         + ("..noctx" if not use_context_emb else "") \
-        + ("..no_retrieval" if disable_retrieval_branch else "")
+        + ("..no_retrieval" if disable_retrieval_branch else "") \
+        + (f"..P{int(n_prototypes)}" if n_prototypes is not None else "") \
+        + ("..grad_cb" if gradient_codebook else "") \
+        + ("" if no_commitment else "..commit") \
+        + ("..nodr" if disable_dead_reinit else "") \
+        + (f"..nbr{nbr_lambda:g}" if abs(nbr_lambda) > 1e-12 else "") \
+        + (f"..nbrk{int(nbr_k)}" if int(nbr_k) != 10 else "") \
+        + (f"..bins{int(num_bins)}" if int(num_bins) != 8 else "") \
+        + (f"..catdim{int(cat_embed_dim)}" if int(cat_embed_dim) != 16 else "") \
+        + ("..detach_retr" if detach_retr_grad else "")
 
 
 def suggest_initial_trial() -> dict:
@@ -212,6 +272,18 @@ def get_search_space(
                                    # optimize.py는 항상 args.num_embedding을 명시적으로
                                    # 넘기므로 실제 파이프라인 동작엔 영향 없음 — 이 함수를
                                    # 직접 호출하는 경우(테스트/노트북 등)를 위한 방어적 기본값.
+    no_commitment: bool = False,     # [ablation] commitment_loss 를 끈다.
+                                   # EMA 에서 commitment 는 **encoder 를 prototype
+                                   # memory 에 정렬시키는 유일한 손실**이다
+                                   # (codebook 은 EMA 가 대체). 그 필요성을 재려면
+                                   # 탐색 공간에서도 빼야 한다 — 안 그러면
+                                   # HPO 가 commitment 를 튜닝한 뒤 재현에서만
+                                   # 끄는 꼴이 된다.
+    use_ema_codebook: bool = True,   # [2026-08] loss_codebook 탐색 여부를 결정한다.
+                                   # EMA 가 기본이 되면서 codebook_loss 가 호출조차
+                                   # 되지 않으므로(실측 배치당 0회) 죽은 차원을
+                                   # 탐색하지 않는다. optimize.py 가
+                                   # not args.gradient_codebook 을 넘긴다.
     fusion_mode: str = "proto_dev",  # [v2] k 탐색 여부를 결정한다.
                                    # retrieval이 예측 경로 밖인 모드에서는 k를 고정
                                    # (_K_UNTUNED_MODES 참고). optimize.py가
@@ -255,7 +327,7 @@ def get_search_space(
         #   Level 1 지표(lo_spearman_mean 등)로 별도 선택한다.
         #   기본값 8 — LLM 입력 길이를 고려한 값(4는 부족, 16은 과다).
         "k": (DEFAULT_K_NO_TUNE if fusion_mode in _K_UNTUNED_MODES
-              else trial.suggest_categorical("k", [4, 8, 16, 32, 48, 64])),
+              else trial.suggest_categorical("k", SEARCHED_K_CHOICES)),
         # [원복 — 2026-07] embedder_layers를 [2,4] → [1,4]로 되돌림.
         # 좁혔던 근거({1:2, 2:1, 3:9, 4:10} 분포, 아래 원래 주석)가 이후
         # 재검토 결과 두 가지 문제가 있었음:
@@ -302,7 +374,8 @@ def get_search_space(
         # 근거: colic(id=25) seed=1에서 loss_diversity=0.466, loss_commitment=0.0019으로
         #       diversity:commitment 비율이 244:1이 되어 centroid가 데이터에서 멀어지는
         #       현상 확인. 두 loss가 같은 order of magnitude에서 탐색되도록 하한 통일.
-        "loss_commitment": trial.suggest_float("loss_commitment", 1e-2, 1e-1, log=True),
+        "loss_commitment": (0.0 if no_commitment else
+                            trial.suggest_float("loss_commitment", 1e-2, 1e-1, log=True)),
 
         # [추가] loss_codebook — codebook_loss(commitment_loss의 반대 방향,
         # centroid를 배정된 쿼리 쪽으로 당김) 가중치. VQ-VAE 원 논문은 이
@@ -312,7 +385,14 @@ def get_search_space(
         # 같은 스케일(1e-2~1e-1)로 시작 — 둘 다 같은 ‖query-centroid‖²를
         # 미는 손실이라 크기가 크게 벌어지면 한쪽만 지배적이 될 위험이 있음
         # (loss_diversity/loss_commitment 하한을 통일했던 것과 같은 이유).
-        "loss_codebook":   trial.suggest_float("loss_codebook",   1e-2, 1e-1, log=True),
+        # ⚠ [2026-08] EMA 에서는 이 값이 **아무 데도 쓰이지 않는다** —
+        #   tabera.py 가 use_ema_codebook 분기에서 codebook_loss 를 호출하지
+        #   않는다(실측: 배치당 0회). 탐색하면 예산 한 차원을 죽은 값에
+        #   쓰고, checkpoint 를 보면 codebook=0.07 이라 "쓰이는 줄" 오해한다.
+        #   loss_diversity 가 이미 같은 이유로 제외돼 있다(위 참고).
+        #   gradient codebook 실험(--gradient_codebook)에서는 그대로 탐색한다.
+        "loss_codebook":   (0.0 if use_ema_codebook else
+                            trial.suggest_float("loss_codebook", 1e-2, 1e-1, log=True)),
 
         # ── 학습 파라미터 ───────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
@@ -333,6 +413,35 @@ def get_search_space(
         # "지금은 노이즈 때문에 신호를 못 본다"는 상태임. regroup_warmup_epochs로
         # 노이즈를 줄인 뒤, 또는 electricity/nomao 같은 대형 데이터셋을 다룰
         # 때 이 결정을 다시 검토해야 함.
+        #
+        # ── [2026-08 갱신] EMA prototype memory 전환 후의 근거 ──────────
+        # 위 근거들은 전부 gradient codebook 시절 것이다. EMA 로 바꾸면서
+        # batch_size 가 **새로운 경로**를 하나 더 갖게 됐다.
+        #
+        #     B  →  gradient noise                    (원래 있던 경로)
+        #     B  →  batch 당 prototype 별 표본 수  →  EMA 갱신의 통계적 안정성
+        #
+        # `c_p ← m_p / N_p` 에서 N_p 는 그 배치에서 prototype p 에 배정된
+        # 샘플 수다. 즉 **N_train 이 아니라 B/P 를 봐야 한다.**
+        #
+        #   ds     N     P    B/P    빈 prototype 기대((1−1/P)^B)
+        #   54    676   26    9.8    0.0%
+        #   31    800   28    9.1    0.0%
+        #   14   1600   40    6.4    0.2%
+        #   1043 3649   60    4.3    1.4%
+        #   1489 4322   65    3.9    1.9%
+        #
+        # P = √N 규칙 덕분에 B=256 에서 B/P 가 3.9~9.8 로 좁게 모인다.
+        # ⚠ 그래서 "작은 데이터셋이니 B 를 32 로" 같은 N 기반 축소 규칙은
+        #   **오히려 해롭다** — ds=54 에 B=32 면 B/P=1.2, 빈 prototype 기대
+        #   29% 가 되어 매 배치 prototype 셋 중 하나가 갱신되지 않는다.
+        #
+        # ⚠ 256 이 최적이라는 뜻이 아니라 **고정된 benchmark protocol** 이다.
+        #   다시 건드린다면 두 축을 같이 봐야 한다:
+        #     ① B/P              EMA 갱신 안정성
+        #     ② (N/B) × epochs   optimizer update budget
+        #   현재 ①은 양호하고 ②는 데이터셋 간 편차가 크다(steps/epoch 2~16).
+        #   ②는 early stopping 이 부분적으로 흡수하지만 통제되지는 않는다.
         "batch_size":      256,
         # "anneal_factor":   trial.suggest_float("anneal_factor", 0.90, 0.99),
         # "n_heads":         trial.suggest_categorical("n_heads", [1, 2, 4, 8]),
@@ -401,8 +510,22 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
             # ⚠ [v2] diversity는 탐색 공간에서 제외됐으므로 신규 study의
             #   best_params에는 이 키가 없다. 0.0으로 fallback한다
             #   (탐색에서 제외 = 비활성화와 같은 의미).
+            # ⚠ [TODO — dead_reinit ablation 후 정리] use_ema_codebook=True 가
+            #   기본이 되면서 loss_codebook / loss_diversity 가 **아무 데도
+            #   쓰이지 않는다**(tabera.py 가 EMA 분기에서 두 손실을 호출조차
+            #   안 함 — 실측: 배치당 호출 0회). 그런데 HPO 는 loss_codebook 을
+            #   계속 탐색하고 값이 checkpoint 에 저장된다.
+            #     · 결과에 영향 없음 (버그 아님)
+            #     · 탐색 예산 한 차원 낭비
+            #     · checkpoint 를 보면 codebook=0.07 이라 "쓰이는 줄" 오해
+            #   ⚠ 지금 고치면 진행 중인 ablation 과 탐색 공간이 달라지므로,
+            #     dead_reinit ON/OFF 결과가 나온 뒤에 정리한다.
             "diversity":   params.get("loss_diversity", 0.0),
-            "commitment":  params["loss_commitment"],
+            # ⚠ [버그 수정] 직접 인덱싱이었다. `--no_commitment` 로 탐색을
+            #   건너뛰면 best_params 에 이 키가 아예 없어 KeyError 가 났다.
+            #   codebook 과 같은 방식(.get)으로 통일한다. 키가 없다는 것은
+            #   "그 손실을 안 쓴다" 는 뜻이므로 0.0 이 맞는 기본값이다.
+            "commitment":  params.get("loss_commitment", 0.0),
             # .get() — codebook_loss 추가 이전에 저장된 구버전 study의
             # best_params에는 이 키가 없음 (그런 경우 codebook_loss 자체가
             # 없던 이전 동작과 동일하게 0.0 사용 — tabera.py의 aux_loss
