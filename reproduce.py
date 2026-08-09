@@ -26,10 +26,15 @@ import torch.nn.functional as F
 from pathlib import Path
 
 from libs.data         import TabularDataset
+from libs import diagnostics as diag
 from libs.search_space import params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE
 from libs.supervised   import TabERAWrapper
+# L_nbr 의 k/τ/margin 은 튜닝 대상이 아니라 모듈 상수다(libs/tabera.py 참고).
+from libs.tabera       import (NBR_K, NBR_TAU, NBR_NEG_MARGIN,
+                               strip_legacy_kwargs)
 from libs.tabera         import TabERA
 from libs.prototypes     import inverse_transform_numeric
+from libs                import diagnostics as diag
 from libs.eval         import calculate_metric, get_preds_and_probs, get_criterion
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -92,43 +97,18 @@ def _format_target_info(tinfo) -> str:
         return f"target≈{tinfo['group_mean']:.3g}(p{tinfo['percentile']:.0f})"
 
 
-def _select_query_similar_features(
-    query: dict, neighbour: dict, cat_names: set,
-    max_n: int = 4, max_gap: float = 0.15,
-) -> list:
-    """
-    "이 이웃의 값이 원래 크다"가 아니라 "query와 이 이웃이 이 feature에서
-    얼마나 가까운가"로 feature를 고른다 — query도 안 보여주고 이웃 혼자
-    값이 큰 feature만 나열하면 "그래서 왜 비슷한 이웃인지" 설명이 안 됨.
-
-    numeric은 |query-neighbour| (이미 [0,1] 정규화됨), categorical은
-    같으면 0/다르면 1 (Gower distance와 동일한 방식 — LabelEncoder 정수
-    코드에 순서가 없어 그냥 뺄셈하면 안 됨). gap이 작을수록(=가까울수록)
-    상위로 정렬하고, max_gap을 넘는 건 애초에 후보에서 제외한다 — 그래서
-    정말 비슷한 feature가 몇 개 없는 이웃은 개수가 max_n보다 적게 나올
-    수 있다(숫자 채우기용으로 안 비슷한 feature를 억지로 넣지 않음).
-    비슷한 feature가 하나도 없으면(전부 max_gap 초과) 그래도 가장 가까운
-    1개는 보여준다 — 완전히 빈 설명보다는 "그나마 제일 가까운 게 이거"가 낫다.
-
-    반환값: [(name, value, kind), ...] — kind는 "numeric"|"categorical".
-    호출부에서 kind별로 나눠 보여줄 수 있게 dict 대신 list로 반환한다.
-    """
-    diffs = []
-    for k, v in neighbour.items():
-        if k not in query:
-            continue
-        is_cat = k in cat_names
-        gap = (0.0 if query[k] == v else 1.0) if is_cat else abs(query[k] - v)
-        diffs.append((k, v, gap, "categorical" if is_cat else "numeric"))
-    if not diffs:
-        return []
-    diffs.sort(key=lambda x: x[2])
-    selected = [(k, v, kind) for k, v, gap, kind in diffs if gap <= max_gap][:max_n]
-    if not selected:
-        k, v, gap, kind = diffs[0]
-        selected = [(k, v, kind)]
-    return selected
-
+# [제거됨] _select_query_similar_features / _select_query_dissimilar_features
+# ─────────────────────────────────────────────────────────────
+# 두 함수를 libs/diagnostics.py의 feature_gaps()로 합쳤다.
+#
+# 제거 이유는 중복이 아니라 **max_gap=0.15라는 임계값**이다. 그 값이
+# "gap > 0.15인 feature는 아예 후보에서 뺀다"를 결정했고, 그래서 결과를
+# 보여주기 **전에** 정보가 삭제됐다 — "왜 비슷한지"만 보이고 "어디가
+# 다른지"는 숨는 확증편향 표시가 된 원인이다. 근거 없는 상수가 무엇을
+# 볼지 정한다는 점에서 detector threshold와 같은 문제다.
+#
+# 지금은 feature_gaps()가 전체 feature의 gap을 그대로 돌려주고, 정렬과
+# 상위 N개 절단은 아래 print_explanation(표시 계층)에서만 한다.
 
 def _split_by_kind(labels, get_kind, get_str):
     """items를 kind별(numeric/categorical)로 나눠 두 개의 문자열 리스트로."""
@@ -141,7 +121,24 @@ def _split_by_kind(labels, get_kind, get_str):
 def print_explanation(explanations: list, sample_idx: int, col_names: list,
                        cat_category_names: dict = None,
                        quantile_transformer=None, num_cols: list = None,
-                       pred_info: dict = None) -> None:
+                       pred_info: dict = None,
+                       target_class_names: list = None,
+                       tasktype: str = None,
+                       max_neighbors: int = 3,
+                       max_features: int = 4,
+                       max_gaps: int = 3,
+                       verbose: bool = False,
+                       max_dims: int = 5) -> None:
+    """
+    ⚠ 표시 계층. 아래 max_* 인자는 **콘솔 줄 수 제한**이지 판정 기준이
+      아니다 — 어떤 claim도 만들지 않는다. libs/diagnostics.py는 순위
+      전체를 반환하고, 자르는 일은 여기서만 한다. 분석 스크립트는
+      diagnostics를 직접 불러 전체 분포를 봐야 한다.
+
+    ⚠ 이 함수는 판정하지 않는다. "모호한 지역이다" 같은 문장을 만들려면
+      경험적 분포에서 기준선을 정해야 하는데, 샘플 하나를 찍는 이 자리에는
+      참조 분포가 없다. 값만 출력한다.
+    """
     e = explanations[sample_idx]
 
     print(f"\n{'━'*52}")
@@ -188,10 +185,12 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     # 다른 값. margin/others/cosine을 같이 보여줘서 이 숫자 하나만으로 판단
     # 안 하고 맥락과 함께 읽게 함.
     print(f"     Assigned prototype: \"{proto['assigned_group']}\"")
-    cos_str = f"  |  cosine similarity={proto['cosine_similarity']:.3f}" if proto.get('cosine_similarity') is not None else ""
-    print(f"     Routing confidence: {proto['routing_confidence']:.1%}"
-          f"  (relative preference among all prototypes, not a prediction probability)")
-    print(f"     Margin over runner-up: {proto['margin']:+.1%}{cos_str}")
+    # [제거] Routing confidence / margin / cosine similarity
+    # 값은 샘플마다 갈리지만 **기준이 없어 읽어도 판단이 안 선다** —
+    # P=28이면 균등이 3.6%인데 '16.5%'가 높은 건지 낮은 건지 알 수 없다.
+    # 바로 아래 Routing distribution이 같은 정보를 비교 가능한 형태로 준다
+    # (2·3위 그룹의 label distribution까지 붙어서 훨씬 잘 읽힘).
+    # 값 자체는 explanations[b]['prototype']에 그대로 남아 있다 — 진단용.
     print(f"     Prototype label distribution: {target_str}")
 
     if proto["runners_up"]:
@@ -218,75 +217,397 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
         if cat_strs:
             print(f"       categorical: {',  '.join(cat_strs)}")
 
-    # ② Neighbor evidence (Attention weight)
+    # ② Local evidence — prototype-conditioned
     ev = e["evidence"]
-    # [명명 정정] "Neighbor Evidence"는 causal claim("이 이웃 때문에 예측했다")을
-    # 함의함 — 이 세션의 necessity 검증(agg_emb 제거해도 accuracy 거의 불변,
-    # 4데이터셋×5seed)에서 이 weight가 실제로 prediction을 좌우한다는 근거가
-    # 부족함이 확인됨. "Retrieved Neighbors"(무엇을 검색했는가, descriptive)로
-    # 표현을 낮추고, 그 아래 한 줄로 한계를 명시. context/agg branch 자체나
-    # 검색 메커니즘은 그대로 유지 — retrieval inspection/error analysis
-    # 용도로는 여전히 유효함.
-    print(f"\n  ② Retrieved Neighbors (Similarity)")
-    print(f"     (attention weight — 실제 예측 결정과의 인과관계는 검증되지 않음)")
-    print(f"     dominant={ev['dominant_weight']:.1%},  entropy={ev['entropy']:.3f}")
-
-    # attention weight가 사실상 0인 이웃은 생략 (반올림하면 0.0%로 보이는 것도
-    # 포함) — weight가 거의 없는 이웃까지 보여주는 건 정보가 아니라 소음이다.
-    # ["기여도"라는 표현은 안 씀 — 위 causal claim 이슈와 같은 이유]
-    _WEIGHT_EPS = 1e-3
-    shown = [(rank, idx, w) for rank, (idx, w) in enumerate(ev["top_neighbours"])
-              if w > _WEIGHT_EPS]
-
-    if not shown:
-        print(f"     (no neighbor received meaningful attention weight)")
-
-    nf = e.get("neighbour_features")
+    le = e.get("local_evidence")
+    nbrs = e.get("neighbors")
+    _single = False          # 이웃이 단일 클래스인가 (아래 ②에서 결정)
+    _skip_contrast = False   # 위 축약 문장이 이미 '반례 없음'을 말했는가
     name_to_idx = {name: i for i, name in enumerate(col_names)} if col_names else {}
 
+    # [Level 2 재정의] 세 가지를 한꺼번에 고친다.
+    #
+    # (a) 이웃 라벨 분포의 의미.
+    #     "가까운 8개 중 6개가 yes" 를 그대로 내보내면 사람은 반드시
+    #     "그러니까 yes" 로 읽는다. 그런데 §6-1이 측정으로 못박았다 —
+    #     같은 prototype 안에서는 raw feature로도 다수결을 못 넘는다.
+    #     그러면 그 6/8은 그룹 분포의 표본 노이즈이지 증거가 아니다.
+    #     §4-4b가 지지하는 유일한 해석은 "이 지역이 얼마나 섞여 있는가"
+    #     (purity 통제 후에도 entropy가 6/6에서 오분류를 유의하게 예측).
+    #     → 항상 그룹 전체 분포와 나란히 찍고, 상대 모호성으로 요약한다.
+    #
+    # (b) scope 명시. 이 검색은 NN(q, G_p)이지 NN(q, D)가 아니다.
+    #     "similar cases"라고만 쓰면 전체 데이터에서 찾은 것으로 읽힌다.
+    #
+    # (c) 반례(contrasting case). 이전 표시는 query와 **가까운** feature만
+    #     골라 보여줬다(_select_query_similar_features는 gap>0.15를 아예
+    #     후보에서 제외한다) — "왜 비슷한지"만 보이고 "어디가 다른지"는
+    #     숨는 확증편향 표시였다. 예측과 결과가 다른 이웃에는 가장 크게
+    #     **어긋난** feature를 같이 보여준다.
+    _p = le.get("prototype") if le else None
+    _scope = f"NN(q, G_{_p})" if _p is not None else "NN(q, G_p)"
+    print(f"\n  ② Local Evidence — prototype-conditioned   {_scope}, not NN(q, D)")
+    # ⚠ 아래 5줄은 **내용이 맞지만 매 샘플 반복될 성질이 아니다.**
+    #   14건을 읽으면 70줄이 되고, 두 번째 샘플부터는 아무도 안 읽는다.
+    #   해석 규칙은 한 번만 읽으면 되는 것이므로 verbose에서만 낸다.
+    #   (설명 전체의 규칙이지 이 샘플의 사실이 아니다.)
+    if verbose:
+        print(f"     같은 prototype 그룹 **안에서만** 검색합니다 — 전체 데이터의 최근접이 아닙니다.")
+        print(f"     ⚠ 이웃의 결과 분포는 **예측 근거가 아닙니다.** 같은 prototype 내부에서는")
+        print(f"       label 분리가 제한적이므로(그룹 내부 판별력 측정 완료), 이웃 다수결을")
+        print(f"       근거로 쓰면 그룹 분포의 표본 노이즈를 증거로 제시하는 셈이 됩니다.")
+        print(f"       여기서 읽을 수 있는 것은 '이 결정이 얼마나 전형적인 영역에서")
+        print(f"       이루어졌는가'(local ambiguity) 하나입니다.")
+
+    # ── 지역 분포 vs 그룹 분포 ────────────────────────────────────
+    def _fmt_label(v):
+        if v is None:
+            return "?"
+        if tasktype == "regression":
+            return f"{v:.4g}"
+        code = int(round(v))
+        if target_class_names and 0 <= code < len(target_class_names):
+            return str(target_class_names[code])
+        return str(code)
+
+    if le is not None:
+        if tasktype == "regression":
+            if le.get("group_std") == le.get("group_std"):   # not nan
+                print(f"\n     이 지역(최근접 {le['n_neighbors']}개)  "
+                      f"mean {le['local_mean']:.4g}  std {le['local_std']:.4g}")
+                print(f"     그룹 전체 (n={le['group_size']})      "
+                      f"mean {le['group_mean']:.4g}  std {le['group_std']:.4g}")
+                _dr = le.get("dispersion_ratio")
+                if _dr is not None and _dr == _dr:
+                    print(f"     → 지역 산포 / 그룹 산포 = {_dr:.2f}  "
+                          f"(판정 기준은 경험적 분포에서 정할 것)")
+        else:
+            def _dist_str(counts, total):
+                if not total:
+                    return "(비어있음)"
+                return ",  ".join(
+                    f"{_fmt_label(float(k))} {c}/{total} ({c/total:.0%})"
+                    for k, c in sorted(counts.items(), key=lambda x: -x[1]))
+            _lc = {int(k): v for k, v in (le.get("label_counts") or {}).items()}
+            _gc = {int(k): v for k, v in (le.get("group_label_counts") or {}).items()}
+            # [축약] 이웃 k개가 전부 같은 라벨이면 (a) H(label)=0,
+            # (b) 상대 모호성 0, (c) Contrasting 없음 — 셋이 **자동으로
+            # 동시에** 성립한다. 같은 사실을 세 번 말하게 되므로
+            # (credit-g 14건 중 7건이 이 경우) 한 문장으로 합친다.
+            # 그룹 분포는 대비가 되므로 함께 남긴다.
+            # ⚠ "단일 클래스 = 반례 없음"이 아니다. 이웃이 전부 **예측과
+            #   반대** 클래스인 경우가 있고(합성 실측: 예측 yes인데 이웃
+            #   6/6이 no), 그때는 오히려 전부가 반례다. 예측 클래스와
+            #   일치하는지까지 봐야 축약할 수 있다.
+            _one = (len(_lc) == 1 and le["n_neighbors"] > 0)
+            _pcode = (pred_info or {}).get("pred_code")
+            _same_as_pred = (_one and _pcode is not None
+                              and next(iter(_lc)) == int(_pcode))
+            _single = _one and _same_as_pred
+            # 라벨 분포 entropy임을 표기에도 남긴다 — 화면에 'entropy'만
+            # 찍히면 evidence_w entropy와 구분이 안 된다.
+            if _single:
+                _skip_contrast = True
+                print(f"\n     이 지역(최근접 {le['n_neighbors']}개)은 전부 "
+                      f"{_fmt_label(float(next(iter(_lc))))} — 단일 클래스 영역 (반례 없음)")
+            elif _one:
+                # 이웃이 전부 예측과 반대 — 축약하지 않고 오히려 강조한다.
+                # 아래 Contrasting 목록에 전부 나온다.
+                print(f"\n     ⚠ 이 지역(최근접 {le['n_neighbors']}개)은 전부 "
+                      f"{_fmt_label(float(next(iter(_lc))))}인데 예측은 "
+                      f"{(pred_info or {}).get('pred_label', '?')}입니다 "
+                      f"— 이웃 전부가 반례")
+            else:
+                print(f"\n     이 지역(최근접 {le['n_neighbors']}개)   "
+                      f"{_dist_str(_lc, le['n_neighbors'])}   H(label) {le['label_entropy']:.3f}")
+            print(f"     그룹 전체 (n={le['group_size']})       "
+                  f"{_dist_str(_gc, le['group_size'])}   H(label) {le['group_label_entropy']:.3f}")
+            _ar = le.get("ambiguity_ratio")
+            if (not _single) and _ar is not None and _ar == _ar:
+                # ⚠ 판정하지 않는다. 이전에는 1.15/0.85를 기준으로 "더 섞인
+                #   지역" 같은 문구를 붙였는데, 그 두 값에는 아무 근거가
+                #   없었다. 어디부터 높은 것인지는 eval set 전체의 경험적
+                #   분포에서 정해야 하고, 그건 분석 스크립트의 일이다.
+                print(f"     → 상대 모호성 {_ar:.2f}  "
+                      f"(= 지역 entropy / 그룹 entropy. 판정 기준은 "
+                      f"경험적 분포에서 정할 것)")
+
+    # ── 사례 목록: supporting / contrasting ───────────────────────
     def _fmt_cat_value(name: str, code_val: float) -> str:
-        # cat_category_names(libs/data.py의 load_data() 결과)가 있으면
-        # 실제 카테고리 문자열 + 원래 코드 번호를 같이, 없으면 코드만.
+        # ⚠ 이름 조회가 실패해도 **설명 전체가 죽으면 안 된다.** 이름이
+        #   없는 것은 표시상의 손실이지만, 여기서 예외가 나면 그 샘플의
+        #   설명이 통째로 사라진다. 매핑이 리스트든 dict든, 코드가 범위를
+        #   벗어나든, 모두 "Category N"으로 안전하게 떨어뜨린다.
         names_for_col = cat_category_names.get(name) if cat_category_names else None
         code = int(code_val)
-        if names_for_col is not None and 0 <= code < len(names_for_col):
-            return f"{name}={names_for_col[code]} [{code}]"
+        try:
+            if names_for_col is not None:
+                nm = (names_for_col[code] if not isinstance(names_for_col, dict)
+                      else names_for_col.get(code))
+                if nm is not None:
+                    return f"{name}={nm} [{code}]"
+        except (IndexError, KeyError, TypeError):
+            pass
         return f"{name}=Category {code}"
 
     def _fmt_num_value(name: str, uniform_val: float) -> str:
-        # quantile_transformer(libs/data.py의 prep_data() 결과)가 있으면
-        # [0,1] uniform 값을 실제 단위로 역변환 — ①의 Distinctive features와
-        # 같은 처리를 ②의 이웃 feature 값에도 동일하게 적용.
         if quantile_transformer is not None and num_cols is not None and name in name_to_idx:
-            real_val = inverse_transform_numeric(quantile_transformer, num_cols, name_to_idx[name], uniform_val)
+            real_val = inverse_transform_numeric(quantile_transformer, num_cols,
+                                                  name_to_idx[name], uniform_val)
             if real_val is not None:
                 return f"{name}={real_val:.3g}"
         return f"{name}={uniform_val:.3f}"
 
-    for rank, idx, w in shown:
-        print(f"     #{rank+1} Neighbor {idx}: {w:.1%}")
-        if nf and idx < len(nf) and nf[idx]:
-            num_strs, cat_strs = _split_by_kind(
-                nf[idx], get_kind=lambda item: item[2],
-                get_str=lambda item: (_fmt_cat_value(item[0], item[1])
-                                       if item[2] == "categorical" else _fmt_num_value(item[0], item[1])),
-            )
-            if num_strs:
-                print(f"        → numeric:     {', '.join(num_strs)}")
-            if cat_strs:
-                print(f"        → categorical: {', '.join(cat_strs)}")
+    def _fmt_items(items):
+        num_strs, cat_strs = _split_by_kind(
+            items, get_kind=lambda it: it[2],
+            get_str=lambda it: (_fmt_cat_value(it[0], it[1])
+                                 if it[2] == "categorical" else _fmt_num_value(it[0], it[1])),
+        )
+        return num_strs, cat_strs
+
+    if not nbrs:
+        print(f"\n     (no neighbors — memory bank가 k개를 못 채웠거나 "
+              f"'neighbors' 키가 없는 구버전 출력입니다)")
+    else:
+        # 예측과 같은 결과 / 다른 결과로 나눈다. 반례가 반례로 보여야
+        # case-based 설명이 성립한다.
+        _pc = (pred_info or {}).get("pred_code")
+        if tasktype == "regression" or _pc is None:
+            groups = [("Cases (예측과의 대조 없음)", nbrs)]
+        else:
+            sup = [n for n in nbrs
+                   if n["label"] is not None and int(round(n["label"])) == int(_pc)]
+            con = [n for n in nbrs
+                   if n["label"] is not None and int(round(n["label"])) != int(_pc)]
+            groups = [("Supporting cases (예측과 같은 결과)", sup),
+                      ("Contrasting cases (예측과 다른 결과)", con)]
+
+        for title, rows in groups:
+            if not rows:
+                # 위에서 "단일 클래스 영역 (반례 없음)"을 이미 말했으면
+                # 같은 사실을 두 번 찍지 않는다.
+                if title.startswith("Contrasting") and not _skip_contrast:
+                    print(f"\n     Contrasting cases — 없음 "
+                          f"(최근접 {len(nbrs)}개가 모두 예측과 같은 결과)")
+                continue
+            print(f"\n     {title}")
+            _is_con = title.startswith("Contrasting")
+            for nb in rows[:max_neighbors]:
+                sid = nb.get("sample_id")
+                sid_str = (f"train #{sid}" if sid is not None and sid >= 0
+                           else f"mem #{nb['memory_idx']}")
+                print(f"       #{nb['rank']+1}  similarity={nb['similarity']:.3f}"
+                      f"   → {_fmt_label(nb.get('label'))}   [{sid_str}]")
+                # [임계값 제거] 이전에는 gap<=0.15인 feature만 후보였다.
+                # 지금은 전체 gap을 받아 **가장 가까운 것부터** max_features
+                # 개를 자를 뿐이다 — 무엇을 보여줄지 상수가 정하지 않는다.
+                gp = nb.get("gaps") or []
+                if gp:
+                    near = sorted(gp, key=lambda g: g["gap"])[:max_features]
+                    ns, cs = _fmt_items([(g["name"], g["neighbor_value"], g["kind"])
+                                          for g in near])
+                    if ns:
+                        print(f"            가까운 feature numeric:     {', '.join(ns)}")
+                    if cs:
+                        print(f"            가까운 feature categorical: {', '.join(cs)}")
+                # 반례에는 "어디가 다른가"를 반드시 같이 보여준다.
+                # ⚠ gap이 0이면 "다른 점"이 아니다. 전체를 gap 내림차순으로
+                #   자르기만 하면, 모든 gap이 0인 경우(중복 행, 혹은
+                #   self-retrieval 같은 이상 상황)에도 "duration 48 → 48"이
+                #   찍힌다. 읽는 사람은 "뭐가 다르지?"가 된다.
+                #   부동소수점 오차까지 고려해 eps로 거른다.
+                _GAP_EPS = 1e-9
+                df = ([(g["name"], g["neighbor_value"], g["kind"], g["delta"])
+                       for g in sorted(gp, key=lambda g: g["gap"], reverse=True)
+                       if g["gap"] > _GAP_EPS][:max_gaps]
+                      if gp else [])
+                if _is_con and df:
+                    # numeric은 quantile 공간([0,1] uniform)의 값이라, 차이는
+                    # 그대로 **백분위 차이**로 읽힌다(−0.498 = 약 50 백분위
+                    # 낮음). 실제 단위로 역변환한 양끝값을 같이 보여줘서,
+                    # ①/②의 다른 numeric 표시(역변환된 실제 단위)와 축이
+                    # 어긋나 보이지 않게 한다.
+                    for name, nval, kind, delta in df:
+                        if kind == "categorical":
+                            qv = nval - delta
+                            print(f"            다른 점: {name}  "
+                                  f"query {_fmt_cat_value(name, qv).split('=', 1)[1]}"
+                                  f" → 이웃 {_fmt_cat_value(name, nval).split('=', 1)[1]}")
+                        else:
+                            qv = nval - delta
+                            print(f"            다른 점: {name}  "
+                                  f"query {_fmt_num_value(name, qv).split('=', 1)[1]}"
+                                  f" → 이웃 {_fmt_num_value(name, nval).split('=', 1)[1]}"
+                                  f"   ({delta*100:+.0f} 백분위)")
+            if len(rows) > max_neighbors:
+                print(f"       ... (+{len(rows) - max_neighbors} more)")
+
+    # evidence_w(attention weight)는 aggregator가 실제로 학습되는 모드에서만
+    # 의미가 있다. proto_dev 계열은 균등 상수라 entropy=log(k)로 고정 —
+    # 그 값을 "이웃이 고르게 쓰였다"로 읽으면 안 되므로, 균등하지 않을
+    # 때만 출력한다(§4-8 ②).
+    _ew = ev.get("top_neighbours") or []
+    if _ew and (max(w for _, w in _ew) - min(w for _, w in _ew)) > 1e-6:
+        # ⚠ 이 entropy는 evidence_w(attention weight) 분포의 것이다.
+        #   위 H(label)과 다른 값 — 이름을 화면에서 구분해 찍는다.
+        print(f"     [aggregator attention] dominant={ev['dominant_weight']:.1%},  "
+              f"H(evidence_w)={ev['entropy']:.3f}")
 
     # Level 3: Retrieval signal magnitude — [추가]
     # "기여도(contribution)"라고 안 부름 — head가 비선형 함수(예: residual
     # 모드의 Head(q+βa))라 ‖βa‖가 prediction에 미치는 실제 영향과 정확히
     # 비례한다는 보장이 없음(위 ②의 "기여도" 명명 정정과 같은 이유).
     # 여기서 주는 건 순수 magnitude 정보 — causal attribution 아님.
-    rs = e.get("retrieval_signal")
-    if rs is not None:
-        print(f"\n  Level 3 — Retrieval Signal Magnitude")
-        print(f"     (representation 크기 비교 — prediction에 대한 causal 기여도가 아님)")
-        beta_str = f"{rs['beta']:.4f}" if rs.get("beta") is not None else "N/A (fusion_mode != residual)"
-        print(f"     ‖query_emb‖={rs['query_norm']:.3f}   ‖agg_emb‖={rs['agg_norm']:.3f}   β={beta_str}")
+    # ③ Prototype-relative deviation (Level 2.5)
+    # §4-2: "argmax는 99.4% 같지만 확률값은 편차가 결정한다" — 확신도를
+    # 설명에 쓰면서 편차를 안 보여주면 faithfulness 문제다.
+    dv = e.get("prototype_deviation")
+    if dv is not None:
+        print(f"\n  ③ Prototype-relative Deviation   h = c + β·normalize(q − c)")
+        # ⚠ 이 분해는 근사가 아니다. dev_head가 단일 Linear이므로
+        #   logits = (W·c + b) + W·(β·r) 이 항등식이고, 두 항의 합이 항상
+        #   실제 logits와 일치한다(스모크에서 오차 0.000e+00로 확인).
+        #   SHAP/IG처럼 baseline을 골라 근사하는 것과 성격이 다르다.
+        if verbose:
+            print(f"     (dev_head가 단일 Linear라 logits = (W·c + b) + W·(β·r) — 정확한 분해)")
+        # [교체] '편차 비중' + '결정: 그대로' → 확률 이동
+        #
+        # ⚠ dev_share는 로짓 크기 비율이라 **크기를 과장한다.** credit-g
+        #   실측: dev_share 5.6~19.3%로 읽히는데 실제 확신도 이동은
+        #   0.2~1.2%p였다. 로짓이 ±0.6 구간이라 sigmoid가 거의 선형이기
+        #   때문이다. 사람이 읽는 단위는 확률이므로 확률로 보여준다.
+        #
+        # ⚠ '결정: 그대로'는 지우지 않는다. credit-g에서는 800/800이
+        #   '그대로'라 죽은 줄이지만, P < C인 데이터셋(ds=1493: 35개
+        #   prototype으로 100개 클래스)에서는 70.5%가 '바뀜'이고 그때
+        #   이 줄이 설명의 핵심이 된다. 조건에 따라 살아나는 줄이다.
+        if dv.get("prob_final") is not None:
+            _pp, _pf = dv["prob_proto"], dv["prob_final"]
+            _lab = (pred_info or {}).get("pred_label", "예측")
+            # ⚠ 이 값은 W·c 에만 의존하므로 **같은 prototype에 배정된 모든
+            #   샘플에서 동일하다**(credit-g 실측: Centroid_16의 7개 샘플이
+            #   전부 65.1%). "prototype만"이라고 쓰면 샘플별 값처럼 읽히므로
+            #   그룹 수준 기준선임을 이름에 드러낸다. 샘플마다 다른 것은
+            #   이동폭뿐이다.
+            print(f"     그룹 기준선(prototype baseline): {_lab} {_pp:.1%}")
+            print(f"     이 샘플의 최종:                   {_lab} {_pf:.1%}"
+                  f"   ({(_pf - _pp) * 100:+.1f}%p)")
+            if dv["argmax_changed"]:
+                _pc = dv.get("proto_pred")
+                _pn = (target_class_names[_pc]
+                       if (target_class_names and _pc is not None
+                           and 0 <= _pc < len(target_class_names)) else _pc)
+                print(f"     ⚠ 결정이 바뀜 — prototype만으로는 \"{_pn}\", "
+                      f"편차가 \"{_lab}\"으로 뒤집음")
+        else:
+            # 회귀: 확률이 없으므로 로짓 분해 그대로
+            print(f"     prototype={dv['logit_proto']:+.4f}"
+                  f"   deviation={dv['logit_dev']:+.4f}"
+                  f"   최종={dv['logit_proto'] + dv['logit_dev']:+.4f}")
+
+        # [제거] 편차 집중도 / dim_contrib
+        # embedding 차원 번호는 사람이 아무것도 할 수 없는 정보다. 25건을
+        # 읽는 동안 한 번도 쓸모를 못 느꼈다. 논문 본문 수치로는 가치가
+        # 있으므로 diagnostics.prototype_deviation()의 dim_contrib에 전체가
+        # 그대로 남아 있다 — 분석 스크립트에서 쓸 것.
+
+    # ③-b feature 공간의 그룹 대비 — 읽을 수 있는 축
+    gc = e.get("group_stats")
+    if gc and (gc.get("numeric") or gc.get("categorical")):
+        print(f"\n     그룹 대비 (feature 공간, n={gc['group_size']})")
+        if verbose:
+            print(f"     ('그룹 대표값'은 quantile 공간 평균의 역변환 — 산술평균이 아님)")
+        # ⚠ 위 ③(embedding 공간의 정확한 logit 분해)과 **다른 축**이다.
+        #   이건 기술 통계지 attribution이 아니다 — "이 feature 때문에
+        #   예측이 이렇게 나왔다"는 문장을 이 값으로 만들면 안 된다.
+        if verbose:
+            print(f"     (같은 그룹 대비 기술 통계 — attribution 아님, ③과 인과로 연결 금지)")
+        # [절단 위치] diagnostics는 전체 feature를 |z| 내림차순으로 준다.
+        for d in gc.get("numeric", [])[:max_features]:
+            # 실단위 역변환. quantile_transformer가 없으면 [0,1] 백분위 그대로.
+            _real = (lambda x: inverse_transform_numeric(
+                        quantile_transformer, num_cols, d["feature_idx"], x)
+                     ) if (quantile_transformer is not None and num_cols is not None) \
+                    else (lambda x: None)
+            _vr, _mr = _real(d["value"]), _real(d["group_mean"])
+
+            def _fmt(x, fallback):
+                # ⚠ 6.19e+03 은 사람이 못 읽는다. 천단위 구분 기호를 쓴다.
+                # ⚠ 정수처럼 보이는 값(existing_credits=1, 그룹 평균=1)에
+                #   반올림을 걸면 "같은데 왜 z가 −0.74지?"가 된다.
+                #   실제로는 1.0 vs 1.4이므로 소수점 한 자리를 남긴다.
+                if x is None:
+                    return f"{fallback:.3f}"
+                ax = abs(x)
+                if ax >= 1000:
+                    return f"{x:,.0f}"
+                if ax >= 10:
+                    # ⚠ 허용오차가 1e-9면 역변환 부동소수점 오차(≈1e-5)에
+                    #   걸려 392가 "392.0"으로 찍힌다. 값 크기에 비례한
+                    #   상대 오차로 판정한다.
+                    return (f"{x:,.1f}" if abs(x - round(x)) > 0.01 * max(ax, 1.0)
+                            else f"{x:,.0f}")
+                return f"{x:.2f}".rstrip("0").rstrip(".")
+
+            _v_s  = _fmt(_vr, d["value"])
+            _mu_s = _fmt(_mr, d["group_mean"])
+            # ⚠ 정수형 feature(existing_credits, installment_commitment 등)는
+            #   둘 다 정수로 반올림되어 "1 (그룹 대표값 1, z=-0.79)"처럼
+            #   **같아 보이는데 z만 붙는** 상태가 된다(14건 numeric 줄의 약 27%).
+            #   읽는 사람은 "같은데 왜 z가 있지?"가 된다. 실제로는 1 vs 1.4다.
+            #   "대표값과 같음"으로 쓰면 1.4라는 정보가 사라지므로, 대신
+            #   **구분될 때까지 대표값의 정밀도를 올린다.**
+            if (_v_s == _mu_s and _vr is not None and _mr is not None
+                    and abs(_vr - _mr) > 1e-6):
+                for _p in (1, 2, 3):
+                    _cand = f"{_mr:,.{_p}f}"
+                    if _cand != _v_s:
+                        _mu_s = _cand
+                        break
+            # 배수는 **양수 연속량에서만** 의미가 있다(금액·기간 등).
+            # 음수나 0을 지나는 값에서 배수는 해석 불가이므로 생략한다.
+            _ratio = ""
+            if _vr is not None and _mr is not None and _mr > 0 and _vr > 0:
+                _r = _vr / _mr
+                if _r >= 1.15 or _r <= 0.87:      # 표시 절단(판정 아님)
+                    _ratio = f"{_r:.1f}배, " if _r >= 1 else f"{1/_r:.1f}배 낮음, "
+            # ⚠ "평균"이라고 쓰면 안 된다. 이 값은 quantile 공간 평균을
+            #   역변환한 것(inverse_transform(mean(q)))이라 실공간의 산술
+            #   평균이 아니다. credit_amount처럼 왜곡된 분포에서는 산술
+            #   평균보다 낮게, 중앙값에 가깝게 나온다. quantile 변환이
+            #   단조라 **부호는 항상 z와 일치**하므로 비교 자체는 유효하다.
+            #   (z는 quantile 공간에서 계산됨 — 축이 다르다는 점도 유의)
+            # ⚠ 화면에는 **백분위**를 쓴다. z는 quantile 공간 값이고 여기
+            #   표시되는 값/대표값은 실단위 역변환이라 축이 다르다 — 이산형
+            #   feature에서 "1 (대표값 1, z=-0.79)"처럼 같아 보이는데 z만
+            #   붙는 문제가 생긴다. 백분위는 단조 변환에 불변이라 두 축이
+            #   일치한다. z는 diagnostics 반환값에 그대로 남아 있다(분석용).
+            _pct = d.get("group_pct")
+            if _pct is None:
+                _pos = f"z={d['z']:+.2f}"
+            elif _pct >= 0.5:
+                _pos = f"그룹 내 상위 {(1 - _pct) * 100:.0f}%"
+            else:
+                _pos = f"그룹 내 하위 {_pct * 100:.0f}%"
+            print(f"       {d['feature_name']}={_v_s}"
+                  f"   (그룹 대표값 {_mu_s},  {_ratio}{_pos})")
+        for d in gc.get("categorical", [])[:max_features]:
+            # ⚠ 거르지 않는다. 이전에는 "이 값이 곧 최빈값이면 건너뛴다"로
+            #   숨겼는데, 무엇을 숨길지 표시부가 정하면 읽는 사람은 그
+            #   feature를 확인한 적이 없다는 사실조차 모른다. 이 샘플의
+            #   비율과 그룹 최빈을 **항상 같이** 찍어 판단을 넘긴다.
+            # 모델은 dataset의 cat_category_names를 모르므로 "Category N"으로
+            # 돌려준다 — 실제 이름 매핑은 여기(출력부)에서 한다.
+            _v  = _fmt_cat_value(d["feature_name"], d["value"]).split("=", 1)[1]
+            _mv = _fmt_cat_value(d["feature_name"], d["group_mode"]).split("=", 1)[1]
+            print(f"       {d['feature_name']}={_v} (그룹의 {d['group_freq']:.0%})"
+                  f"   |   그룹 최빈 {_mv} ({d['group_mode_freq']:.0%})")
+
+    # [제거] Representation Magnitude 블록
+    # β는 모델 상수라 25/25 샘플에서 글자 그대로 같았고(β=0.1039),
+    # ‖query_emb‖는 절대값이라 해석 기준이 없다. 정보량 0인 블록이었다.
+    # 값은 explanations[b]["retrieval_signal"]에 그대로 있다 — 진단용.
 
     print(f"{'━'*52}")
 
@@ -1592,6 +1913,8 @@ def run_calibration_analysis(model, X_test, y_test, tasktype: str,
         for start in range(0, len(X_test), batch_size):
             X_batch = X_test[start:start + batch_size]
             y_batch = y_test[start:start + batch_size]
+            # forward는 이제 라우팅 설명만 만든다(이웃 조립/그룹 통계는
+            # diagnostics로 빠짐) — 여기서 비용을 따로 끌 이유가 없어졌다.
             out = model(X_batch, return_explanations=True)
 
             explanations = out.get("explanations", [])
@@ -2018,7 +2341,7 @@ def run_single_seed(
               + ("..confscale_detach" if (args.confidence_scaling and args.confidence_scaling_detach) else "") \
               + ("..no_query_emb" if args.no_query_emb else "") \
               + ("..no_context_emb" if args.no_context_emb else "") \
-              + ("..ema_codebook" if args.ema_codebook else "") \
+              + ("..grad_cb" if args.gradient_codebook else "") \
               + (f"..ema_decay{args.ema_decay_override:g}" if args.ema_decay_override is not None else "") \
               + ("..blockLN" if args.blockwise_layernorm else "") \
               + ("..branchL2norm" if args.head_branch_l2norm else "") \
@@ -2095,7 +2418,9 @@ def run_single_seed(
         # 우리가 방금 위에서 직접 저장한 신뢰 가능한 파일이라(외부에서
         # 받은 게 아님) weights_only=False로 명시.
         _saved_state = torch.load(args.from_saved_state, map_location=device, weights_only=False)
-        model_kwargs = _saved_state["model_kwargs"]
+        # ⚠ 구버전 checkpoint 에는 nbr_k/nbr_tau/nbr_neg_margin 이 인자로
+        #   들어 있다. 상수로 내리면서 생성자에서 뺐으므로 걷어내야 한다.
+        model_kwargs = strip_legacy_kwargs(_saved_state["model_kwargs"])
         # [2026-07] 로드한 체크포인트의 **실제** 구조 설정을 찍는다.
         # [왜] meta.pkl은 args를 기록하므로 --from_saved_state 실행에서는
         # 실제 모델과 어긋난다. 예: P1(retr_proj=linear) 체크포인트를 불러
@@ -2160,11 +2485,11 @@ def run_single_seed(
             print(f"  ⚠️  --no_context_emb는 재학습 시에만 의미가 있습니다 — "
                   f"--from_saved_state는 저장된 model_kwargs(head 입력 차원 포함)를 "
                   f"그대로 쓰므로 이 플래그를 무시합니다.")
-        if args.ema_codebook:
-            print(f"  ⚠️  --ema_codebook은 재학습 시에만 의미가 있습니다 — "
+        if args.gradient_codebook:
+            print(f"  ⚠️  --gradient_codebook은 재학습 시에만 의미가 있습니다 — "
                   f"--from_saved_state는 저장된 model_kwargs(EMA 사용 여부 포함)를 "
-                  f"그대로 쓰므로 이 플래그를 무시합니다(체크포인트 자체가 EMA로 "
-                  f"학습됐다면 자동으로 EMA 구조로 복원됩니다).")
+                  f"그대로 쓰므로 이 플래그를 무시합니다(체크포인트가 어느 "
+                  f"방식으로 학습됐든 그 구조로 복원됩니다).")
         if args.blockwise_layernorm:
             print(f"  ⚠️  --blockwise_layernorm은 재학습 시에만 의미가 있습니다 — "
                   f"--from_saved_state는 저장된 model_kwargs(head LayerNorm 구조 포함)를 "
@@ -2206,6 +2531,15 @@ def run_single_seed(
             fusion_mode=args.fusion_mode,
             use_context_emb=not args.no_context_emb,
             disable_retrieval_branch=args.disable_retrieval_branch,
+            # optimize.py 와 같은 규칙 — 지정했을 때만 ..P{n} 이 붙는다.
+            n_prototypes=args.n_prototypes,
+            gradient_codebook=args.gradient_codebook,
+            no_commitment=not args.commitment,
+            disable_dead_reinit=args.disable_dead_reinit,
+            nbr_lambda=args.nbr_lambda,
+            num_bins=args.num_bins,
+            cat_embed_dim=args.cat_embed_dim,
+            detach_retr_grad=args.detach_retr_grad,
         )
         fname = os.path.join(log_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
         if not os.path.exists(fname):
@@ -2324,6 +2658,18 @@ def run_single_seed(
             best_params["dropout"] = args.dropout_override  # 저장/재출력 시 실제 학습값과 일치하도록
             print(f"  [--dropout_override] dropout: {_old_dropout} → {args.dropout_override} "
                   f"(나머지 파라미터는 best_params 그대로)")
+        # ⚠ 아래 *_override 들은 **optimize.py 에 대응 플래그가 없다.**
+        #   쓰면 HPO 가 탐색한 아키텍처와 재현하는 아키텍처가 달라진다.
+        #   진단·ablation 용이며 기본 벤치마크에서는 쓰지 않는다.
+        _ovr = [n for n, v in (
+            ("evidence_temperature", args.evidence_temperature_override),
+            ("regroup_warmup_epochs", args.regroup_warmup_epochs_override),
+            ("dead_reinit_patience", args.dead_reinit_patience_override),
+            ("dead_reinit_noise_scale", args.dead_reinit_noise_scale_override),
+        ) if v is not None]
+        if _ovr:
+            print(f"  ⚠️  optimize.py 에 대응 플래그가 없는 override 사용: "
+                  f"{', '.join(_ovr)} — HPO 와 다른 아키텍처로 재현됩니다.")
         if args.evidence_temperature_override is not None:
             # [통제 실험용] AttentionAggregator의 evidence_w softmax temperature.
             # best_params에는 애초에 없는 값(HPO 탐색 대상 아님, 기본 1.0)이라
@@ -2360,14 +2706,26 @@ def run_single_seed(
                 model_kwargs["residual_vq_size"] = args.residual_vq_size
             print(f"  [--residual_vq] 2단계 residual VQ 활성 "
                   f"(P2={args.residual_vq_size or 'P1과 동일'})")
+        # ⚠ [버그 수정] 예전에는 `if args.nbr_lambda > 0:` 안에서만 주입했다.
+        #   λ 기본값이 0.005 이던 시절엔 문제가 없었지만, 기본이 0 으로
+        #   바뀌면서 **주입이 통째로 건너뛰어지고 생성자 기본값(0.005)이
+        #   쓰였다.** 즉 L_nbr 을 껐는데 켜진 채로 학습됐다.
+        #   (증상: 로그에 `[L_nbr] raw kNN graph 생성` 이 뜬다.)
+        #   조건 없이 항상 주입한다.
+        model_kwargs["nbr_lambda"] = args.nbr_lambda
+        # nbr_k / nbr_tau / nbr_neg_margin 은 libs/tabera.py 의 모듈 상수다.
+        # 튜닝 대상이 아니므로 주입하지 않는다.
         if args.nbr_lambda > 0:
-            model_kwargs["nbr_lambda"]     = args.nbr_lambda
-            model_kwargs["nbr_k"]          = args.nbr_k
-            model_kwargs["nbr_tau"]        = args.nbr_tau
-            model_kwargs["nbr_neg_margin"] = args.nbr_neg_margin
             print(f"  [--nbr_lambda] L_nbr = {args.nbr_lambda:g} "
-                  f"(k={args.nbr_k}, tau={args.nbr_tau:g}, "
-                  f"neg_margin={args.nbr_neg_margin})")
+                  f"(k={NBR_K}, tau={NBR_TAU:g}, "
+                  f"neg_margin={NBR_NEG_MARGIN})  ← 고정 상수, 튜닝 안 함")
+        if not args.commitment:
+            # HPO 가 탐색한 값을 덮어써서 0 으로 만든다. optimize.py 는
+            # 탐색 자체를 안 하므로 저장된 best_params 에도 0 이 들어 있다.
+            model_kwargs.setdefault("loss_weights", {})
+            model_kwargs["loss_weights"] = {**model_kwargs.get("loss_weights", {}),
+                                            "commitment": 0.0}
+            print("  commitment_loss = 0 (기본 — §10)")
         if args.disable_dead_reinit:
             # patience를 학습 epoch 수보다 크게 두면 재초기화가 한 번도
             # 발생하지 않는다 — 별도 분기 추가 없이 완전 OFF를 만든다.
@@ -2401,7 +2759,7 @@ def run_single_seed(
             global_retrieve=args.global_retrieve,
             use_context_emb=not args.no_context_emb,
             use_query_emb_in_head=not args.no_query_emb,
-            use_ema_codebook=args.ema_codebook,
+            use_ema_codebook=not args.gradient_codebook,
             ema_decay=args.ema_decay_override if args.ema_decay_override is not None else 0.99,
             value_mode=("default" if args.value_mode in ("default", "label_only") else args.value_mode),
             neighbor_interaction_mode=args.neighbor_interaction_mode,
@@ -2497,6 +2855,9 @@ def run_single_seed(
         target_class_names=dataset.target_class_names,
         quantile_transformer=dataset.quantile_transformer,
         regroup_log_every=args.regroup_log_every,
+        time_epoch=args.time_epoch,
+        log_beta=args.log_beta,
+        beta_lr_mult=args.beta_lr_mult,
         refresh_on_best=args.refresh_on_best,
         log_branch_gradients=args.log_branch_gradients,
         log_branch_gradients_first_n_epochs=args.log_branch_gradients_first_n_epochs,
@@ -4079,6 +4440,8 @@ def run_single_seed(
     _rb_branch_chunks = {}       # [Step 2 진단] head 3-branch 표현 {name: [chunks]}
     _rb_evraw_chunks  = {}       # [Step 2 진단] T 사후 스윕용 원본 (sim/val/ew)
     _rb_neighbor_label_chunks = []    # [2026-07] 검색된 이웃의 실제 라벨 (N, k)
+    _rb_nbr_label_entropy_chunks = []
+    _rb_nbr_label_neff_chunks = []
     _rb_neighbor_sid_chunks   = []    # [2026-07] 검색된 이웃의 **원본 train 행 번호** (N, k)
     _rb_purity_chunks = []            # [추가] top-k 중 query와 같은 라벨인 비율 (unweighted)
     _rb_weighted_purity_chunks = []   # [추가] evidence_w로 가중한 same-label 비율
@@ -4137,6 +4500,15 @@ def run_single_seed(
                 _rb_centroid_id_chunks.append(_out["centroid_id"].cpu())
                 _rb_routing_confidence_chunks.append(_out["routing_confidence"].cpu())
                 _rb_topk_idx_chunks.append(_out["topk_idx"].cpu())
+                # ⚠ 이것은 **evidence_w(attention weight) 분포**의 entropy이지
+                #   검색된 이웃의 라벨 불확실성이 아니다. 이름이 그냥
+                #   `entropy`로 나가므로 "retrieval uncertainty"로 오독되기
+                #   쉽다 — 그 용도로는 아래 neighbor_label_entropy를 쓸 것.
+                #   proto_dev 계열에서는 evidence_w가 균등 상수(1/k)라
+                #   entropy=log(k), n_eff=k, top1_weight=1/k 로 **전 샘플
+                #   동일**하다(실측). 상수 컬럼이므로 AUC는 정확히 0.5,
+                #   로지스틱 회귀는 특이행렬이 된다. 컬럼 자체는 모델 상태의
+                #   실제 값이므로 하위호환을 위해 그대로 둔다.
                 _rb_entropy_chunks.append(
                     -(_ew.clamp_min(1e-12) * _ew.clamp_min(1e-12).log()).sum(-1)
                 )
@@ -4217,6 +4589,34 @@ def run_single_seed(
                     # (설명 재현성 측정에 필수 — 없으면 아예 계산이 불가능하다.)
                     _rb_neighbor_sid_chunks.append(
                         model.memory.sample_ids[_out["topk_idx"]].cpu().long())
+                    # [추가] 이웃 **라벨 분포**의 entropy — H(Y_N(x)).
+                    #
+                    # ⚠ 위쪽에서 저장하는 `entropy` 컬럼과 완전히 다른 값이다.
+                    #   그건 evidence_w(attention weight) 분포의 entropy이고,
+                    #   proto_dev 계열에서는 evidence_w가 균등 상수(1/k)라
+                    #   **모든 샘플에서 정확히 log(k)** 로 고정된다(n_eff=k,
+                    #   top1_weight=1/k도 같이 상수, weighted_purity는
+                    #   unweighted purity와 완전히 동일해짐 — 실측 확인).
+                    #   즉 그 컬럼으로는 상수 예측자밖에 만들 수 없고,
+                    #   AUC는 정확히 0.5, 회귀는 특이행렬이 된다.
+                    #
+                    # ⚠ 이름이 그냥 `entropy`라 "retrieval uncertainty"로
+                    #   읽히기 쉬운 것이 문제의 핵심이었다. 기존 컬럼은
+                    #   하위호환을 위해 그대로 두되(모델 상태의 실제 값이긴
+                    #   하다), 출처를 이름에 박은 이 컬럼을 따로 내보낸다.
+                    #   retrieval uncertainty를 보려면 **이쪽**을 쓸 것.
+                    _n_cls = int(model.memory.labels[:int(model.memory.filled.item())]
+                                 .max().item()) + 1
+                    _cnt = torch.zeros(_neighbor_labels.shape[0], _n_cls)
+                    _cnt.scatter_add_(1, _neighbor_labels,
+                                       torch.ones_like(_neighbor_labels, dtype=torch.float))
+                    _p_lab = _cnt / _cnt.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                    _H_lab = -(_p_lab * (_p_lab + 1e-12).log()).sum(-1)      # (B,)
+                    _rb_nbr_label_entropy_chunks.append(_H_lab)
+                    # 유효 라벨 종류 수 = exp(H). "이웃 k개가 실질적으로 몇
+                    # 종류의 답을 담고 있는가" — entropy와 같은 정보를
+                    # 개수 단위로 읽는 값(evidence n_eff와 혼동 금지).
+                    _rb_nbr_label_neff_chunks.append(torch.exp(_H_lab))
                     _same_label = (_neighbor_labels == _batch_y_int.unsqueeze(-1)).float()  # (B, k)
                     _rb_purity_chunks.append(_same_label.mean(dim=-1))            # unweighted: 단순 top-k 중 동일 라벨 비율
                     _rb_weighted_purity_chunks.append((_ew * _same_label).sum(dim=-1))  # evidence_w-weighted: 실제 aggregation에 반영되는 비중까지 고려
@@ -4729,7 +5129,18 @@ def run_single_seed(
                 _rb_savez_kwargs["in_group_ratio_error"] = np.array(
                     [f"{type(_ie).__name__}: {_ie}"], dtype=object)
             _rb_savez_kwargs["retrieval_label_purity"] = torch.cat(_rb_purity_chunks, dim=0).numpy()
+            # ⚠ proto_dev 계열에서는 evidence_w가 균등 상수라 이 값이
+            #   retrieval_label_purity와 **완전히 동일**해진다(실측 max diff 0).
+            #   두 컬럼이 같으면 aggregator가 비활성이라는 신호다.
             _rb_savez_kwargs["retrieval_weighted_label_purity"] = torch.cat(_rb_weighted_purity_chunks, dim=0).numpy()
+            # [추가] H(Y_N(x)) — 검색된 이웃 **라벨 분포**의 entropy.
+            # ⚠ `entropy` 컬럼(evidence_w 기반)과 다른 값이다. retrieval
+            #   uncertainty를 보려면 이쪽을 쓸 것 — 위 계산 지점 주석 참고.
+            if _rb_nbr_label_entropy_chunks:
+                _rb_savez_kwargs["neighbor_label_entropy"] = torch.cat(
+                    _rb_nbr_label_entropy_chunks, dim=0).numpy()
+                _rb_savez_kwargs["neighbor_label_n_eff"] = torch.cat(
+                    _rb_nbr_label_neff_chunks, dim=0).numpy()
         if _rb_sim_top1_chunks:
             _rb_savez_kwargs["similarity_top1"] = torch.cat(_rb_sim_top1_chunks, dim=0).numpy()
             _rb_savez_kwargs["similarity_bottomk"] = torch.cat(_rb_sim_bottomk_chunks, dim=0).numpy()
@@ -4815,7 +5226,7 @@ def run_single_seed(
             _rb_savez_kwargs["error"] = -np.log(np.clip(_rb_p_true, 1e-12, 1.0))  # per-sample logloss
         _rb_path = save_dir / f"data={openml_id}{_save_tag}..seed{args.seed}_centroid_retrieval_behavior.npz"
         np.savez(str(_rb_path), **_rb_savez_kwargs)
-        print(f"  [export_centroid_retrieval_behavior] sample_id/centroid_id/routing_confidence/topk_idx/neighbor_labels/neighbor_sample_ids/group_size/entropy/n_eff/top1_weight"
+        print(f"  [export_centroid_retrieval_behavior] sample_id/centroid_id/routing_confidence/topk_idx/neighbor_labels/neighbor_sample_ids/group_size/entropy(=evidence_w)/n_eff/top1_weight/neighbor_label_entropy/neighbor_label_n_eff"
               f"{'/retrieval_label_purity/retrieval_weighted_label_purity' if _rb_purity_chunks else ''}"
               f"{'/similarity_top1/bottomk/margin/std' if _rb_sim_top1_chunks else ''}"
               f"{'/cos_qa/query_emb_norm/agg_emb_norm/beta_agg_ratio/representation_shift_norm' if _rb_cos_qa_chunks else ''}"
@@ -4906,7 +5317,63 @@ def run_single_seed(
         # zip 가능 (regroup_history는 매 epoch, branch_gradient_history는
         # log_branch_gradients=True일 때만 매 epoch — 둘 다 켰으면 길이가 같음).
         "regroup_history": wrapper.regroup_history,
+        # ── [축 2] prototype behavior ────────────────────────────────
+        # 논문 주장 "prototype은 class prototype이 아니라 density-driven
+        # anchor이며 granularity가 task 복잡도에 맞춰진다"를 지지하는 지표.
+        # ⚠ 지금까지는 체크포인트에서 사후 계산했는데, 그러면 결과 표를
+        #   만들 때마다 전 체크포인트를 다시 열어야 하고 계산 코드가
+        #   바뀌면 예전 결과와 어긋난다. 학습 시점에 같이 남긴다.
+        "prototype_alignment": diag.prototype_class_alignment(model),
+        "context_diversity":   diag.context_space_diversity(model),
+        # ⚠ --log_beta 로 기록한 dev_beta_raw 궤적. 켜지 않았으면 빈 리스트다.
+        #   콘솔 출력만으로는 나중에 재분석할 수 없어 meta에도 남긴다.
+        "beta_history": getattr(wrapper, "beta_history", []),
+        "beta_lr_mult": getattr(wrapper, "beta_lr_mult", 1.0),
+        # ── [config freeze] 이 run 이 v3 기본 설정에서 벗어났는가 ──────
+        # ⚠ freeze_check.py 는 **코드의 기본값**만 검사한다. 실행할 때
+        #   플래그로 덮어쓰면 못 잡는다. 결과 파일 자체에 "무엇이 기본과
+        #   달랐는지"를 남겨야 나중에 표를 만들 때 조건을 특정할 수 있다.
+        #   이번 세션에서 P=35 study가 P=100 실행에 덮여 사라진 적이 있다.
+        "freeze_deviations": {
+            k: v for k, v in {
+                "n_prototypes":  args.n_prototypes,
+                "beta_lr_mult":  args.beta_lr_mult,
+                # A/O 실험 조건 — meta.pkl 만 보고 어느 조건이었는지 알 수 있어야 한다
+                "gradient_codebook":   args.gradient_codebook,
+                "commitment":          args.commitment,
+                "disable_dead_reinit": args.disable_dead_reinit,
+                "epochs":        args.epochs,
+                "patience":      args.patience,
+                "nbr_lambda":    args.nbr_lambda,
+                "num_bins":      args.num_bins,
+                "cat_combine":   args.cat_combine,
+                "num_embedding": args.num_embedding,
+                "evidence_metric": args.evidence_metric,
+                "fusion_mode":   args.fusion_mode,
+            }.items()
+            if v != {"n_prototypes": None, "beta_lr_mult": 1.0,
+                     "gradient_codebook": False, "commitment": False,
+                     "disable_dead_reinit": False,
+                     "epochs": HPO_TRAINING_SCHEDULE["epochs"],
+                     "patience": HPO_TRAINING_SCHEDULE["patience"],
+                     # ⚠ 기본값 전환(2026-08)에 맞춰 0.005 → 0.0.
+                     #   전환 후 `--nbr_lambda 0` 은 기본이므로 이탈이 아니다.
+                     "nbr_lambda": 0.0, "num_bins": 8,
+                     "cat_combine": "onehot", "num_embedding": "ple",
+                     "evidence_metric": "cosine", "fusion_mode": "proto_dev"}[k]
+        },
+        # --time_epoch 계측도 같은 이유로 저장한다.
+        "epoch_timing": getattr(wrapper, "_timing", {}),
         "evidence_stats_history": wrapper.evidence_stats_history,
+        # ── optimizer update budget ────────────────────────────────
+        # ⚠ epoch 수만으로는 데이터셋 간 학습량을 비교할 수 없다.
+        #   batch=256 고정이라 steps/epoch 이 N 에 비례해 2~16 으로 갈린다
+        #   (ds=54 는 epoch 당 2회, ds=1489 는 16회 — 8배 차이).
+        #   early stopping 이 부분적으로 흡수하지만 통제되지는 않으므로
+        #   실제 update 횟수를 남긴다. batch_size 를 다시 검토할 때 필요하다.
+        "steps_per_epoch": (
+            (len(X_train) // best_params["batch_size"])
+            if best_params.get("batch_size") else None),
         "deterministic": args.deterministic,
         "deterministic_warn_only": args.deterministic_warn_only if args.deterministic else None,
         "use_offset_correction": True,
@@ -4915,8 +5382,8 @@ def run_single_seed(
         "global_retrieve": args.global_retrieve,
         "use_context_emb": not args.no_context_emb,
         "use_query_emb_in_head": not args.no_query_emb,
-        "use_ema_codebook": args.ema_codebook,
-        "ema_decay": (args.ema_decay_override if args.ema_decay_override is not None else 0.99) if args.ema_codebook else None,
+        "use_ema_codebook": not args.gradient_codebook,
+        "ema_decay": (args.ema_decay_override if args.ema_decay_override is not None else 0.99) if not args.gradient_codebook else None,
         "blockwise_layernorm": args.blockwise_layernorm,
         "head_branch_l2norm": args.head_branch_l2norm,
         "fusion_mode": args.fusion_mode,
@@ -5111,21 +5578,34 @@ def run_single_seed(
                 conf = float(pred_probs[b, idx].item())
                 label = (dataset.target_class_names[idx]
                          if getattr(dataset, "target_class_names", None) else str(idx))
-                pred_infos.append({"pred_label": label, "pred_confidence": conf})
+                # pred_code: supporting/contrasting 분리 기준. 라벨 문자열만
+                # 있으면 이웃 라벨(정수 코드)과 비교할 수 없다.
+                pred_infos.append({"pred_label": label, "pred_confidence": conf,
+                                    "pred_code": idx})
 
-        topk_idx = out.get("topk_idx")
-        if model.feature_store is not None and topk_idx is not None:
-            cat_names = {dataset.col_names[i] for i in dataset.X_cat}
-            X_show_cpu = X_show.detach().cpu().numpy()
-            neighbour_feats = model.feature_store.retrieve(topk_idx)  # list[list[dict]]
-            for b, exp in enumerate(explanations):
-                if b < len(neighbour_feats):
-                    query_dict = {name: float(X_show_cpu[b, i])
-                                  for i, name in enumerate(dataset.col_names)}
-                    exp["neighbour_features"] = [
-                        _select_query_similar_features(query_dict, nd, cat_names)
-                        for nd in neighbour_feats[b]
-                    ]
+        # 설명 재료는 모델이 아니라 관찰자 계층에서 만든다.
+        # forward는 예측 상태(logits/topk_idx/context_emb/query_retr/
+        # neighbor_mask)만 내보내고, 아래 네 함수가 그걸 관찰해서 재구성한다.
+        # 동일성은 verify_equivalence.py로 확인함(최대 오차 3e-08).
+        _nbrs = diag.retrieved_neighbors(model, out)
+        _le   = diag.local_label_evidence(model, out)
+        _pdv  = diag.prototype_deviation(model, out)
+        _gst  = diag.group_relative_feature_stats(model, out, X_show)
+
+        cat_names = {dataset.col_names[i] for i in dataset.X_cat}
+        X_show_cpu = X_show.detach().cpu().numpy()
+        for b, exp in enumerate(explanations):
+            query_dict = {name: float(X_show_cpu[b, i])
+                          for i, name in enumerate(dataset.col_names)}
+            exp["neighbors"]           = (_nbrs[b] if _nbrs else [])
+            exp["local_evidence"]      = (_le[b]   if _le   else None)
+            exp["prototype_deviation"] = (_pdv[b]  if _pdv  else None)
+            exp["group_stats"]         = (_gst[b]  if _gst  else None)
+            for nb in exp["neighbors"]:
+                if nb.get("features"):
+                    # 전체 gap을 붙인다 — 정렬/절단은 표시 계층에서.
+                    nb["gaps"] = diag.feature_gaps(
+                        query_dict, nb["features"], cat_names)
         if not explanations:
             print("  (no explanations — memory bank has not been filled yet)")
             print("  → try increasing epochs or n_trials.")
@@ -5135,7 +5615,11 @@ def run_single_seed(
                                    cat_category_names=dataset.cat_category_names,
                                    quantile_transformer=dataset.quantile_transformer,
                                    num_cols=list(dataset.X_num),
-                                   pred_info=pred_infos[i])
+                                   pred_info=pred_infos[i],
+                                   target_class_names=getattr(
+                                       dataset, "target_class_names", None),
+                                   tasktype=tasktype,
+                                   verbose=getattr(args, "explain_verbose", False))
 
     return {"train_seed": train_seed, "val_metrics": val_metrics, "test_metrics": test_metrics}
 
@@ -5237,6 +5721,31 @@ def main():
                         help="[수정] 기본값을 HPO_TRAINING_SCHEDULE에서 가져옴 — 위 --epochs 참고.")
     parser.add_argument("--n_explain", type=int, default=3,
                         help="설명 출력할 테스트 샘플 수")
+    parser.add_argument("--n_prototypes", type=int, default=None,
+                        help=("optimize.py에서 --n_prototypes 로 만든 study를 찾을 때 "
+                              "같은 값을 지정하세요. study 파일명에 ..P{n}이 붙어 "
+                              "있습니다. --from_saved_state 를 쓰면 불필요합니다."))
+    parser.add_argument("--beta_lr_mult", type=float, default=1.0,
+                        help=("dev_beta_raw 전용 학습률 배수 (기본 1.0 = 기존 동작). "
+                              "β가 학습 내내 단조 상승하다 early stopping에서 잘리는 "
+                              "것이 실측돼, 균형점이 존재하는지 확인하기 위한 실험용 "
+                              "플래그입니다. (0,1) 경계는 유지됩니다."))
+    parser.add_argument("--log_beta", action="store_true",
+                        help=("proto_dev 계열의 dev_beta_raw 값과 그래디언트를 "
+                              "epoch별로 기록해 학습 종료 후 출력합니다. "
+                              "β가 초기값 근처에 머무는 것이 '균형'인지 '정체'인지 "
+                              "가릅니다. 배치마다 동기화가 생기므로 기본은 꺼짐."))
+    parser.add_argument("--time_epoch", action="store_true",
+                        help=("epoch 구간별(regroup_update / cache_sample_groups / "
+                              "feature_store 전송 / label 계산) 누적 소요 시간을 "
+                              "학습 종료 후 표로 출력합니다. 켜면 정확한 측정을 위해 "
+                              "CUDA sync가 들어가므로 기본은 꺼져 있습니다."))
+    parser.add_argument("--explain_verbose", action="store_true",
+                        help=("설명 출력에 해석 규칙 주석을 함께 표시합니다. "
+                              "기본값(꺼짐)에서는 샘플마다 반복되는 고정 문구 "
+                              "(② 경고 5줄, 그룹 대비 주석 2줄, ③ 분해 주석 1줄)를 "
+                              "생략합니다 — 규칙은 한 번만 읽으면 되는 내용이고, "
+                              "샘플 14건이면 그것만 100줄이 넘습니다."))
     parser.add_argument("--explain",   action="store_true",
                         help="학습 후 feature 기여도 설명 출력")
     parser.add_argument("--from_saved_state", type=str, default=None,
@@ -5357,20 +5866,6 @@ def main():
                             "기본값(v1 복원)이라 이 플래그는 더 이상 아무 효과가 없음(줘도 "
                             "안전 — 어차피 기본 동작). context_emb를 head에서 빼려면(v2식) "
                             "--no_context_emb를 쓸 것."
-                        ))
-    parser.add_argument("--ema_codebook", action="store_true",
-                        help=(
-                            "[구조 변경] codebook_loss(gradient 기반, centroid→query 방향)를 "
-                            "EMA(exponential moving average) 업데이트로 대체. commitment_loss"
-                            "(query→centroid 방향, embedder에 gradient)는 그대로 유지 — Huh et "
-                            "al.(2023)이 정리한 VQ-VAE 표준 구도(EMA는 codebook 쪽만 대체, "
-                            "commitment는 gradient 기반 유지)를 그대로 따름. [부작용] "
-                            "diversity_loss도 이 모드에서는 자동으로 꺼짐 — centroid_emb가 "
-                            "requires_grad=False가 되므로(EMA가 매 배치 .data를 통째로 "
-                            "덮어써서 gradient 기반 업데이트와 공존이 안 됨) diversity_loss를 "
-                            "계산해도 갈 곳이 없어 아예 호출을 생략함. 즉 이 모드는 "
-                            "'codebook_loss만 EMA로'가 아니라 'centroid를 EMA 하나로만 "
-                            "위치시키고 밀어내기(diversity) 효과는 포기'하는 트레이드오프임."
                         ))
     parser.add_argument("--ema_decay_override", type=float, default=None,
                         help=(
@@ -5527,7 +6022,7 @@ def main():
     parser.add_argument("--fusion_mode", type=str, default="proto_dev",
                         choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta",
                                  "proto_residual", "proto_query_residual", "proto_only",
-                                 "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
+                                 "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
                                  "proto_residual_query"],
                         help=(
                             "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
@@ -5931,7 +6426,13 @@ def main():
                         ))
     parser.add_argument("--residual_vq_size", type=int, default=None,
                         help="stage2 코드북 크기 P2. 미지정이면 P1과 동일(√N).")
-    parser.add_argument("--nbr_lambda", type=float, default=0.005,
+    parser.add_argument("--commitment", action="store_true",
+                        help=("[ablation] commitment_loss 를 켠다(기본 꺼짐, §10). "
+                              "⚠ optimize.py 와 반드시 같아야 한다."))
+    parser.add_argument("--gradient_codebook", action="store_true",
+                        help=("centroid 를 gradient 로 학습합니다(v3 이전 기본값). "
+                              "지금은 EMA 가 기본입니다."))
+    parser.add_argument("--nbr_lambda", type=float, default=0.0,
                         help=(
                             "[v3] L_nbr 가중치 — raw feature 이웃 구조를 encoder에 "
                             "보존시키는 contrastive loss. positive는 raw kNN(prototype "
@@ -5943,16 +6444,6 @@ def main():
                             "sweep 권장: 0 / 0.001 / 0.005 / 0.01 / 0.05 / 0.1 "
                             "(InfoNCE는 log(batch)≈3~5 스케일이라 CE보다 크다). "
                             "판정: kNN recall·Level 1 상승 + accuracy 유지."
-                        ))
-    parser.add_argument("--nbr_k", type=int, default=10,
-                        help="L_nbr의 raw kNN positive 후보 수")
-    parser.add_argument("--nbr_tau", type=float, default=0.1,
-                        help="L_nbr InfoNCE 온도")
-    parser.add_argument("--nbr_neg_margin", type=int, default=50,
-                        help=(
-                            "negative에서 제외할 raw 이웃 수. tabular은 raw 근접 ≈ "
-                            "같은 클래스인 경우가 많아, 배치 negative에 이웃이 섞이면 "
-                            "같은 neighborhood를 서로 밀어내는 충돌이 생긴다."
                         ))
     parser.add_argument("--disable_dead_reinit", action="store_true",
                         help=(
