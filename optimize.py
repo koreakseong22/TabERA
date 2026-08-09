@@ -107,14 +107,47 @@ parser.add_argument("--fusion_mode", type=str, default="proto_dev",
                         "규칙으로 저장된 옛날 study 파일은 새 태그 규칙과 파일명이 달라지므로 "
                         "리네임이 필요할 수 있음(레포 마이그레이션 스크립트 참고)."
                     ))
-parser.add_argument("--nbr_lambda", type=float, default=0.005,
+parser.add_argument("--n_prototypes", type=int, default=None,
+                    help=("prototype 개수를 직접 지정합니다(구조 변수). 생략하면 "
+                          "clip(sqrt(N), C, N/k)로 자동 계산합니다. "
+                          "지정하면 study 파일명에 ..P{n}이 붙어 다른 P의 실험과 "
+                          "섞이지 않습니다 — 예전에는 P만 다른 실험이 같은 study를 "
+                          "덮어써서 재현이 불가능해진 사례가 있었습니다."))
+parser.add_argument("--commitment", action="store_true",
+                    help=("[ablation] commitment_loss 를 켠다(기본은 꺼짐). "
+                          "⚠ §10: 제거해도 cos(q,c)가 안 떨어지고(3/5는 오히려 상승) "
+                          "예측도 유의차가 없어(p=0.14) 기본에서 뺐다. STE+CE 가 이미 "
+                          "정렬을 만든다. ⚠ reproduce.py 와 반드시 같아야 한다."))
+parser.add_argument("--allow_self_retrieval", action="store_true",
+                    help=("검색에서 자기 자신을 제외하지 않는다(기본은 제외). "
+                          "⚠ reproduce.py 와 같아야 한다 — 이전엔 이 인자가 "
+                          "optimize.py 에 없어 HPO 는 self 포함, 재현은 제외로 "
+                          "달랐다. proto_dev 에서는 retrieval 이 예측 경로 밖이라 "
+                          "예측에 영향이 없었지만 다른 fusion_mode 에서는 다르다."))
+parser.add_argument("--gradient_codebook", action="store_true",
+                    help=("centroid 를 gradient(codebook_loss + CE)로 학습합니다. "
+                          "[v3 이전 기본값] 지금은 EMA 가 기본이므로 이 플래그로 "
+                          "옛 동작을 재현합니다. A/O 비교 결과: 예측은 동등하고"
+                          "(5 데이터셋 × 5 seed, 전 지표 p>0.4) centroid drift 만 "
+                          "gradient 쪽이 크다(끝/최대 11~45% vs 1~16%)."))
+parser.add_argument("--ema_codebook", action="store_true",
+                    help=("[더 이상 필요 없음 — EMA 가 기본] 하위호환용. "
+                          "EMA 로 한다. centroid_emb 가 optimizer 대상에서 빠지고, "
+                          "매 배치 배정된 query 의 이동평균으로 직접 갱신된다. "
+                          "⚠ reproduce.py 와 반드시 같아야 한다 — HPO 를 gradient "
+                          "조건에서 하고 재현만 EMA 로 하면 서로 다른 아키텍처를 "
+                          "기준으로 최적화한 셈이 된다."))
+parser.add_argument("--disable_dead_reinit", action="store_true",
+                    help=("죽은 centroid 재초기화를 끈다. ⚠ A(gradient) vs O(EMA) "
+                          "비교에서는 **양쪽 다 꺼야 한다.** 재초기화는 centroid "
+                          "위치를 바꾸는 또 하나의 갱신 경로라, 켜두면 비교 대상이 "
+                          "'갱신 방식 하나'가 아니라 둘이 된다."))
+parser.add_argument("--nbr_lambda", type=float, default=0.0,
                     help=(
-                        "[v3 확정] L_nbr 가중치. ⚠ reproduce.py와 반드시 같아야 한다 — "
+                        "[기본 0 — 제거됨] L_nbr 가중치. ⚠ reproduce.py와 반드시 같아야 한다 — "
                         "HPO가 L_nbr 없는 조건에서 HP를 찾고 재현에서만 켜면, 서로 다른 "
                         "아키텍처를 기준으로 최적화한 셈이 된다."
                     ))
-parser.add_argument("--nbr_k", type=int, default=10,
-                    help="L_nbr의 raw kNN positive 후보 수")
 parser.add_argument("--use_context_emb", action="store_true",
                     help=(
                         "[2026-07, deprecated — 하위호환용] use_context_emb=True가 다시 "
@@ -192,7 +225,10 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # ← MultiTab 원본과
 import optuna, torch, json, joblib, datetime, math, gc
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
-from libs.search_space import get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE
+from libs.search_space import (get_search_space, suggest_initial_trial,
+                              params_to_model_kwargs, study_pkl_tag,
+                              HPO_TRAINING_SCHEDULE, DEFAULT_K_NO_TUNE,
+                              _K_UNTUNED_MODES, SEARCHED_K_CHOICES)
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
 import warnings
@@ -231,8 +267,20 @@ _ablation_tag = study_pkl_tag(
     num_embedding=args.num_embedding,
     evidence_metric=args.evidence_metric,
     fusion_mode=args.fusion_mode,
-    use_context_emb=args.use_context_emb,
+    use_context_emb=(not args.no_context_emb),
     disable_retrieval_branch=args.disable_retrieval_branch,
+    # ⚠ 자동 계산 P는 여기서 알 수 없다(데이터 로드 전). 명시 지정한
+    #   경우에만 태그에 넣는다 — 자동 P가 코드 버전에 따라 달라져 기존
+    #   study와 어긋나는 경우는 아래 가드가 막는다.
+    n_prototypes=args.n_prototypes,
+    # 기본이 EMA 이므로, 태그는 '옛 동작(gradient)' 일 때만 붙인다.
+    gradient_codebook=args.gradient_codebook,
+    no_commitment=not args.commitment,
+    disable_dead_reinit=args.disable_dead_reinit,
+    nbr_lambda=args.nbr_lambda,
+    num_bins=args.num_bins,
+    cat_embed_dim=args.cat_embed_dim,
+    detach_retr_grad=args.detach_retr_grad,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -301,10 +349,60 @@ if train:
     # output_dim: n_classes 사용 (y가 1D이므로 shape[1] 불가)
     output_dim = dataset.n_classes if tasktype == "multiclass" else 1
 
-    # n_prototypes: sqrt(N) 자동 설정
-    # 근거: 데이터 크기에 비례한 centroid 수로 커버리지를 균일하게 유지.
-    n_proto_default = max(4, int(math.sqrt(len(y_train))))
-    print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
+    # ── n_prototypes ────────────────────────────────────────────────
+    #
+    # 기본값은 **P = sqrt(N)** 이다. 바꾸지 않는다.
+    #
+    # [왜 sqrt(N) 인가]
+    #   평균 그룹 크기 |G| = N/P = sqrt(N) 이므로, P가 커지면 prototype
+    #   표현력이 늘고 그룹이 작아진다 — 그 둘의 균형점이다. centroid는
+    #   TabERA에서 세 역할을 동시에 한다.
+    #       prediction anchor (context_emb) / retrieval partition /
+    #       explanation unit
+    #   그래서 P는 일반적인 k-means의 k 선택 문제가 아니다.
+    #
+    # [한때 clip(sqrt(N), C, N/k) 로 바꿨다가 되돌린 이유]
+    #   ds=1493 (N=1279, C=100)에서 P를 35 → 100 으로 올리면
+    #       acc  0.772 → 0.821  (+4.9pp, paired t p=0.009, 5/5 seed)
+    #       β    0.691 → 0.51   (편차가 분류를 덜 떠맡음)
+    #   여기까지는 capacity mismatch 해소가 맞다. 그러나 동시에
+    #       H(Y_G)     1.32  → 0.086
+    #       alignment  0.367 → 0.949
+    #       |G|/k      4.8   → 1.5
+    #   가 되어, prototype이 class-specific memory unit 처럼 행동하고
+    #   그룹 내부 구조(설명 계층 ②가 의존하는 것)가 사라진다.
+    #   ⚠ 즉 이건 고쳐야 할 버그가 아니라 **두 목적이 서로 다른 P를
+    #     요구하는 trade-off** 다. 기본값이 한쪽을 임의로 택하면 안 된다.
+    #
+    # [그래서 어떻게 하는가]
+    #   기본은 sqrt(N) — TabERA의 prototype은 class prototype이 아니라
+    #   해석 가능한 지역 서술자(local region descriptor)이기 때문이다.
+    #   capacity 쪽을 보고 싶으면 --n_prototypes 로 명시한다(별도 study).
+    #   C > P 인 경우는 경고만 남긴다 — 편차 항이 보완한다는 사실을
+    #   알고 있어야 결과를 해석할 수 있다.
+    _sqrtN = max(4, int(math.sqrt(len(y_train))))
+    _C     = dataset.n_classes if tasktype == "multiclass" else None
+    _k_ref = (DEFAULT_K_NO_TUNE if args.fusion_mode in _K_UNTUNED_MODES
+              else max(SEARCHED_K_CHOICES))
+
+    if args.n_prototypes is not None:
+        n_proto_default = int(args.n_prototypes)
+        print(f"  n_prototypes: {n_proto_default}  (--n_prototypes 로 직접 지정)")
+    else:
+        n_proto_default = _sqrtN
+        print(f"  Auto n_prototypes: sqrt({len(y_train)}) = {n_proto_default}")
+
+    if _C is not None and n_proto_default < _C:
+        print(f"    ⚠ P({n_proto_default}) < C({_C}) — logits ≈ W·c 에서 c는 P개 "
+              f"값만 취하므로 prototype 항만으로는 모든 클래스를 표현할 수 "
+              f"없습니다. 편차 항 W·Δ 가 분류를 떠맡습니다(β 상승, "
+              f"argmax_changed 상승). 성능을 보려면 --n_prototypes {_C} 로 "
+              f"별도 study를 만드세요 — 다만 그룹 크기가 {len(y_train)//_C}로 "
+              f"줄어 설명 계층이 약해집니다.")
+    _grp = len(y_train) // max(n_proto_default, 1)
+    if _grp < _k_ref:
+        print(f"    ⚠ 평균 그룹 크기({_grp}) < k({_k_ref}) — retrieval이 "
+              f"cross-group fallback을 탑니다.")
 
     # ── PLE(Piecewise Linear Encoding) 구간 경계 계산 (num_embedding=ple일 때만) ──
     # reproduce.py와 동일 로직 — objective() 밖에서 한 번만 계산 (trial마다
@@ -317,12 +415,32 @@ if train:
 
     # ── 자동 가설 생성 (컬럼 평균 기준) ──────────────────
 
+    # ── [재현성 가드] 기존 study가 다른 P로 만들어졌는가 ──────────
+    # ⚠ study 파일명에는 자동 계산 P가 안 들어간다. 그래서 코드 버전이
+    #   바뀌어 자동 P가 달라지면(ds=1493: 35 → 100) **같은 파일에 다른
+    #   구조의 trial이 섞이거나 덮인다.** 실제로 P=35 study가 P=100
+    #   실행에 사라진 사례가 있었다. P는 구조 변수이므로 섞이면 안 된다.
+    _prev_P = {t.user_attrs.get("n_prototypes_actual")
+               for t in study.trials
+               if t.state == optuna.trial.TrialState.COMPLETE
+               and t.user_attrs.get("n_prototypes_actual") is not None}
+    if _prev_P and _prev_P != {n_proto_default}:
+        raise SystemExit(
+            f"\n[중단] 기존 study의 n_prototypes={sorted(_prev_P)} 인데 이번 실행은 "
+            f"{n_proto_default} 입니다.\n"
+            f"  파일: {fname}\n"
+            f"  P는 구조 변수라 같은 study에 섞으면 재현이 불가능해집니다.\n"
+            f"  → --n_prototypes {n_proto_default} 로 지정해 별도 study(..P{n_proto_default})를 "
+            f"만들거나, 기존 study를 다른 이름으로 옮기세요.")
+
     global best_so_far
     best_so_far = study.best_value if completed_trials_count > 0 else None
 
     # ── Objective  (MultiTab 원본 구조와 동일) ─────────────
     def objective(trial):
         params       = get_search_space(trial, num_features=X_train.size(1),
+                                        use_ema_codebook=not args.gradient_codebook,
+                                        no_commitment=not args.commitment,
                                         data_id=args.openml_id, metric=args.metric,
                                         num_embedding=args.num_embedding,
                                         fusion_mode=args.fusion_mode)
@@ -358,13 +476,30 @@ if train:
             detach_context_grad=args.detach_context_grad,
             use_context_projection=args.context_projection,
             evidence_metric=args.evidence_metric,
+            # ⚠ [감사 수정] 이전엔 이 인자를 아예 안 넘겨 생성자 기본값
+            #   (False)이 쓰였다. reproduce.py 는 `not args.allow_self_retrieval`
+            #   로 True 를 넘긴다 — HPO 와 재현이 다른 검색 규칙을 쓴 것이다.
+            #   proto_dev 에서는 retrieval 이 예측 경로 밖이라 예측에 영향이
+            #   없지만(실측 최대차 0.000e+00), 실제 불일치이므로 맞춘다.
+            exclude_self_retrieval=(not args.allow_self_retrieval),
             fusion_mode=args.fusion_mode,
             # [v3] L_nbr — reproduce.py와 같은 값이어야 HPO가 같은
             #   아키텍처를 기준으로 탐색한다.
             nbr_lambda=args.nbr_lambda,
-            nbr_k=args.nbr_k,
+            # [조건 O] centroid 갱신 방식. reproduce.py 와 같아야 한다.
+            use_ema_codebook=not args.gradient_codebook,
+            # dead reinit 은 patience 를 학습 epoch 수보다 크게 두어 끈다
+            # (reproduce.py 와 같은 방식 — 별도 분기를 만들지 않는다).
+            #   reproduce.py 와 같은 값(1e9)을 써야 조건이 일치한다.
+            **({"dead_reinit_patience": 10 ** 9} if args.disable_dead_reinit else {}),
             disable_retrieval_branch=args.disable_retrieval_branch,
-            use_context_emb=args.use_context_emb,
+            # ⚠ [감사 수정] reproduce.py 는 `not args.no_context_emb`(기본 True)
+            #   를 쓰는데 여기는 `args.use_context_emb`(기본 False)를 썼다.
+            #   --use_context_emb 는 deprecated(효과 없음)라고 적혀 있었으나
+            #   실제로는 이 값이 그대로 전달되고 있었다.
+            #   proto_dev/query_only_linear 에서는 head 를 안 타서 영향이
+            #   없지만, concat 에서는 출력이 달라진다(실측 최대차 0.454).
+            use_context_emb=(not args.no_context_emb),
             # [필수 수정 — 이전엔 아예 빠져 있었음] categorical/numeric feature
             # 인코딩. 이게 없으면 cat_col_idx=None이 돼서 cat_combine/
             # num_embedding 설정과 무관하게 raw-encoding 경로로 빠짐 — HPO가
