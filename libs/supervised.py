@@ -14,6 +14,7 @@ TabERA 전용으로 재작성한 버전입니다.
 
 import math
 import copy
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -106,7 +107,10 @@ class TabERAWrapper:
         cat_category_names: Optional[Dict[str, List[str]]] = None,
         target_class_names: Optional[List[str]] = None,
         quantile_transformer=None,
-        regroup_log_every: int = 10,   # [Regroup] 로그 출력 주기(epoch). 진단 목적으로 좁힐 수 있게.
+        regroup_log_every: int = 10,
+        time_epoch: bool = False,
+        log_beta: bool = False,
+        beta_lr_mult: float = 1.0,   # [Regroup] 로그 출력 주기(epoch). 진단 목적으로 좁힐 수 있게.
         refresh_on_best: bool = False,
         # [추가] best_state 복원 직후 model.refresh_memory_keys()를 호출할지.
         # 기본 False — 기존 Optuna study/best_params는 이 플래그와 무관하게
@@ -230,6 +234,12 @@ class TabERAWrapper:
         self.epochs   = epochs
         self.patience = patience
         self.regroup_log_every = max(1, regroup_log_every)
+        # epoch 구간별 소요 시간 계측 (기본 꺼짐 — 켜면 CUDA sync가 들어간다)
+        self.time_epoch = bool(time_epoch)
+        # dev_beta_raw 궤적 기록 (기본 꺼짐 — 배치마다 동기화가 생긴다)
+        self.log_beta = bool(log_beta)
+        # dev_beta_raw 전용 lr 배수 (1.0 = 기존 동작)
+        self.beta_lr_mult = float(beta_lr_mult)
         self._best_state = None
         self._data_id    = "?"      # tqdm 표시용 (optimize.py에서 주입)
         self.regroup_history: List[Dict[str, float]] = []
@@ -382,6 +392,48 @@ class TabERAWrapper:
             )
         return regroup_stats
 
+    # ─────────────────────────────────────────────────────────
+    # epoch 단위 구간별 소요 시간 계측
+    # ─────────────────────────────────────────────────────────
+    # 왜 필요한가: 학습이 "배치는 빠른데 epoch 경계에서 잠깐 멈춘다"는
+    # 체감이 있었다. regroup_update / cache_sample_groups 가 매 epoch
+    # 전체 데이터를 훑기 때문으로 **추정**되지만, 추정으로 최적화하면
+    # 엉뚱한 곳을 고친다. 비율을 실측한 뒤 판단한다.
+    #
+    # ⚠ CUDA는 비동기라 sync 없이 재면 시간이 다음 구간으로 밀린다.
+    #   sync 자체가 비용이므로 --time_epoch 일 때만 켠다(기본 꺼짐).
+    #   즉 이 계측은 **평소 학습 속도에 영향을 주지 않는다.**
+    def _t(self):
+        if not getattr(self, "_timing_on", False):
+            return None
+        if self._timing_cuda:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _tick(self, key, t0):
+        if t0 is None:
+            return
+        if self._timing_cuda:
+            torch.cuda.synchronize()
+        self._timing[key] = self._timing.get(key, 0.0) + (time.perf_counter() - t0)
+
+    def _timing_report(self):
+        if not getattr(self, "_timing_on", False) or not self._timing:
+            return
+        total = self._timing.get("epoch_total", 0.0)
+        if total <= 0:
+            return
+        print(f"\n  [timing] epoch 구간별 누적  (총 {total:.1f}s, "
+              f"{self._timing.get('n_epoch', 0):.0f} epoch)")
+        # epoch_total 은 분모이므로 목록에서 뺀다
+        items = [(k, v) for k, v in self._timing.items()
+                 if k not in ("epoch_total", "n_epoch")]
+        for k, v in sorted(items, key=lambda x: -x[1]):
+            print(f"    {k:<28}{v:>8.1f}s   {v / total:>6.1%}")
+        _acc = sum(v for _, v in items)
+        print(f"    {'(그 외 = 배치 학습)':<28}{total - _acc:>8.1f}s   "
+              f"{(total - _acc) / total:>6.1%}")
+
     def fit(
         self,
         X_train: torch.Tensor,
@@ -421,8 +473,37 @@ class TabERAWrapper:
             if not _p.requires_grad:
                 continue
             (_no_decay if _n.endswith(("beta_raw", "gamma_raw")) else _decay).append(_p)
+        # ── [beta_lr_mult] dev_beta_raw 전용 학습률 배수 ────────────────
+        # 왜: β = σ(dev_beta_raw) 가 학습 내내 **한 방향으로만** 오르다가
+        #   early stopping에서 잘린다는 것이 실측됐다.
+        #     ds=31   32 epoch, β 0.100 → 0.111, 부호 전환 0%,
+        #             |signed|/|grad| = 1.000
+        #             Δraw 실제 0.112 vs 이론 최대(lr×배치×epoch) 0.110 → 비율 1.02
+        #     ds=1489 98 epoch, β 0.109 → 0.806, 부호 전환 0%
+        #   AdamW는 그래디언트 크기를 정규화하므로 부호가 일정하면 step ≈ lr 이다.
+        #   비율 1.02는 **낼 수 있는 최대 속도로 끝까지 올라갔다**는 뜻이고,
+        #   따라서 최종 β는 수렴값이 아니라 최적화 예산의 산물이다.
+        #   실제로 β 차이가 데이터가 아니라 예산으로 설명된다:
+        #     ds=31   lr 0.00086 × 4배치  × 32ep =  110 step-lr → β 0.111
+        #     ds=1489 lr 0.00579 × 17배치 × 98ep = 9648 step-lr → β 0.806
+        #
+        # ⚠ parameterization(softplus)으로는 못 고친다. σ'(β=0.1)=0.09 로
+        #   최대(0.25)의 36%라 죽은 영역이 아니고, softplus로 바꿔도 이동
+        #   거리가 3.58 → 2.46(69%)으로 줄 뿐이다. 문제는 saturation이 아니라
+        #   **이동 거리 대비 step 예산**이므로 lr 을 키우는 것이 직접적인 개입이다.
+        #
+        # ⚠ (0,1) 경계는 유지한다. centroid_emb 가 정규화되어 ‖c‖=1 이므로
+        #   β 는 곧 ‖β·r‖/‖c‖ 이고, β<1 은 "편차가 prototype 크기를 넘지
+        #   못한다"는 실질 제약이다. 이 경계를 풀면 과거 실패한
+        #   `W_c·c + λ·W_q·q`(‖W_q‖가 24배로 커져 우회)와 같은 문이 열린다.
+        #
+        # ⚠ 기본값 1.0 = 기존 동작 그대로. 실험용 플래그다.
+        _beta_lr = self.params["lr"] * float(self.beta_lr_mult)
         _pg = [{"params": _decay, "weight_decay": self.params["weight_decay"]},
-               {"params": _no_decay, "weight_decay": 0.0}]
+               {"params": _no_decay, "weight_decay": 0.0, "lr": _beta_lr}]
+        if abs(float(self.beta_lr_mult) - 1.0) > 1e-9:
+            print(f"  [beta_lr_mult] dev_beta_raw/gamma_raw 전용 lr = "
+                  f"{_beta_lr:.6f}  (base {self.params['lr']:.6f} x {self.beta_lr_mult})")
         try:
             optimizer = torch.optim.AdamW(
                 _pg,
@@ -547,7 +628,18 @@ class TabERAWrapper:
             leave=True,
         )
 
+        # 계측 상태. --time_epoch 이 없으면 전부 no-op.
+        self.beta_history = []
+        self._beta_grad_sum = 0.0
+        self._beta_grad_signed = 0.0
+        self._beta_grad_n = 0
+
+        self._timing = {}
+        self._timing_on = bool(getattr(self, "time_epoch", False))
+        self._timing_cuda = self._timing_on and torch.cuda.is_available()
+
         for epoch in pbar:
+            _t_epoch = self._t()
             # [v3] RVQ 진단을 이 에폭의 첫 배치에서만 계산하도록 초기화.
             #   진단은 벡터화 후에도 배치당 ~1ms이고, 에폭 단위로만 읽히므로
             #   매 배치 계산할 이유가 없다.
@@ -860,6 +952,24 @@ class TabERAWrapper:
                             })
 
                 nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # ── [계측] dev_beta_raw 의 값과 그래디언트 ─────────────
+                # 왜: 최종 β가 7개 데이터셋에서 초기값 σ(-2.197)=0.100 근처에
+                #   머문다(1.02~1.23배). 두 해석이 가능한데 최종값만으로는
+                #   못 가른다.
+                #     (a) 균형 — 편차가 필요 없어서 안 오른 것
+                #     (b) 정체 — 그래디언트가 안 흘러 초기값에 갇힌 것
+                #   (b)라면 우리가 정한 초기값이 결과를 정하는 셈이라
+                #   논문에서 방어할 수 없다.
+                # ⚠ clip_grad_norm_/optimizer.step() **전에** 읽어야 한다 —
+                #   그 뒤에는 grad가 지워지거나 잘려 있다.
+                # ⚠ 기본은 꺼져 있다(--log_beta). 켜면 배치마다 .item() 이
+                #   들어가 CUDA 동기화가 생기므로 평소 학습에 영향이 없도록.
+                if getattr(self, "log_beta", False):
+                    _bp = getattr(self.model, "dev_beta_raw", None)
+                    if _bp is not None and _bp.grad is not None:
+                        self._beta_grad_sum += float(_bp.grad.abs().sum())
+                        self._beta_grad_signed += float(_bp.grad.sum())
+                        self._beta_grad_n += 1
                 optimizer.step()
                 # [CosFace 표준] centroid_emb를 매 step 후 단위벡터로 강제
                 # 재투영 — weight_decay가 켜져 있어도 방향만 남고 크기는
@@ -894,11 +1004,15 @@ class TabERAWrapper:
                     else:
                         emb_regroup = self.model.memory.keys[:n_mem]           # (n_mem, D) — MemoryBank 임베딩
                         fs = self.model.feature_store
+                        _t0 = self._t()
                         x_regroup = (
                             fs._store[:n_mem].to(self.device)              # (n_mem, F) — 원본 feature
                             if fs is not None else None
                         )
+                        self._tick("feature_store→GPU 복사", _t0)
+                        _t0 = self._t()
                         regroup_stats = self.model.prototype_layer.regroup_update(emb_regroup, x_regroup)
+                        self._tick("regroup_update", _t0)
                         # [최적화] label_all_groups/label_groups_by_target는
                         # 순수 읽기 전용(설명용 텍스트 캐싱)이라 학습(가중치/
                         # early stopping 판단)에 전혀 영향을 안 준다. 예전엔
@@ -1013,11 +1127,13 @@ class TabERAWrapper:
                     # 유지 — 그건 collapse 여부와 무관하게 실제 메모리
                     # 크래시를 막는 별개의 안전장치.
 
+                    _t0 = self._t()
                     self.model.memory.cache_sample_groups(
                         self.model.prototype_layer.sample_groups,
                         device=torch.device(self.device),
                         centroid_emb=self.model.prototype_layer.centroid_emb,
                     )
+                    self._tick("cache_sample_groups", _t0)
 
                     if epoch % self.regroup_log_every == 0:
                         _reinit = regroup_stats.get('reinit_count', 0)
@@ -1534,6 +1650,7 @@ class TabERAWrapper:
                     and self.col_names is not None
                     and x_regroup is not None
                 ):
+                    _t0 = self._t()
                     self.model.prototype_layer.group_labels = label_all_groups(
                         x_regroup.detach().cpu().numpy(),
                         self.model.prototype_layer.sample_groups,
@@ -1550,6 +1667,7 @@ class TabERAWrapper:
                         self.tasktype,
                         class_names=self.target_class_names,
                     )
+                    self._tick("label_all_groups / target (val 갱신 시)", _t0)
                 best_sample_groups = copy.deepcopy(self.model.prototype_layer.sample_groups)
                 best_group_labels  = copy.deepcopy(self.model.prototype_layer.group_labels)
                 best_target_labels = copy.deepcopy(self.model.prototype_layer.target_labels)
@@ -1572,6 +1690,29 @@ class TabERAWrapper:
             )
 
             # 조기 종료
+            if getattr(self, "log_beta", False):
+                _bp = getattr(self.model, "dev_beta_raw", None)
+                if _bp is not None:
+                    _n = max(self._beta_grad_n, 1)
+                    self.beta_history.append({
+                        "epoch": int(epoch),
+                        "raw": float(_bp.detach().mean()),
+                        "beta": float(torch.sigmoid(_bp.detach()).mean()),
+                        # 배치 평균. |grad| 는 크기, signed 는 방향.
+                        # signed ≈ 0 인데 |grad| 가 크면 방향이 계속 뒤집히는
+                        # 것이므로 "필요하지만 균형" (경우 C)이다.
+                        "grad_abs_mean":    self._beta_grad_sum / _n,
+                        "grad_signed_mean": self._beta_grad_signed / _n,
+                        "n_batch": int(self._beta_grad_n),
+                    })
+                    self._beta_grad_sum = 0.0
+                    self._beta_grad_signed = 0.0
+                    self._beta_grad_n = 0
+
+            self._tick("epoch_total", _t_epoch)
+            if self._timing_on:
+                self._timing["n_epoch"] = self._timing.get("n_epoch", 0) + 1
+
             if es.step(val_v, higher_is_better):
                 tqdm.write(f"Early stopping at epoch {epoch}")
                 break
@@ -1627,6 +1768,28 @@ class TabERAWrapper:
                         tqdm.write(f"  [refresh_on_best] clean 임베딩 기준으로 sample_groups 재동기화 "
                                    f"완료 (active={regroup_stats.get('active_ratio', 0)*100:.0f}%, "
                                    f"reinit={regroup_stats.get('reinit_count', 0)})")
+        self._timing_report()
+        if getattr(self, "log_beta", False) and self.beta_history:
+            h = self.beta_history
+            print(f"\n  [beta] dev_beta_raw 궤적  ({len(h)} epoch)")
+            print(f"    {'epoch':<8}{'beta':<11}{'raw':<11}{'|grad| 평균':<14}{'signed 평균'}")
+            _idx = sorted(set(list(range(min(5, len(h))))
+                              + list(range(0, len(h), max(1, len(h) // 8)))
+                              + [len(h) - 1]))
+            for i in _idx:
+                r = h[i]
+                print(f"    {r['epoch']:<8}{r['beta']:<11.5f}{r['raw']:<11.4f}"
+                      f"{r['grad_abs_mean']:<14.3e}{r['grad_signed_mean']:+.3e}")
+            _ga = [r["grad_abs_mean"] for r in h]
+            _gs = [r["grad_signed_mean"] for r in h]
+            print(f"    beta {h[0]['beta']:.5f} → {h[-1]['beta']:.5f}"
+                  f"   |grad| 중앙 {float(np.median(_ga)):.3e}"
+                  f"   signed 중앙 {float(np.median(_gs)):+.3e}")
+            # signed 의 부호가 얼마나 자주 바뀌는가 — 경우 C 판정용
+            _sg = np.sign(_gs)
+            _flip = float(np.mean(_sg[1:] != _sg[:-1])) if len(_sg) > 1 else float("nan")
+            print(f"    signed 부호 전환율 {_flip:.1%}  "
+                  f"(높으면 균형 상태, 0에 가까우면 한쪽으로 계속 밀림)")
         self._best_state = best_state
 
         # ── centroid margin z-score 진단 (best epoch 복원된 모델 기준) ──
