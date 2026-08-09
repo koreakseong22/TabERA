@@ -341,6 +341,12 @@ class HeadCrossAttention(nn.Module):
                 "top_neighbours":  top_n_list,
                 "dominant_weight": float(w.max()),
                 "ignored_ratio":   float((w < 0.05).mean()),
+                # ⚠ evidence_w(attention weight) 분포의 entropy다. 검색된
+                #   이웃의 **라벨** 불확실성이 아니다 — 그건
+                #   diagnostics.local_label_evidence()의 label_entropy.
+                #   aggregator를 안 쓰는 fusion_mode(proto_dev 계열)에서는
+                #   evidence_w가 균등 상수라 이 값이 log(k)로 고정된다.
+                #   키 이름은 하위호환을 위해 그대로 둔다.
                 "entropy":         float(-(w * np.log(w + 1e-8)).sum()),
             })
         return out
@@ -1029,6 +1035,12 @@ class AttentionAggregator(nn.Module):
                 "top_neighbours":  top_n_list,
                 "dominant_weight": float(w.max()),
                 "ignored_ratio":   float((w < 0.05).mean()),
+                # ⚠ evidence_w(attention weight) 분포의 entropy다. 검색된
+                #   이웃의 **라벨** 불확실성이 아니다 — 그건
+                #   diagnostics.local_label_evidence()의 label_entropy.
+                #   aggregator를 안 쓰는 fusion_mode(proto_dev 계열)에서는
+                #   evidence_w가 균등 상수라 이 값이 log(k)로 고정된다.
+                #   키 이름은 하위호환을 위해 그대로 둔다.
                 "entropy":         float(-(w * np.log(w + 1e-8)).sum()),
             })
         return out
