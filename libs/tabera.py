@@ -1209,7 +1209,9 @@ class TabERA(nn.Module):
         column_names: Optional[List[str]] = None,
         use_offset_correction: bool = True,
         global_retrieve: bool = False,
-        exclude_self_retrieval: bool = False,  # [추가] True면 MemoryBank 검색 시
+        # ⚠ [2026-08] 기본 True — CLI 기본값(`not --allow_self_retrieval`)과 맞춘다.
+        #   생성자를 직접 쓰는 경로에서 옛 동작이 살아나지 않도록.
+        exclude_self_retrieval: bool = True,   # True면 MemoryBank 검색 시
             # 쿼리 자신과 sample_id가 같은 슬롯(이전 epoch에 저장해둔 자기 자신)을
             # 후보에서 제외. 기본 False(하위호환, 기존 체크포인트/재현 결과와 동일
             # 동작). 동기: self-retrieval이 실측 결과 데이터셋마다 크게 다름
@@ -1249,7 +1251,11 @@ class TabERA(nn.Module):
             # 갱신함(SupervisedTrainer.query_detach_warmup_epochs/_steps 참고).
             # __init__ 기본값 False는 정적 초기값일 뿐 — 실제 on/off는
             # 학습 중 supervised.py가 model.detach_query_warmup을 직접 덮어씀.
-        use_ema_codebook: bool = False,
+        # ⚠ [2026-08] 기본 True — EMA prototype memory 가 기본 구조다(§8).
+        #   nbr_lambda 와 같은 함정을 피하려고 생성자 기본값도 맞춘다:
+        #   CLI 만 바꾸면 생성자를 직접 쓰는 경로(테스트·probe)에서 옛 동작이
+        #   조용히 살아난다. `--gradient_codebook` 이 옛 동작을 되살린다.
+        use_ema_codebook: bool = True,
         ema_decay: float = 0.99,
         blockwise_layernorm: bool = False,
         head_branch_l2norm: bool = False,  # [v1.1, 추가] head 입력 직전(concat
