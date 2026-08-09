@@ -43,6 +43,56 @@ from libs.evidence     import AttentionAggregator, HeadCrossAttention
 
 
 # ─────────────────────────────────────────────────────────────
+# [Level 2] aggregator를 쓰지 않는 fusion_mode 목록
+# ─────────────────────────────────────────────────────────────
+# forward() 안의 `_V2_NO_AGG` 지역 판정과 설명 블록의 "agg 값이 의미가
+# 있는가" 판정이 **서로 다른 곳에 같은 목록을 두 벌 두는** 구조였다면,
+# 새 모드를 추가할 때 한쪽만 고쳐져 설명이 조용히 틀어진다(§9의
+# "진단값이 조건 간 동일하면 배선을 의심" 유형). 한 곳에서만 정의한다.
+#
+# ⚠ 이 목록에 속하면 agg_emb는 zeros다. ‖agg_emb‖=0.000을 "retrieval
+#   기여가 없다"로 읽으면 안 된다 — 애초에 만들지 않은 값이다(§9-⑧).
+NO_AGG_FUSION_MODES = (
+    "proto_only", "proto_only_linear",
+    "query_only_linear", "proto_residual_query",
+    # ⚠ proto_dev는 agg를 쓰지 않으므로 여기 포함.
+    #   proto_dev_agg는 **제외** — 그 모드가 agg_emb를 쓴다.
+    "proto_dev", "proto_dev_vec",
+)
+
+# proto_dev 계열(σ(dev_beta_raw)를 β로 쓰는 모드)
+PROTO_DEV_FUSION_MODES = ("proto_dev", "proto_dev_vec", "proto_dev_agg")
+
+# 예전 체크포인트의 model_kwargs 에는 아래 셋이 인자로 들어 있다. 상수로
+# 내리면서 생성자에서 제거했으므로 그대로 넘기면 TypeError 가 난다.
+# 로드 쪽에서 걷어내도록 헬퍼를 둔다 — 값은 어차피 기본값(10/0.1/50)이라
+# 버려도 동작이 달라지지 않는다.
+_LEGACY_NBR_KWARGS = ("nbr_k", "nbr_tau", "nbr_neg_margin")
+
+
+def strip_legacy_kwargs(model_kwargs: dict) -> dict:
+    """구버전 checkpoint 의 model_kwargs 에서 제거된 인자를 걷어낸다."""
+    return {k: v for k, v in model_kwargs.items() if k not in _LEGACY_NBR_KWARGS}
+
+
+# ── Neighbourhood regulariser (L_nbr) 의 고정 상수 ────────────────────
+# ⚠ λ(nbr_lambda)와 이 셋은 근거의 성격이 다르다.
+#     λ        {0, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2} 를 실제로 비교했고
+#              acc 7/9 개선(p=0.039), 순위 13위→7위. 그래서 CLI 로 남긴다.
+#     k/τ/margin  sweep 기록이 없다. 합리적인 기본값을 그대로 쓴 것이다.
+#
+# ⚠ 그래서 **CLI 로 노출하지 않는다.** 조절 가능하게 두면 "왜 튜닝을
+#   안 했나"는 질문을 부르지만, 상수로 박혀 있으면 implementation detail
+#   로 넘어간다. 논문에도 "fixed a priori, not tuned" 로 쓴다.
+#
+# ⚠ 바꾸려면 여기를 고치고, λ sweep 결과가 k=10 전제 위에서 나온 것이므로
+#   λ 도 다시 재야 한다.
+NBR_K          = 10      # raw feature kNN 의 positive 후보 수
+NBR_TAU        = 0.1     # InfoNCE 온도
+NBR_NEG_MARGIN = 50      # raw 거리 상위 이만큼은 negative 로 쓰지 않는다
+
+
+# ─────────────────────────────────────────────────────────────
 # 보조 블록
 # ─────────────────────────────────────────────────────────────
 
@@ -585,8 +635,53 @@ class MemoryBank(nn.Module):
         grp_sizes = self._cached_group_sizes[ha]        # (B,)
 
         # fallback 여부 판단: 그룹 크기 < k 인 샘플
-        fallback_mask = grp_sizes < k                   # (B,) bool
+        # [버그 수정] self-exclusion이 켜져 있으면 그룹은 k+1개가 있어야
+        # 자기 자신을 빼고 k개를 채울 수 있다. 기존 조건(< k)은 그룹 크기가
+        # **정확히 k**인 경우를 정상 경로로 보냈는데, 그러면 self를 -1e9로
+        # 마스킹해도 유효 후보가 k-1개뿐이라 topk(k)가 마스킹된 자기 자신을
+        # k번째로 되돌려준다.
+        #   ds=1489 실측: 그룹 크기가 정확히 8(=k)인 centroid 30의 8개 샘플
+        #   전부가 자기 자신을 이웃으로 가져왔다. 원본에도 있던 문제다.
+        # ⚠ 추론 시에는 sample_ids를 넘기지 않아 exclude_ids=None이므로
+        #   임계값이 k 그대로다 — test 경로(--explain)의 동작은 안 바뀐다.
+        _min_grp = k + (1 if exclude_ids is not None else 0)
+        fallback_mask = grp_sizes < _min_grp            # (B,) bool
         normal_mask   = ~fallback_mask
+
+        # ── [버그 수정] fallback 경로의 self-exclusion ──────────────
+        # 정상 경로(그룹 >= k)와 전역 fallback(n < k)에는 exclude_ids
+        # 마스킹이 있었지만 **cross-group fallback(그룹 < k)에는 없었다.**
+        # 결과: 작은 그룹에 배정된 샘플은 예외 없이 자기 자신을
+        # similarity 1.000의 top-1 이웃으로 가져왔다.
+        #   credit-g 실측 — 그룹 <k 인 12개 전부, 그룹 >=k 인 788개는 0개.
+        #
+        # 영향 범위: proto_dev는 retrieval을 예측에 안 쓰므로 **예측·논문
+        #   수치에는 영향 없음.** 다만 train 기준 진단이 오염된다
+        #   (retrieval_label_purity 과대추정, neighbor_label_entropy 과소추정)
+        #   — 자기 라벨이 항상 이웃에 섞이기 때문.
+        #
+        # fallback은 유사도를 7곳에서 계산한다(확장그룹/전역 × 벡터화/루프).
+        # 각 지점에 마스킹을 흩뿌리면 또 하나가 빠지므로, 자기 슬롯을 한 번만
+        # 구해 공용 헬퍼로 적용한다.
+        _self_slot = None
+        if exclude_ids is not None:
+            _eq  = self.sample_ids[:n].unsqueeze(0) == exclude_ids.unsqueeze(1).to(dev)
+            _hit = _eq.any(dim=1)                                     # (B,)
+            _self_slot = torch.where(
+                _hit, _eq.float().argmax(dim=1),
+                torch.full((_eq.shape[0],), -1, dtype=torch.long, device=dev))
+
+        def _drop_self(sim, cand, rows):
+            """sim (M, C) 에서 rows 각 샘플의 자기 슬롯을 -inf 처리.
+
+            cand (M, C) 또는 (1, C) = 각 열이 가리키는 memory 슬롯 번호.
+            전역 검색이면 arange(n) 을 broadcast 하면 된다.
+            자기 자신이 메모리에 없으면(_self_slot = -1) 아무것도 지우지 않는다.
+            """
+            if _self_slot is None:
+                return sim
+            s = _self_slot[rows].reshape(-1, 1)                       # (M, 1)
+            return sim.masked_fill((cand == s) & (s >= 0), -1e9)
 
         # 결과 버퍼 (fallback 샘플은 zeros 유지)
         out_nk    = torch.zeros(B, k, D,          device=dev)
@@ -645,6 +740,15 @@ class MemoryBank(nn.Module):
             # 갱신). 아직 한 번도 갱신 안 됐거나 CPU 환경이면 __init__의
             # 폴백값(4096, 이것도 근거 없는 값)이 쓰임 — 이 경우는 문서화된
             # 한계로 남겨둠.
+            # ⚠ exclude_ids 를 csort 좌표계로 정렬한 값. 예전에는 아래 `if` 분기
+            #   (그룹이 임계 이하) 안에서만 만들었는데, `else`(tier 확장) 분기의
+            #   self-mask 도 이 값을 쓴다 — 임계를 넘는 순간 UnboundLocalError 로
+            #   죽었다. 두 분기 공통으로 올린다.
+            #   ⚠ tier 분기는 최대 그룹 크기 > _outlier_threshold(기본 4096)일 때만
+            #     도는데, 벤치마크 10개는 최대 2615라 한 번도 실행되지 않았다.
+            #     그래서 이 버그가 지금까지 드러나지 않았다.
+            ids_c_sorted = (exclude_ids[nm_idx].to(dev)[csort_idx]
+                            if exclude_ids is not None else None)
             _OUTLIER_THRESHOLD = self._outlier_threshold
 
             if local_max_g_raw <= _OUTLIER_THRESHOLD:
@@ -684,8 +788,6 @@ class MemoryBank(nn.Module):
                     # 동일한 convention)로 남겨 어떤 후보와도 매칭 안 되게 함. 이
                     # 자리는 결과 사용 시 i_final_u[group_id, rank]로 걸러지므로
                     # 어차피 안 쓰이지만, 방어적으로 sentinel 처리.
-                    ids_nm       = exclude_ids[nm_idx].to(dev)         # (Bn,)
-                    ids_c_sorted = ids_nm[csort_idx]                   # (Bn,)
                     Ids_pad = torch.full((U_pad, max_q), -1, dtype=ids_c_sorted.dtype, device=dev)
                     Ids_pad[group_id, rank] = ids_c_sorted
                     cand_ids_u = self.sample_ids[safe_u.reshape(-1)].view(U_pad, local_max_g)  # (U_pad, local_max_g)
@@ -755,6 +857,22 @@ class MemoryBank(nn.Module):
                     sim_t = sim_t.masked_fill(~valid_t.unsqueeze(1), -1e9)
 
                     k_eff_t = min(k, local_max_g_tier)
+                    # [버그 수정] tier 확장 경로에도 self-exclusion이 없었다.
+                    # [버그 수정] tier 확장 경로에도 self-exclusion이 없었다.
+                    # main 경로(위 Ids_pad 블록)와 **레이아웃이 같으므로**
+                    # (둘 다 [group, rank] 좌표계) 같은 방식으로 그대로 만든다.
+                    # ⚠ 이 경로는 credit-g에서 한 번도 실행되지 않아 실측
+                    #   검증을 못 했다. main 경로와 구조가 동일하다는 점에만
+                    #   근거한 수정이므로, tier가 실제로 도는 데이터셋에서
+                    #   self-retrieval 0건인지 확인할 것.
+                    if exclude_ids is not None:
+                        Ids_pad_t = torch.full((Ut_pad, max_q_tier), -1,
+                                                dtype=ids_c_sorted.dtype, device=dev)
+                        Ids_pad_t[local_gid, local_rank] = ids_c_sorted[sel_pos]
+                        cand_ids_t = self.sample_ids[safe_t.reshape(-1)].view(
+                            Ut_pad, local_max_g_tier)
+                        sim_t = sim_t.masked_fill(
+                            cand_ids_t.unsqueeze(1) == Ids_pad_t.unsqueeze(-1), -1e9)
                     _, top_t  = sim_t.topk(k_eff_t, dim=-1)
                     i_final_t = safe_t.unsqueeze(1).expand(-1, max_q_tier, -1).gather(2, top_t)
                     i_final_sel = i_final_t[local_gid, local_rank]      # (Bt, k_eff_t)
@@ -811,6 +929,7 @@ class MemoryBank(nn.Module):
                         ).squeeze(1)                                      # (Bs, max_eg)
                         sim_sel  = sim_sel.masked_fill(~valid_sel, -1e9)
 
+                        sim_sel = _drop_self(sim_sel, safe_sel, fb_idx[ext_idx])
                         _, top_sel   = sim_sel.topk(k_eff_ext, dim=-1)     # (Bs, k_eff_ext)
                         real_idx_sel = safe_sel.gather(1, top_sel).clamp(0, n - 1)
 
@@ -828,6 +947,7 @@ class MemoryBank(nn.Module):
                         k_eff_ss = min(k, n)
 
                         sim_all    = q_ss @ keys_all.T                     # (Bt, n)
+                        sim_all = _drop_self(sim_all, torch.arange(n, device=dev).unsqueeze(0), fb_idx[ss_idx])
                         _, idx_all = sim_all.topk(k_eff_ss, dim=-1)
                         idx_all    = idx_all.clamp(0, n - 1)
 
@@ -841,6 +961,7 @@ class MemoryBank(nn.Module):
                     keys_all  = self._keys_norm[:n]
                     k_eff_all = min(k, n)
                     sim_all    = q_fb @ keys_all.T                         # (Bf, n)
+                    sim_all = _drop_self(sim_all, torch.arange(n, device=dev).unsqueeze(0), fb_idx)
                     _, idx_all = sim_all.topk(k_eff_all, dim=-1)
                     idx_all    = idx_all.clamp(0, n - 1)
 
@@ -877,6 +998,7 @@ class MemoryBank(nn.Module):
                             # 그래도 부족하면 전체 검색
                             keys_all = self._keys_norm[:n]
                             sim_all  = q_e @ keys_all.T
+                            sim_all = _drop_self(sim_all, torch.arange(n, device=dev).unsqueeze(0), b_pos.reshape(1))
                             _, idx_all = sim_all.topk(min(k, n), dim=-1)
                             idx_all = idx_all.squeeze(0).clamp(0, n - 1)
                             out_nk[b_pos]     = keys_full[idx_all]
@@ -884,6 +1006,7 @@ class MemoryBank(nn.Module):
                             top_k_idx[b_pos]  = idx_all
                         else:
                             sim_e = q_e @ keys_e.T                           # (1, valid)
+                            sim_e = _drop_self(sim_e, si_e[vm_e].unsqueeze(0), b_pos.reshape(1))
                             _, top_e = sim_e.topk(min(k, keys_e.shape[0]), dim=-1)
                             real_idx = si_e[vm_e][top_e.squeeze(0)]          # (k,)
                             real_idx = real_idx.clamp(0, n - 1)
@@ -901,6 +1024,7 @@ class MemoryBank(nn.Module):
                         q_s   = q_fb[i:i+1]
                         keys_all = self._keys_norm[:n]
                         sim_all  = q_s @ keys_all.T
+                        sim_all = _drop_self(sim_all, torch.arange(n, device=dev).unsqueeze(0), b_pos.reshape(1))
                         _, idx_all = sim_all.topk(min(k, n), dim=-1)
                         idx_all = idx_all.squeeze(0).clamp(0, n - 1)
                         out_nk[b_pos]     = keys_full[idx_all]
@@ -913,6 +1037,7 @@ class MemoryBank(nn.Module):
                     b_pos = fb_idx[i]
                     q_s   = q_fb[i:i+1]
                     sim_all = q_s @ keys_all.T
+                    sim_all = _drop_self(sim_all, torch.arange(n, device=dev).unsqueeze(0), b_pos.reshape(1))
                     _, idx_all = sim_all.topk(min(k, n), dim=-1)
                     idx_all = idx_all.squeeze(0).clamp(0, n - 1)
                     out_nk[b_pos]     = keys_full[idx_all]
@@ -1282,6 +1407,7 @@ class TabERA(nn.Module):
         plr_n_frequencies: int = 16,
         plr_freq_scale: float = 0.01,
         plr_out_dim: int = 8,
+        freeze_centroid_after: "int | None" = None,   # [조건 F] prototypes.py 참고
         regroup_warmup_epochs: int = 0,   # [추가] CentroidLayer로 배선 — 지금까지는
                                             # 이 값이 TabERA 생성자에 아예 없어서
                                             # CentroidLayer 자체 기본값(0=즉시 활성화)이
@@ -1314,16 +1440,11 @@ class TabERA(nn.Module):
         #     λ를 detach 스위치로 겸용하면 이 검증을 잃는다.
         residual_vq: bool = False,           # [v3] 2단계 residual 양자화
         residual_vq_size: Optional[int] = None,   # P2. None이면 P1과 동일
-        nbr_lambda: float = 0.005,           # [v3 확정] L_nbr 가중치.
+        nbr_lambda: float = 0.0,             # [2026-08] 기본 0 — L_nbr 제거.
                                              # raw feature 이웃 구조를 encoder에 보존.
                                              # acc 7/9 개선(p=0.039), 순위 13→7위.
                                              # ⚠ prototype 전용 효과다 —
                                              # query_only_linear에서는 +0.002로 사라진다.
-        nbr_k: int = 10,                     # raw feature kNN에서 positive 후보 수
-        nbr_tau: float = 0.1,                # InfoNCE 온도
-        nbr_neg_margin: int = 50,            # negative에서 제외할 raw 이웃 수
-                                             # (raw 거리 상위 이만큼은 negative로 안 씀)
-                                             # 0이면 완전히 꺼짐(기본값 = v2 동작)
         retr_proj_mode: str = "none",
         detach_retr_grad: bool = False,
         disable_retrieval_branch: bool = False,  # [2026-07, 추가] "진짜"
@@ -1436,7 +1557,7 @@ class TabERA(nn.Module):
         if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate",
                                "context_gated_beta", "proto_residual",
                                "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
                                "proto_residual_query"):
             raise ValueError(f"fusion_mode은 'concat'/'residual'/'gated_sum'/'anchor_gate'/'context_gated_beta' 중 하나여야 합니다: {fusion_mode}")
         if fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") and not use_query_emb_in_head:
@@ -1494,9 +1615,11 @@ class TabERA(nn.Module):
                 dead_reinit_noise_scale=dead_reinit_noise_scale,
             )
         self.nbr_lambda        = nbr_lambda
-        self.nbr_k             = nbr_k
-        self.nbr_tau           = nbr_tau
-        self.nbr_neg_margin    = nbr_neg_margin
+        # ⚠ 생성자 인자가 아니라 모듈 상수다(위 NBR_* 참고). 튜닝 대상이 아니며
+        #   checkpoint 재현 시에도 코드 값이 그대로 쓰인다.
+        self.nbr_k             = NBR_K
+        self.nbr_tau           = NBR_TAU
+        self.nbr_neg_margin    = NBR_NEG_MARGIN
         # raw feature kNN graph — set_nbr_graph()로 학습 전에 주입한다.
         # ⚠ register_buffer를 쓰지 않는다: state_dict에 들어가면
         #   --from_saved_state(strict=True)가 구버전 체크포인트에서 깨진다.
@@ -1549,6 +1672,7 @@ class TabERA(nn.Module):
             col_names=column_names,
             routing_scale=routing_scale,
             regroup_warmup_epochs=regroup_warmup_epochs,
+            freeze_centroid_after=freeze_centroid_after,
             dead_reinit_patience=dead_reinit_patience,
             dead_reinit_noise_scale=dead_reinit_noise_scale,
             use_ema_codebook=use_ema_codebook,
@@ -1572,7 +1696,20 @@ class TabERA(nn.Module):
             )
         self.aggregator_mode = aggregator_mode
 
-        if aggregator_mode == "pooling":
+        # ── [2026-08] agg 를 안 쓰는 fusion_mode 에서는 aggregator 를 만들지 않는다
+        # forward 가 NO_AGG_FUSION_MODES 에서 `agg_emb = zeros` 로 건너뛰므로
+        # 이 모듈은 **호출되지도, gradient 를 받지도 않는다.** 그런데 생성은
+        # 됐고 optimizer 에도 들어가 있었다:
+        #     ds=31 (embed 64)   16,640 / 165,257   10.1%
+        #     ds=54 (embed 256) 263,680 / 939,693   28.1%
+        # 결과에는 영향이 없지만(forward 에 없음) 메모리·checkpoint 용량을
+        # 차지하고, 논문에 파라미터 수를 쓸 때 부풀린다.
+        # ⚠ 같은 상수(NO_AGG_FUSION_MODES)를 본다 — 판정이 두 벌이면 forward 는
+        #   건너뛰는데 생성은 되는 상태가 조용히 생긴다.
+        if fusion_mode in NO_AGG_FUSION_MODES:
+            self.ot_selector = None
+            self.head_cross_attn = None
+        elif aggregator_mode == "pooling":
             self.ot_selector = AttentionAggregator(
                 embed_dim=embed_dim,
                 k=k,
@@ -1811,6 +1948,19 @@ class TabERA(nn.Module):
                 # neighbor evidence는 보조 역할이어야 한다.
                 self.dev_gamma_raw = nn.Parameter(torch.tensor([-2.944]))  # σ≈0.05
                 self.head = None
+            elif fusion_mode == "proto_dev_vec":
+                # ── β를 스칼라가 아니라 **차원별 벡터**로 ──────────────
+                # proto_dev는 residual의 모든 방향에 같은 배율을 준다.
+                # 그런데 q−c 안에는 순위에 유용한 방향과 잡음 방향이 섞여
+                # 있을 수 있다. 차원별 β가 그걸 가려낼 수 있는지 본다.
+                #
+                # ⚠ 추가 파라미터는 D개뿐이다(prototype별 행렬 A_p는 P·D·D).
+                #   β가 사실상 상수로 수렴하면 A_p도 무의미하다는 근거가 되고,
+                #   특정 차원만 살아남으면 그때 A_p를 고민하면 된다.
+                self.dev_head = nn.Linear(embed_dim, n_output)
+                self.dev_beta_raw = nn.Parameter(
+                    torch.full((embed_dim,), -2.197))   # σ≈0.1
+                self.head = None
             elif fusion_mode == "proto_dev":
                 # ── h = c + β·normalize(q − c),  logits = W·h ──────────
                 # ⚠ W를 **공유**한다. E 조건(W_c·c + λ·W_q·q)은 두 행렬이
@@ -2020,7 +2170,7 @@ class TabERA(nn.Module):
             #   log_branch_gradients)은 이 모드에서 의미가 없고, 대신
             #   logit decomposition(pr_* 지표)이 직접적인 ground truth다.
             if fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
                                "proto_residual_query"):
                 self._head_first_linear = None
             else:
@@ -2283,6 +2433,15 @@ class TabERA(nn.Module):
         # attention/memory-fallback 분기에서 out dict 구성 시 NameError
         # 방지, 그리고 아래에서 채운 값을 뒤에서 다시 None으로 덮는 순서
         # 버그 재발 방지).
+        # ── 검색 슬롯 유효성 마스크 ────────────────────────────────
+        # ⚠ 이건 설명용 편의값이 아니라 **retrieval 상태의 일부**다.
+        #   그룹 크기 < k 등으로 채우지 못한 슬롯은 nk가 정확히 zeros이고
+        #   topk_idx는 0으로 남는다. 그런데 0은 실재하는 메모리 슬롯 번호라,
+        #   forward 밖에서는 "0번 이웃"과 "빈 자리"를 구분할 방법이 없다 —
+        #   유일하게 외부 복원이 불가능한 정보라서 여기서 내보낸다.
+        #   (유사도·라벨·raw feature는 topk_idx와 memory만 있으면 전부
+        #    복원되므로 forward가 만들지 않는다 — libs/diagnostics.py 참고.)
+        _neighbor_mask = None     # (B, k) bool
         _similarity_top1_per_sample = None
         _similarity_bottomk_per_sample = None
         _similarity_margin_per_sample = None
@@ -2304,6 +2463,12 @@ class TabERA(nn.Module):
                 hard_assignment=(None if self.global_retrieve else hard_assignment),
                 exclude_ids=(sample_ids if self.exclude_self_retrieval else None),
             )
+
+            # ⚠ ablation_mode(neighbor_shuffle/neighbor_noise)가 nk를 바꾸기
+            #   **전에** 잰다. shuffle은 nk/labels만 섞고 topk_idx는 안 섞기
+            #   때문에, 뒤에서 재면 마스크와 인덱스가 서로 다른 이웃을 가리킨다.
+            with torch.no_grad():
+                _neighbor_mask = nk.detach().norm(dim=-1) > 1e-8         # (B, k)
 
             # [진단용, 추가] self-retrieval 검증 — MemoryBank는 epoch를 넘어
             # 유지되는 circular buffer라, retrieve()가 이번 배치 자기 자신을
@@ -2377,13 +2542,9 @@ class TabERA(nn.Module):
             #     neighbors → Aggregator → evidence representation → LLM
             # 그 위치에서는 prediction과 무관하므로 shortcut 문제가 없고,
             # 평가 축도 explanation quality가 된다.
-            _V2_NO_AGG = self.fusion_mode in (
-                "proto_only", "proto_only_linear",
-                "query_only_linear", "proto_residual_query",
-                # ⚠ proto_dev는 agg를 쓰지 않으므로 여기 포함.
-                #   proto_dev_agg는 **제외** — 그 모드가 agg_emb를 쓴다.
-                "proto_dev",
-            )
+            # [Level 2] 목록은 모듈 상단 NO_AGG_FUSION_MODES 한 곳에만 둔다
+            # — 설명 블록도 같은 상수를 본다(정의가 두 벌이면 조용히 어긋남).
+            _V2_NO_AGG = self.fusion_mode in NO_AGG_FUSION_MODES
             if _V2_NO_AGG:
                 # agg_emb를 만들지 않는다. 아래 fusion 코드가 참조하지 않도록
                 # zeros로 두되(shape 호환), head 입력에는 들어가지 않는다
@@ -2439,6 +2600,11 @@ class TabERA(nn.Module):
             agg_emb    = torch.zeros_like(query_emb)
             evidence_w = torch.full((X.shape[0], self.k), 1.0 / self.k, device=X.device)
             topk_idx   = torch.zeros(X.shape[0], self.k, dtype=torch.long, device=X.device)
+            # ⚠ 진짜 검색이 아니므로 전부 무효다. None으로 두면 forward 밖에서
+            #   "마스크가 없으니 전부 유효"로 읽혀 존재하지 않는 이웃 k개가
+            #   설명에 등장한다.
+            _neighbor_mask = torch.zeros(X.shape[0], self.k, dtype=torch.bool,
+                                          device=X.device)
             # [추가] fallback 경로는 진짜 검색이 아니라 균등분포를 그냥
             # 채운 것이라 query/key norm·distance 자체가 없음 — None으로
             # 표시해 supervised.py가 이 배치를 통계에서 자연스럽게 제외
@@ -2739,7 +2905,7 @@ class TabERA(nn.Module):
                     _head_gate_entropy_mean = float(_be.mean().item())
                     _agg_beta_per_sample = _beta_d.clone()
             elif self.fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_agg",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
                                "proto_residual_query"):
                 # 이 모드는 combined를 쓰지 않는다(z_proto + Δz로 직접 계산).
                 combined = _parts[0]
@@ -2808,6 +2974,48 @@ class TabERA(nn.Module):
                             _pr_diag["dev_acc_full"] - _pr_diag["dev_acc_c"])
                         _pr_diag["dev_delta_acc_agg"] = (
                             _pr_diag["dev_acc_full"] - _pr_diag["dev_acc_q"])
+                    _proto_residual_diag = _pr_diag
+                    _dev_logits_c = _lg_c
+            elif self.fusion_mode == "proto_dev_vec":
+                _beta = torch.sigmoid(self.dev_beta_raw)          # (D,)
+                _dev = query_emb - context_emb
+                _dev_n = F.normalize(_dev, dim=-1)
+                _h = context_emb + _beta * _dev_n                 # 차원별 곱
+                logits = self.dev_head(_h)
+                with torch.no_grad():
+                    _lg_c = self.dev_head(context_emb)
+                    _b = _beta.detach()
+                    _pr_diag = {
+                        "dev_beta": float(_b.mean()),
+                        # ⚠ 핵심 판정 지표. β가 상수로 수렴하면
+                        #   (std/mean이 작으면) 방향 가중이 무의미하다는 뜻이고,
+                        #   그러면 A_p 같은 고표현력 확장도 기대할 게 없다.
+                        "dev_beta_std": float(_b.std()),
+                        "dev_beta_cv": float(_b.std() / _b.mean().clamp_min(1e-8)),
+                        "dev_beta_min": float(_b.min()),
+                        "dev_beta_max": float(_b.max()),
+                        # 상위 10% 차원이 전체 크기의 몇 %를 차지하는가
+                        "dev_beta_top10_share": float(
+                            _b.topk(max(1, _b.numel() // 10)).values.sum()
+                            / _b.sum().clamp_min(1e-8)),
+                        "dev_residual_ratio": float(
+                            (_beta * _dev_n).norm(dim=-1).mean()
+                            / context_emb.norm(dim=-1).mean().clamp_min(1e-8)),
+                        "dev_raw_norm": float(_dev.norm(dim=-1).mean()),
+                        "dev_unique_logits": float(
+                            len(torch.unique(logits.round(decimals=4), dim=0))),
+                        "dev_changed_rate": float(
+                            (self._hard_pred(logits)
+                             != self._hard_pred(_lg_c)).float().mean()),
+                    }
+                    if labels is not None and self.tasktype != "regression":
+                        _yl = labels.long()
+                        _pr_diag["dev_acc_c"] = float(
+                            (self._hard_pred(_lg_c) == _yl).float().mean())
+                        _pr_diag["dev_acc_full"] = float(
+                            (self._hard_pred(logits) == _yl).float().mean())
+                        _pr_diag["dev_delta_acc"] = (
+                            _pr_diag["dev_acc_full"] - _pr_diag["dev_acc_c"])
                     _proto_residual_diag = _pr_diag
                     _dev_logits_c = _lg_c
             elif self.fusion_mode == "proto_dev":
@@ -3127,10 +3335,24 @@ class TabERA(nn.Module):
                         _pr_diag["pr_final_acc"] = float(_fc.float().mean())
                         _pr_diag["pr_fixed_rate"] = float((~_pc & _fc).float().mean())
                         _pr_diag["pr_broke_rate"] = float((_pc & ~_fc).float().mean())
-                        _tgt = (F.one_hot(labels, z_proto.shape[-1]).float()
-                                - torch.softmax(z_proto, dim=-1))
-                        _pr_diag["pr_delta_align"] = float(
-                            F.cosine_similarity(delta_z, _tgt, dim=-1).mean())
+                        # [수정, 기존 버그] 두 가지가 겹쳐 있었다.
+                        #   (1) labels가 float다(binclass는 data.py에서 float으로 저장되고
+                        #       supervised.py도 그대로 넘긴다) → one_hot이 LongTensor를
+                        #       요구해 RuntimeError. 바로 위 두 줄은 이미 labels.long()을
+                        #       쓰고 있어서 여기만 빠져 있었다.
+                        #   (2) 그런데 .long()만 붙여도 binclass에서는 여전히 깨진다 —
+                        #       n_output=1이라 z_proto가 (B,1)이고, one_hot(1, num_classes=1)은
+                        #       범위 초과이며 softmax((B,1))은 항상 1.0이라 _tgt 자체가 무의미.
+                        #       §9-④("이진 분류에서 argmax가 항상 0")와 같은 유형이다.
+                        # → multiclass에서만 계산하고 나머지는 nan으로 둔다(0으로 채우면
+                        #   "정합도 0"이라는 실제 측정값으로 오독된다).
+                        if self.tasktype == "multiclass":
+                            _tgt = (F.one_hot(labels.long(), z_proto.shape[-1]).float()
+                                    - torch.softmax(z_proto, dim=-1))
+                            _pr_diag["pr_delta_align"] = float(
+                                F.cosine_similarity(delta_z, _tgt, dim=-1).mean())
+                        else:
+                            _pr_diag["pr_delta_align"] = float("nan")
                     _proto_residual_diag = _pr_diag
             elif self.fusion_mode == "proto_residual":
                 # ── [V2] z = z_proto(context) + Δz(query→neighbors) ────────
@@ -3231,10 +3453,24 @@ class TabERA(nn.Module):
                             # ③ 방향 정합도 — ‖Δz‖(크기)보다 중요하다.
                             #   목표 방향 = onehot(y) − softmax(z_proto)
                             #   +1에 가까울수록 옳은 방향, 음수면 반대로 밀고 있음.
-                            _tgt = (F.one_hot(labels, z_proto.shape[-1]).float()
-                                    - torch.softmax(z_proto, dim=-1))
-                            _pr_diag["pr_delta_align"] = float(
-                                F.cosine_similarity(delta_z, _tgt, dim=-1).mean())
+                            # [수정, 기존 버그] 두 가지가 겹쳐 있었다.
+                            #   (1) labels가 float다(binclass는 data.py에서 float으로 저장되고
+                            #       supervised.py도 그대로 넘긴다) → one_hot이 LongTensor를
+                            #       요구해 RuntimeError. 바로 위 두 줄은 이미 labels.long()을
+                            #       쓰고 있어서 여기만 빠져 있었다.
+                            #   (2) 그런데 .long()만 붙여도 binclass에서는 여전히 깨진다 —
+                            #       n_output=1이라 z_proto가 (B,1)이고, one_hot(1, num_classes=1)은
+                            #       범위 초과이며 softmax((B,1))은 항상 1.0이라 _tgt 자체가 무의미.
+                            #       §9-④("이진 분류에서 argmax가 항상 0")와 같은 유형이다.
+                            # → multiclass에서만 계산하고 나머지는 nan으로 둔다(0으로 채우면
+                            #   "정합도 0"이라는 실제 측정값으로 오독된다).
+                            if self.tasktype == "multiclass":
+                                _tgt = (F.one_hot(labels.long(), z_proto.shape[-1]).float()
+                                        - torch.softmax(z_proto, dim=-1))
+                                _pr_diag["pr_delta_align"] = float(
+                                    F.cosine_similarity(delta_z, _tgt, dim=-1).mean())
+                            else:
+                                _pr_diag["pr_delta_align"] = float("nan")
                         _proto_residual_diag = _pr_diag
             else:
                 logits = self.head(combined)
@@ -3453,6 +3689,10 @@ class TabERA(nn.Module):
             "evidence_w":  evidence_w,
             "evidence_diag": evidence_diag,
             "topk_idx":    topk_idx,
+            # (B, k) bool — topk_idx의 각 슬롯이 실제 검색 결과인지.
+            # 위 정의 지점의 주석 참고. 유사도/라벨/raw feature는 여기 없다
+            # (topk_idx + memory로 외부 복원 가능 — libs/diagnostics.py).
+            "neighbor_mask": _neighbor_mask,
             "agg_emb":     agg_emb,
             # [추가, 진단용] linear probe(query_emb/context_emb/agg_emb 각각에 별도
             # 선형 분류기를 붙여 "정보가 없어서 head가 무시하는가(A) vs 정보는
@@ -3556,29 +3796,73 @@ class TabERA(nn.Module):
                     dim=-1)                                                # (B, P)
 
             proto_exp = self.prototype_layer.explain_routing(hard_assignment, soft_probs, cos_sim=cos_sim)
+            # ⚠ [2026-08] agg 를 안 쓰는 fusion_mode 에서는 aggregator 자체를
+            #   만들지 않는다(위 NO_AGG_FUSION_MODES 분기). 그러면 여기서
+            #   None.explain_evidence() 로 터진다 — aggregator_mode 만 보고
+            #   판정하면 안 되고 실제 존재 여부를 봐야 한다.
+            #   agg 가 없으면 evidence 설명도 없다(빈 dict).
+            _agg_mod = (self.ot_selector if self.aggregator_mode == "pooling"
+                        else self.head_cross_attn)
             ev_exp    = (
-                self.ot_selector.explain_evidence(evidence_w)
-                if self.aggregator_mode == "pooling"
-                else self.head_cross_attn.explain_evidence(evidence_w)
+                _agg_mod.explain_evidence(evidence_w)
+                if _agg_mod is not None else [{} for _ in range(query_emb.size(0))]
             )
 
-            # Retrieval signal magnitude (Integration).
+            # Representation magnitude.
             # 주의: "기여도(contribution)"라고 부르지 않는다 — head가
             # Head(q+βa) 같은 비선형 함수라 ‖βa‖가 prediction에 미치는
             # 영향과 정확히 비례한다는 보장이 없다(evidence_w의 이전
             # "기여도" 명명 정정과 같은 이유). 여기서 주는 건 순수하게
-            # "retrieval representation이 query 대비 얼마나 큰 신호였는가"
-            # 라는 magnitude 정보이지, causal attribution이 아니다.
+            # "이 표현이 query 대비 얼마나 큰 신호였는가"라는 magnitude
+            # 정보이지, causal attribution이 아니다.
+            #
+            # [Level 2 수정] 이전에는 β를 getattr(self, "fusion_beta")로
+            # 읽었다. fusion_beta는 fusion_mode="residual"(v1) 전용이라
+            # proto_dev에서는 아예 존재하지 않는 속성이고, 그래서 β가 항상
+            # None으로 출력됐다 — proto_dev에도 β(=σ(dev_beta_raw))가 분명히
+            # 있는데도 설명에는 "N/A"만 나왔다는 뜻이다. 모드에 맞는
+            # 파라미터를 읽도록 고친다. 계산식은 forward의 proto_dev 분기와
+            # 글자 그대로 같다(σ(dev_beta_raw)) — 설명과 실제가 어긋나지
+            # 않도록 별도 근사식을 쓰지 않는다.
             with torch.no_grad():
-                _beta_val = getattr(self, "fusion_beta", None)
-                _beta_scalar = float(_beta_val.detach().item()) if _beta_val is not None else None
+                _beta_source = None
+                if (self.fusion_mode in PROTO_DEV_FUSION_MODES
+                        and getattr(self, "dev_beta_raw", None) is not None):
+                    _b_t = torch.sigmoid(self.dev_beta_raw.detach())
+                    # proto_dev_vec은 β가 (D,) 벡터다. 스칼라 한 개로
+                    # 요약할 때 그 사실을 이름에 남긴다 — 안 그러면
+                    # "β=0.24"가 스칼라 β인지 차원별 평균인지 알 수 없다.
+                    _beta_scalar = float(_b_t.mean())
+                    _beta_source = ("dev_beta_raw" if _b_t.numel() == 1
+                                    else "dev_beta_raw (mean of %d dims)" % _b_t.numel())
+                elif getattr(self, "fusion_beta", None) is not None:
+                    _beta_scalar = float(self.fusion_beta.detach().mean())
+                    _beta_source = "fusion_beta"
+                else:
+                    _beta_scalar = None
+
+                # ⚠ agg_emb는 NO_AGG_FUSION_MODES와 memory 미충족 fallback에서
+                #   zeros다. 그래서 agg_norm=0.0이 "retrieval 신호가 약했다"로
+                #   읽히는 오독이 있었다. 다만 키의 계약(float)은 유지한다 —
+                #   None으로 바꾸면 이 값을 float으로 가정하는 하위 코드가
+                #   깨진다. 대신 agg_available 플래그를 추가해 0.0의 의미를
+                #   구분한다: False면 "약한 신호"가 아니라 "만들지 않은 값"이다.
+                _agg_available = bool(
+                    self.fusion_mode not in NO_AGG_FUSION_MODES
+                    and agg_emb is not None
+                    and _neighbor_mask is not None      # 검색이 실제로 돌았는가
+                )
                 _query_norm_ps = query_emb.detach().norm(dim=-1).cpu().numpy()
-                _agg_norm_ps   = agg_emb.detach().norm(dim=-1).cpu().numpy() if agg_emb is not None else None
+                _agg_norm_ps   = (agg_emb.detach().norm(dim=-1).cpu().numpy()
+                                  if agg_emb is not None else None)
             signal_exp = [
                 {
                     "query_norm": float(_query_norm_ps[b]),
                     "agg_norm": (float(_agg_norm_ps[b]) if _agg_norm_ps is not None else None),
-                    "beta": _beta_scalar,  # fusion_mode != "residual"면 None
+                    # [추가] agg_norm=0.0의 의미 구분. 기존 키는 그대로 둔다.
+                    "agg_available": _agg_available,
+                    "beta": _beta_scalar,
+                    "beta_source": _beta_source,
                 }
                 for b in range(X.shape[0])
             ]
@@ -3588,6 +3872,10 @@ class TabERA(nn.Module):
                     "prototype": proto_exp[b],
                     "evidence":  ev_exp[b],
                     "retrieval_signal": signal_exp[b],
+                    # ⚠ 이웃 목록 / 지역 라벨 증거 / 편차 분해 / 그룹 대비는
+                    #   여기서 만들지 않는다. forward는 예측 상태만 내보내고,
+                    #   해석은 libs/diagnostics.py가 out을 관찰해 재구성한다.
+                    #   (동일성은 verify_equivalence.py로 확인 — 최대 오차 3e-08)
                 }
                 for b in range(X.shape[0])
             ]
@@ -3698,8 +3986,8 @@ class TabERA(nn.Module):
                  f"  head LayerNorm : {'블록별(query/context/agg 따로)' if self._per_branch_ln else '결합(하나로 묶어서, 기존 방식)'}",
                  f"  head fusion    : {'concat([q‖c‖a] → MLP, 기존 방식)' if self.fusion_mode == 'concat' else (f'residual(z=LN(q)+α·LN(c)+β·LN(a) → MLP, α/β 학습됨)' if self.fusion_mode == 'residual' else (f'gated_sum(h=Σ g_i·LN(branch_i), g=softmax(MLP([q,c,a])) 샘플별 학습됨)' if self.fusion_mode == 'gated_sum' else (f'anchor_gate(h=LN(q)+σ(MLP([q,a]))·LN(a), query anchor 고정+agg만 sigmoid gate)' if self.fusion_mode == 'anchor_gate' else f'context_gated_beta(h=LN(q)+β(context)·LN(a), β=σ(MLP(LN(context))), gate가 agg 내용은 안 보고 centroid 지역만 봄)')))}",
                  f"  branch L2norm  : {'ON (v1.1, concat 전 branch별 unit-L2-norm)' if getattr(self, 'head_branch_l2norm', False) else 'OFF (기존과 동일)'}",
-                 f"  neighbor mixing: {(self.ot_selector.neighbor_interaction_mode or 'OFF (v1 그대로, pooling 전 이웃 상호작용 없음)') if self.aggregator_mode == 'pooling' else 'N/A (aggregator_mode=cross_attention — pooling 자체가 없음)'}",
-                 f"  aggregator     : {'pooling(AttentionAggregator, 고정 weighted-sum)' if self.aggregator_mode == 'pooling' else f'cross_attention(HeadCrossAttention, n_heads=1, alpha={self.head_cross_attn.alpha.detach().item():.3f}, neighbor_source={self.head_cross_attn.neighbor_source})'}" ]
+                 f"  neighbor mixing: {'N/A (이 fusion_mode 는 aggregator 를 만들지 않음)' if self.ot_selector is None and self.head_cross_attn is None else ((self.ot_selector.neighbor_interaction_mode or 'OFF (v1 그대로, pooling 전 이웃 상호작용 없음)') if self.aggregator_mode == 'pooling' else 'N/A (aggregator_mode=cross_attention — pooling 자체가 없음)')}",
+                 f"  aggregator     : {'없음 (NO_AGG_FUSION_MODES — 생성하지 않음)' if self.ot_selector is None and self.head_cross_attn is None else ('pooling(AttentionAggregator, 고정 weighted-sum)' if self.aggregator_mode == 'pooling' else f'cross_attention(HeadCrossAttention, n_heads=1, alpha={self.head_cross_attn.alpha.detach().item():.3f}, neighbor_source={self.head_cross_attn.neighbor_source})')}" ]
 
         # [Limitation 진단] k가 평균 그룹 크기(N_train/P)보다 크면
         # cross-group fallback이 상시 발동할 위험이 있음 — 4개 데이터셋
