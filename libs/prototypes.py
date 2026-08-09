@@ -394,6 +394,7 @@ class CentroidLayer(nn.Module):
         n_features: int = 0,
         prototype_labels: Optional[List[str]] = None,
         regroup_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
+        freeze_centroid_after: "int | None" = None,   # 아래 설명 참고
         dead_reinit_patience: int = 5,    # 5회 연속 dead면 재초기화 — [주의] 문헌
                                             # (Jukebox/SoundStream/NSVQ)이 실제로 쓰는
                                             # 기준은 "연속 N epoch"이 아니라 "사용률이
@@ -425,6 +426,26 @@ class CentroidLayer(nn.Module):
         self.D                 = embed_dim
         self.F                 = n_features
         self.regroup_warmup_epochs = regroup_warmup_epochs
+        # ── [조건 F] centroid 갱신 정지 ────────────────────────────────
+        # 이 에폭 이후로 centroid_emb 를 어떤 경로로도 움직이지 않는다.
+        #     · gradient (codebook_loss)      requires_grad_(False)
+        #     · EMA                            ema_update() 조기 반환
+        #     · dead reinit                    regroup_update() 에서 건너뜀
+        #
+        # ⚠ 세 경로를 다 막아야 한다. dead centroid 재초기화도 "갱신" 이므로
+        #   하나라도 남으면 static 조건이 아니게 된다.
+        #
+        # ⚠ **초기값 고정(freeze_centroid_after=0)이 아니다.** 0 으로 두면
+        #   KMeans++ 초기 partition 을 끝까지 쓰는 것이고, 그건
+        #   "centroid 가 필요한가" 가 아니라 "무작위 partition 으로 충분한가" 를
+        #   묻는 실험이 된다. warmup 이후 값(이미 형성된 conditional
+        #   partition)을 고정해야 질문이 성립한다.
+        #
+        # ⚠ assignment step(regroup_update 의 재배정)은 계속 돈다.
+        #   encoder 가 움직이면 멤버십은 따라 바뀌고 centroid 만 멈춘다.
+        #   그래야 "update step 이 필요한가" 만 남는다.
+        self.freeze_centroid_after = freeze_centroid_after
+        self._centroid_frozen = False
         self.dead_reinit_patience  = dead_reinit_patience
         self.dead_reinit_noise_scale = dead_reinit_noise_scale
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
@@ -666,6 +687,9 @@ class CentroidLayer(nn.Module):
         자체도 @torch.no_grad()라 어차피 gradient는 안 생기지만, 명시적으로
         detach된 텐서를 넘기는 게 호출부의 의도를 명확히 함.
         """
+        # [조건 F] centroid 정지 시 EMA 갱신도 막는다.
+        if getattr(self, "_centroid_frozen", False):
+            return
         if not self.use_ema_codebook:
             return
         P = self.P
@@ -691,6 +715,16 @@ class CentroidLayer(nn.Module):
     # ─────────────────────────────────────────────────────────
 
     @torch.no_grad()
+    def maybe_freeze_centroid(self, epoch: int) -> bool:
+        """freeze_centroid_after 에 도달하면 centroid 를 완전히 정지시킨다."""
+        if self.freeze_centroid_after is None or self._centroid_frozen:
+            return self._centroid_frozen
+        if int(epoch) < int(self.freeze_centroid_after):
+            return False
+        self.centroid_emb.requires_grad_(False)
+        self._centroid_frozen = True
+        return True
+
     def regroup_update(
         self,
         X_emb: torch.Tensor,        # (N, D) 전체 훈련 임베딩 — assignment 계산용
@@ -736,6 +770,11 @@ class CentroidLayer(nn.Module):
         # current_epoch을 먼저 증가시킨 뒤 warmup 여부를 판단 — 조기 반환
         # 되더라도 카운터는 정상적으로 흘러가서 warmup 기간이 실제로 끝난다.
         self.current_epoch += 1
+        # [조건 F] 지정 에폭에 도달하면 centroid 를 정지시킨다.
+        # ⚠ 여기서 호출하는 이유: regroup_update 는 매 에폭 정확히 한 번
+        #   불리고 current_epoch 을 관리하는 유일한 지점이다. 학습 루프에
+        #   별도 호출을 넣으면 두 곳이 epoch 을 세게 되어 어긋난다.
+        self.maybe_freeze_centroid(epoch)
         in_warmup = epoch < self.regroup_warmup_epochs
 
         if assignments is None:
@@ -822,6 +861,9 @@ class CentroidLayer(nn.Module):
                             - self.centroid_emb.data[p]
                         )))
                         _reinit_mask_now[p] = True
+                        # [조건 F] 재초기화도 갱신이므로 정지 시 건너뛴다.
+                        if getattr(self, "_centroid_frozen", False):
+                            continue
                         self.centroid_emb.data[p] = new_vec.to(self.centroid_emb.dtype)
                         self.dead_streak[p] = 0
                         n_reinit += 1
