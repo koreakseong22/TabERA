@@ -96,7 +96,7 @@ parser.add_argument("--fusion_mode", type=str, default="proto_dev",
                     choices=["concat", "residual", "gated_sum", "anchor_gate",
                              "context_gated_beta", "proto_residual",
                              "proto_query_residual", "proto_only", "proto_only_linear",
-                             "query_only_linear", "proto_dev", "proto_dev_agg", "proto_residual_query"],
+                             "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg", "proto_residual_query", "proto_dev_retr"],
                     help=(
                         "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
                         "폭넓은 비교 실험(6개 데이터셋)에서도 concat 대비 일관된 우위를 "
@@ -129,14 +129,7 @@ parser.add_argument("--gradient_codebook", action="store_true",
                           "[v3 이전 기본값] 지금은 EMA 가 기본이므로 이 플래그로 "
                           "옛 동작을 재현합니다. A/O 비교 결과: 예측은 동등하고"
                           "(5 데이터셋 × 5 seed, 전 지표 p>0.4) centroid drift 만 "
-                          "gradient 쪽이 크다(끝/최대 11~45% vs 1~16%)."))
-parser.add_argument("--ema_codebook", action="store_true",
-                    help=("[더 이상 필요 없음 — EMA 가 기본] 하위호환용. "
-                          "EMA 로 한다. centroid_emb 가 optimizer 대상에서 빠지고, "
-                          "매 배치 배정된 query 의 이동평균으로 직접 갱신된다. "
-                          "⚠ reproduce.py 와 반드시 같아야 한다 — HPO 를 gradient "
-                          "조건에서 하고 재현만 EMA 로 하면 서로 다른 아키텍처를 "
-                          "기준으로 최적화한 셈이 된다."))
+                          "gradient 쪽이 크다(끝/최대 11~45%% vs 1~16%%)."))
 parser.add_argument("--disable_dead_reinit", action="store_true",
                     help=("죽은 centroid 재초기화를 끈다. ⚠ A(gradient) vs O(EMA) "
                           "비교에서는 **양쪽 다 꺼야 한다.** 재초기화는 centroid "
