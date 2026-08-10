@@ -58,21 +58,35 @@ NO_AGG_FUSION_MODES = (
     # ⚠ proto_dev는 agg를 쓰지 않으므로 여기 포함.
     #   proto_dev_agg는 **제외** — 그 모드가 agg_emb를 쓴다.
     "proto_dev", "proto_dev_vec",
+    # proto_dev_retr builds its own neighbour summary from topk_idx and never
+    # touches agg_emb, so the aggregator is not needed here either.
+    "proto_dev_retr",
 )
 
 # proto_dev 계열(σ(dev_beta_raw)를 β로 쓰는 모드)
-PROTO_DEV_FUSION_MODES = ("proto_dev", "proto_dev_vec", "proto_dev_agg")
+# Sharpening constant for the retrieval weights in proto_dev_retr. Fixed
+# rather than tuned: k is already small, so this only decides how much the
+# nearest neighbour dominates the summary.
+RETR_WEIGHT_SCALE = 10.0
+
+PROTO_DEV_FUSION_MODES = ("proto_dev", "proto_dev_vec", "proto_dev_agg",
+                          "proto_dev_retr")
 
 # 예전 체크포인트의 model_kwargs 에는 아래 셋이 인자로 들어 있다. 상수로
 # 내리면서 생성자에서 제거했으므로 그대로 넘기면 TypeError 가 난다.
 # 로드 쪽에서 걷어내도록 헬퍼를 둔다 — 값은 어차피 기본값(10/0.1/50)이라
 # 버려도 동작이 달라지지 않는다.
-_LEGACY_NBR_KWARGS = ("nbr_k", "nbr_tau", "nbr_neg_margin")
+# Arguments removed from __init__ that may still appear in older checkpoints.
+# Constructing TabERA with them raises TypeError, so strip_legacy_kwargs()
+# drops them before the call.
+#   nbr_k / nbr_tau / nbr_neg_margin   L_nbr constants, now module-level
+#   value_mode                         AttentionAggregator value composition
+_LEGACY_KWARGS = ("nbr_k", "nbr_tau", "nbr_neg_margin", "value_mode")
 
 
 def strip_legacy_kwargs(model_kwargs: dict) -> dict:
-    """구버전 checkpoint 의 model_kwargs 에서 제거된 인자를 걷어낸다."""
-    return {k: v for k, v in model_kwargs.items() if k not in _LEGACY_NBR_KWARGS}
+    """Drop arguments that older checkpoints carry but __init__ no longer takes."""
+    return {k: v for k, v in model_kwargs.items() if k not in _LEGACY_KWARGS}
 
 
 # ── Neighbourhood regulariser (L_nbr) 의 고정 상수 ────────────────────
@@ -1358,12 +1372,15 @@ class TabERA(nn.Module):
             # rho=0.986, query_norm vs distance_mean rho=0.998). 그래서
             # evidence_metric="cosine"/"cosine_scaled" 도입(아래) — temperature
             # 자체는 기각됐지만 하위 호환을 위해 파라미터는 유지.
-        evidence_metric: str = "euclidean",   # [추가] "euclidean"(기본값, 기존과
+        # Defaults follow what the CLI produces. Where the two disagree, any
+        # path that builds TabERA directly -- probes, tests, notebooks -- gets
+        # a different model than reproduce.py trains, and nothing reports it.
+        evidence_metric: str = "cosine",   # [추가] "cosine"(기본값, 기존과
             # 동일)/"cosine"/"cosine_scaled". CentroidLayer 라우팅처럼 q,k를
             # 먼저 정규화해 evidence_temperature로도 못 잡은 collapse(query_emb
             # norm 성장에 유사도 계산이 그대로 종속되는 문제)를 원천 제거하려는
             # 개입. evidence.py의 AttentionAggregator.__init__ docstring 참고.
-        value_mode: str = "default",   # [추가] AttentionAggregator의 value 구성
+
             # 방식. "default"(기존과 100% 동일, 하위호환)/"offset_only"/"balanced".
             # evidence.py의 AttentionAggregator.__init__ docstring 참고 — 동기는
             # diagnose_value_components 실측(T(query-neighbour) 항이 label_emb
@@ -1406,6 +1423,10 @@ class TabERA(nn.Module):
         cat_cardinalities: Optional[List[int]] = None,
         cat_combine: str = "onehot",
         cat_embed_dim: int = 16,
+        # Left at plr_lite even though the CLI passes ple: ple additionally
+        # requires num_bin_edges, so making it the default turns a missing
+        # keyword into a hard error for every caller that does not compute
+        # quantiles. The scripts always pass both together.
         num_embedding: str = "plr_lite",
         num_bin_edges: Optional[torch.Tensor] = None,
         ple_d_embedding: int = 12,   # [추가] TabularEmbedder와 동일 — 고정 기본값,
@@ -1563,7 +1584,7 @@ class TabERA(nn.Module):
         if fusion_mode not in ("concat", "residual", "gated_sum", "anchor_gate",
                                "context_gated_beta", "proto_residual",
                                "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg", "proto_dev_retr",
                                "proto_residual_query"):
             raise ValueError(f"fusion_mode은 'concat'/'residual'/'gated_sum'/'anchor_gate'/'context_gated_beta' 중 하나여야 합니다: {fusion_mode}")
         if fusion_mode in ("residual", "gated_sum", "anchor_gate", "context_gated_beta") and not use_query_emb_in_head:
@@ -1728,7 +1749,6 @@ class TabERA(nn.Module):
                 evidence_temperature=evidence_temperature,
                 learn_evidence_temperature=learn_evidence_temperature,
                 evidence_metric=evidence_metric,
-                value_mode=value_mode,
                 neighbor_interaction_mode=neighbor_interaction_mode,
                 interaction_n_heads=interaction_n_heads,
             )
@@ -1943,6 +1963,22 @@ class TabERA(nn.Module):
                 #   B            logits = W · c          prototype = sufficient statistic
                 #   E            logits = W·c + λ·W·q    prototype = anchor + residual
                 self.query_head = nn.Linear(embed_dim, n_output)
+                self.head = None
+            elif fusion_mode == "proto_dev_retr":
+                # z = W*c + beta*W*normalize(q - c) + gamma*M*r_ret
+                #
+                # proto_dev_agg shares W across both correction terms so only
+                # beta and gamma act as handles. Here the retrieval term gets
+                # its own projection M: the retrieval deviation is nearly
+                # orthogonal to the query deviation (median cosine 0.088), so
+                # forcing both through one W makes them compete for the same
+                # directions. M starts at zero, which makes the model identical
+                # to proto_dev at initialisation.
+                self.dev_head = nn.Linear(embed_dim, n_output)
+                self.dev_beta_raw = nn.Parameter(torch.tensor([-2.197]))   # σ≈0.1
+                self.dev_gamma_raw = nn.Parameter(torch.tensor([-2.944]))  # σ≈0.05
+                self.retr_head = nn.Linear(embed_dim, n_output, bias=False)
+                nn.init.zeros_(self.retr_head.weight)
                 self.head = None
             elif fusion_mode == "proto_dev_agg":
                 # ── h = c + β·normalize(q−c) + γ·normalize(agg−c) ─────
@@ -2176,7 +2212,7 @@ class TabERA(nn.Module):
             #   log_branch_gradients)은 이 모드에서 의미가 없고, 대신
             #   logit decomposition(pr_* 지표)이 직접적인 ground truth다.
             if fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg", "proto_dev_retr",
                                "proto_residual_query"):
                 self._head_first_linear = None
             else:
@@ -2911,7 +2947,7 @@ class TabERA(nn.Module):
                     _head_gate_entropy_mean = float(_be.mean().item())
                     _agg_beta_per_sample = _beta_d.clone()
             elif self.fusion_mode in ("proto_residual", "proto_query_residual", "proto_only",
-                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
+                               "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg", "proto_dev_retr",
                                "proto_residual_query"):
                 # 이 모드는 combined를 쓰지 않는다(z_proto + Δz로 직접 계산).
                 combined = _parts[0]
@@ -2935,6 +2971,57 @@ class TabERA(nn.Module):
                     if labels is not None and self.tasktype != "regression":
                         _pr_diag["pr_final_acc"] = float(
                             (self._hard_pred(logits) == labels.long()).float().mean())
+                    _proto_residual_diag = _pr_diag
+            elif self.fusion_mode == "proto_dev_retr":
+                # z = W*c + beta*W*normalize(q - c) + gamma*M*r_ret
+                #
+                # r_ret summarises the retrieved neighbours as a
+                # distance-weighted mean of their residuals from the same
+                # centroid, so the query term and the retrieval term describe
+                # the same quantity -- a direction away from c -- measured
+                # from two sources: the sample itself and its neighbourhood.
+                _beta = torch.sigmoid(self.dev_beta_raw)
+                _gamma = torch.sigmoid(self.dev_gamma_raw)
+                _dev_q = F.normalize(query_emb - context_emb, dim=-1)
+                _h = context_emb + _beta * _dev_q
+                logits = self.dev_head(_h)
+                _retr_logit = torch.zeros_like(logits)
+                if topk_idx is not None and self.memory.filled.item() >= self.k:
+                    # `nk` is the retrieval output, so it already reflects
+                    # ablation_mode. Reading memory.keys[topk_idx] directly
+                    # would bypass those ablations and make "does neighbour
+                    # identity matter?" untestable.
+                    _nb = nk if nk is not None else self.memory.keys[topk_idx]
+                    _nb_dev = F.normalize(
+                        _nb - context_emb.unsqueeze(1), dim=-1)      # (B, k, D)
+                    _sim = F.cosine_similarity(
+                        _dev_q.unsqueeze(1), _nb_dev, dim=-1)        # (B, k)
+                    _w = torch.softmax(_sim * RETR_WEIGHT_SCALE, dim=1)
+                    _r_ret = F.normalize(
+                        (_w.unsqueeze(-1) * _nb_dev).sum(dim=1), dim=-1)
+                    _retr_logit = self.retr_head(_r_ret)
+                    logits = logits + _gamma * _retr_logit
+                with torch.no_grad():
+                    _lg_c = self.dev_head(context_emb)
+                    _pr_diag = {
+                        "dev_beta": float(_beta),
+                        "dev_gamma": float(_gamma),
+                        "retr_logit_abs": float(_retr_logit.abs().mean()),
+                        "proto_logit_abs": float(_lg_c.abs().mean()),
+                        "query_logit_abs": float((logits - _lg_c
+                                                  - _gamma * _retr_logit).abs().mean()),
+                    }
+                    if labels is not None and self.tasktype != "regression":
+                        _pr_diag["pr_final_acc"] = float(
+                            (self._hard_pred(logits) == labels.long()).float().mean())
+                        _pr_diag["pr_proto_acc"] = float(
+                            (self._hard_pred(_lg_c) == labels.long()).float().mean())
+                        # Accuracy with the retrieval term removed from the
+                        # same checkpoint. gamma being large says nothing on
+                        # its own: it can grow while M contributes nothing.
+                        _pr_diag["pr_noretr_acc"] = float(
+                            (self._hard_pred(logits - _gamma * _retr_logit)
+                             == labels.long()).float().mean())
                     _proto_residual_diag = _pr_diag
             elif self.fusion_mode == "proto_dev_agg":
                 _beta = torch.sigmoid(self.dev_beta_raw)
