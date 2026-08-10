@@ -196,9 +196,23 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     if proto["runners_up"]:
         print(f"     Routing distribution:")
         print(f"       • {proto['assigned_group']:<20s} {proto['routing_confidence']:>6.1%}  (assigned)")
+        # ⚠ [렌더링 필터] 구성원이 없는 prototype 은 라우팅 확률이 높아도
+        #   보여주지 않는다. `(no target info)` 는 설명이 부족한 게 아니라
+        #   설명할 대상 자체가 없는 상태다(죽었거나 방금 재초기화됨).
+        #   사용자에게는 정보가 아니라 혼란이다.
+        #   ⚠ 모델 변경이 아니라 표시 계층의 validity filter 다 — 라우팅
+        #     확률 자체는 그대로이고 Others 질량에도 영향을 주지 않는다.
+        _shown = 0
         for r in proto["runners_up"]:
+            if r.get("target_info") is None:
+                continue
+            _shown += 1
             print(f"       • {r['label']:<20s} {r['routing_confidence']:>6.1%}  "
                   f"({_format_target_info(r['target_info'])})")
+        if _shown < len(proto["runners_up"]) and verbose:
+            _hid = len(proto["runners_up"]) - _shown
+            print(f"       ⚠ 구성원이 없는 prototype {_hid}개는 생략했습니다"
+                  f" (라우팅 확률은 있으나 설명할 그룹이 없음)")
         print(f"       • {'Others':<20s} {proto['others_mass']:>6.1%}")
 
     # 이 그룹을 다른 그룹들과 가장 뚜렷이 구별시키는 feature의 실제
@@ -459,18 +473,28 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     # 모드의 Head(q+βa))라 ‖βa‖가 prediction에 미치는 실제 영향과 정확히
     # 비례한다는 보장이 없음(위 ②의 "기여도" 명명 정정과 같은 이유).
     # 여기서 주는 건 순수 magnitude 정보 — causal attribution 아님.
-    # ③ Prototype-relative deviation (Level 2.5)
-    # §4-2: "argmax는 99.4% 같지만 확률값은 편차가 결정한다" — 확신도를
-    # 설명에 쓰면서 편차를 안 보여주면 faithfulness 문제다.
+    # ③ Query-direction correction (Level 2.5)
+    # §4-2: "argmax는 99.4% 같지만 확률값은 이 항이 결정한다" — 확신도를
+    # 설명에 쓰면서 이 항을 안 보여주면 faithfulness 문제다.
+    #
+    # ⚠ [명칭 정정 §9] 예전엔 "Prototype-relative Deviation" 이라 불렀으나
+    #   부정확하다. `‖c‖=1` 고정인데 `‖q‖` 가 7~1197 이라
+    #       r = normalize(q − c) ≈ normalize(q) = q̂
+    #   이고 실측 `cos(r, q)` 가 0.994~1.000 이다(v3·EMA 양쪽, 전 데이터셋).
+    #   c 를 빼는 연산이 방향에 사실상 영향을 주지 않는다. 따라서 이 항은
+    #   "prototype 으로부터의 편차" 가 아니라 **query 방향 보정** 이다.
+    #   분해 항등식(logits = W·c + W·(β·r))은 그대로 정확하다.
     dv = e.get("prototype_deviation")
     if dv is not None:
-        print(f"\n  ③ Prototype-relative Deviation   h = c + β·normalize(q − c)")
+        print(f"\n  ③ Query-direction Correction   h = c + β·normalize(q − c) ≈ c + β·q̂")
         # ⚠ 이 분해는 근사가 아니다. dev_head가 단일 Linear이므로
         #   logits = (W·c + b) + W·(β·r) 이 항등식이고, 두 항의 합이 항상
         #   실제 logits와 일치한다(스모크에서 오차 0.000e+00로 확인).
         #   SHAP/IG처럼 baseline을 골라 근사하는 것과 성격이 다르다.
         if verbose:
             print(f"     (dev_head가 단일 Linear라 logits = (W·c + b) + W·(β·r) — 정확한 분해)")
+            print(f"     ⚠ r = normalize(q−c)이지만 ‖q‖≫‖c‖=1이라 사실상 q의 방향이다"
+                  f" (cos(r,q)≈1.00). prototype으로부터의 편차가 아니다.")
         # [교체] '편차 비중' + '결정: 그대로' → 확률 이동
         #
         # ⚠ dev_share는 로짓 크기 비율이라 **크기를 과장한다.** credit-g
@@ -499,11 +523,11 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                        if (target_class_names and _pc is not None
                            and 0 <= _pc < len(target_class_names)) else _pc)
                 print(f"     ⚠ 결정이 바뀜 — prototype만으로는 \"{_pn}\", "
-                      f"편차가 \"{_lab}\"으로 뒤집음")
+                      f"query 방향 보정이 \"{_lab}\"으로 뒤집음")
         else:
             # 회귀: 확률이 없으므로 로짓 분해 그대로
             print(f"     prototype={dv['logit_proto']:+.4f}"
-                  f"   deviation={dv['logit_dev']:+.4f}"
+                  f"   query_dir={dv['logit_dev']:+.4f}"
                   f"   최종={dv['logit_proto'] + dv['logit_dev']:+.4f}")
 
         # [제거] 편차 집중도 / dim_contrib
@@ -2331,6 +2355,10 @@ def run_single_seed(
     if len(getattr(args, '_train_seed_list', [train_seed])) > 1 or train_seed != args.seed:
         print(f"  [train_seed={train_seed}] 학습 초기화/배치 순서 seed (데이터 분할은 --seed={args.seed} 그대로)")
 
+    # ⚠ Any fusion_mode other than the default must appear in the filename.
+    #   Listing modes one by one left proto_dev_retr (and proto_dev_vec,
+    #   proto_only, ...) untagged, so their checkpoints overwrote the default
+    #   run's: the study tag told them apart but the checkpoint name did not.
     _save_tag = (f"..retrproj_{args.retr_proj_mode}" if args.retr_proj_mode != "none" else "") \
               + ("..detachretr" if args.detach_retr_grad else "") \
               + ("..global_retrieve" if args.global_retrieve else "") \
@@ -2345,17 +2373,13 @@ def run_single_seed(
               + (f"..ema_decay{args.ema_decay_override:g}" if args.ema_decay_override is not None else "") \
               + ("..blockLN" if args.blockwise_layernorm else "") \
               + ("..branchL2norm" if args.head_branch_l2norm else "") \
-              + ("..fusion_residual" if args.fusion_mode == "residual" else "") \
-              + ("..fusion_concat" if args.fusion_mode == "concat" else "") \
-              + ("..fusion_gatedsum" if args.fusion_mode == "gated_sum" else "") \
-              + ("..fusion_anchorgate" if args.fusion_mode == "anchor_gate" else "") \
-              + ("..fusion_ctxgatedbeta" if args.fusion_mode == "context_gated_beta" else "") \
+              + (f"..fusion_{args.fusion_mode}" if args.fusion_mode != "proto_dev" else "") \
               + ("..no_retrieval" if args.disable_retrieval_branch else "") \
               + (f"..infT{args.inference_evidence_temperature:g}" if args.inference_evidence_temperature is not None else "") \
               + (f"..k{args.k_override}" if args.k_override is not None else "") \
               + (f"..gateT{args.fusion_gate_temperature:g}" if args.fusion_gate_temperature != 1.0 else "") \
               + ("..allowSelfRet" if args.allow_self_retrieval else "") \
-              + (f"..valMode_{args.value_mode}" if args.value_mode != "default" else "") \
+              + ("..labelOnly" if args.value_mode == "label_only" else "") \
               + (f"..nbrInt_{args.neighbor_interaction_mode}" if args.neighbor_interaction_mode is not None else "") \
               + (f"..nbrHeads{args.interaction_n_heads}" if args.interaction_n_heads != 2 else "") \
               + (f"..aggMode_{args.aggregator_mode}" if args.aggregator_mode != "pooling" else "") \
@@ -2761,7 +2785,6 @@ def run_single_seed(
             use_query_emb_in_head=not args.no_query_emb,
             use_ema_codebook=not args.gradient_codebook,
             ema_decay=args.ema_decay_override if args.ema_decay_override is not None else 0.99,
-            value_mode=("default" if args.value_mode in ("default", "label_only") else args.value_mode),
             neighbor_interaction_mode=args.neighbor_interaction_mode,
             interaction_n_heads=args.interaction_n_heads,
             aggregator_mode=args.aggregator_mode,
@@ -5869,43 +5892,22 @@ def main():
                         ))
     parser.add_argument("--ema_decay_override", type=float, default=None,
                         help=(
-                            "[통제 실험용] --ema_codebook의 EMA decay(문헌 기본값 0.99 — "
+                            "[통제 실험용] EMA prototype memory 의 decay(문헌 기본값 0.99 — "
                             "van den Oord et al. 2017 Appendix, VQ-VAE-2/Jukebox/SoundStream "
                             "공통. 이 프로젝트 데이터로 검증된 값 아님, 스윕 대상). "
-                            "--ema_codebook 없이는 무효과."
+                            "--gradient_codebook 과 함께 쓰면 무효과."
                         ))
     parser.add_argument("--value_mode", type=str, default="default",
-                        choices=["default", "label_only", "offset_only", "balanced",
-                                 "offset_normalized", "sum_normalized",
-                                 "neighbor_only", "neighbor_offset",
-                                 "interaction", "interaction_only", "interaction_ln"],
+                        choices=["default", "label_only"],
                         help=(
-                            "[재개, ablation] AttentionAggregator의 value = "
-                            "label_emb + T(query-neighbour) 구성 방식. "
-                            "'default'(기존과 동일, 하위호환): 정규화 없이 그대로 더함. "
-                            "'label_only': T() 자체를 안 만듦, value=label_emb만 "
-                            "(use_offset_correction=False와 동일 — 이웃 label 정보 "
-                            "단독의 유용성 검증). 'offset_only': value=T(query-neighbour)만 "
-                            "(label_emb 항을 뺌 — 지금 모델이 사실상 이것만 쓰고 있는지 "
-                            "검증). 'balanced': value=LN(label_emb)+LN(T(query-neighbour)) "
-                            "(두 항을 unit-scale로 맞춘 뒤 더함). 동기: "
-                            "diagnose_value_components 실측에서 T(query-neighbour) 항이 "
-                            "label_emb보다 평균 4.9배 크다는 게 확인됨(mfeat-zernike) — "
-                            "concat 시절 embed_dim 스케일 격차 문제와 구조적으로 같은 "
-                            "패턴이 value 구성 단계에서 재현된 것으로 추정. "
-                            "[추가] adult(1590) 실측: offset_only의 agg cos_sim(0.984)이 "
-                            "default(0.985)와 거의 동일 — offset norm이 label의 5만 배까지 폭주하며 "
-                            "collapse의 지배적 원인으로 확인됨, 그런데 label_only accuracy가 "
-                            "default보다 오히려 살짝 높았음(0.852 vs 0.847). 다음 질문("
-                            "'offset을 완전히 없애야 하나, scale만 통제해도 되나')을 위해 "
-                            "두 개 추가: 'offset_normalized': value=label_emb+"
-                            "T(query-neighbour)/||T(query-neighbour)|| (T()의 방향은 "
-                            "살리고 크기 폭주만 제거). 'sum_normalized': "
-                            "value=(label_emb+T(query-neighbour))/||label_emb+"
-                            "T(query-neighbour)|| (최종 합 벡터 자체를 unit-norm으로 강제 — "
-                            "'balanced'와 다르게 각 항을 따로 정규화하는 게 아니라 더한 "
-                            "결과를 한 번에 정규화)."
-                        ))
+                            "[ablation] AttentionAggregator value 구성. 이 인자는 "
+                            "이제 use_offset_correction 하나만 결정한다 — "
+                            "'label_only' 면 T(query-neighbour) 항을 빼고 "
+                            "value=label_emb 만 쓴다. "
+                            "⚠ 나머지 변형(offset_only/balanced/interaction 등)은 "
+                            "제거했다: aggregator 를 만들지 않는 fusion_mode 에서는 "
+                            "value 구성 자체가 존재하지 않고, 최종 모델(proto_dev)이 "
+                            "여기에 해당한다."))
     parser.add_argument("--gradient_attribution", action="store_true",
                         help=(
                             "[진단용, fusion_mode='concat' 전용] --log_branch_gradients(학습 중 "
@@ -6023,7 +6025,7 @@ def main():
                         choices=["concat", "residual", "gated_sum", "anchor_gate", "context_gated_beta",
                                  "proto_residual", "proto_query_residual", "proto_only",
                                  "proto_only_linear", "query_only_linear", "proto_dev", "proto_dev_vec", "proto_dev_agg",
-                                 "proto_residual_query"],
+                                 "proto_residual_query", "proto_dev_retr"],
                         help=(
                             "[2026-07, 되돌림] 'residual'을 잠시 기본값으로 뒀었으나, 이후 "
                             "6개 데이터셋에 걸친 폭넓은 비교(ablation/trajectory/retrieval-free "
@@ -6290,7 +6292,7 @@ def main():
                             "배경: T=1.0은 HPO 탐색 대상도 아니어서 한 번도 조정된 적이 없었고, "
                             "관측된 similarity margin(0.03~0.68)에서는 산술적으로 거의 균등분포가 "
                             "된다(n_eff/k≈1, 10/10). 또 최적 sharpness가 k에 따라 달라지는데"
-                            "(k=4에선 sharp가 +1.4%p 우세, k=48에선 -14.1%p) k는 HPO가 정하고 "
+                            "(k=4에선 sharp가 +1.4%%p 우세, k=48에선 -14.1%%p) k는 HPO가 정하고 "
                             "T는 고정이라 둘이 맞을 이유가 없었다. 학습된 T 값 자체가 진단 "
                             "지표가 된다 — 1.0 근처에 머물면 '구분할 것이 없어서', 내려가면 "
                             "'선별을 시작'으로 읽는다."
@@ -6415,11 +6417,11 @@ def main():
                             "c2는 잔차 r = q - sg(c1)을 euclidean으로 양자화한 코드다. "
                             "⚠ v2는 f(x) = W·c_k 라 최대 P개의 서로 다른 예측만 "
                             "가능하다(ds=14: test 200개 → 고유 예측 31개). Voronoi "
-                            "accuracy 상한 0.852의 97.3%에 이미 도달했고 auroc 손실은 "
-                            "동점이 114% 설명한다 — 병목은 학습이 아니라 표현력이다. "
+                            "accuracy 상한 0.852의 97.3%%에 이미 도달했고 auroc 손실은 "
+                            "동점이 114%% 설명한다 — 병목은 학습이 아니라 표현력이다. "
                             "⚠ continuous residual(E 조건)로 풀면 안 된다: lambda를 "
                             "작게 둬도 optimizer가 ||W_q||를 24배 키워 우회하고 "
-                            "prototype이 무력화된다(query 기여 98.6%). 두 항 모두 "
+                            "prototype이 무력화된다(query 기여 98.6%%). 두 항 모두 "
                             "discrete여야 무제한 정보 경쟁자가 없다. "
                             "판정: rvq_H_c2_given_c1 > 0 (게이트), rvq_delta_acc, "
                             "rvq_unique_pred_c12 증가, auroc 회복."
