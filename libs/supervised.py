@@ -630,6 +630,7 @@ class TabERAWrapper:
 
         # 계측 상태. --time_epoch 이 없으면 전부 no-op.
         self.beta_history = []
+        self._last_retr_diag = {}
         self._beta_grad_sum = 0.0
         self._beta_grad_signed = 0.0
         self._beta_grad_n = 0
@@ -841,6 +842,11 @@ class TabERAWrapper:
                     # 조용히 버려지고 있었다(regroup_history / ec_*에 이어 세 번째).
                     _rd = out.get("retr_diag")
                     if _rd:
+                        # Keep the latest batch so the per-epoch beta_history
+                        # entry can record the retrieval term's magnitude.
+                        self._last_retr_diag = {
+                            k: v for k, v in _rd.items()
+                            if isinstance(v, float)}
                         for _rk, _rv in _rd.items():
                             if isinstance(_rv, (int, float)) and not isinstance(_rv, bool):
                                 _retr_extra_sums[_rk] = _retr_extra_sums.get(_rk, 0.0) + float(_rv)
@@ -1704,6 +1710,16 @@ class TabERAWrapper:
                         "grad_abs_mean":    self._beta_grad_sum / _n,
                         "grad_signed_mean": self._beta_grad_signed / _n,
                         "n_batch": int(self._beta_grad_n),
+                        # proto_dev_retr: gamma alone is not evidence that the
+                        # retrieval branch is used -- it can grow while the
+                        # term contributes nothing -- so log the magnitude too.
+                        **({"gamma": float(torch.sigmoid(
+                                self.model.dev_gamma_raw.detach()).mean())}
+                           if getattr(self.model, "dev_gamma_raw", None) is not None
+                           else {}),
+                        **({k: v for k, v in (self._last_retr_diag or {}).items()
+                            if k in ("retr_logit_abs", "proto_logit_abs",
+                                     "query_logit_abs")}),
                     })
                     self._beta_grad_sum = 0.0
                     self._beta_grad_signed = 0.0
