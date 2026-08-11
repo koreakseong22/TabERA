@@ -37,6 +37,7 @@ python visualize_embeddings.py --openml_id 54 --seed 1 --proj tsne --from_pkl
 """
 
 import os
+import glob
 import argparse
 import json
 import pickle
@@ -64,42 +65,16 @@ warnings.filterwarnings("ignore")
 # params_to_model_kwargs 인라인 (순환 import 방지)
 # ─────────────────────────────────────────────────────────────
 
-def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict:
-    # [수정] search_space.py의 params_to_model_kwargs와 동기화.
-    # 이 파일이 순환 import 방지를 위해 그 함수를 따로 복사해 쓰고 있는데,
-    # search_space.py 쪽만 여러 번 바뀌는 동안(k 고정, loss_codebook 추가,
-    # entropy_loss 제거) 이 복사본이 안 따라가서 실제로 문제가 됐음:
-    #   - params["k"]: k는 고정값이라 Optuna best_params에 아예 없어 KeyError
-    #   - routing_scale: 아예 안 넘겨서, 이 파일이 --from_saved_state 없이
-    #     wrapper.fit()으로 처음부터 재학습하는데도 HPO가 찾은 값이 아니라
-    #     기본값(1.0)으로 조용히 학습되고 있었음(크래시 없이 다른 모델을
-    #     시각화하는 셈이라 더 위험했음)
-    #   - loss_entropy: entropy_loss 자체가 이미 죽은 코드라 제거됐는데
-    #     이 파일만 그 개념을 계속 참조하고 있었음
-    # search_space.py를 다시 바꿀 때 이 함수도 같이 맞춰야 한다는 걸
-    # 잊지 않도록 이 주석을 남겨둠 — 근본적으로는 순환 import 문제를
-    # 풀어서 하나의 source of truth로 합치는 게 맞음.
-    return {
-        "n_features":      n_features,
-        "embed_dim":       params["embed_dim"],
-        "n_prototypes":    params["n_prototypes"],
-        "k":               params.get("k", 16),
-        "embedder_layers": params["embedder_layers"],
-        "dropout":         params["dropout"],
-        "n_output":        n_output,
-        "loss_weights": {
-            "diversity":   params["loss_diversity"],
-            "commitment":  params["loss_commitment"],
-            "codebook":    params.get("loss_codebook", 0.0),
-        },
-        "routing_scale":   params.get("routing_scale", 1.0),
-    }
+# params_to_model_kwargs lives in libs/search_space.py. A local copy used to
+# sit here and had already fallen behind: it indexed params["loss_commitment"],
+# which studies run with commitment off do not contain.
+from libs.search_space import params_to_model_kwargs  # noqa: E402
+from libs.tabera import strip_legacy_kwargs  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────
 # 색상
 # ─────────────────────────────────────────────────────────────
-
 PALETTE = [
     "#4878CF", "#D65F5F", "#6ACC65", "#B47CC7",
     "#C4AD66", "#77BEDB", "#E78AC3", "#A6D854",
@@ -109,26 +84,46 @@ QUERY_COLOR = "#c0392b"
 BG_COLOR    = "#f8f8f6"
 
 
-# ─────────────────────────────────────────────────────────────
-# 임베딩 추출
-# ─────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def extract_embeddings(model, X_all, y_all, device, chunk=512):
     model.eval()
     model = model.to(device)
+    model.eval()
     all_emb, all_assign, all_prob, all_ew, all_topk, all_x = [], [], [], [], [], []
 
     for start in range(0, len(X_all), chunk):
         xb  = X_all[start:start+chunk].to(device)
-        out = model(xb, return_explanations=False)
+        # Pass sample_ids so exclude_self_retrieval can do its job. Without
+        # them a training row retrieves itself as its own nearest neighbour
+        # (cosine 1.0), which makes Figure C show the query pointing at itself.
+        # Rows past n_train are validation/test and have no memory slot; -1
+        # excludes nothing for them, which is correct.
+        # X_all is in original row order (train, val, test concatenated in
+        # that order), so position == sample_id here. Do NOT reuse this with
+        # feature_store_state[0], whose rows are in memory-slot order and
+        # need feature_store_state[3] as ids instead.
+        _n_tr = getattr(model.memory, "filled", None)
+        _n_tr = int(_n_tr.item()) if _n_tr is not None else 0
+        _ids = torch.arange(start, start + xb.shape[0], device=device)
+        _ids = torch.where(_ids < _n_tr, _ids, torch.full_like(_ids, -1))
+        out = model(xb, sample_ids=_ids, return_explanations=False)
+        # detach explicitly: the model may be left in train mode by a caller,
+        # and buffers such as memory.keys carry graph history in some modes.
         emb = model.embedder(xb)
-        all_emb.append(emb.cpu().numpy())
-        all_assign.append(out["hard_group"].cpu().numpy())
-        all_prob.append(out["routing"].cpu().numpy())
-        all_ew.append(out["evidence_w"].cpu().numpy())
-        all_topk.append(out["topk_idx"].cpu().numpy())
-        all_x.append(xb.cpu().numpy())
+        all_emb.append(emb.detach().cpu().numpy())
+        all_assign.append(out["hard_group"].detach().cpu().numpy())
+        all_prob.append(out["routing"].detach().cpu().numpy())
+        # evidence_w is AttentionAggregator's output. proto_dev does not build
+        # the aggregator, so it comes back as a uniform 1/k vector and carries
+        # no information. Use cosine similarity between the query and each
+        # retrieved neighbour, which is what the retrieval actually ranks by.
+        _q = torch.nn.functional.normalize(out["query_emb"], dim=-1)
+        _nb = torch.nn.functional.normalize(
+            model.memory.keys[out["topk_idx"]], dim=-1)
+        all_ew.append(
+            torch.einsum("bd,bkd->bk", _q, _nb).detach().cpu().numpy())
+        all_topk.append(out["topk_idx"].detach().cpu().numpy())
+        all_x.append(xb.detach().cpu().numpy())
 
     hard_assign = np.concatenate(all_assign, axis=0)
     X_concat    = np.concatenate(all_x,      axis=0)
@@ -152,9 +147,11 @@ def extract_embeddings(model, X_all, y_all, device, chunk=512):
         emb          = np.concatenate(all_emb,    axis=0),
         hard_assign  = hard_assign,
         routing_prob = np.concatenate(all_prob,   axis=0),
+        # Named evidence_w for backward compatibility with the pkl format;
+        # holds cosine similarities, not aggregator weights.
         evidence_w   = np.concatenate(all_ew,     axis=0),
         topk_idx     = np.concatenate(all_topk,   axis=0),
-        y            = y_all.cpu().numpy().astype(int),
+        y            = y_all.detach().cpu().numpy().astype(int),
         centroid_emb = model.prototype_layer.centroid_emb.detach().cpu().numpy(),
         centroid_x   = centroid_x,
         P            = P,
@@ -513,7 +510,12 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
     ql      = int(y[si])
     nbr_idx = topk_in_2d(topk_idx, n_train, si, k_show=k_show)
     ew_raw  = evidence_w[si][:len(nbr_idx)]
-    ew_norm = ew_raw / (ew_raw.sum() + 1e-8)
+    # evidence_w now holds cosine similarities, which do not sum to one.
+    # Rescaling them to shares turned every bar into 1/k: within a prototype
+    # the cosines sit in a narrow band (0.994-0.997 on credit-g), so dividing
+    # by their sum erases the differences entirely. Plot the values as they
+    # are and let the axis limits carry the spread.
+    ew_norm = ew_raw
 
     # 이웃의 그룹 내/외 여부 (MemoryBank 기준 — 실제 모델 동작)
     # ni는 MemoryBank 인덱스 = train 데이터 인덱스
@@ -649,7 +651,7 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
                    zorder=5, alpha=0.9)
 
         # 라벨 구성
-        label_str = f"k{k+1}  {ew*100:.0f}%"
+        label_str = f"k{k+1}  {ew:.3f}"
         if proj_distorted:
             # 실제 그룹 내이지만 투영 왜곡으로 타원 밖에 보임
             label_str += "\n(proj. out)"
@@ -758,7 +760,11 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
             edge_colors_b.append("#999999")   # proj. out
         else:
             edge_colors_b.append(QUERY_COLOR) # 정상 in-group
-    axb.barh(labels_b[::-1], ew_norm[::-1]*100,
+    # Axis range from the values themselves. These cosines differ in the third
+    # decimal, so an axis anchored at zero draws k identical bars.
+    _lo, _hi = float(ew_norm.min()), float(ew_norm.max())
+    _pad = max((_hi - _lo) * 0.35, 1e-3)
+    axb.barh(labels_b[::-1], ew_norm[::-1],
              color=bar_colors[::-1],
              edgecolor=edge_colors_b[::-1], linewidth=0.8, alpha=0.85)
     for i, (ew, ni, ig, po) in enumerate(
@@ -770,11 +776,11 @@ def draw_figure_C(X2d, y, C2d, hard_assign, evidence_w, topk_idx,
             suffix, tc = " ↗", "#999999"
         else:
             suffix, tc = "", "#333"
-        axb.text(ew*100 + 0.5, i, f"{ew*100:.1f}%{suffix}",
+        axb.text(ew + (_hi - _lo) * 0.06 + 1e-3, i, f"{ew:.3f}{suffix}",
                  va="center", ha="left", fontsize=8, color=tc)
-    axb.set_xlabel("Attention weight (%)", fontsize=8)
-    axb.set_title("Evidence weights\n(evidence_w)", fontsize=9, pad=6)
-    axb.set_xlim(0, ew_norm.max() * 135)
+    axb.set_xlabel("cos(query, neighbour)", fontsize=8)
+    axb.set_title("Neighbour similarity\ncos(q, neighbour)", fontsize=9, pad=6)
+    axb.set_xlim(max(0.0, _lo - _pad), min(1.0, _hi + _pad * 2.2))
     axb.tick_params(labelsize=8)
     axb.grid(axis="x", linestyle="--", linewidth=0.35, alpha=0.4)
 
@@ -794,6 +800,8 @@ def main():
     parser.add_argument("--gpu_id",      type=int,  default=0)
     parser.add_argument("--openml_id",   type=int,  required=True)
     parser.add_argument("--seed",        type=int,  default=1)
+    parser.add_argument("--fusion_mode", type=str,  default="proto_dev",
+                        help="Must match the run being visualised.")
     parser.add_argument("--savepath",    type=str,  default=".",
                         help="optim_logs가 있는 상위 경로")
     parser.add_argument("--json",        type=str,  default="dataset_id.json")
@@ -837,25 +845,71 @@ def main():
         else:
             log_dir = args.savepath
 
-        state_path = os.path.join(log_dir,
-                                  f"data={oid}..seed{args.seed}_model_state.pt")
+        # reproduce.py writes the run configuration into the filename
+        # (cat_onehot..num_ple..evM_cosine..deterministic..), so an exact path
+        # never matches. Glob on the two stable ends instead and prefer the
+        # single-seed file over the per-train-seed ones.
+        _pat = os.path.join(log_dir, f"data={oid}..*seed{args.seed}_model_state.pt")
+        # --run_tag writes the tag into the filename too, so ablation runs
+        # (beta_x5, nocommit, ...) sit alongside the default one. Prefer the
+        # shortest name: the default run carries no extra tag.
+        _EXP = ("trainseed", "beta_x5", "beta_base", "nocommit", "grad_cb",
+                "nodr", "nbr0", "labelOnly")
+        _cand = [p for p in sorted(glob.glob(_pat))
+                 if not any(t in os.path.basename(p) for t in _EXP)]
+        _cand = _cand or [p for p in sorted(glob.glob(_pat))
+                          if "trainseed" not in p]
+        _cand = _cand or sorted(glob.glob(_pat))
+        _cand.sort(key=lambda p: len(os.path.basename(p)))
+        state_path = _cand[0] if _cand else os.path.join(
+            log_dir, f"data={oid}..seed{args.seed}_model_state.pt")
+        if _cand and len(_cand) > 1:
+            print(f"  ⚠ {len(_cand)}개 후보 중 첫 번째 사용: "
+                  f"{os.path.basename(state_path)}")
         if not os.path.exists(state_path):
             raise FileNotFoundError(
                 f"model state 없음: {state_path}\n"
                 f"먼저 reproduce.py --openml_id {oid} --seed {args.seed} 를 실행하세요.")
 
         print(f"[TabERA Visualize] {dataset_name} (id={oid})  → state 로드")
-        ckpt = torch.load(state_path, map_location=device)
+        # PyTorch 2.6 flipped weights_only to True. The checkpoint holds
+        # sample_groups and feature_store_state, which are plain Python
+        # objects, so it has to be loaded with weights_only=False.
+        ckpt = torch.load(state_path, map_location=device, weights_only=False)
 
         col_names  = ckpt["col_names"]
         n_train    = ckpt["n_train"]
-        model_kwargs = ckpt["model_kwargs"]
+        # Older checkpoints carry arguments __init__ no longer takes
+        # (value_mode, nbr_k/tau/margin); passing them raises TypeError.
+        model_kwargs = strip_legacy_kwargs(ckpt["model_kwargs"])
         print(f"  val : {ckpt['val_metrics']}")
         print(f"  test: {ckpt['test_metrics']}")
 
-        model = TabERA(**model_kwargs, column_names=col_names,
-                       memory_size=min(n_train * 2, 10_000))
-        model.load_state_dict(ckpt["state_dict"])
+        # The checkpoint's model_kwargs already carries memory_size, and it
+        # has to match the saved memory.keys shape, so use that value rather
+        # than recomputing one.
+        model_kwargs.setdefault("memory_size", min(n_train * 2, 10_000))
+        # column_names is passed separately below; some checkpoints carry it
+        # too, which would be the same duplicate-keyword error.
+        model_kwargs.pop("column_names", None)
+        _fm = model_kwargs.get("fusion_mode")
+        print(f"  fusion_mode: {_fm}   memory_size: {model_kwargs['memory_size']}")
+        if _fm != "proto_dev":
+            # Runs that differ only by fusion_mode share a filename, so an
+            # ablation checkpoint can shadow the benchmark one.
+            print(f"  ⚠ 최종 모델은 proto_dev 입니다. 이 체크포인트는 '{_fm}' 이므로 "
+                  f"ablation 실행일 수 있습니다 — --savepath 로 디렉터리를 "
+                  f"지정하거나 해당 파일을 옮기세요.")
+        model = TabERA(**model_kwargs, column_names=col_names)
+        # strict=False: checkpoints trained before the aggregator was dropped
+        # still carry ot_selector.* weights, which the model no longer has.
+        _res = model.load_state_dict(ckpt["state_dict"], strict=False)
+        _unexpected = [k for k in _res.unexpected_keys
+                       if not k.startswith("ot_selector")]
+        if _res.missing_keys or _unexpected:
+            raise RuntimeError(
+                f"state_dict mismatch — missing={_res.missing_keys[:3]} "
+                f"unexpected={_unexpected[:3]}")
         model = model.to(device)
         model.eval()
         print("  model state 로드 완료.")
@@ -948,7 +1002,15 @@ def main():
         else:
             log_dir = args.savepath
 
-        fname = os.path.join(log_dir, f"data={oid}..model=tabera.pkl")
+        # Same naming issue as the checkpoint: the study filename carries the
+        # run configuration and the model version tag (..v3ema2..).
+        _sp = os.path.join(log_dir, f"data={oid}..*model=tabera.pkl")
+        _sc = sorted(glob.glob(_sp))
+        fname = _sc[0] if _sc else os.path.join(
+            log_dir, f"data={oid}..model=tabera.pkl")
+        if len(_sc) > 1:
+            print(f"  ⚠ study 후보 {len(_sc)}개 — 첫 번째 사용: "
+                  f"{os.path.basename(fname)}")
         if not os.path.exists(fname):
             raise FileNotFoundError(
                 f"최적화 로그 없음: {fname}\n"
@@ -972,6 +1034,16 @@ def main():
             **model_kwargs,
             column_names=col_names,
             memory_size=min(int(len(y_train) * 2), 10_000),
+            # Match what reproduce.py builds. Passing these explicitly rather
+            # than relying on constructor defaults: the two have drifted apart
+            # before and the mismatch is silent.
+            fusion_mode=args.fusion_mode,
+            evidence_metric="cosine",
+            num_embedding="ple",
+            cat_combine="onehot",
+            use_ema_codebook=True,
+            nbr_lambda=0.0,
+            exclude_self_retrieval=True,
         )
         wrapper = TabERAWrapper(
             model, best_params, tasktype,
