@@ -373,7 +373,9 @@ if train:
     #   capacity 쪽을 보고 싶으면 --n_prototypes 로 명시한다(별도 study).
     #   C > P 인 경우는 경고만 남긴다 — 편차 항이 보완한다는 사실을
     #   알고 있어야 결과를 해석할 수 있다.
-    _sqrtN = max(4, int(math.sqrt(len(y_train))))
+    # P = floor(sqrt(N_train)). No lower bound: it would only bind below
+    # N_train = 16, and a run that small is not a case this rule is for.
+    _sqrtN = int(math.sqrt(len(y_train)))
     _C     = dataset.n_classes if tasktype == "multiclass" else None
     _k_ref = (DEFAULT_K_NO_TUNE if args.fusion_mode in _K_UNTUNED_MODES
               else max(SEARCHED_K_CHOICES))
