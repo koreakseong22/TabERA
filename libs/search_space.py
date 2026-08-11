@@ -63,14 +63,7 @@ optimize.py/reproduce.py 둘 다 이 값을 직접 import해서 쓰고, 각자
 # retrieval이 예측 경로 밖인 fusion_mode에서는 k가 HPO objective에
 # 영향을 주지 않는다. 아래 모드에서는 k를 고정한다.
 _K_UNTUNED_MODES = ("proto_only", "proto_only_linear",
-                    "query_only_linear", "proto_dev", "proto_dev_agg", "proto_residual_query",
-                    # proto_dev_retr does use k in the prediction path, but it
-                    # is held fixed so that it can be compared against
-                    # proto_dev on equal footing: tuning k only in the
-                    # retrieval arm would give it one extra degree of freedom
-                    # and confound "retrieval carries information" with
-                    # "k was tuned". The effect of k is a separate question.
-                    "proto_dev_retr")
+                    "query_only_linear", "proto_dev", "proto_dev_agg", "proto_residual_query")
 DEFAULT_K_NO_TUNE = 8
 # k 탐색 후보. optimize.py의 n_prototypes 상한(N/k) 계산이 같은 목록을
 # 봐야 하므로 상수로 둔다 — 두 곳에 하드코딩하면 한쪽만 바뀔 수 있다.
@@ -281,10 +274,10 @@ def get_search_space(
                                    # optimize.py는 항상 args.num_embedding을 명시적으로
                                    # 넘기므로 실제 파이프라인 동작엔 영향 없음 — 이 함수를
                                    # 직접 호출하는 경우(테스트/노트북 등)를 위한 방어적 기본값.
-    # Default matches the CLI (commitment is off, §10). A mismatch here would
-    # mean any caller that omits the argument searches a weight the forward
-    # pass never reads.
-    no_commitment: bool = True,      # [ablation] commitment_loss 를 끈다.
+    # Default matches the CLI (commitment is off, §10). With False here any
+    # caller that omits the argument searches a weight the forward pass
+    # never reads -- and reproduce.py then trains with it.
+    no_commitment: bool = True,     # [ablation] commitment_loss 를 끈다.
                                    # EMA 에서 commitment 는 **encoder 를 prototype
                                    # memory 에 정렬시키는 유일한 손실**이다
                                    # (codebook 은 EMA 가 대체). 그 필요성을 재려면
