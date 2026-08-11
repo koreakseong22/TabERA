@@ -20,7 +20,7 @@ perturbing inputs, fitting a surrogate, or attributing against a dataset-wide
 baseline.
 
 TabERA puts the structure in the model. Every sample is hard-assigned to one of
-`P` prototypes, and that assignment does two things: it supplies the context
+`P` centroids, and that assignment does two things: it supplies the context
 the prediction is built from, and it defines the neighbourhood the evidence is
 retrieved from.
 
@@ -44,11 +44,11 @@ model conditioned on, not a neighbourhood computed separately afterwards.
 
 ## What an explanation looks like
 
-Three levels, printed by `reproduce.py --explain`. Each reads a different part
-of the same forward pass. The example below is `credit-g`, predicting loan
-default.
+Three levels, printed by `reproduce.py --explain`. Levels ① and ③ are read off
+the computation that produced the prediction; level ② is the retrieval, which
+runs beside it. The example is `credit-g`, predicting loan default.
 
-### ① Which group is this?
+### ① Prototype assignment
 
 ```
 Assigned prototype: "Centroid_6"
@@ -62,13 +62,18 @@ Distinctive features:
   categorical: other_parties = none (95%), housing = own (56%)
 ```
 
-The phrasing is deliberate. A centroid is a *similarity anchor*, not a class
-representative — the honest reading is "this group holds 160 samples, 78% of
-which defaulted", not "this group represents default". The routing distribution
-shows how close the call was: a sample between two prototypes is a different
-kind of case from one sitting inside one.
+Which prototype the sample was routed to, what the label distribution of that
+group is, and which feature values distinguish the group from the others.
 
-### ② Which past cases resemble it?
+The routing distribution shows how decided the assignment was. Here the top two
+prototypes are one percentage point apart, so the sample sits near a boundary —
+a different situation from one that lands well inside a region.
+
+A centroid is a similarity anchor, not a class representative. The reading is
+"this group holds 160 samples, 78% of which defaulted", not "this group means
+default".
+
+### ② Local evidence
 
 ```
 neighbourhood (k=8)   bad 7/8 (88%), good 1/8 (12%)   H(label) 0.377
@@ -85,12 +90,21 @@ Contrasting cases
        differs: duration   48 → 18
 ```
 
-Real training rows, ranked by the cosine similarity the retrieval uses. Cases
-that *disagree* get their own section with the columns that differ — a nearest
-neighbour that came out the other way is the most useful thing this level can
-surface, and burying it among the agreeing cases would waste it.
+The `k` nearest training rows inside the assigned group, ranked by cosine
+similarity, split into those that share the sample's outcome and those that do
+not. For each contrasting case, the columns where it differs from the query.
 
-### ③ What is unusual about it, for that group?
+Above them, two label distributions and their entropies: the neighbourhood's
+and the whole group's. Their ratio is what this level is for — whether the
+decision was made in a typical part of its region or an ambiguous one.
+
+The neighbours' outcome distribution is not evidence for the prediction.
+Label separation inside a prototype is limited, so treating a neighbour
+majority as support would present sampling noise from the group distribution as
+if it were a reason. The cases are shown so a person can look at them; the
+quantity to read is the ambiguity ratio.
+
+### ③ Query-direction correction
 
 ```
 prototype baseline:  bad 70.4%
@@ -102,20 +116,28 @@ against the group (n=160)
   purpose = business      10% of the group  |  group mode: new car (36%)
 ```
 
-This is the axis feature-attribution methods do not have. SHAP asks how far
-each feature moved the prediction from a dataset-wide baseline; level ③ asks
-what makes this sample unusual *within its own group* — often the question a
-domain expert was actually asking.
+What the prediction would have been from the prototype alone, what it became
+after the correction, and — separately — where this sample sits within its group
+on each feature.
 
-It is exact rather than approximate. The head is a single `Linear` with `W`
-shared across both terms, so
+The first part is exact. The head is a single `Linear` with `W` shared across
+both terms, so
 
 ```
 z = W·c + β·W·normalize(q − c)
 ```
 
-holds to floating point. The prototype baseline and the sample's correction are
-the prediction, decomposed — not a model of it.
+holds to floating point: the prototype baseline and the correction are the
+prediction, decomposed rather than approximated. When the correction changes
+the argmax, the output says so.
+
+The second part is descriptive statistics against the group, not attribution.
+It says the sample's `duration` is twice its group's typical value; it does not
+say that is why the correction moved the logits. The two are printed together
+because both are about the same group, and they should not be read causally.
+
+The group typical value is the inverse transform of a mean taken in quantile
+space, not an arithmetic mean.
 
 ---
 
@@ -153,8 +175,7 @@ itself. The term is a correction along the query direction, and the code names
 it accordingly; calling it a deviation *from the prototype* would be wrong.
 
 **Retrieval.** k-NN inside the assigned prototype's members, self excluded.
-`k = 8` is fixed: it is an explanation budget, and since retrieval sits outside
-the prediction, the search objective could not respond to it anyway.
+`k = 8` is fixed — it sets how many cases an explanation shows.
 
 ---
 
@@ -189,8 +210,6 @@ Because the same `a` drives both, the evidence cannot drift from the decision.
 A person reading the retrieved cases is reading the neighbourhood the
 prediction was conditioned on, not a similarity search run afterwards.
 
----
-
 ## Training
 
 A single cross-entropy objective on the logits. The prototype layer carries no
@@ -220,8 +239,6 @@ Ten OpenML datasets, five seeds each.
 | 1489 — phoneme | 0.8932 | 0.9449 | 0.3012 |
 | **mean** | **0.8309** | **0.9168** | **0.5490** |
 
-`ds=1493` is the capacity-limited case: 100 classes, 35 prototypes. Its log
-loss is the price of a partition too coarse for the label space.
 
 ---
 
@@ -283,8 +300,6 @@ visualize_tabera.py figures
 ---
 
 ## References
-
-The nine that carry the method:
 
 - Gorishniy et al. (2022). On Embeddings for Numerical Features in Tabular Deep Learning. *NeurIPS*. — piecewise-linear embeddings
 - van den Oord, Vinyals & Kavukcuoglu (2017). Neural Discrete Representation Learning. *NeurIPS*. — hard assignment with a straight-through gradient, EMA codebook
