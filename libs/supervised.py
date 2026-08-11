@@ -107,6 +107,9 @@ class TabERAWrapper:
         cat_category_names: Optional[Dict[str, List[str]]] = None,
         target_class_names: Optional[List[str]] = None,
         quantile_transformer=None,
+        # 0 disables the per-epoch regroup / refresh lines. reproduce.py
+        # passes 0 unless --verbose is given: they describe how a run got
+        # where it did, which matters while developing and not while using.
         regroup_log_every: int = 10,
         time_epoch: bool = False,
         log_beta: bool = False,
@@ -233,7 +236,9 @@ class TabERAWrapper:
         self.device   = device
         self.epochs   = epochs
         self.patience = patience
-        self.regroup_log_every = max(1, regroup_log_every)
+        # max(1, ...) would turn 0 into 1 and print every epoch, which is
+        # the opposite of what 0 asks for. Clamp only negatives.
+        self.regroup_log_every = max(0, int(regroup_log_every))
         # epoch 구간별 소요 시간 계측 (기본 꺼짐 — 켜면 CUDA sync가 들어간다)
         self.time_epoch = bool(time_epoch)
         # dev_beta_raw 궤적 기록 (기본 꺼짐 — 배치마다 동기화가 생긴다)
@@ -1141,7 +1146,7 @@ class TabERAWrapper:
                     )
                     self._tick("cache_sample_groups", _t0)
 
-                    if epoch % self.regroup_log_every == 0:
+                    if self.regroup_log_every and epoch % self.regroup_log_every == 0:
                         _reinit = regroup_stats.get('reinit_count', 0)
                         pbar.write(
                             f"  [Regroup] active={regroup_stats['active_ratio']*100:.0f}%  "
@@ -1193,7 +1198,7 @@ class TabERAWrapper:
                     _denom = epoch_record[f"{name}_weight_norm"] * epoch_record[f"{name}_act_norm"]
                     epoch_record[f"{name}_alignment"] = _contrib_mean / _denom if _denom > 1e-12 else float("nan")
                 self.branch_gradient_history.append(epoch_record)
-                if epoch % self.regroup_log_every == 0:
+                if self.regroup_log_every and epoch % self.regroup_log_every == 0:
                     _names = list(_branch_grad_sum.keys())
                     # [버그 수정] weight_norm은 self.model._head_block_slices가
                     # 채워진 concat 계열 모드에서만 존재(residual/gated_sum은
@@ -1267,7 +1272,7 @@ class TabERAWrapper:
                     ev_record["self_retrieval_top1_rate"] = _self_retrieval_top1_sum / _self_retrieval_batches
                     ev_record["self_retrieval_topk_rate"] = _self_retrieval_topk_sum / _self_retrieval_batches
                 self.evidence_stats_history.append(ev_record)
-                if epoch % self.regroup_log_every == 0:
+                if self.regroup_log_every and epoch % self.regroup_log_every == 0:
                     _extra = ""
                     if "query_norm" in ev_record:
                         _extra = (f"  qnorm={ev_record['query_norm']:.2f} "
@@ -1349,7 +1354,7 @@ class TabERAWrapper:
                     ),
                 }
                 self.fusion_trajectory_history.append(fusion_record)
-                if epoch % self.regroup_log_every == 0:
+                if self.regroup_log_every and epoch % self.regroup_log_every == 0:
                     _a, _b = fusion_record["alpha"], fusion_record["beta"]
                     _ag, _bg = fusion_record["mean_alpha_grad"], fusion_record["mean_beta_grad"]
                     _qn, _cn, _an = (fusion_record["query_norm_mean"], fusion_record["context_norm_mean"],
@@ -1443,7 +1448,7 @@ class TabERAWrapper:
                             "norm_mi": _norm_mi,          # I(C;Y)/H(Y), 0~1
                             "n_centroids_used": float(len(_unique_c)),
                         })
-                        if epoch % self.regroup_log_every == 0:
+                        if self.regroup_log_every and epoch % self.regroup_log_every == 0:
                             pbar.write(
                                 f"  [CentroidLabelMI] I(C;Y)/H(Y)={_norm_mi:.4f}  "
                                 f"H(Y|C)={_H_YC:.4f}  n_centroids_used={len(_unique_c)}"
@@ -1460,6 +1465,7 @@ class TabERAWrapper:
             # 다 거치는 forward 3회라 log_centroid_label_mi_trajectory보다
             # 비쌈 — 매 epoch은 과함).
             if (self.log_shuffle_ablation_trajectory and self.tasktype != "regression"
+                    and self.regroup_log_every
                     and epoch % self.regroup_log_every == 0):
                 with torch.no_grad():
                     _bs = self.params.get("batch_size", 512)
@@ -1515,6 +1521,7 @@ class TabERAWrapper:
             # fusion_mode="residual"이 아니면(head_query_ln/agg_ln/_head_first_linear
             # 구성이 다르거나 없음) None으로 남김.
             if (self.log_representation_drift_trajectory and self.tasktype != "regression"
+                    and self.regroup_log_every
                     and epoch % self.regroup_log_every == 0):
                 with torch.no_grad():
                     _n_anchor = min(256, len(X_val))

@@ -396,12 +396,6 @@ class CentroidLayer(nn.Module):
         regroup_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
         freeze_centroid_after: "int | None" = None,   # 아래 설명 참고
         dead_reinit_patience: int = 5,    # 5회 연속 dead면 재초기화 — [주의] 문헌
-                                            # (Jukebox/SoundStream/NSVQ)이 실제로 쓰는
-                                            # 기준은 "연속 N epoch"이 아니라 "사용률이
-                                            # threshold 아래로 떨어지면"이라 이 파라미터화
-                                            # 자체가 문헌과 다름. 5라는 값도 검증된 적
-                                            # 없음(과거 별개 안전장치의 임계값과 우연히
-                                            # 같았을 뿐) — 스윕 대상으로 취급할 것.
         dead_reinit_noise_scale: float = 0.01,   # [추가] 재초기화 시 anchor 벡터에
                                             # 더하는 가우시안 노이즈의 상대 크기
                                             # (noise_std = 이 값 × anchor.norm()).
@@ -570,105 +564,43 @@ class CentroidLayer(nn.Module):
     def initialize_from_data(
         self,
         X_emb: torch.Tensor,             # (N, D) 훈련 임베딩
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — [미사용, 호출부 하위 호환용 시그니처만 유지]
-        y_labels: Optional[torch.Tensor] = None, # (N,) 레이블 (소수 클래스 보장용)
+        X_raw: Optional[torch.Tensor] = None,    # [미사용, 호출부 호환]
+        y_labels: Optional[torch.Tensor] = None, # [미사용, 호출부 호환]
     ) -> None:
-        """
-        KMeans++ 스타일 초기화.
+        """Seed the prototype memory from observed training embeddings.
 
-        Arthur & Vassilvitskii (SODA 2007) "k-means++: The Advantages of
-        Careful Seeding"의 거리 기반 확률적 시딩을 구현합니다.
+        P rows are drawn uniformly from the embeddings the encoder produces
+        before the first epoch. This is the rule dead-prototype recovery
+        already uses, so the memory is created and repaired the same way.
 
-        알고리즘
-        ────────
-        1. 첫 centroid: 균등 무작위 선택
-        2. 이후 각 centroid: 기존 centroid와의 최소 거리²에 비례한
-           확률로 다음 centroid 선택
-           → 멀리 있는 점이 선택될 확률이 높아져 dead centroid 방지
+        ⚠ 레이블을 읽지 않는다 — initialization, assignment, EMA 갱신이 모두
+          class-agnostic 이다.
 
-        y_labels가 주어지면 소수 클래스 보장
-        ──────────────────────────────────
-        P개 선택 후에도 특정 클래스가 대표 centroid를 갖지 못하면
-        해당 클래스의 대표 샘플(클래스 평균에 가장 가까운 샘플)로
-        마지막 centroid를 대체합니다.
+        ⚠ 예전에는 k-means++ 였다. 10 데이터셋 × 5 seed 비교에서 accuracy
+          −0.0017 (p=0.670), AUROC −0.0040 (p=0.478), active ratio −0.9%
+          (p=0.508) 로 차이가 없어, geometry 전용 초기화 절차를 유지할
+          근거가 없다고 판단했다(§16).
         """
         N   = X_emb.shape[0]
         dev = X_emb.device
-        X_n = F.normalize(X_emb.float(), dim=-1)  # (N, D) 정규화
-
-        # ── Step 1: KMeans++ 시딩 ────────────────────────────────
-        selected_idx = []
-
-        # 첫 centroid: 균등 무작위
-        first = torch.randint(N, (1,), device=dev).item()
-        selected_idx.append(first)
-
-        for _ in range(self.P - 1):
-            ctrs  = X_n[torch.tensor(selected_idx, device=dev)]
-            sims  = X_n @ ctrs.T
-            max_sim, _ = sims.max(dim=1)
-            dists_sq = (1.0 - max_sim).clamp(min=0.0) ** 2
-            dists_sq[torch.tensor(selected_idx, device=dev)] = 0.0
-            if dists_sq.sum() < 1e-10:
-                nxt = torch.randint(N, (1,), device=dev).item()
-            else:
-                nxt = torch.multinomial(dists_sq, 1).item()
-            selected_idx.append(nxt)
-
-        # ── Step 2: 소수 클래스 보장 (y_labels 있을 때) ────────────
-        if y_labels is not None:
-            y_cpu = y_labels.cpu()
-            unique_cls = y_cpu.unique().tolist()
-            sel_labels = y_cpu[torch.tensor(selected_idx)].tolist()
-
-            for cls in unique_cls:
-                if cls not in sel_labels:
-                    # 해당 클래스 샘플들의 평균 임베딩에 가장 가까운 샘플
-                    cls_mask = (y_cpu == cls).nonzero(as_tuple=True)[0]
-                    cls_emb  = X_n[cls_mask.to(dev)].mean(0, keepdim=True)
-                    dists    = 1.0 - (X_n[cls_mask.to(dev)] @ cls_emb.T).squeeze()
-                    rep_idx  = cls_mask[dists.argmin().item()].item()
-                    # 가장 큰 클러스터에 해당하는 마지막 selected를 교체
-                    sel_t    = torch.tensor(selected_idx)
-                    sel_lbl  = y_cpu[sel_t]
-                    majority = sel_lbl.long().bincount().argmax().item()
-                    maj_pos  = (sel_lbl == majority).nonzero(as_tuple=True)[0]
-                    if len(maj_pos) > 1:
-                        selected_idx[maj_pos[-1].item()] = rep_idx
-
-        # ── Step 3: centroid 등록 ────────────────────────────────
-        idx_t = torch.tensor(selected_idx, device=dev)
-        self.centroid_emb.data = X_n[idx_t]
-
-        # [제거됨] 이전엔 여기서 ig_baseline(IG medoid)도 같이 초기화했음.
-        # X_raw 파라미터는 supervised.py 호출부 하위 호환을 위해 시그니처는
-        # 유지하되, 더 이상 이 함수 내부에서 쓰이지 않음(③=SHAP 통일).
-        self.sample_groups = [[] for _ in range(self.P)]
-
-        # [추가] EMA buffer도 방금 정해진 실제 KMeans++ 결과와 일치시킴 —
-        # __init__ 시점엔 centroid_emb가 아직 orthogonal random 초기값이라
-        # 거기 맞춰 잡았던 ema_embed_sum이 이 시점엔 stale해짐. 여기서
-        # 다시 맞추지 않으면 첫 ema_update() 호출 때 "KMeans++가 잡아준
-        # 위치"에서 "orthogonal random 초기값 쪽" 방향으로 급격히 끌려가는
-        # 원치 않는 점프가 생김.
-        if self.use_ema_codebook:
+        # Uniform sample of P observed embeddings, without replacement.
+        idx = torch.randperm(N, device=dev)[: self.P]
+        if idx.numel() < self.P:
+            # Only reachable when P is set directly: P = floor(sqrt(N))
+            # gives P <= N for every N. Falls back to replacement, which
+            # duplicates prototypes -- dead-prototype recovery separates
+            # them again once training starts.
+            pad = torch.randint(0, N, (self.P - idx.numel(),), device=dev)
+            idx = torch.cat([idx, pad])
+        self.centroid_emb.data.copy_(F.normalize(X_emb[idx].float(), dim=-1))
+        if hasattr(self, 'ema_cluster_size'):
             self.ema_cluster_size.fill_(1.0)
             self.ema_embed_sum.data = (
-                self.centroid_emb.data.clone() * self.ema_cluster_size.unsqueeze(-1)
-            )
+                self.centroid_emb.data.clone()
+                * self.ema_cluster_size.unsqueeze(-1))
+        print(f"  [CentroidLayer] {self.P} prototypes sampled from "
+              f"{N} training embeddings")
 
-        # 초기화 품질 로그: centroid 간 평균 코사인 거리
-        sim_mat  = self.centroid_emb.data @ self.centroid_emb.data.T
-        mask     = ~torch.eye(self.P, dtype=torch.bool, device=dev)
-        avg_dist = (1.0 - sim_mat[mask]).mean().item()
-        print(f"  [CentroidLayer] KMeans++ {self.P} centroids "
-              f"from {N} samples. avg_inter_dist={avg_dist:.3f}")
-
-    # ─────────────────────────────────────────────────────────
-    # [추가] EMA 기반 codebook 업데이트 (codebook_loss의 gradient-free 대체)
-    # ─────────────────────────────────────────────────────────
-
-    @torch.no_grad()
     def ema_update(self, query_emb: torch.Tensor, hard_assignment: torch.Tensor) -> None:
         """
         van den Oord et al.(2017) Appendix / VQ-VAE-2(Razavi et al. 2019)
