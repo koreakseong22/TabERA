@@ -135,7 +135,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
       전체를 반환하고, 자르는 일은 여기서만 한다. 분석 스크립트는
       diagnostics를 직접 불러 전체 분포를 봐야 한다.
 
-    ⚠ 이 함수는 판정하지 않는다. "모호한 지역이다" 같은 문장을 만들려면
+    ⚠ 이 함수는 판정하지 않는다. "ambiguous region" 같은 문장을 만들려면
       경험적 분포에서 기준선을 정해야 하는데, 샘플 하나를 찍는 이 자리에는
       참조 분포가 없다. 값만 출력한다.
     """
@@ -162,7 +162,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     proto = e["prototype"]
     print(f"\n  ① Prototype Assignment")
 
-    # 이 그룹의 target(클래스) 분포 — ①의 주 콘텐츠 (label_groups_by_target(),
+    # 이 of the group target(클래스) 분포 — ①의 주 콘텐츠 (label_groups_by_target(),
     # regroup_update() 직후 캐싱됨). ②(실제 이웃의 raw feature 값)와 정보 종류가
     # 겹치지 않도록, feature 요약이 아니라 "이 그룹이 어떤 부류인가"만 보여준다.
     tinfo = proto.get("target_info")
@@ -189,7 +189,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     # 값은 샘플마다 갈리지만 **기준이 없어 읽어도 판단이 안 선다** —
     # P=28이면 균등이 3.6%인데 '16.5%'가 높은 건지 낮은 건지 알 수 없다.
     # 바로 아래 Routing distribution이 같은 정보를 비교 가능한 형태로 준다
-    # (2·3위 그룹의 label distribution까지 붙어서 훨씬 잘 읽힘).
+    # (2·3위 of the group label distribution까지 붙어서 훨씬 잘 읽힘).
     # 값 자체는 explanations[b]['prototype']에 그대로 남아 있다 — 진단용.
     print(f"     Prototype label distribution: {target_str}")
 
@@ -211,8 +211,8 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                   f"({_format_target_info(r['target_info'])})")
         if _shown < len(proto["runners_up"]) and verbose:
             _hid = len(proto["runners_up"]) - _shown
-            print(f"       ⚠ 구성원이 없는 prototype {_hid}개는 생략했습니다"
-                  f" (라우팅 확률은 있으나 설명할 그룹이 없음)")
+            print(f"       {_hid} prototype(s) with no members hidden"
+                  f" (they have routing mass but no group to describe)")
         print(f"       • {'Others':<20s} {proto['others_mass']:>6.1%}")
 
     # 이 그룹을 다른 그룹들과 가장 뚜렷이 구별시키는 feature의 실제
@@ -225,7 +225,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             labels, get_kind=lambda fl: fl.kind,
             get_str=lambda fl: f"{fl.feature_name}={fl.label}",
         )
-        print(f"     Distinctive features:")
+        print(f"     Characteristic features:")
         if num_strs:
             print(f"       numeric:     {',  '.join(num_strs)}")
         if cat_strs:
@@ -260,18 +260,18 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     #     **어긋난** feature를 같이 보여준다.
     _p = le.get("prototype") if le else None
     _scope = f"NN(q, G_{_p})" if _p is not None else "NN(q, G_p)"
-    print(f"\n  ② Local Evidence — prototype-conditioned   {_scope}, not NN(q, D)")
+    print(f"\n  ② Similar cases in the same group")
     # ⚠ 아래 5줄은 **내용이 맞지만 매 샘플 반복될 성질이 아니다.**
     #   14건을 읽으면 70줄이 되고, 두 번째 샘플부터는 아무도 안 읽는다.
     #   해석 규칙은 한 번만 읽으면 되는 것이므로 verbose에서만 낸다.
     #   (설명 전체의 규칙이지 이 샘플의 사실이 아니다.)
     if verbose:
-        print(f"     같은 prototype 그룹 **안에서만** 검색합니다 — 전체 데이터의 최근접이 아닙니다.")
-        print(f"     ⚠ 이웃의 결과 분포는 **예측 근거가 아닙니다.** 같은 prototype 내부에서는")
-        print(f"       label 분리가 제한적이므로(그룹 내부 판별력 측정 완료), 이웃 다수결을")
-        print(f"       근거로 쓰면 그룹 분포의 표본 노이즈를 증거로 제시하는 셈이 됩니다.")
-        print(f"       여기서 읽을 수 있는 것은 '이 결정이 얼마나 전형적인 영역에서")
-        print(f"       이루어졌는가'(local ambiguity) 하나입니다.")
+        print(f"     Search is restricted to the assigned prototype group, not the whole training set.")
+        print(f"     The neighbours' outcome distribution is not evidence for the prediction. Label")
+        print(f"       separation inside a prototype is limited, so reading a neighbour majority as")
+        print(f"       support would present sampling noise from the group distribution as a reason.")
+        print(f"       What this section carries is one quantity: whether the decision was made in")
+        print(f"       a typical part of its region or an ambiguous one.")
 
     # ── 지역 분포 vs 그룹 분포 ────────────────────────────────────
     def _fmt_label(v):
@@ -287,18 +287,18 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     if le is not None:
         if tasktype == "regression":
             if le.get("group_std") == le.get("group_std"):   # not nan
-                print(f"\n     이 지역(최근접 {le['n_neighbors']}개)  "
+                print(f"\n     neighbourhood (k={le['n_neighbors']})  "
                       f"mean {le['local_mean']:.4g}  std {le['local_std']:.4g}")
-                print(f"     그룹 전체 (n={le['group_size']})      "
+                print(f"     whole group (n={le['group_size']})      "
                       f"mean {le['group_mean']:.4g}  std {le['group_std']:.4g}")
                 _dr = le.get("dispersion_ratio")
                 if _dr is not None and _dr == _dr:
-                    print(f"     → 지역 산포 / 그룹 산포 = {_dr:.2f}  "
-                          f"(판정 기준은 경험적 분포에서 정할 것)")
+                    print(f"     -> local / group entropy = {_dr:.2f}  "
+                          f"(threshold to be set from the empirical distribution)")
         else:
             def _dist_str(counts, total):
                 if not total:
-                    return "(비어있음)"
+                    return "(empty)"
                 return ",  ".join(
                     f"{_fmt_label(float(k))} {c}/{total} ({c/total:.0%})"
                     for k, c in sorted(counts.items(), key=lambda x: -x[1]))
@@ -322,19 +322,19 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             # 찍히면 evidence_w entropy와 구분이 안 된다.
             if _single:
                 _skip_contrast = True
-                print(f"\n     이 지역(최근접 {le['n_neighbors']}개)은 전부 "
-                      f"{_fmt_label(float(next(iter(_lc))))} — 단일 클래스 영역 (반례 없음)")
+                print(f"\n     the k={le['n_neighbors']} nearest are all "
+                      f"{_fmt_label(float(next(iter(_lc))))} — single-class region, no contrasting case")
             elif _one:
                 # 이웃이 전부 예측과 반대 — 축약하지 않고 오히려 강조한다.
                 # 아래 Contrasting 목록에 전부 나온다.
-                print(f"\n     ⚠ 이 지역(최근접 {le['n_neighbors']}개)은 전부 "
-                      f"{_fmt_label(float(next(iter(_lc))))}인데 예측은 "
-                      f"{(pred_info or {}).get('pred_label', '?')}입니다 "
-                      f"— 이웃 전부가 반례")
+                print(f"\n     ⚠ the k={le['n_neighbors']} nearest are all "
+                      f"{_fmt_label(float(next(iter(_lc))))} while the prediction is "
+                      f"{(pred_info or {}).get('pred_label', '?')} "
+                      f"— every neighbour contradicts it")
             else:
-                print(f"\n     이 지역(최근접 {le['n_neighbors']}개)   "
+                print(f"\n     neighbourhood (k={le['n_neighbors']})   "
                       f"{_dist_str(_lc, le['n_neighbors'])}   H(label) {le['label_entropy']:.3f}")
-            print(f"     그룹 전체 (n={le['group_size']})       "
+            print(f"     whole group (n={le['group_size']})       "
                   f"{_dist_str(_gc, le['group_size'])}   H(label) {le['group_label_entropy']:.3f}")
             _ar = le.get("ambiguity_ratio")
             if (not _single) and _ar is not None and _ar == _ar:
@@ -342,9 +342,9 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                 #   지역" 같은 문구를 붙였는데, 그 두 값에는 아무 근거가
                 #   없었다. 어디부터 높은 것인지는 eval set 전체의 경험적
                 #   분포에서 정해야 하고, 그건 분석 스크립트의 일이다.
-                print(f"     → 상대 모호성 {_ar:.2f}  "
-                      f"(= 지역 entropy / 그룹 entropy. 판정 기준은 "
-                      f"경험적 분포에서 정할 것)")
+                print(f"     -> relative ambiguity {_ar:.2f}  "
+                      f"(local entropy / group entropy; the threshold for "
+                      f"calling a region ambiguous is not fixed here)")
 
     # ── 사례 목록: supporting / contrasting ───────────────────────
     def _fmt_cat_value(name: str, code_val: float) -> str:
@@ -381,29 +381,29 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
         return num_strs, cat_strs
 
     if not nbrs:
-        print(f"\n     (no neighbors — memory bank가 k개를 못 채웠거나 "
-              f"'neighbors' 키가 없는 구버전 출력입니다)")
+        print(f"\n     (no neighbours — the memory bank held fewer than k, or this "
+              f"is output from a version without the 'neighbors' key)")
     else:
         # 예측과 같은 결과 / 다른 결과로 나눈다. 반례가 반례로 보여야
         # case-based 설명이 성립한다.
         _pc = (pred_info or {}).get("pred_code")
         if tasktype == "regression" or _pc is None:
-            groups = [("Cases (예측과의 대조 없음)", nbrs)]
+            groups = [("Cases (no outcome contrast)", nbrs)]
         else:
             sup = [n for n in nbrs
                    if n["label"] is not None and int(round(n["label"])) == int(_pc)]
             con = [n for n in nbrs
                    if n["label"] is not None and int(round(n["label"])) != int(_pc)]
-            groups = [("Supporting cases (예측과 같은 결과)", sup),
-                      ("Contrasting cases (예측과 다른 결과)", con)]
+            groups = [("Outcome-matched cases", sup),
+                      ("Outcome-contrasting cases", con)]
 
         for title, rows in groups:
             if not rows:
                 # 위에서 "단일 클래스 영역 (반례 없음)"을 이미 말했으면
                 # 같은 사실을 두 번 찍지 않는다.
                 if title.startswith("Contrasting") and not _skip_contrast:
-                    print(f"\n     Contrasting cases — 없음 "
-                          f"(최근접 {len(nbrs)}개가 모두 예측과 같은 결과)")
+                    print(f"\n     Outcome-contrasting cases — none "
+                          f"(all {len(nbrs)} nearest share the prediction)")
                 continue
             print(f"\n     {title}")
             _is_con = title.startswith("Contrasting")
@@ -422,9 +422,9 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                     ns, cs = _fmt_items([(g["name"], g["neighbor_value"], g["kind"])
                                           for g in near])
                     if ns:
-                        print(f"            가까운 feature numeric:     {', '.join(ns)}")
+                        print(f"            close on numeric:     {', '.join(ns)}")
                     if cs:
-                        print(f"            가까운 feature categorical: {', '.join(cs)}")
+                        print(f"            close on categorical: {', '.join(cs)}")
                 # 반례에는 "어디가 다른가"를 반드시 같이 보여준다.
                 # ⚠ gap이 0이면 "다른 점"이 아니다. 전체를 gap 내림차순으로
                 #   자르기만 하면, 모든 gap이 0인 경우(중복 행, 혹은
@@ -445,15 +445,15 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                     for name, nval, kind, delta in df:
                         if kind == "categorical":
                             qv = nval - delta
-                            print(f"            다른 점: {name}  "
+                            print(f"            differs: {name}  "
                                   f"query {_fmt_cat_value(name, qv).split('=', 1)[1]}"
-                                  f" → 이웃 {_fmt_cat_value(name, nval).split('=', 1)[1]}")
+                                  f" -> neighbour {_fmt_cat_value(name, nval).split('=', 1)[1]}")
                         else:
                             qv = nval - delta
-                            print(f"            다른 점: {name}  "
+                            print(f"            differs: {name}  "
                                   f"query {_fmt_num_value(name, qv).split('=', 1)[1]}"
-                                  f" → 이웃 {_fmt_num_value(name, nval).split('=', 1)[1]}"
-                                  f"   ({delta*100:+.0f} 백분위)")
+                                  f" -> neighbour {_fmt_num_value(name, nval).split('=', 1)[1]}"
+                                  f"   ({delta*100:+.0f} pct)")
             if len(rows) > max_neighbors:
                 print(f"       ... (+{len(rows) - max_neighbors} more)")
 
@@ -486,15 +486,15 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     #   분해 항등식(logits = W·c + W·(β·r))은 그대로 정확하다.
     dv = e.get("prototype_deviation")
     if dv is not None:
-        print(f"\n  ③ Query-direction Correction   h = c + β·normalize(q − c) ≈ c + β·q̂")
+        print(f"\n  ③ How this sample differs from its group")
         # ⚠ 이 분해는 근사가 아니다. dev_head가 단일 Linear이므로
         #   logits = (W·c + b) + W·(β·r) 이 항등식이고, 두 항의 합이 항상
         #   실제 logits와 일치한다(스모크에서 오차 0.000e+00로 확인).
         #   SHAP/IG처럼 baseline을 골라 근사하는 것과 성격이 다르다.
         if verbose:
-            print(f"     (dev_head가 단일 Linear라 logits = (W·c + b) + W·(β·r) — 정확한 분해)")
-            print(f"     ⚠ r = normalize(q−c)이지만 ‖q‖≫‖c‖=1이라 사실상 q의 방향이다"
-                  f" (cos(r,q)≈1.00). prototype으로부터의 편차가 아니다.")
+            print(f"     (dev_head is a single Linear, so logits = (W·c + b) + W·(β·r) — an exact decomposition)")
+            print(f"     r = normalize(q−c), but ‖q‖ >> ‖c‖ = 1, so it points along q"
+                  f" (cos(r, q) ~ 1.00). It is not a deviation from the prototype.")
         # [교체] '편차 비중' + '결정: 그대로' → 확률 이동
         #
         # ⚠ dev_share는 로짓 크기 비율이라 **크기를 과장한다.** credit-g
@@ -508,27 +508,27 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
         #   이 줄이 설명의 핵심이 된다. 조건에 따라 살아나는 줄이다.
         if dv.get("prob_final") is not None:
             _pp, _pf = dv["prob_proto"], dv["prob_final"]
-            _lab = (pred_info or {}).get("pred_label", "예측")
+            _lab = (pred_info or {}).get("pred_label", "prediction")
             # ⚠ 이 값은 W·c 에만 의존하므로 **같은 prototype에 배정된 모든
             #   샘플에서 동일하다**(credit-g 실측: Centroid_16의 7개 샘플이
             #   전부 65.1%). "prototype만"이라고 쓰면 샘플별 값처럼 읽히므로
             #   그룹 수준 기준선임을 이름에 드러낸다. 샘플마다 다른 것은
             #   이동폭뿐이다.
-            print(f"     그룹 기준선(prototype baseline): {_lab} {_pp:.1%}")
-            print(f"     이 샘플의 최종:                   {_lab} {_pf:.1%}"
+            print(f"     prototype-only prediction: {_lab} {_pp:.1%}")
+            print(f"     this sample:              {_lab} {_pf:.1%}"
                   f"   ({(_pf - _pp) * 100:+.1f}%p)")
             if dv["argmax_changed"]:
                 _pc = dv.get("proto_pred")
                 _pn = (target_class_names[_pc]
                        if (target_class_names and _pc is not None
                            and 0 <= _pc < len(target_class_names)) else _pc)
-                print(f"     ⚠ 결정이 바뀜 — prototype만으로는 \"{_pn}\", "
-                      f"query 방향 보정이 \"{_lab}\"으로 뒤집음")
+                print(f"     the correction changes the decision — prototype alone gives \"{_pn}\", "
+                      f"the query-direction correction flips it to \"{_lab}\"")
         else:
             # 회귀: 확률이 없으므로 로짓 분해 그대로
             print(f"     prototype={dv['logit_proto']:+.4f}"
                   f"   query_dir={dv['logit_dev']:+.4f}"
-                  f"   최종={dv['logit_proto'] + dv['logit_dev']:+.4f}")
+                  f"   final={dv['logit_proto'] + dv['logit_dev']:+.4f}")
 
         # [제거] 편차 집중도 / dim_contrib
         # embedding 차원 번호는 사람이 아무것도 할 수 없는 정보다. 25건을
@@ -539,14 +539,14 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     # ③-b feature 공간의 그룹 대비 — 읽을 수 있는 축
     gc = e.get("group_stats")
     if gc and (gc.get("numeric") or gc.get("categorical")):
-        print(f"\n     그룹 대비 (feature 공간, n={gc['group_size']})")
+        print(f"\n     against the group (feature space, n={gc['group_size']})")
         if verbose:
-            print(f"     ('그룹 대표값'은 quantile 공간 평균의 역변환 — 산술평균이 아님)")
+            print(f"     (the group typical value is the inverse transform of a mean taken in quantile space, not an arithmetic mean)")
         # ⚠ 위 ③(embedding 공간의 정확한 logit 분해)과 **다른 축**이다.
         #   이건 기술 통계지 attribution이 아니다 — "이 feature 때문에
         #   예측이 이렇게 나왔다"는 문장을 이 값으로 만들면 안 된다.
         if verbose:
-            print(f"     (같은 그룹 대비 기술 통계 — attribution 아님, ③과 인과로 연결 금지)")
+            print(f"     (descriptive statistics against the same group — not attribution; do not read causally with the decomposition above)")
         # [절단 위치] diagnostics는 전체 feature를 |z| 내림차순으로 준다.
         for d in gc.get("numeric", [])[:max_features]:
             # 실단위 역변환. quantile_transformer가 없으면 [0,1] 백분위 그대로.
@@ -577,7 +577,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             _v_s  = _fmt(_vr, d["value"])
             _mu_s = _fmt(_mr, d["group_mean"])
             # ⚠ 정수형 feature(existing_credits, installment_commitment 등)는
-            #   둘 다 정수로 반올림되어 "1 (그룹 대표값 1, z=-0.79)"처럼
+            #   둘 다 정수로 반올림되어 "1 (group typical 1, z=-0.79)"처럼
             #   **같아 보이는데 z만 붙는** 상태가 된다(14건 numeric 줄의 약 27%).
             #   읽는 사람은 "같은데 왜 z가 있지?"가 된다. 실제로는 1 vs 1.4다.
             #   "대표값과 같음"으로 쓰면 1.4라는 정보가 사라지므로, 대신
@@ -595,7 +595,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             if _vr is not None and _mr is not None and _mr > 0 and _vr > 0:
                 _r = _vr / _mr
                 if _r >= 1.15 or _r <= 0.87:      # 표시 절단(판정 아님)
-                    _ratio = f"{_r:.1f}배, " if _r >= 1 else f"{1/_r:.1f}배 낮음, "
+                    _ratio = f"{_r:.1f}x, " if _r >= 1 else f"{1/_r:.1f}x lower, "
             # ⚠ "평균"이라고 쓰면 안 된다. 이 값은 quantile 공간 평균을
             #   역변환한 것(inverse_transform(mean(q)))이라 실공간의 산술
             #   평균이 아니다. credit_amount처럼 왜곡된 분포에서는 산술
@@ -611,11 +611,11 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             if _pct is None:
                 _pos = f"z={d['z']:+.2f}"
             elif _pct >= 0.5:
-                _pos = f"그룹 내 상위 {(1 - _pct) * 100:.0f}%"
+                _pos = f"top {(1 - _pct) * 100:.0f}%"
             else:
-                _pos = f"그룹 내 하위 {_pct * 100:.0f}%"
+                _pos = f"bottom {_pct * 100:.0f}%"
             print(f"       {d['feature_name']}={_v_s}"
-                  f"   (그룹 대표값 {_mu_s},  {_ratio}{_pos})")
+                  f"   (group typical {_mu_s},  {_ratio}{_pos})")
         for d in gc.get("categorical", [])[:max_features]:
             # ⚠ 거르지 않는다. 이전에는 "이 값이 곧 최빈값이면 건너뛴다"로
             #   숨겼는데, 무엇을 숨길지 표시부가 정하면 읽는 사람은 그
@@ -625,8 +625,8 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             # 돌려준다 — 실제 이름 매핑은 여기(출력부)에서 한다.
             _v  = _fmt_cat_value(d["feature_name"], d["value"]).split("=", 1)[1]
             _mv = _fmt_cat_value(d["feature_name"], d["group_mode"]).split("=", 1)[1]
-            print(f"       {d['feature_name']}={_v} (그룹의 {d['group_freq']:.0%})"
-                  f"   |   그룹 최빈 {_mv} ({d['group_mode_freq']:.0%})")
+            print(f"       {d['feature_name']}={_v} (of the group {d['group_freq']:.0%})"
+                  f"   |   group mode {_mv} ({d['group_mode_freq']:.0%})")
 
     # [제거] Representation Magnitude 블록
     # β는 모델 상수라 25/25 샘플에서 글자 그대로 같았고(β=0.1039),
@@ -2623,8 +2623,9 @@ def run_single_seed(
         # 뒤에서 더 우선시되도록 이 대입이 먼저 와야 함(순서 중요).
         model_kwargs["evidence_metric"] = args.evidence_metric
         if args.evidence_metric != "euclidean":
-            print(f"  [--evidence_metric] evidence_metric={args.evidence_metric} "
-                  f"(이 값으로 HPO된 study를 불러옴 — study_pkl_tag 참고)")
+            if args.verbose:
+                print(f"  [--evidence_metric] evidence_metric={args.evidence_metric} "
+                      f"(이 값으로 HPO된 study를 불러옴 — study_pkl_tag 참고)")
         if args.loss_commitment_override is not None:
             _old_commitment_w = model_kwargs.get("loss_weights", {}).get("commitment", 0.0)
             model_kwargs.setdefault("loss_weights", {})["commitment"] = args.loss_commitment_override
@@ -2749,7 +2750,8 @@ def run_single_seed(
             model_kwargs.setdefault("loss_weights", {})
             model_kwargs["loss_weights"] = {**model_kwargs.get("loss_weights", {}),
                                             "commitment": 0.0}
-            print("  commitment_loss = 0 (기본 — §10)")
+            if args.verbose:
+                print("  commitment_loss = 0 (기본 — §10)")
         if args.disable_dead_reinit:
             # patience를 학습 epoch 수보다 크게 두면 재초기화가 한 번도
             # 발생하지 않는다 — 별도 분기 추가 없이 완전 OFF를 만든다.
@@ -2877,6 +2879,10 @@ def run_single_seed(
         cat_category_names=dataset.cat_category_names,
         target_class_names=dataset.target_class_names,
         quantile_transformer=dataset.quantile_transformer,
+        # Silent unless asked. These lines track how the partition formed,
+        # which is a development concern rather than a result.
+        # Same default as optimize.py: every 10 epochs. --regroup_log_every 0
+        # turns the lines off entirely.
         regroup_log_every=args.regroup_log_every,
         time_epoch=args.time_epoch,
         log_beta=args.log_beta,
@@ -3029,8 +3035,9 @@ def run_single_seed(
 
             refresh_stats = model.refresh_memory_keys()
             if refresh_stats is not None:
-                print(f"  [--refresh_on_best] memory.keys {refresh_stats['n_refreshed']}개 "
-                      f"슬롯을 frozen weight로 재계산 완료")
+                if args.verbose:
+                    print(f"  [--refresh_on_best] memory.keys {refresh_stats['n_refreshed']}개 "
+                          f"슬롯을 frozen weight로 재계산 완료")
 
                 if _stale_prev is not None:
                     try:
@@ -5079,7 +5086,7 @@ def run_single_seed(
             # 애초에 append 안 함).
             _rb_savez_kwargs["neighbor_labels"] = torch.cat(_rb_neighbor_label_chunks, dim=0).numpy()
             _rb_savez_kwargs["neighbor_sample_ids"] = torch.cat(_rb_neighbor_sid_chunks, dim=0).numpy()
-            # [2026-07] 각 test 샘플이 배정된 centroid 그룹의 train 크기.
+            # [2026-07] 각 test 샘플이 배정된 centroid of the group train 크기.
             # 재현성 Jaccard의 해석에 필수 — 그룹이 작으면 서로 다른 두 모델이
             # 우연히 같은 이웃을 고를 확률이 높아진다. 무작위 null을
             # E[J] = (k²/G) / (2k − k²/G) 로 계산하려면 G가 있어야 한다.
@@ -5190,7 +5197,7 @@ def run_single_seed(
             # [2026-07, 추가] agg_emb의 between-group / within-group 분산 분해.
             # [무엇을 재는가] agg_emb가 "샘플마다 다른 표현"인지 "그룹마다 고정된
             # 조회값"인지를 직접 구분한다. evidence_w가 사실상 균등하고(n_eff/k≈1)
-            # 검색이 centroid 그룹 내로 제한되면, agg는 그룹의 평균에 수렴해
+            # 검색이 centroid 그룹 내로 제한되면, agg는 of the group 평균에 수렴해
             # context_emb(centroid 그대로 읽기)와 같은 층위의 정보가 된다.
             #   ratio → 1 : 그룹 조회에 가까움 (같은 그룹이면 거의 같은 값)
             #   ratio → 0 : 샘플별로 실제로 다른 값
@@ -5495,13 +5502,14 @@ def run_single_seed(
     print(f"\n  저장: {pred_path}")
     if wrapper.centroid_geometry_diag is not None:
         _diag = wrapper.centroid_geometry_diag
-        print(f"  centroid_geometry_diag: "
-              f"reinit_per_epoch={_diag.get('reinit_per_epoch', float('nan')):.3f}  "
-              f"active_ratio_std={_diag.get('active_ratio_std', float('nan')):.4f}  "
-              f"margin_percentile={_diag.get('margin_percentile', float('nan')):.3f}  "
-              f"avg_inter_dist_final={_diag.get('avg_inter_dist_final', float('nan')):.3f} "
-              f"(← 위 '[CentroidLayer] KMeans++ ... avg_inter_dist=' 값과 비교 — "
-              f"학습 끝에서 뚜렷이 작아졌으면 centroid들이 서로 뭉쳤다는 뜻)")
+        if args.verbose:
+            print(f"  centroid_geometry_diag: "
+                  f"reinit_per_epoch={_diag.get('reinit_per_epoch', float('nan')):.3f}  "
+                  f"active_ratio_std={_diag.get('active_ratio_std', float('nan')):.4f}  "
+                  f"margin_percentile={_diag.get('margin_percentile', float('nan')):.3f}  "
+                  f"avg_inter_dist_final={_diag.get('avg_inter_dist_final', float('nan')):.3f} "
+                  f"(← 위 '[CentroidLayer] KMeans++ ... avg_inter_dist=' 값과 비교 — "
+                  f"학습 끝에서 뚜렷이 작아졌으면 centroid들이 서로 뭉쳤다는 뜻)")
     if wrapper.branch_gradient_history:
         _first, _last = wrapper.branch_gradient_history[0], wrapper.branch_gradient_history[-1]
         _names = [k[:-len("_grad_norm")] for k in _first if k.endswith("_grad_norm")]
@@ -5763,6 +5771,13 @@ def main():
                               "feature_store 전송 / label 계산) 누적 소요 시간을 "
                               "학습 종료 후 표로 출력합니다. 켜면 정확한 측정을 위해 "
                               "CUDA sync가 들어가므로 기본은 꺼져 있습니다."))
+    parser.add_argument("--verbose", action="store_true",
+                        help=(
+                            "Also print the lines that describe how a run got "
+                            "where it did rather than what it produced: which "
+                            "study was loaded, memory refresh, and centroid "
+                            "geometry. Training progress is controlled "
+                            "separately by --regroup_log_every."))
     parser.add_argument("--explain_verbose", action="store_true",
                         help=("설명 출력에 해석 규칙 주석을 함께 표시합니다. "
                               "기본값(꺼짐)에서는 샘플마다 반복되는 고정 문구 "
@@ -6142,7 +6157,7 @@ def main():
                             "optimize.py --evidence_metric으로 이 값에 맞춰 HPO를 새로 돌린 뒤, "
                             "여기서도 같은 값을 줘야 그 study를 찾음(study_pkl_tag가 파일명에 "
                             "반영). euclidean이면 기존과 완전히 동일 — 태그 없음. "
-                            "--evidence_metric_override(아래)와 다른 점: 이건 '그 metric으로 "
+                            "--evidence_metric_override(아래)와 differs: 이건 '그 metric으로 "
                             "HPO된 study를 불러와서 재학습'이고, override는 '기존 euclidean "
                             "study의 best_params에 이 값만 강제로 바꿔치기해서 재학습'(정식 "
                             "HPO 없이 빠르게 확인하는 용도) — 둘 다 주면 override가 우선."
@@ -6536,6 +6551,7 @@ def main():
                             "많은 데이터셋에서는 그만큼 배로 느려지므로 필요할 때만 켤 것."
                         ))
     args = parser.parse_args()
+    # The centroid initialisation line lives in libs.prototypes, which does
 
     # ── [Step A, v2 정리] 폐기된 옵션의 기본값 주입 ────────────────
     # 아래 항목은 v2에서 폐기 확정되어 **CLI에서 제거**했다. 다만 코드
