@@ -1,52 +1,36 @@
 """
 libs/prototypes.py
 ==================
-CentroidLayer — Dual-Space Prototype Representation
-    (이중 공간 프로토타입 기반 계층적 설명가능 검색 레이어)
+CentroidLayer — the prototype partition of the learned representation.
 
-가설 핵심 구현
-──────────────
-(1) 임베딩 공간 centroid
-    - centroid_emb  (P, D) : 임베딩 공간 — STE routing + FAISS 마스킹용
+What it does
+────────────
+(1) Prototype memory
+    centroid_emb (P, D), unit vectors. Not neural parameters: they are
+    maintained as an EMA of the embeddings assigned to them, and unused ones
+    are reinitialised from observed embeddings. Neither step reads labels.
 
-(2) Straight-Through Estimator (STE) Hard Routing + FAISS 범위 제한
-    - O(N) → O(P + k·log k) 복잡도 개선
-    - 배정된 centroid 그룹 내 샘플 인덱스만 FAISS 검색 후보로 제한
-    - train: Straight-Through Estimator (STE) / eval: argmax hard
-    - STE: forward=argmax(hard), backward=softmax gradient 통과
-    - 근거: VQ-VAE(van den Oord, 2017) 표준 설계 + commitment loss
+(2) Hard routing with a straight-through estimator
+    a = argmax_p cos(q, c_p), scaled by routing_scale before the softmax.
+    Forward takes the hard argmax; backward passes the softmax gradient
+    (Bengio et al. 2013; the hard-assignment trick from VQ-VAE,
+    van den Oord et al. 2017). This single assignment fixes both the
+    prediction baseline c and the retrieval pool G(a).
 
-(3) 그룹 텍스트 라벨 — ①의 그룹 설명용
-    - ①의 주 콘텐츠: 이 그룹이 어떤 target(클래스)에 해당하는지
-      (label_groups_by_target) — ②/③ 어디에도 없는 ①만의 고유 정보
-    - 보조 정보: 그룹을 가장 잘 특징짓는 feature들의 실제 그룹 평균값
-      (label_all_groups) — 정성적 밴드("매우 높음" 등)가 아니라 원값
-    - 매 epoch regroup_update() 직후 supervised.py에서 계산·캐싱
-    - [설계 변경 이력] 이전에는 centroid_x(medoid)를 buffer로 저장해
-      ①에서 대표 데이터 1개를 그대로 보여줬으나, (a) 표본이 적은
-      그룹에서 outlier 1개가 그대로 대표값이 될 위험, (b) "실제 존재
-      하는 샘플을 보여준다"는 medoid의 장점은 이미 ②(MemoryBank 이웃
-      k개 + evidence_w)가 더 강한 근거로 제공하고 있어 역할이 중복됨
-      — 두 이유로 ①에서는 제거하고 텍스트 요약으로 대체함. 처음엔
-      별도 파일(libs/group_labels.py)이었으나, CentroidLayer에만
-      쓰이는 전용 헬퍼라 파일을 분리해 둘 이유가 없어 이 파일로 합침.
+(3) Group text labels — the material for explanation layer (1)
+    label_groups_by_target() answers "which target does this group
+    correspond to", which is the one thing layers (2) and (3) cannot say.
+    label_all_groups() adds the group means of the features that
+    characterise it, as raw values rather than qualitative bands.
+    Both are computed in supervised.py right after each regroup_update().
 
-[제거됨] ig_baseline — 이전엔 Integrated Gradients(③) 전용 medoid를 여기서
-    관리했음. ③을 SHAP으로 통일하면서 제거됨 — SHAP은 IG처럼 baseline→input
-    연속 경로가 필요 없고(gradient 기반이 아니라 black-box perturbation
-    기반), background로 medoid 1개가 아니라 여러 대표 샘플의 "분포"가
-    필요해 이 buffer의 용도 자체가 없어짐(SHAP background는 reproduce.py
-    에서 X_train 랜덤 샘플링으로 별도 처리).
-    [하위 호환 주의] ig_baseline / ig_baseline_initialized buffer가 state_dict
-    에서 빠짐 — 이전에 저장된 체크포인트를 --from_saved_state로 로드하면
-    strict=True 기준으로는 실패함 (그 checkpoint를 쓸 일이 있다면 로딩 시
-    strict=False 필요).
+    These used to be a separate module (libs/group_labels.py). They are
+    helpers used only by CentroidLayer, so there was no reason to keep the
+    split.
 
-이론적 근거
-───────────
-- Dual-Space Prototype Representation (본 가설)
-- Straight-Through Estimator (Bengio et al. 2013)
-- VQ-VAE hard assignment trick (van den Oord et al. 2017)
+⚠ The prototype layer carries **no gradient-based objective of its own**.
+  Assignment is discrete, the update is EMA, and dead-prototype recovery is
+  maintenance. The only training signal in the model is cross-entropy.
 """
 
 from __future__ import annotations
@@ -62,39 +46,40 @@ import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────
-# 그룹 텍스트 라벨링 헬퍼 (구 libs/group_labels.py)
+# Group text-labelling helpers (formerly libs/group_labels.py)
 # ─────────────────────────────────────────────────────────────
-# CentroidLayer.sample_groups/target_labels/group_labels 캐싱에만
-# 쓰이는 전용 함수들이라, CentroidLayer와 같은 파일에 둔다.
-# supervised.py에서 `from libs.prototypes import label_all_groups,
-# label_groups_by_target`로 가져다 쓴다.
+# These exist only to fill CentroidLayer.sample_groups / target_labels /
+# group_labels, so they live in the same file. supervised.py imports them as
+# `from libs.prototypes import label_all_groups, label_groups_by_target`.
 #
-# 두 부분으로 구성된다:
-# 1) label_groups_by_target()  — ①의 주 콘텐츠. "이 그룹이 어떤
-#    target(클래스)에 해당하는가". ②/③ 어디에도 없는, ①만의 고유 정보.
-# 2) label_all_groups()        — 그 그룹을 가장 잘 특징짓는("두드러진")
-#    feature들의 실제 그룹 평균값(원값, 정성적 밴드 아님).
+# Two parts:
+# 1) label_groups_by_target()  the main content of explanation layer (1):
+#    which target this group corresponds to. Layers (2) and (3) cannot say it.
+# 2) label_all_groups()        the group means of the features that most
+#    characterise it, as raw values rather than qualitative bands.
 #
-# 랭킹 기준: 그룹 간 대비(cross-group distinctiveness)
-# ─────────────────────────────────────────────
-# 목표는 "각 centroid의 서로 구별되는 특징"을 보여주는 것이다. "이 그룹이
-# 전체 데이터셋 대비 얼마나 극단적인가"만 보면, 여러 그룹에 걸쳐 비슷하게
-# 튀는 feature가 계속 1등을 차지해서 서로 다른 centroid들이 같은 feature로
-# 도배되는 문제가 있었다. 대신 "이 그룹의 값이 다른 그룹들의 값 분포에서
-# 얼마나 벗어나는가"(다른 그룹들 대비 robust z-score)로 랭킹한다.
+# Ranking criterion: cross-group distinctiveness
+# ──────────────────────────────────────────────
+# The goal is to show what distinguishes each centroid *from the others*.
+# Ranking by "how extreme is this group against the whole dataset" made
+# features that are extreme in many groups win every time, so different
+# centroids ended up described by the same feature. Ranking instead by "how
+# far this group's value sits from the distribution of the other groups'
+# values" (a robust z-score against the other groups) fixes that.
 #
-# numeric은 그룹 median(표본이 작을 때(흔히 1~10개) outlier에 안 휘둘림),
-# categorical은 최빈 카테고리 + 그 비율을 그대로 값으로 보여준다 — "매우
-# 높음/보통" 같은 구간 라벨은 안 쓴다(원값이 이미 직접 해석 가능하고,
-# 구간 경계값에 대한 근거를 따로 만들 필요가 없어짐).
+# Numeric features use the group median, which does not swing on an outlier
+# when the group is small (often 1-10 samples). Categorical features show the
+# most frequent category and its share. No qualitative bands ("very high",
+# "moderate"): the raw value is already interpretable, and bands would need
+# their own justification for where the boundaries fall.
 
 @dataclass
 class FeatureLabel:
     feature_idx:  int
     feature_name: str
     kind:         str    # "numeric" | "categorical"
-    label:        str    # 그룹의 실제 값 (예: "10.4" 또는 "Category 2 (65%)")
-    detail: dict          # 사람이 검증/디버그할 때 참고할 원값
+    label:        str    # the group's actual value, e.g. "10.4" or "Category 2 (65%)"
+    detail: dict          # raw values, for verification and debugging
 
 
 def _group_stats_numeric(
@@ -103,7 +88,7 @@ def _group_stats_numeric(
     sample_groups: Sequence[Sequence[int]],
     feature_idx: int,
 ) -> Dict[int, float]:
-    """그룹별 median (raw 값). {group_idx: group_median}"""
+    """Per-group median of the raw values: {group_idx: group_median}."""
     col = X_train[:, feature_idx]
     return {p: float(np.median(col[sample_groups[p]])) for p in valid_groups}
 
@@ -115,7 +100,7 @@ def _group_stats_categorical(
     feature_idx: int,
     eps: float = 1e-6,
 ) -> Dict[int, dict]:
-    """그룹별 (최빈 카테고리, 그 비율, lift). {group_idx: {...}}"""
+    """Per-group modal category with its share and lift: {group_idx: {...}}."""
     col = np.rint(X_train[:, feature_idx]).astype(int)
     out = {}
     for p in valid_groups:
@@ -136,34 +121,36 @@ def _group_stats_categorical(
 
 def _cross_group_distinctiveness(this_value: float, other_values: Sequence[float]) -> Optional[float]:
     """
-    other_values(다른 그룹들의 같은 feature 값) 분포에서 this_value가
-    얼마나 벗어나는지 robust z-score로 계산.
-    median/MAD(median absolute deviation) 사용 — 그룹 몇 개가 극단치여도
-    std보다 덜 흔들림. 비교할 다른 그룹이 2개 미만이면(=P가 아주 작은
-    경우) 계산 불가하므로 None 반환 → 호출부에서 fallback.
+    Robust z-score of `this_value` against `other_values`, the same feature's
+    values in the other groups.
+
+    Uses median and MAD (median absolute deviation) rather than mean and std,
+    so a few extreme groups do not dominate. With fewer than two other groups
+    to compare against (very small P) it cannot be computed and returns None;
+    the caller falls back.
     """
     if len(other_values) < 2:
         return None
     others = np.asarray(other_values, dtype=float)
     med = np.median(others)
-    mad = np.median(np.abs(others - med)) * 1.4826 + 1e-6  # 정규분포 가정 시 std와 동일 스케일
+    mad = np.median(np.abs(others - med)) * 1.4826 + 1e-6  # scaled to match std under normality
     return float(abs(this_value - med) / mad)
 
 
 def inverse_transform_numeric(qt, num_cols: Sequence[int], feature_idx: int, value: float) -> Optional[float]:
     """
-    numeric feature는 libs/data.py의 prep_data()에서 QuantileTransformer로
-    [0,1] uniform 값으로 바뀐 채 저장된다 — "0.328"이 실제로 몇 단위인지
-    (예: credit_amount가 몇 마르크인지) 알 방법이 없었던 원인. qt(fit된
-    QuantileTransformer)가 주어지면 실제 단위로 역변환한다.
+    Numeric features are stored after prep_data() has pushed them through a
+    QuantileTransformer into [0,1], which is why "0.328" carried no unit --
+    there was no way to say how many marks a credit_amount of 0.328 is. Given
+    the fitted transformer, this maps a value back to its original unit.
 
-    QuantileTransformer는 각 컬럼을 독립적으로 처리하므로(fit 시 컬럼별로
-    별도 분위수 매핑을 학습함), 다른 컬럼에 아무 값이나 채워 넣어도
-    feature_idx 위치의 역변환 결과에는 영향이 없다 — 그래서 그룹 값 하나만
-    바꿔 넣은 더미 행으로 역변환해도 안전하다(검증됨).
+    QuantileTransformer treats each column independently (it learns a separate
+    quantile mapping per column at fit time), so whatever fills the other
+    columns cannot affect the inverse transform at feature_idx. Passing a
+    dummy row with only this value substituted is therefore safe (verified).
 
-    qt가 None이거나 feature_idx가 num_cols에 없으면 None 반환 →
-    호출부에서 [0,1] 값 그대로 표시하는 걸로 fallback.
+    Returns None when qt is None or feature_idx is not a numeric column; the
+    caller then displays the [0,1] value as-is.
     """
     if qt is None:
         return None
@@ -191,20 +178,20 @@ def label_all_groups(
     quantile_transformer=None,
 ) -> Dict[int, List[FeatureLabel]]:
     """
-    regroup_update() 직후 호출해서 캐싱해두는 용도.
-    반환값: {group_index: [FeatureLabel, ...]}  (top_k개, 그룹 간
-    대비(distinctiveness) 내림차순 — "이 그룹만 유별난" feature가 위로)
+    Called right after regroup_update() and cached.
 
-    cat_category_names: {col_name: [원본 카테고리 문자열, ...]}가 주어지면
-    (libs/data.py의 load_data()가 반환하는 것), categorical 라벨을
-    "Category 0" 대신 실제 이름("male single" 등)으로 표시한다. 없으면
-    "Category N"으로 fallback (하위 호환 — 이 인자 없이 부르던 기존 코드도
-    그대로 동작).
+    Returns {group_index: [FeatureLabel, ...]}: the top_k features, sorted by
+    cross-group distinctiveness, so features unusual *for this group* come
+    first.
 
-    quantile_transformer: libs/data.py의 prep_data()가 반환하는 fit된
-    QuantileTransformer가 주어지면, numeric 라벨을 [0,1] uniform 값
-    대신 실제 단위(예: credit_amount=3271)로 역변환해 보여준다. 없으면
-    [0,1] 값 그대로 표시 (하위 호환).
+    cat_category_names: {col_name: [original category strings, ...]}, as
+    returned by load_data(). When given, categorical labels show the real name
+    ("male single") instead of "Category 0". Without it they fall back to
+    "Category N".
+
+    quantile_transformer: the fitted QuantileTransformer returned by
+    prep_data(). When given, numeric labels are mapped back to their original
+    unit (credit_amount = 3271) instead of the [0,1] value.
     """
     valid_groups = [p for p, g in enumerate(sample_groups)
                      if g is not None and len(g) >= min_group_size]
@@ -256,7 +243,7 @@ def label_all_groups(
             others_log = [float(np.log2(s["lift"] + 1e-6)) for q, s in stats.items() if q != p]
             dist = _cross_group_distinctiveness(this_log, others_log)
             if dist is None:
-                dist = abs(this_log)  # fallback: lift=1(log=0)에서 얼마나 떨어졌는지
+                dist = abs(this_log)  # fallback: distance from lift = 1 (log = 0)
 
             fname = col_names[fi] if fi < len(col_names) else f"f{fi}"
             names_for_col = cat_category_names.get(fname) if cat_category_names else None
@@ -278,29 +265,27 @@ def label_all_groups(
     return result
 
 
-def format_group_labels(labels: List[FeatureLabel]) -> str:
-    if not labels:
-        return "(그룹 크기가 작아 특징을 요약할 수 없습니다)"
-    lines = [f"  - {fl.feature_name}: {fl.label}" for fl in labels]
-    return "\n".join(lines)
 
 
 def label_groups_by_target(
-    labels: np.ndarray,                      # (N,) MemoryBank 라벨(class index as float, 또는 regression target)
+    labels: np.ndarray,                      # (N,) MemoryBank labels: class index as float, or regression target
     sample_groups: Sequence[Sequence[int]],
     tasktype: str,                            # "multiclass" | "binclass" | "regression"
     class_names: Optional[Sequence[str]] = None,
     min_group_size: int = 2,
-    second_class_threshold: float = 0.2,      # 2등 클래스가 이 비율 이상이면 같이 표시
+    second_class_threshold: float = 0.2,      # show the runner-up class when it reaches this share
 ) -> Dict[int, Optional[dict]]:
     """
-    각 그룹이 실제로 어떤 target에 해당하는지 요약 — ①의 주 콘텐츠.
-    - classification(multiclass/binclass): 최다 클래스 + 비율. 2등
-      클래스가 second_class_threshold 이상이면 같이 반환(그룹이 두
-      클래스에 걸쳐 있다는 걸 숨기지 않기 위함).
-    - regression: 그룹 target 평균이 전체 분포에서 몇 percentile인지.
+    Summarise which target each group corresponds to -- the main content of
+    explanation layer (1).
 
-    반환값: {group_idx: {...} or None}  (그룹 크기 미달 시 None)
+    - classification: the most frequent class and its share. The runner-up is
+      returned as well once it reaches second_class_threshold, so a group
+      straddling two classes is not presented as if it were pure.
+    - regression: the percentile of the group's mean target within the overall
+      distribution.
+
+    Returns {group_idx: {...} or None}; None when the group is too small.
     """
     labels = np.asarray(labels)
     result: Dict[int, Optional[dict]] = {}
@@ -351,40 +336,27 @@ def label_groups_by_target(
     return result
 
 
-def format_target_label(info: Optional[dict]) -> str:
-    """label_groups_by_target()의 그룹 하나 결과를 사람이 읽을 텍스트로."""
-    if info is None:
-        return "(그룹 크기가 작아 요약할 수 없습니다)"
-
-    if info["kind"] == "classification":
-        s = f"주로 \"{info['top_class_name']}\" {info['top_count']}/{info['n']} ({info['top_prop']:.0%})"
-        if info["second"] is not None:
-            s += (f" — \"{info['second']['name']}\"도 "
-                  f"{info['second']['count']}/{info['n']} ({info['second']['prop']:.0%}) 포함")
-        return s
-    else:
-        s = (f"target 평균 {info['group_mean']:.3g} "
-             f"(전체 분포 기준 백분위 {info['percentile']:.0f}, n={info['n']})")
-        return s
 
 
 class CentroidLayer(nn.Module):
     """
-    이중 공간 프로토타입 표현 레이어.
+    Prototype partition over the learned representation.
 
     Parameters
     ──────────
-    n_prototypes      : centroid 수 P
-    embed_dim         : 임베딩 차원 D
-    n_features        : 원본 feature 수 F (이중 공간 저장용)
-    prototype_labels  : centroid 의미론적 이름 (없으면 "Centroid_i" 자동 생성)
-    regroup_warmup_epochs : 이 에폭 이후부터 그룹 재계산(regroup_update) 활성화 (기본 0 = 즉시)
-    dead_reinit_patience : 이 횟수만큼 연속으로 regroup_update에서 배정을 하나도
-                          못 받으면(연속 dead) 그 centroid를 실제 embedding
-                          (무작위 샘플 + 작은 가우시안 노이즈)으로 재초기화한다
-                          (Jukebox/SoundStream 스타일 dead-code reset). 0이면 비활성화.
-    dropout           : 컨텍스트 벡터 드롭아웃
-    col_names         : 원본 feature 컬럼명 (설명 출력용)
+    n_prototypes      : number of prototypes P
+    embed_dim         : embedding dimension D
+    n_features        : number of raw features F
+    prototype_labels  : human-readable prototype names; "Centroid_i" if absent
+    regroup_warmup_epochs : regroup_update starts publishing groups after this
+                          epoch (0 = immediately)
+    dead_reinit_patience : after this many consecutive regroup_update rounds
+                          without a single assignment, the prototype is
+                          reinitialised from an observed embedding (a random
+                          sample plus small Gaussian noise), in the style of
+                          Jukebox / SoundStream dead-code reset. 0 disables it.
+    dropout           : dropout on the context vector
+    col_names         : raw feature column names, for explanation output
     """
 
     def __init__(
@@ -393,179 +365,180 @@ class CentroidLayer(nn.Module):
         embed_dim: int,
         n_features: int = 0,
         prototype_labels: Optional[List[str]] = None,
-        regroup_warmup_epochs: int = 0,   # 즉시 활성화 (warmup 없음)
-        freeze_centroid_after: "int | None" = None,   # 아래 설명 참고
-        dead_reinit_patience: int = 5,    # 5회 연속 dead면 재초기화 — [주의] 문헌
-        dead_reinit_noise_scale: float = 0.01,   # [추가] 재초기화 시 anchor 벡터에
-                                            # 더하는 가우시안 노이즈의 상대 크기
-                                            # (noise_std = 이 값 × anchor.norm()).
-                                            # 문헌은 "small Gaussian noise"라고만 하지
-                                            # 구체적 수치를 안 줌 — 0.01도 검증 안 된 값.
+        regroup_warmup_epochs: int = 0,   # active immediately; no warmup
+        freeze_centroid_after: "int | None" = None,   # see the note below
+        dead_reinit_patience: int = 5,    # reinitialise after this many
+        dead_reinit_noise_scale: float = 0.01,   # relative size of the Gaussian
+                                            # noise added to the anchor vector on
+                                            # reinitialisation
+                                            # (noise_std = this * anchor.norm()).
+                                            # The literature says only "small
+                                            # Gaussian noise"; 0.01 is unverified.
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
         routing_scale: float = 1.0,
         use_ema_codebook: bool = False,
-        ema_decay: float = 0.99,   # [문헌 근거] van den Oord et al.(2017) Appendix,
+        ema_decay: float = 0.99,   # van den Oord et al. (2017), Appendix, and
                                    # VQ-VAE-2(Razavi et al. 2019), Jukebox/SoundStream
-                                   # 등 EMA 기반 VQ 구현 전반에서 공통으로 쓰는 기본값.
-                                   # 다만 이 프로젝트 데이터로 검증된 값은 아님 —
-                                   # dead_reinit_patience/noise_scale과 같은 성격의
-                                   # "문헌 기본값, 스윕 대상"으로 취급할 것.
+                                   # the common default across EMA-based VQ
+                                   # implementations. Not verified on this
+                                   # project's data -- treat it like
+                                   # dead_reinit_patience and noise_scale: a
+                                   # literature default that is still a sweep
+                                   # candidate.
         ema_eps: float = 1e-5,     # Laplace smoothing (VQ-VAE-2 Appendix A.1) —
-                                   # N_i(EMA 배정 횟수)가 0에 가까워질 때 분모가
-                                   # 불안정해지는 걸 막음.
+                                   # keeps the denominator stable when the EMA
+                                   # assignment count N_i approaches zero.
     ) -> None:
         super().__init__()
         self.P                 = n_prototypes
         self.D                 = embed_dim
         self.F                 = n_features
         self.regroup_warmup_epochs = regroup_warmup_epochs
-        # ── [조건 F] centroid 갱신 정지 ────────────────────────────────
-        # 이 에폭 이후로 centroid_emb 를 어떤 경로로도 움직이지 않는다.
-        #     · gradient (codebook_loss)      requires_grad_(False)
-        #     · EMA                            ema_update() 조기 반환
-        #     · dead reinit                    regroup_update() 에서 건너뜀
-        #
-        # ⚠ 세 경로를 다 막아야 한다. dead centroid 재초기화도 "갱신" 이므로
-        #   하나라도 남으면 static 조건이 아니게 된다.
-        #
-        # ⚠ **초기값 고정(freeze_centroid_after=0)이 아니다.** 0 으로 두면
-        #   KMeans++ 초기 partition 을 끝까지 쓰는 것이고, 그건
-        #   "centroid 가 필요한가" 가 아니라 "무작위 partition 으로 충분한가" 를
-        #   묻는 실험이 된다. warmup 이후 값(이미 형성된 conditional
-        #   partition)을 고정해야 질문이 성립한다.
-        #
-        # ⚠ assignment step(regroup_update 의 재배정)은 계속 돈다.
-        #   encoder 가 움직이면 멤버십은 따라 바뀌고 centroid 만 멈춘다.
-        #   그래야 "update step 이 필요한가" 만 남는다.
+        # ── Freeze centroid updates after this epoch ────────────────────
+        # From this epoch on, centroid_emb must not move through any path:
+        #     EMA           ema_update() returns early
+        #     dead reinit   skipped inside regroup_update()
+        # ⚠ Every path has to be blocked. Reinitialising a dead prototype is
+        #   also an update, so leaving one open breaks the static condition.
+        # ⚠ This is **not** freezing at initialisation
+        #   (freeze_centroid_after=0). Freezing at 0 keeps the initial
+        #   partition forever, which asks "is a random partition enough"
+        #   rather than "is centroid updating needed". The question only holds
+        #   when the frozen value is a partition that has already formed.
+        # ⚠ The assignment step (reassignment inside regroup_update) keeps
+        #   running: as the encoder moves, membership follows and only the
+        #   centroids stand still. That is what isolates the update step.
         self.freeze_centroid_after = freeze_centroid_after
         self._centroid_frozen = False
         self.dead_reinit_patience  = dead_reinit_patience
         self.dead_reinit_noise_scale = dead_reinit_noise_scale
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
-        # [추가] routing softmax의 scale factor. ArcFace/CosFace/AdaCos/
-        # von Mises-Fisher Loss 등 코사인 유사도 기반 softmax를 쓰는
-        # 문헌에서 공통적으로 지적하는 문제 — cos유사도가 [-1,1]이라는
-        # 좁은 범위에 갇혀 있어 스케일링 없이 그대로 softmax에 넣으면
-        # 분포가 평평(flat)해지고, 그 결과 STE backward의 gradient
-        # 신호가 약해짐. 학습 파라미터가 아니라 고정 배수(기본 1.0 =
-        # 기존과 완전 동일, state_dict도 안 바뀜 — 새 학습 파라미터가
-        # 아니라 plain 속성이라 하위 호환 유지) — HPO로 데이터셋마다
-        # 탐색 가능하게 둠 (AdaCos 논문: 최적 scale이 클래스/그룹 수에
-        # 따라 달라짐 — 고정 상수 하나로는 부족).
+        # Scale factor for the routing softmax. Cosine-similarity softmax
+        # methods (ArcFace, CosFace, AdaCos, von Mises-Fisher losses) all note
+        # the same issue: cosine similarity is confined to [-1, 1], so feeding
+        # it to a softmax unscaled gives a flat distribution and a weak
+        # gradient through the STE backward pass. This is a fixed multiplier,
+        # not a learned parameter -- a plain attribute, so the state_dict is
+        # unchanged. It is derived from P rather than searched (see
+        # derived_routing_scale in search_space.py). TabERA does not use
+        # AdaCos itself; it borrows the shape of that scaling with the
+        # prototype count P in place of the class count.
         self.routing_scale     = routing_scale
 
-        # ── 온도 (register_buffer: 저장되지만 gradient 없음) ──
+        # ── Buffers: saved in the state_dict, no gradient ──
         self.register_buffer("current_epoch", torch.tensor(0, dtype=torch.long))
-        # dead-code reset용: centroid별 "연속으로 배정 0이었던 regroup_update 횟수"
+        # For dead-prototype recovery: consecutive regroup_update rounds in
+        # which this prototype received no assignment.
         self.register_buffer("dead_streak", torch.zeros(n_prototypes, dtype=torch.long))
 
-        # ── centroid 임베딩 (학습 가능 파라미터: routing + FAISS 마스킹) ──
+        # ── Prototype memory. Not a learned parameter under EMA: see below ──
         self.centroid_emb = nn.Parameter(torch.empty(n_prototypes, embed_dim))
         nn.init.orthogonal_(self.centroid_emb)
 
-        # ── [추가] EMA 기반 codebook 업데이트 ──────────────────────
-        # Huh et al.(2023)이 정리한 표준 구도를 따름: codebook_loss(gradient
-        # 기반, centroid → query 방향)를 EMA가 대체하고 commitment_loss
-        # (query → centroid 방향, embedder에 gradient)는 그대로 둠. 이
-        # 프로젝트 특유의 제약: centroid_emb가 항상 단위벡터여야 하므로
-        # (CosFace 스타일) 표준 EMA 공식(가중평균)에 매 업데이트 후
-        # 재정규화를 추가함 — 두 단위벡터의 가중평균은 단위벡터가 아님.
+        # ── EMA prototype memory ──────────────────────────────────
+        # The standard arrangement (surveyed in Huh et al. 2023): the EMA
+        # replaces the gradient-based codebook update that would pull a
+        # centroid toward its assigned queries. One constraint is specific to
+        # this project -- centroid_emb must stay a unit vector (CosFace
+        # style) -- so the usual weighted-average update is followed by a
+        # renormalisation, since the weighted average of two unit vectors is
+        # not itself a unit vector.
         #
-        # [중요한 설계 결정] diversity_loss도 원래 centroid_emb를 gradient로
-        # 밀어내는 손실인데, EMA는 매 배치 centroid_emb.data를 통째로
-        # 덮어쓰므로 그 직전에 optimizer.step()이 반영한 diversity_loss의
-        # gradient 효과가 즉시 지워짐(같은 파라미터를 두 메커니즘이 서로
-        # 다른 방식-누적 gradient vs hard overwrite-으로 동시에 건드리면
-        # 후자가 전자를 실질적으로 무효화함). 그래서 use_ema_codebook=True면
-        # centroid_emb를 아예 optimizer 대상에서 제외(requires_grad=False)
-        # 하고, diversity_loss도 호출 자체를 건너뜀(tabera.py에서 처리) —
-        # "밀어내기" 효과 없이 순수 EMA(=배정된 데이터의 이동평균)만으로
-        # centroid 위치가 정해짐. diversity_loss의 EMA-호환 버전(예: EMA
-        # 업데이트 직후 비-gradient 방식으로 서로 가까운 centroid를 살짝
-        # 밀어내는 로직)은 아직 없음 — 필요하면 별도로 설계해야 함.
+        # ⚠ Under EMA, centroid_emb is removed from the optimizer entirely
+        #   (requires_grad = False). Any gradient-based push on the same
+        #   tensor would be erased anyway: EMA overwrites centroid_emb.data
+        #   wholesale every batch, so whatever optimizer.step() applied just
+        #   before it disappears. When two mechanisms write one parameter --
+        #   one accumulating a gradient, one overwriting -- the overwriting
+        #   one wins. Centroid positions are therefore set purely by the
+        #   running mean of the embeddings assigned to them.
         self.use_ema_codebook = use_ema_codebook
         self.ema_decay = ema_decay
         self.ema_eps   = ema_eps
         if use_ema_codebook:
             self.centroid_emb.requires_grad_(False)
-            # N_i(EMA 배정 횟수 누적)를 1로 시작 — 0으로 시작하면 첫 배치
-            # 직후 분모가 극단적으로 작아 첫 업데이트가 과도하게 튐.
+            # N_i (the accumulated EMA assignment count) starts at 1. Starting
+            # at 0 would make the denominator tiny right after the first batch
+            # and send that first update flying.
             self.register_buffer("ema_cluster_size", torch.ones(n_prototypes))
-            # m_i(EMA 배정 임베딩 합) — KMeans++ 초기화 결과와 즉시 일치하도록
-            # centroid_emb(단위벡터) × ema_cluster_size로 시작. 이러면 첫
-            # ema_update() 호출 전까지는 centroid_emb.data / ema_cluster_size
-            # == centroid_emb.data 그대로라 초기화 직후 급격한 점프가 없음.
+            # m_i (the accumulated EMA sum of assigned embeddings) starts at
+            # centroid_emb (a unit vector) * ema_cluster_size so that it agrees
+            # with the initialisation immediately. Until the first
+            # ema_update(), centroid_emb.data / ema_cluster_size therefore
+            # equals centroid_emb.data and there is no jump.
             self.register_buffer(
                 "ema_embed_sum",
                 self.centroid_emb.data.clone() * self.ema_cluster_size.unsqueeze(-1)
             )
 
-        # [제거됨] IG(③) 전용 baseline buffer — ③이 SHAP으로 통일되면서
-        # 더 이상 필요 없어짐 (모듈 docstring 참고). n_features 파라미터
-        # 자체는 다른 용도(생성자 시그니처 하위 호환)로 유지.
+        # The IG-only baseline buffer was removed when explanation layer (3)
+        # moved to an exact decomposition. n_features is kept in the signature
+        # for compatibility.
 
-        # ── centroid별 샘플 인덱스 그룹 (FAISS 범위 제한용) ──
+        # ── Member sample indices per prototype; the retrieval pool G(a) ──
         # list of lists: sample_groups[p] = [idx, idx, ...]
         self.sample_groups: Optional[List[List[int]]] = None
 
-        # ── centroid별 텍스트 라벨 캐시 (libs/group_labels.py 결과) ──
-        # {p: [FeatureLabel, ...]} — regroup_update() 직후 supervised.py에서
-        # 채워짐. ①의 그룹 특징 설명은 이 캐시가 담당한다.
+        # ── Cached text labels per prototype ──
+        # {p: [FeatureLabel, ...]}, filled by supervised.py right after each
+        # regroup_update(). This cache backs the group description in
+        # explanation layer (1).
         self.group_labels: Optional[Dict[int, list]] = None
 
-        # ── centroid별 target(클래스) 분포 캐시 (①의 주 콘텐츠) ──
-        # {p: {"kind": ..., "top_class_name": ..., ...} or None} —
-        # regroup_update() 직후 supervised.py에서 label_groups_by_target()로 채움.
+        # ── Cached target distribution per prototype ──
+        # The main content of explanation layer (1). Filled by supervised.py
+        # via label_groups_by_target() right after each regroup_update().
         self.target_labels: Optional[Dict[int, Optional[dict]]] = None
 
-        # ── centroid별 평균 레이블 (Rank-Consistency Loss용) ──
+        # ── Mean label per prototype ──
         self.register_buffer(
             'centroid_labels',
             torch.full((n_prototypes,), float('nan'))
         )
 
-        # ── 레이블 ────────────────────────────────────────────
+        # ── Labels ────────────────────────────────────────────
         self.labels = prototype_labels or [f"Centroid_{i}" for i in range(n_prototypes)]
 
         self.dropout = nn.Dropout(dropout)
 
-        # ── [Step 1-4] 안정성 진단용 상태 ─────────────────────
-        # EMA / codebook loss가 겨냥하는 failure(centroid drift)가 TabERA에
-        # 실제 존재하는지 진단하기 위한 관측 변수. regroup_update()가 매 에폭
-        # 갱신하고, 결과는 반환 dict → supervised.regroup_history → meta.pkl.
+        # ── State for the stability diagnostics ─────────────────
+        # Observation variables used to check whether centroid drift -- the
+        # failure that codebook losses target -- actually occurs here.
+        # regroup_update() refreshes them every epoch and the result travels
+        # through its return dict into supervised.regroup_history and meta.pkl.
         #
-        # ⚠ register_buffer를 쓰지 않는다(의도적).
-        #   buffer로 등록하면 state_dict에 새 키가 생겨 기존 체크포인트의
-        #   --from_saved_state가 load_state_dict(strict=True)에서 깨진다.
-        #   진단용 상태는 저장할 필요도 없다. 대가는 체크포인트를 로드해
-        #   재개할 때 첫 에폭의 drift가 nan이 되는 것뿐(정상 동작).
-        self._diag_prev_centroid = None    # (P, D)  직전 에폭 종료 시점 centroid
-        self._diag_prev_assign   = None    # (N,)    직전 에폭 배정
+        # ⚠ Deliberately not register_buffer. Registering them would add keys
+        #   to the state_dict and break --from_saved_state on existing
+        #   checkpoints under load_state_dict(strict=True). Diagnostic state
+        #   does not need saving. The only cost is that drift reads nan for
+        #   the first epoch after resuming from a checkpoint.
+        self._diag_prev_centroid = None    # (P, D)  centroids at end of last epoch
+        self._diag_prev_assign   = None    # (N,)    assignments of last epoch
         self._diag_prev_active   = None    # (P,)    bool
         self._diag_prev_sizes    = None    # (P,)    long
-        self._diag_reinit_mask   = None    # (P,)    bool, 직전 에폭에 reinit됨
+        self._diag_reinit_mask   = None    # (P,)    reinitialised last epoch
 
-        # ── [Step 1-4] dead_reinit 자체를 평가하기 위한 이력 ──────
-        # dead_reinit은 retrieval 성능을 직접 올리는 장치가 아니라
-        # "죽은 centroid를 다시 사용되게 만드는" 장치다.
-        # ⚠ 평가 기준은 "오래 살아있는가"(VQ 관점)가 아니라
-        #   "재초기화 이후 실제로 배정을 받고 쓸 만한 cluster를 형성하는가"다.
-        #   TabERA에서 centroid의 목적은 retrieval partition이므로.
-        self._diag_reinit_total  = None    # (P,) long  누적 재초기화 횟수
-        self._diag_since_reinit  = None    # (P,) long  마지막 재초기화 후 경과 에폭
-                                           #            (-1 = 재초기화된 적 없음)
+        # ── History for evaluating dead-prototype recovery itself ──
+        # Recovery is not a device that raises retrieval quality directly; it
+        # makes dead centroids used again.
+        # ⚠ The criterion is not "does it survive long" (the VQ view) but
+        #   whether it goes on to receive assignments and form a usable
+        #   cluster -- the centroid's purpose here is to partition retrieval.
+        self._diag_reinit_total  = None    # (P,) long  cumulative reinit count
+        self._diag_since_reinit  = None    # (P,) long  epochs since last reinit
+                                           #            (-1 = never reinitialised)
 
     # ─────────────────────────────────────────────────────────
-    # 초기화: 훈련 데이터로 centroid 설정
+    # Initialisation: seed the centroids from training data
     # ─────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def initialize_from_data(
         self,
-        X_emb: torch.Tensor,             # (N, D) 훈련 임베딩
-        X_raw: Optional[torch.Tensor] = None,    # [미사용, 호출부 호환]
-        y_labels: Optional[torch.Tensor] = None, # [미사용, 호출부 호환]
+        X_emb: torch.Tensor,             # (N, D) training embeddings
+        X_raw: Optional[torch.Tensor] = None,    # unused; kept for caller compatibility
+        y_labels: Optional[torch.Tensor] = None, # unused; kept for caller compatibility
     ) -> None:
         """Seed the prototype memory from observed training embeddings.
 
@@ -573,13 +546,14 @@ class CentroidLayer(nn.Module):
         before the first epoch. This is the rule dead-prototype recovery
         already uses, so the memory is created and repaired the same way.
 
-        ⚠ 레이블을 읽지 않는다 — initialization, assignment, EMA 갱신이 모두
-          class-agnostic 이다.
 
-        ⚠ 예전에는 k-means++ 였다. 10 데이터셋 × 5 seed 비교에서 accuracy
-          −0.0017 (p=0.670), AUROC −0.0040 (p=0.478), active ratio −0.9%
-          (p=0.508) 로 차이가 없어, geometry 전용 초기화 절차를 유지할
-          근거가 없다고 판단했다(§16).
+        ⚠ No label is read. Initialisation, assignment and the EMA update are
+          all class-agnostic.
+
+        ⚠ This used to be k-means++. Across 10 datasets and 5 seeds the
+          difference was accuracy -0.0017 (p = 0.670), AUROC -0.0040
+          (p = 0.478) and active ratio -0.9% (p = 0.508) -- no case for
+          keeping a geometry-specific initialisation procedure.
         """
         N   = X_emb.shape[0]
         dev = X_emb.device
@@ -603,23 +577,30 @@ class CentroidLayer(nn.Module):
 
     def ema_update(self, query_emb: torch.Tensor, hard_assignment: torch.Tensor) -> None:
         """
-        van den Oord et al.(2017) Appendix / VQ-VAE-2(Razavi et al. 2019)
-        Appendix A.1의 표준 EMA 형태:
-            N_i ← decay·N_i + (1-decay)·n_i
-            m_i ← decay·m_i + (1-decay)·Σ(이번 배치에서 centroid i에 배정된 query_emb)
-            centroid_i ← m_i / N_i
-        에 이 프로젝트의 단위구 제약을 반영해 두 가지를 추가:
-          (a) Laplace smoothing — N_i가 0에 가까운 centroid의 분모 불안정 방지
-              (VQ-VAE-2 Appendix A.1 그대로)
-          (b) 매 업데이트 후 단위벡터로 재정규화 — 두 단위벡터의 가중평균은
-              단위벡터가 아니므로, CosFace 제약(매 optimizer step 후 재투영)과
-              동일한 불변조건을 EMA 경로에서도 유지해야 함.
+        The standard EMA form from van den Oord et al. (2017), Appendix, and
+        VQ-VAE-2 (Razavi et al. 2019), Appendix A.1:
 
-        query_emb는 detach된 상태로 넘겨받는다고 가정(호출부 책임) — 이 함수
-        자체도 @torch.no_grad()라 어차피 gradient는 안 생기지만, 명시적으로
-        detach된 텐서를 넘기는 게 호출부의 의도를 명확히 함.
+            N_i        <- decay * N_i + (1 - decay) * n_i
+            m_i        <- decay * m_i + (1 - decay) * sum(query_emb assigned
+                                                          to centroid i in
+                                                          this batch)
+            centroid_i <- m_i / N_i
+
+        with two additions for this project's unit-sphere constraint:
+          (a) Laplace smoothing, so a centroid whose N_i approaches zero does
+              not get an unstable denominator (exactly as in VQ-VAE-2
+              Appendix A.1);
+          (b) renormalisation to a unit vector after every update, because the
+              weighted average of two unit vectors is not a unit vector. This
+              keeps the same invariant on the EMA path that the CosFace-style
+              reprojection keeps after every optimizer step.
+
+        query_emb is assumed to arrive detached (the caller's responsibility).
+        This function is decorated with @torch.no_grad() so no gradient would
+        form regardless, but passing an explicitly detached tensor makes the
+        caller's intent clear.
         """
-        # [조건 F] centroid 정지 시 EMA 갱신도 막는다.
+        # When centroids are frozen, the EMA path must stop as well.
         if getattr(self, "_centroid_frozen", False):
             return
         if not self.use_ema_codebook:
@@ -633,7 +614,7 @@ class CentroidLayer(nn.Module):
         self.ema_cluster_size.mul_(d).add_(batch_count, alpha=1 - d)
         self.ema_embed_sum.mul_(d).add_(batch_sum, alpha=1 - d)
 
-        # Laplace smoothing (VQ-VAE-2 Appendix A.1 그대로)
+        # Laplace smoothing, exactly as in VQ-VAE-2 Appendix A.1
         n = self.ema_cluster_size.sum()
         smoothed_size = (
             (self.ema_cluster_size + self.ema_eps)
@@ -643,12 +624,12 @@ class CentroidLayer(nn.Module):
         self.centroid_emb.data.copy_(F.normalize(new_centroid, dim=-1))
 
     # ─────────────────────────────────────────────────────────
-    # (3) sample_groups 재계산 (regroup_update, 에폭 종료 후 호출)
+    # (3) Refresh sample_groups (regroup_update, called at end of epoch)
     # ─────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def maybe_freeze_centroid(self, epoch: int) -> bool:
-        """freeze_centroid_after 에 도달하면 centroid 를 완전히 정지시킨다."""
+        """Stop all centroid movement once freeze_centroid_after is reached."""
         if self.freeze_centroid_after is None or self._centroid_frozen:
             return self._centroid_frozen
         if int(epoch) < int(self.freeze_centroid_after):
@@ -659,31 +640,30 @@ class CentroidLayer(nn.Module):
 
     def regroup_update(
         self,
-        X_emb: torch.Tensor,        # (N, D) 전체 훈련 임베딩 — assignment 계산용
-        X_raw: Optional[torch.Tensor] = None,   # (N, F) 원본 feature — [미사용, 호출부 하위 호환용 시그니처만 유지]
+        X_emb: torch.Tensor,        # (N, D) all training embeddings, for assignment
+        X_raw: Optional[torch.Tensor] = None,   # (N, F) raw features; unused, kept for caller compatibility
         assignments: Optional[torch.Tensor] = None,  # (N,) hard assignment
     ) -> Dict[str, float]:
         """
-        에폭 종료 후 호출: sample_groups 갱신.
+        Called at the end of an epoch to refresh sample_groups.
 
-        [제거됨] 이전엔 여기서 ig_baseline(IG(③) 전용 medoid)도 매 에폭
-        갱신했음 — ③이 SHAP으로 통일되면서 제거됨(모듈 docstring 참고).
-        ①의 그룹 텍스트 라벨(group_labels)은 이 함수가 sample_groups를
-        갱신한 직후, supervised.py의 호출부에서 libs/group_labels.py로
-        별도 계산·캐싱한다 (이 변경과 무관하게 그대로 유지).
+        What it does
+        ────────────
+        - refresh sample_groups, which bounds the retrieval search to G(a)
+        - detect dead prototypes, so a collapse can stop the run early
 
-        유지되는 기능
-        ─────────────
-        - sample_groups 갱신: KNN 검색 범위 제한 (필수)
-        - dead centroid 감지: collapse 조기 종료 (필수)
+        The group text labels for explanation layer (1) are computed and
+        cached separately by the caller in supervised.py, immediately after
+        this function refreshes sample_groups.
 
-        [추가] dead-code 재초기화
-        ─────────────────────────
-        dead_reinit_patience회 연속 배정 0인 centroid를 실제 embedding
-        (+ 작은 노이즈)으로 재초기화 — Jukebox(Dhariwal et al. 2020)/
-        SoundStream(Zeghidour et al. 2021) 스타일. k-means++ 초기화가
-        "출발선"만 보장하는 것과 달리, 학습 중 encoder drift로 인해
-        나중에 죽는 centroid까지 계속 구제한다.
+        Dead-prototype recovery
+        ───────────────────────
+        A centroid that received no assignment for dead_reinit_patience
+        consecutive rounds is reinitialised from an observed embedding plus
+        small noise, in the style of Jukebox (Dhariwal et al. 2020) and
+        SoundStream (Zeghidour et al. 2021). Initialisation only guarantees a
+        starting point; this keeps rescuing centroids that die later as the
+        encoder drifts.
 
         Returns
         ───────
@@ -691,36 +671,32 @@ class CentroidLayer(nn.Module):
                 "max_cluster_size": int, "reinit_count": int}
         """
         epoch = self.current_epoch.item()
-        # [버그 수정] current_epoch 증가를 warmup 체크 "직후"로 옮김 — 원래는
-        # 이 함수 맨 아래(warmup을 통과해야만 도달하는 지점)에서만 증가시켜서,
-        # epoch < warmup이면 조기 반환되어 current_epoch이 절대 못 늘어나는
-        # 순환 참조가 있었음(증가하려면 warmup을 통과해야 하고, warmup을
-        # 통과하려면 먼저 증가해야 함) — regroup_warmup_epochs>0이면 매 호출마다
-        # 무조건 조기 반환되어 사실상 영원히 켜지지 않는 상태였음(실측: vehicle
-        # 에서 warmup=5/10 둘 다 학습 끝까지 active=0%, sample_groups 전부 빈
-        # 상태로 확인됨). 이제 이 호출이 몇 번째 호출인지와 무관하게 매번
-        # current_epoch을 먼저 증가시킨 뒤 warmup 여부를 판단 — 조기 반환
-        # 되더라도 카운터는 정상적으로 흘러가서 warmup 기간이 실제로 끝난다.
+        # ⚠ current_epoch is incremented *before* the warmup check, not at the
+        # end of the function. It used to be incremented only at the bottom, a
+        # point reachable only after passing warmup -- a circular dependency:
+        # the counter had to grow to clear warmup, and warmup had to clear for
+        # the counter to grow. With regroup_warmup_epochs > 0 every call
+        # returned early, so warmup never ended (measured on vehicle: warmup=5
+        # and warmup=10 both left active=0% and every sample_group empty for
+        # the whole run). Incrementing first means the counter advances even
+        # on an early return, so the warmup period actually finishes.
         self.current_epoch += 1
-        # [조건 F] 지정 에폭에 도달하면 centroid 를 정지시킨다.
-        # ⚠ 여기서 호출하는 이유: regroup_update 는 매 에폭 정확히 한 번
-        #   불리고 current_epoch 을 관리하는 유일한 지점이다. 학습 루프에
-        #   별도 호출을 넣으면 두 곳이 epoch 을 세게 되어 어긋난다.
+        # Freeze the centroids once the configured epoch is reached.
+        # ⚠ Called here because regroup_update runs exactly once per epoch and
+        #   is the only place that manages current_epoch. Adding a second call
+        #   in the training loop would put two counters out of step.
         self.maybe_freeze_centroid(epoch)
         in_warmup = epoch < self.regroup_warmup_epochs
 
         if assignments is None:
-            # 현재 centroid 기준으로 재배정 — warmup 중에도 매번 새로 계산.
-            # dead-centroid 판정(아래)이 "이번 epoch에 배정을 하나라도
-            # 받았는가"를 warmup 여부와 무관하게 실시간으로 봐야 하기 때문.
+            # Reassign against the current centroids, recomputed every call
+            # including during warmup: the dead-prototype check below asks
+            # whether a centroid received any assignment *this* epoch, and
+            # that must hold regardless of warmup.
             q = F.normalize(X_emb.float(), dim=-1)
             c = F.normalize(self.centroid_emb, dim=-1)
             assignments = (q @ c.T).argmax(dim=-1)
 
-        # [제거됨] 이전엔 여기서 벡터화된 medoid 계산(all_sims/medoid_indices/
-        # assigned_mask)으로 ig_baseline을 갱신했음. ig_baseline이 제거되면서
-        # 이 계산 블록도 함께 제거(다른 곳에서 재사용되지 않음 — sample_groups
-        # 갱신은 아래에서 assignments_cpu 기반의 별도 로직으로 처리됨).
         P = self.P
         assignments_cpu = assignments.cpu()
         new_groups: List[List[int]] = [[] for _ in range(P)]
@@ -730,12 +706,13 @@ class CentroidLayer(nn.Module):
             new_groups[p] = mask_cpu.tolist()
             sizes[p] = len(new_groups[p])
 
-        # ── [Step 1-4] 안정성 진단: 스냅샷만 여기서 ──────────────
-        # centroid_emb를 "이번 에폭 학습 직후 / reinit 직전" 시점에 잡아둔다.
-        # 실제 지표 계산은 함수 끝(reinit 및 sizes 재계산 이후)에서 한다 —
-        # reinit이 일어나면 아래에서 sample_groups/sizes가 통째로 다시
-        # 계산되므로, 여기서 size 기반 지표를 만들면 반환되는 active_ratio
-        # 등과 서로 다른 시점의 값이 되어버린다.
+        # ── Stability diagnostics: snapshot only ────────────────────
+        # Capture centroid_emb after this epoch's training and before any
+        # reinitialisation. The metrics themselves are computed at the end of
+        # the function, after reinit and after the sizes are recomputed: a
+        # reinit rebuilds sample_groups and the sizes entirely, so a
+        # size-based metric taken here would describe a different moment than
+        # the active_ratio that gets returned.
         _diag_cur_centroid = self.centroid_emb.detach().clone()
         _reinit_jumps: List[float] = []
         _reinit_mask_now = torch.zeros(P, dtype=torch.bool,
@@ -745,33 +722,35 @@ class CentroidLayer(nn.Module):
             self._diag_reinit_total = torch.zeros(P, dtype=torch.long, device=_dev)
             self._diag_since_reinit = torch.full((P,), -1, dtype=torch.long, device=_dev)
 
-        # [수정] sample_groups(=KNN 검색 범위로 실제 쓰이는 캐시) 발행만
-        # warmup 동안 미룬다 — 예전엔 이 함수 전체가 조기 반환돼서 아래
-        # dead-centroid reinit까지 같이 꺼져 있었는데(사용자 지적), reinit은
-        # "학습 초반 불안정을 완화"하려는 warmup의 목적과 반대로 오히려
-        # 계속 돌아가야 하는 안전장치라 분리함. 실측(vehicle, rwe20)에서
-        # reinit이 warmup 끝나는 순간 한 번에 몰려서(26개 중 20개) 터지는
-        # 현상이 바로 이 결합 때문이었음.
+        # Only the publication of sample_groups (the cache that actually
+        # bounds retrieval) is deferred during warmup. Previously the whole
+        # function returned early, which also disabled the dead-prototype
+        # reinitialisation below. Reinit is a safeguard that should keep
+        # running -- the opposite of what warmup is for. Measured on vehicle
+        # with rwe20, that coupling made reinits pile up and fire all at once
+        # (20 of 26) the moment warmup ended.
         if not in_warmup:
             self.sample_groups = new_groups
 
-        # ── dead-code 재초기화 (Jukebox/SoundStream 스타일) ────────
-        # [배경] k-means++ 시딩은 "출발선"에서만 도움을 줄 뿐, 학습 중
-        # encoder가 계속 움직이면서(drift) 한때 살아있던 centroid도 배정을
-        # 잃고 죽을 수 있다는 게 NSVQ 논문 통제실험(완벽한 초기화에서
-        # 출발해도 collapse가 재발함)으로 확인됨 — 초기화와는 별개로
-        # 학습 내내 필요한 안전장치. dead_reinit_patience회 연속으로
-        # 배정을 하나도 못 받은 centroid를, 이번 epoch 실제 embedding
-        # 중 무작위로 하나 골라 작은 가우시안 노이즈를 더해 재배치한다
-        # (문헌 표현 그대로: "randomly sampled encoder outputs plus
-        # small Gaussian noise"). centroid_emb는 항상 단위벡터로 유지
-        # 되므로(supervised.py의 매 optimizer step 후 재투영) 재초기화
-        # 결과도 정규화해서 그 불변조건을 깨지 않게 한다.
-        # [수정] warmup 여부와 무관하게 항상 실행 — dead_streak 누적을
-        # 학습 시작부터 추적해야 "진짜로 오래 죽어있던" centroid를 놓치지
-        # 않는다. warmup 중에 죽기 시작한 centroid를 warmup이 끝날 때까지
-        # 방치했다가 뒤늦게 한꺼번에 감지하면, 그 순간 여러 centroid가
-        # 동시에 재배치되어 오히려 불안정을 몰아주는 문제가 있었음(실측).
+        # ── Dead-prototype recovery (Jukebox / SoundStream style) ───
+        # Seeding at initialisation only helps at the starting line. As the
+        # encoder drifts during training, a centroid that was alive can lose
+        # its assignments and die -- the NSVQ paper shows collapse recurring
+        # even from a perfect initialisation. This is a safeguard needed
+        # throughout training, independently of how the centroids started.
+        #
+        # A centroid that received no assignment for dead_reinit_patience
+        # consecutive rounds is moved to a randomly chosen embedding from this
+        # epoch plus small Gaussian noise (the literature's phrasing:
+        # "randomly sampled encoder outputs plus small Gaussian noise").
+        # centroid_emb is always kept on the unit sphere, so the
+        # reinitialised value is normalised too and the invariant holds.
+        #
+        # ⚠ This runs regardless of warmup. dead_streak has to accumulate from
+        #   the start of training, otherwise centroids that begin dying during
+        #   warmup go unnoticed until it ends and are then all relocated at
+        #   once -- concentrating the instability rather than avoiding it
+        #   (measured).
         n_reinit = 0
         if self.dead_reinit_patience > 0:
             with torch.no_grad():
@@ -786,46 +765,53 @@ class CentroidLayer(nn.Module):
                         anchor  = X_emb[src_idx].float()
                         noise   = torch.randn_like(anchor) * self.dead_reinit_noise_scale * anchor.norm().clamp(min=1e-6)
                         new_vec = F.normalize(anchor + noise, dim=-1)
-                        # [Step 1-4] reinit 점프량 기록 — drift와 분리해야
-                        # EMA/codebook이 겨냥하는 신호가 묻히지 않는다.
+                        # Record the reinit jump separately from drift, so
+                        # the signal the update rule is judged on is not
+                        # swamped by relocation distance.
                         _reinit_jumps.append(float(torch.norm(
                             new_vec.to(self.centroid_emb.dtype)
                             - self.centroid_emb.data[p]
                         )))
                         _reinit_mask_now[p] = True
-                        # [조건 F] 재초기화도 갱신이므로 정지 시 건너뛴다.
+                        # Reinit is an update too, so it is skipped when
+                        # centroids are frozen.
                         if getattr(self, "_centroid_frozen", False):
                             continue
                         self.centroid_emb.data[p] = new_vec.to(self.centroid_emb.dtype)
                         self.dead_streak[p] = 0
                         n_reinit += 1
-                        # [추가] EMA를 쓰는 경우, 이 centroid의 누적 통계도
-                        # 같이 리셋 — 안 하면 다음 ema_update()에서 죽어있던
-                        # 동안 쌓인(사실상 0에 수렴한) 낡은 N_i/m_i가 방금
-                        # 새로 심어준 위치를 도로 원래 자리로 끌어당길 수 있음.
+                        # Under EMA, this centroid's accumulated statistics
+                        # are reset as well. Otherwise the stale N_i and m_i
+                        # built up while it was dead (both near zero) would
+                        # pull the freshly placed centroid back toward its old
+                        # position on the next ema_update().
                         if self.use_ema_codebook:
                             self.ema_cluster_size[p] = 1.0
                             self.ema_embed_sum.data[p] = new_vec.to(self.ema_embed_sum.dtype)
 
-        # [버그 수정] dead-code reinit이 여러 centroid를 동시에 재배치하면
-        # (jasmine 실측: 한 번의 regroup_update에서 최대 11개, P=48의 20%
-        # 이상), 그 새 위치들이 재초기화 안 된 다른 centroid들의 영역까지
-        # 침범할 수 있다 — 라우팅은 상대적 거리로 정해지므로, centroid
-        # 하나만 옮겨도 그 이웃 centroid들의 담당 영역(Voronoi 경계)이
-        # 같이 바뀐다. 그런데 sample_groups는 reinit *이전* centroid_emb
-        # 기준으로 이미 계산돼 있었고(위 self.sample_groups = new_groups),
-        # 정작 저장되는 건(supervised.py의 best_state) reinit *이후*
-        # centroid_emb이므로, 이 둘이 서로 다른 시점의 스냅샷이 되어버림.
-        # dual_space_faithfulness의 "재배정 일치율"이 무작위 수준(심지어
-        # 그보다 낮게)까지 떨어지는 근본 원인이 이것이었음(재초기화된
-        # centroid 자신의 sample_groups는 원래 비어있어 문제가 안 되지만,
-        # 그 영향을 받는 "다른" centroid들의 sample_groups가 stale해짐).
-        # reinit이 하나라도 있었다면, 최종 centroid_emb 기준으로 assignment를
-        # 다시 계산해 sample_groups/sizes를 덮어써서 항상 서로 일치하게
-        # 만든다 — 비용은 이미 갖고 있는 X_emb에 대한 argmax 한 번 더뿐.
-        # [수정] 이 재계산·재발행도 sample_groups 발행 자체와 마찬가지로
-        # warmup 중에는 건너뜀 — 이번 호출에서 sample_groups를 아직 발행
-        # 안 했으므로(위 in_warmup 분기) 다시 계산해서 덮어쓸 대상이 없다.
+        # ⚠ When dead-prototype recovery relocates several centroids at once
+        # (measured on jasmine: up to 11 in a single regroup_update, over 20%
+        # of P=48), the new positions can intrude on the territory of
+        # centroids that were *not* reinitialised. Routing is decided by
+        # relative distance, so moving one centroid also shifts the Voronoi
+        # boundaries of its neighbours.
+        #
+        # But sample_groups was already computed against the centroid_emb from
+        # *before* the reinit, while what gets saved (best_state in
+        # supervised.py) is the centroid_emb from *after* it -- two snapshots
+        # of different moments. This was the root cause of the reassignment
+        # agreement rate dropping to chance level or below. The reinitialised
+        # centroid's own group was empty anyway; the damage was to the *other*
+        # centroids' groups going stale.
+        #
+        # So if any reinit happened, assignments are recomputed against the
+        # final centroid_emb and sample_groups / sizes are overwritten, which
+        # keeps the two consistent. The cost is one more argmax over the
+        # X_emb already in hand.
+        #
+        # Like the publication of sample_groups itself, this recomputation is
+        # skipped during warmup: nothing was published this round, so there is
+        # nothing to overwrite.
         if n_reinit > 0 and not in_warmup:
             with torch.no_grad():
                 q_final = F.normalize(X_emb.float(), dim=-1)
@@ -839,23 +825,25 @@ class CentroidLayer(nn.Module):
                 sizes[p] = len(new_groups[p])
             self.sample_groups = new_groups
 
-        # ── [Step 1-4] 안정성 지표 계산 (reinit·sizes 재계산 이후) ──
-        # drift는 "얼마나 움직였나"가 아니라 "수렴하는가"로 정의한다.
-        #   정상   ΔC: 0.8 → 0.5 → 0.3 → 0.15 → 0.07   (수렴)
-        #   drift  ΔC: 0.7 → 0.6 → 0.8 → 0.5  → 0.7    (계속 흔들림)
-        # 스칼라 하나가 아니라 에폭별 궤적으로 기록하고 추세를 본다.
-        # centroid가 움직이는 것 자체는 failure가 아니다 — 학습 초반에는
-        # 당연히 움직인다. failure는 "안정화되지 못하는 것"이다.
+        # ── Stability metrics (after reinit and after sizes are rebuilt) ──
+        # Drift is defined as "does it converge", not "how far did it move".
+        #   healthy  dC: 0.8 -> 0.5 -> 0.3 -> 0.15 -> 0.07   (converging)
+        #   drifting dC: 0.7 -> 0.6 -> 0.8 -> 0.5  -> 0.7    (never settles)
+        # It is recorded as a per-epoch trajectory rather than one scalar, and
+        # read as a trend. Centroids moving is not itself a failure -- early in
+        # training they should. The failure is not settling.
         #
-        # reinit 이동은 drift가 아니다 — dead_reinit은 정의상 centroid를 멀리
-        # 던지므로(실측 매 에폭 평균 2.7개) 섞이면 신호가 묻힌다. 그래서
-        #   - _diag_prev_centroid 는 "reinit 이후"(에폭 종료 시점) 값을 저장
-        #   - _diag_cur_centroid  는 "학습 직후 / reinit 직전" 값
-        # 로 잡는다. 이러면 reinit된 centroid의 다음 에폭 이동량이
-        # "새 자리에서 정착하는 이동"이 되어 점프가 섞이지 않는다.
+        # A reinit jump is not drift. Dead-prototype recovery throws a centroid
+        # far by construction (measured: 2.7 per epoch on average), so mixing
+        # the two buries the signal. Hence:
+        #   _diag_prev_centroid  holds the value *after* reinit (end of epoch)
+        #   _diag_cur_centroid   holds the value after training, *before* reinit
+        # With that split, a reinitialised centroid's movement in the next
+        # epoch reads as settling into its new place, and the jump does not
+        # contaminate the measurement.
         #
-        # centroid_emb는 항상 단위벡터로 유지되므로(supervised.py가 매
-        # optimizer step 후 재투영) L2 거리는 코사인 거리와 단조 관계다.
+        # centroid_emb is always kept on the unit sphere, so L2 distance is
+        # monotone in cosine distance.
         _diag: Dict[str, float] = {}
         _sizes_t = torch.tensor(sizes, device=self.centroid_emb.device,
                                 dtype=torch.long)
@@ -866,27 +854,30 @@ class CentroidLayer(nn.Module):
             _rm = self._diag_reinit_mask
             if _rm is None or _rm.numel() != P:
                 _rm = torch.zeros_like(_active)
-            _sel = _active & (~_rm)            # 살아있고 + 직전에 reinit 안 됨
+            _sel = _active & (~_rm)            # alive and not just reinitialised
             if bool(_sel.any()):
                 _diag["drift_mean"] = float(_step[_sel].mean())
                 _diag["drift_max"]  = float(_step[_sel].max())
             if bool(_rm.any()):
-                # 직전 에폭에 재초기화된 centroid가 자리 잡는 이동 (별도 지표)
+                # Movement of centroids reinitialised last epoch as they
+                # settle; reported separately.
                 _diag["drift_settle_mean"] = float(_step[_rm].mean())
         else:
-            # 첫 에폭 또는 체크포인트 재개 직후 (plain 속성이라 복원 안 됨)
+            # First epoch, or right after resuming from a checkpoint (these
+            # are plain attributes and are not restored).
             _diag["drift_mean"] = float("nan")
 
-        # assignment 변경률 — centroid가 조금만 움직여도 배정이 뒤집힐 수
-        # 있으므로 이동량과 함께 봐야 의미가 있다.
+        # Assignment churn. A small centroid movement can already flip an
+        # assignment, so this only means something read together with the
+        # movement magnitude.
         #
-        # ⚠ 이 값 하나만으로 "centroid가 불안정하다"고 읽으면 안 된다.
-        #   regroup에 들어오는 X_emb는 매 에폭 재인코딩된 MemoryBank keys라
-        #   배정 변화에는 두 원인이 섞여 있다:
-        #     (a) centroid가 움직여서   (b) 임베딩 자체가 움직여서
-        #   아래 assign_change_centroid_only가 (a)만 분리한다 —
-        #   같은 임베딩을 직전 centroid와 현재 centroid로 각각 배정해 비교.
-        #   전체 변화율에서 이 값을 빼면 대략 (b)의 몫이 된다.
+        # ⚠ Do not read this value alone as "the centroids are unstable". The
+        #   X_emb entering regroup are MemoryBank keys re-encoded every epoch,
+        #   so a change in assignment has two possible causes:
+        #     (a) the centroid moved, or (b) the embedding itself moved.
+        #   assign_change_centroid_only below isolates (a) by assigning the
+        #   same embeddings against the previous and the current centroids.
+        #   Subtracting it from the total churn leaves roughly (b).
         _assign_final = (assignments_final if (n_reinit > 0 and not in_warmup)
                          else assignments_cpu)
         if (self._diag_prev_assign is not None
@@ -901,16 +892,17 @@ class CentroidLayer(nn.Module):
                 _a_cur  = (_q @ F.normalize(self.centroid_emb.detach().float(), dim=-1).T).argmax(-1)
                 _diag["assign_change_centroid_only"] = float((_a_prev != _a_cur).float().mean())
 
-        # active_delta — 개수가 같아도 구성이 바뀌었는지.
-        # (24 → 24 인데 A,B가 죽고 C,D가 새로 생긴 경우를 구분한다.
-        #  active_centroids만 보면 이 둘이 똑같아 보인다.)
+        # active_delta: did the membership change even when the count did not?
+        # (24 -> 24 with A and B dying while C and D appear is a different
+        #  event, and active_centroids alone cannot tell them apart.)
         if self._diag_prev_active is not None and self._diag_prev_active.numel() == P:
             _diag["active_delta"] = int((_active ^ self._diag_prev_active).sum())
             _diag["active_died"]  = int((self._diag_prev_active & (~_active)).sum())
             _diag["active_born"]  = int(((~self._diag_prev_active) & _active).sum())
 
-        # size shock — 살아있는 채로 일어나는 대규모 재편(20 → 2 등).
-        # active_delta는 죽고 사는 것만 잡으므로 이 지표로만 보인다.
+        # size shock: a large reshuffle among prototypes that stay alive
+        # (20 -> 2, say). active_delta only catches deaths and births, so this
+        # is the only place such an event shows up.
         if self._diag_prev_sizes is not None and self._diag_prev_sizes.numel() == P:
             _delta = (_sizes_t - self._diag_prev_sizes).abs()
             _base  = torch.clamp(self._diag_prev_sizes, min=1)
@@ -922,21 +914,24 @@ class CentroidLayer(nn.Module):
             _diag["reinit_jump_mean"] = float(sum(_reinit_jumps) / len(_reinit_jumps))
             _diag["reinit_jump_max"]  = float(max(_reinit_jumps))
 
-        # ── dead_reinit 평가 지표 ────────────────────────────────
-        # ⚠ 평가 기준은 "오래 살아있는가"가 아니다. 그건 VQ-VAE의 관점이다
-        #   (거기선 codebook이 유일한 정보 경로라 죽으면 모델이 망가진다).
-        #   TabERA에서 centroid의 목적은 retrieval하기 좋은 partition을
-        #   만드는 것이므로, 기준도 거기 맞춰야 한다:
+        # ── Metrics for dead-prototype recovery ────────────────────
+        # ⚠ The criterion is not "does it survive long". That is the VQ-VAE
+        #   view, where the codebook is the only information path and a dead
+        #   code breaks the model. Here a centroid exists to produce a
+        #   partition that retrieval can use, so the criterion follows that:
         #
-        #     Case A  20 epoch 생존, cluster size 1  → 오래 살아도 쓸모없음
-        #     Case B  3 epoch마다 reinit, 매번 희귀 영역을 잘 대표
-        #             → 분포 변화에 적응하는 것일 수 있음. 문제가 아님
+        #     Case A  survives 20 epochs with cluster size 1
+        #             -> long-lived and useless
+        #     Case B  reinitialised every 3 epochs, each time representing a
+        #             sparse region well
+        #             -> possibly adaptation to a shifting distribution; fine
         #
-        #   Jukebox/SoundStream의 목적도 "오래 살아라"가 아니라
-        #   "사용되는 code가 되라"였다. 그래서 주 지표는 배정을 받는지다.
+        #   Jukebox and SoundStream aim for "become a used code", not "stay
+        #   alive". So the primary metric is whether assignments arrive.
         #
-        # 주 지표: 재초기화된 centroid가 실제로 assignment를 받는가
-        # 참고 지표: survival / repeat — 판정 기준이 아니라 Case B 식별용
+        # Primary: do reinitialised centroids actually receive assignments?
+        # Secondary: survival and repeat counts -- not criteria, but they
+        # identify Case B.
         _prev_since = self._diag_since_reinit.clone()
         _ever = _prev_since >= 0
         self._diag_since_reinit = torch.where(_ever, _prev_since + 1, _prev_since)
@@ -946,23 +941,27 @@ class CentroidLayer(nn.Module):
 
         _tot = self._diag_reinit_total
         if bool((_tot > 0).any()):
-            _re = _tot > 0                      # 한 번이라도 재초기화된 centroid
+            _re = _tot > 0                      # ever reinitialised
 
-            # [주] 배정을 받는가 — dead_reinit의 목적에 직접 대응
+            # Primary metric: does it receive assignments? This corresponds
+            # directly to what recovery is for.
             _diag["reinit_assigned_rate"] = float((_re & _active).sum() / _re.sum())
             _diag["reinit_dead_now"]      = int((_re & (~_active)).sum())
 
-            # [주] 형성된 cluster가 retrieval에 쓸 수 있는 크기인가.
-            #      k는 여기서 모르므로 크기 분포를 그대로 내보내고 판정은 밖에서.
+            # Primary metric: is the resulting cluster large enough to be
+            # useful for retrieval? k is not known here, so the size
+            # distribution is emitted as-is and judged outside.
             _diag["reinit_size_mean"]   = float(_sizes_t[_re].float().mean())
             _diag["reinit_size_median"] = float(_sizes_t[_re].float().median())
             _diag["reinit_size_max"]    = int(_sizes_t[_re].max())
-            # 비교 기준: 재초기화된 적 없는 살아있는 centroid의 크기
+            # Reference: sizes of live centroids that were never
+            # reinitialised.
             _never = (~_re) & _active
             if bool(_never.any()):
                 _diag["never_reinit_size_mean"] = float(_sizes_t[_never].float().mean())
 
-            # [참고] 판정 기준 아님 — Case B(짧게 살지만 잘 대표) 식별용
+            # Secondary, not a criterion: identifies Case B (short-lived but
+            # representative).
             _diag["reinit_repeat_rate"] = float((_tot >= 2).sum() / _re.sum())
             _diag["reinit_max_count"]   = int(_tot.max())
             _alive_re = _re & _active
@@ -970,7 +969,8 @@ class CentroidLayer(nn.Module):
                 _diag["reinit_age_mean"] = float(
                     self._diag_since_reinit[_alive_re].float().mean())
 
-        # 다음 에폭용 상태 갱신 — centroid는 "reinit 이후"(최종) 값을 저장
+        # Update the state for the next epoch. The centroid stored is the
+        # post-reinit (final) value.
         self._diag_prev_centroid = self.centroid_emb.detach().clone()
         self._diag_prev_assign   = _assign_final.clone()
         self._diag_prev_active   = _active.clone()
@@ -978,16 +978,16 @@ class CentroidLayer(nn.Module):
         self._diag_reinit_mask   = _reinit_mask_now
 
         if in_warmup:
-            # sample_groups는 발행 안 했지만 reinit_count는 warmup 중에도
-            # 실제로 일어난 값을 그대로 보고 — 로그로 "warmup 중 몇 개가
-            # 이미 구제됐는지" 볼 수 있게 한다.
-            # [Step 1-4] _diag도 함께 반환 — warmup 중에도 centroid는
-            # 움직이므로, 이 구간을 비우면 "수렴하는가" 판정의 앞부분이
-            # 통째로 사라진다.
+            # sample_groups was not published, but reinit_count reports what
+            # actually happened during warmup, so the log shows how many
+            # prototypes were already rescued before it ended.
+            # The diagnostics are returned too: centroids move during warmup,
+            # and leaving this interval empty would remove the first part of
+            # any "does it converge" judgement.
             return {"active_ratio": 0.0, "min_cluster_size": 0,
                     "max_cluster_size": 0, "reinit_count": n_reinit, **_diag}
 
-        # 통계
+        # Statistics
         n_assigned = sum(1 for s in sizes if s > 0)
 
         return {
@@ -1001,18 +1001,22 @@ class CentroidLayer(nn.Module):
         }
 
     # ─────────────────────────────────────────────────────────
-    # 온도 어닐링 (에폭마다 호출)
+    # Temperature annealing hook, called once per epoch
     # ─────────────────────────────────────────────────────────
 
     def anneal(self, factor: Optional[float] = None) -> None:
         """
-        (하위 호환) 온도 어닐링 인터페이스.
-        factor가 None이면 tau_anneal_rate 기반 지수 감소.
+        No-op, kept so the training loop's call site stays valid.
+
+        Temperature annealing became unnecessary when routing moved to a
+        straight-through argmax: there is no temperature left to anneal. The
+        method is retained because supervised.py calls model.anneal() once per
+        epoch; removing it would only move the no-op to the caller.
         """
-        pass  # STE 전환으로 annealing 불필요
+        pass
 
     # ─────────────────────────────────────────────────────────
-    # FAISS 마스킹용 인덱스 반환
+    # Member indices of the assigned prototype group
     # ─────────────────────────────────────────────────────────
 
     def get_candidate_indices(
@@ -1021,11 +1025,15 @@ class CentroidLayer(nn.Module):
         max_candidates: int = 5000,
     ) -> Optional[List[List[int]]]:
         """
-        배정된 centroid 그룹의 샘플 인덱스를 반환합니다.
-        FAISS 검색 범위를 해당 그룹으로 제한하는 데 사용합니다.
-        O(N) → O(P + k·log k) 복잡도 개선의 핵심.
+        Return the member sample indices of each assigned prototype group.
 
-        Returns None if sample_groups not yet initialized.
+        This is the same partition MemoryBank.retrieve() uses to bound the
+        search to G(a) rather than the whole training split.
+
+        ⚠ Nothing currently calls this method: retrieve() reads the cached
+          groups directly. It is kept as the readable form of that lookup.
+
+        Returns None if sample_groups has not been initialised yet.
         """
         if self.sample_groups is None:
             return None
@@ -1036,7 +1044,7 @@ class CentroidLayer(nn.Module):
             p = hard_assignment[b].item()
             grp = self.sample_groups[p]
             if len(grp) == 0:
-                result.append(None)  # 빈 그룹: 전체 검색으로 fallback
+                result.append(None)  # empty group: fall back to a full search
             else:
                 result.append(grp[:max_candidates])
         return result
@@ -1048,103 +1056,112 @@ class CentroidLayer(nn.Module):
     def forward(
         self,
         query_emb: torch.Tensor,                          # (B, D)
-        top_m: int = 1,                                    # 신규: 사용할 centroid 수
+        top_m: int = 1,                                    # centroids to mix; always 1
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Hierarchical-extended forward.
+        Route a batch of query embeddings to prototypes.
 
         Parameters
         ──────────
-        query_emb : (B, D) 임베더 출력
-        top_m     : 사용할 top-M centroid 수 (default 1 = 기존 hard routing)
-                    M=1이면 기존 STE 동작과 완전 동일 (backward-compat)
-                    M=2~3이면 hierarchical soft routing
+        query_emb : (B, D) encoder output
+        top_m     : number of centroids to mix. **The model always calls this
+                    with the default 1**, which is the hard straight-through
+                    routing the architecture is defined by. Values above 1
+                    give a soft mixture over the top-M and exist only as an
+                    exploratory path.
 
         Returns
         ───────
-        context_emb      : (B, D)   — top-M centroid 가중 혼합 (gradient 흐름)
-        hard_assignment   : (B,)     — Top-1 centroid (FAISS 마스킹 + 설명용)
-        routing_probs     : (B, P)   — 전체 분포 (entropy loss용, STE-style for M=1)
-        topM_idx          : (B, M)   — top-M centroid 인덱스 (retrieve용)
-        topM_weights      : (B, M)   — top-M softmax 가중치 (differentiable)
-        top1_confidence   : (B,)     — [추가] soft[hard_assignment] — STE로 인해
-            routing_probs 자체는 forward 값 기준 정확히 one-hot이라(=STE 정의상
-            forward=hard) 샘플별로 다른 "confidence"로 못 쓴다(모든 샘플에서
-            max()가 항상 정확히 1.0). 진짜 샘플마다 다른, gradient도 흐르는
-            confidence가 필요한 곳(head 입력 스케일링 등)은 이 값을 써야 함.
-            soft 전체가 아니라 top1 스칼라만 반환하는 이유: head는 결국
-            선택된 centroid 하나만 쓰므로 이거면 충분하고, (B,P) 전체를
-            들고 다니는 것보다 메모리도 적게 씀. M=1/M>1 관계없이 항상
-            "실제로 선택된 hard_assignment 위치의 soft 확률"을 반환함
-            (M>1이어도 hard_assignment는 top-1이므로 정의가 그대로 성립).
+        context_emb      : (B, D)  the assigned centroid c (a weighted mix when
+                                   top_m > 1)
+        hard_assignment  : (B,)    the top-1 centroid. This single value fixes
+                                   both the prediction baseline and the
+                                   retrieval pool G(a)
+        routing_probs    : (B, P)  full distribution; straight-through when
+                                   top_m == 1
+        topM_idx         : (B, M)  top-M centroid indices
+        topM_weights     : (B, M)  top-M softmax weights (differentiable)
+        top1_confidence  : (B,)    soft[hard_assignment].
 
-        Backward-compatibility
-        ──────────────────────
-        top_m=1일 때:
-          - hard_assignment, routing_probs 동작은 기존과 동일 (STE 유지)
-          - context_emb = centroid_emb[hard_assignment] (기존과 동일)
-          - topM_idx = hard_assignment.unsqueeze(1) — (B, 1)
-          - topM_weights = ones(B, 1) — 단일 centroid이므로 1.0
+            ⚠ routing_probs cannot serve as a per-sample confidence. Under the
+              straight-through estimator its forward value is exactly one-hot
+              by definition, so max() is exactly 1.0 for every sample. Anything
+              that needs a confidence that actually varies per sample -- and
+              that carries a gradient -- must use this value instead.
+
+            Only the top-1 scalar is returned rather than the whole soft
+            distribution: consumers use the one selected centroid, so this is
+            sufficient and cheaper than carrying (B, P). The definition holds
+            for top_m > 1 as well, since hard_assignment is still the top-1.
+
+        With top_m = 1:
+          - hard_assignment and routing_probs keep the straight-through
+            behaviour
+          - context_emb = centroid_emb[hard_assignment]
+          - topM_idx    = hard_assignment.unsqueeze(1), shape (B, 1)
+          - topM_weights = ones(B, 1)
         """
-        # 코사인 유사도 로짓
+        # Cosine similarity logits
         q = F.normalize(query_emb, dim=-1)               # (B, D)
         c = F.normalize(self.centroid_emb, dim=-1)        # (P, D)
-        logits = (q @ c.T) * self.routing_scale           # (B, P) — scale 적용
+        logits = (q @ c.T) * self.routing_scale           # (B, P), scaled
 
-        # ── 전체 softmax (STE backward gradient용, M=1에서 STE 적용) ─
+        # ── Full softmax; carries the straight-through backward gradient ─
         soft = F.softmax(logits, dim=-1)                  # (B, P)
 
-        # ── Top-M soft routing (핵심 변경) ──────────────
-        top_m_eff = min(top_m, self.P)  # P 초과 방지
+        # ── Top-M selection ────────────────────────────
+        top_m_eff = min(top_m, self.P)  # never exceed P
         topM_logits, topM_idx = logits.topk(top_m_eff, dim=-1)  # (B, M)
 
-        # ── hard_assignment: Top-1 (FAISS 마스킹 + 설명용) ──
+        # ── hard_assignment: top-1. Fixes both the prediction baseline
+        #    and the retrieval pool G(a) ──
         hard_assignment = topM_idx[:, 0]                  # (B,)
 
-        # ── [추가] top1_confidence: 실제 라우팅에 쓰이는 soft에서 선택된
-        # 위치의 확률 — routing_probs(STE 결과, forward=one-hot)와 달리
-        # 샘플마다 실제로 다름. M=1/M>1 분기와 무관하게 여기서 한 번만 계산.
+        # ── top1_confidence: the soft probability at the selected position.
+        #    Unlike routing_probs (one-hot in the forward value under the
+        #    straight-through estimator) this actually varies per sample.
+        #    Computed once here, independent of the top_m branch below.
         top1_confidence = soft.gather(1, hard_assignment.unsqueeze(1)).squeeze(1)  # (B,)
 
-        # ── routing_probs 분기 ──────────────────────────
-        # M=1: 기존 STE 동작 유지 (backward gradient가 soft를 거쳐 흐르게 함)
-        # M>1: 일반 softmax (hierarchical 경로에서는 STE 의미 없음)
+        # ── routing_probs ──────────────────────────────
+        # top_m == 1: straight-through, so the backward gradient flows
+        #             through the soft distribution
+        # top_m > 1:  a plain softmax; the straight-through estimator has no
+        #             meaning on the mixture path
         if top_m_eff == 1:
-            # STE: forward는 hard (argmax), backward는 soft gradient
-            # training/eval 무관하게 항상 STE 유지.
+            # Straight-through: forward takes the hard argmax, backward
+            # passes the soft gradient. Kept in eval mode as well.
             #
-            # [근거]
-            # VQ-VAE (van den Oord et al. 2017)와 Bengio et al. 2013의 STE 원 정의는
-            # training/eval 구분 없이 forward=hard, backward=soft를 유지한다.
-            # eval에서 STE를 끄면 ∂context_emb/∂query_emb = 0이 됨.
-            # [갱신] 이 gradient 경로는 원래 ③(IG)이 eval 모드에서 context_emb
-            # 기여를 측정하려고 필요했던 것인데, ③이 SHAP(gradient 불필요한
-            # black-box 방법)으로 통일되면서 그 필요성 자체는 없어짐. 다만
-            # eval에서도 STE를 유지하는 이 코드는 forward 값 기준으로 hard
-            # argmax와 완전히 동일하므로(∵ soft + (hard-soft).detach() = hard,
-            # 값 기준) 굳이 되돌릴 이유도 없어 그대로 둠 — 순수 gradient
-            # 경로 하나가 이제 아무도 안 쓰는 채로 남아있을 뿐, 예측 결과에는
-            # 영향 없음.
+            # VQ-VAE (van den Oord et al. 2017) and Bengio et al. (2013)
+            # define the estimator without a train/eval distinction:
+            # forward = hard, backward = soft. Disabling it at eval time would
+            # make d(context_emb)/d(query_emb) zero.
+            #
+            # That gradient path is no longer needed by anything, but keeping
+            # it costs nothing: by value the forward result is identical to a
+            # plain hard argmax, since soft + (hard - soft).detach() == hard.
+            # Predictions are unaffected either way.
             hard_one_hot = F.one_hot(hard_assignment, self.P).float()  # (B, P)
             routing_probs = soft + (hard_one_hot - soft).detach()      # STE (always)
 
-            # topM_weights = 1.0 (단일 centroid)
+            # topM_weights = 1.0 for the single centroid
             topM_weights = torch.ones_like(topM_logits)   # (B, 1)
 
-            # context_emb: 기존과 동일 (routing_probs @ centroid_emb)
+            # context_emb = routing_probs @ centroid_emb
             context_emb = self.dropout(routing_probs @ self.centroid_emb)
         else:
-            # Hierarchical 경로
-            # routing_probs는 forward() 반환값(diagnose/설명 등 호출부에서
-            # 전체 분포를 참조할 수 있게) — soft 그대로, gradient 흐름
+            # Mixture path.
+            # routing_probs is returned as the soft distribution so callers
+            # (diagnostics, explanations) can read the full spread, and the
+            # gradient flows through it.
             routing_probs = soft
 
-            # topM_weights: top-M에 대한 softmax (differentiable!)
+            # topM_weights is a softmax over the top-M and is differentiable,
+            # so the gradient reaches the centroid selection.
             topM_weights = F.softmax(topM_logits, dim=-1) # (B, M)
 
-            # context_emb: top-M centroid 가중 혼합
-            # ★ topM_weights가 differentiable → centroid 선택에 gradient 흐름
+            # context_emb is the weighted mixture of the top-M centroids.
             topM_centroids = self.centroid_emb[topM_idx]  # (B, M, D)
             context_emb = (
                 topM_weights.unsqueeze(-1) * topM_centroids
@@ -1154,128 +1171,59 @@ class CentroidLayer(nn.Module):
         return context_emb, hard_assignment, routing_probs, topM_idx, topM_weights, top1_confidence
 
     # ─────────────────────────────────────────────────────────
-    # Auxiliary Losses (기존 tabr.py 호환)
-    # ─────────────────────────────────────────────────────────
+    # ⚠ entropy_loss was removed. It was defined but never connected to any
+    # objective. For the record: it maximised the entropy of the *batch-mean*
+    # routing distribution (the VQ-VAE-2 approach to codebook utilisation and
+    # dead codes), which is a different goal from making each individual
+    # sample's routing confident. That second goal would need a different
+    # loss (per-sample entropy minimisation), and it is not being reinstated
+    # without a separate case for it.
 
-    def diversity_loss(self) -> torch.Tensor:
-        """Centroid 붕괴 방지: off-diagonal cosine similarity 최소화.
-        clamp(max=1e4): STE collapse 시 nan 전파 방지
-        """
-        c = F.normalize(self.centroid_emb, dim=-1)
-        sim = c @ c.T
-        mask = 1.0 - torch.eye(self.P, device=sim.device)
-        loss = (sim.pow(2) * mask).sum() / (self.P * (self.P - 1))
-        return loss.clamp(max=1e4)  # nan 방지
 
-    # [제거됨] entropy_loss — 정의만 되어 있고 tabera.py의 aux_loss 조합
-    # (diversity + commitment)에 실제로는 한 번도 연결된 적 없는 죽은
-    # 코드였음. 참고로 이 손실은 "배치 평균 라우팅 분포"의 entropy를
-    # 최대화하는 것(codebook utilization/dead-centroid 방지, VQ-VAE-2
-    # 방식)이라 "샘플 하나하나의 라우팅을 confident하게 만드는" 것과는
-    # 다른 목적이었음 — 그 목적(샘플별 confidence)을 위해서는 이것과
-    # 다른 손실(샘플별 entropy 최소화, entropy minimization 계열)이
-    # 필요하며, 별도 검토 없이 지금 다시 넣지 않기로 함.
 
-    def cosine_similarity_matrix(self) -> torch.Tensor:
-        """진단용: centroid 간 cosine similarity 행렬 반환 (P, P)."""
-        c = F.normalize(self.centroid_emb.detach(), dim=-1)
-        return (c @ c.T).cpu()
-
-    def commitment_loss(
-        self, query_emb: torch.Tensor, hard_assignment: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        쿼리를 배정된 centroid 방향으로.
-
-        [수정] raw 벡터가 아니라 정규화된 벡터끼리 MSE를 계산한다.
-        라우팅(hard_assignment를 정하는 코사인 유사도)은 방향에만
-        의존하는데(query_emb/centroid_emb를 F.normalize()한 뒤 내적),
-        이전 구현은 정규화 안 된 raw 벡터로 MSE를 계산해 크기(norm) 차이
-        에도 반응했다 — centroid_emb는 초기화 시점부터 단위 벡터인 반면
-        (initialize_from_data의 X_n = F.normalize(...)) query_emb(임베더
-        raw 출력)는 그럴 이유가 없어, 라우팅과 무관한 "크기 맞추기"에
-        gradient가 낭비될 수 있었다. 정규화된 벡터의 MSE는 2-2·cos_sim과
-        동치라(‖â-b̂‖² = 2-2â·b̂, 단위벡터끼리) 이 수정은 사실상 라우팅과
-        동일한 기준(코사인 유사도)을 손실로도 쓰는 것과 같다.
-        """
-        assigned = self.centroid_emb[hard_assignment]
-        q_norm = F.normalize(query_emb, dim=-1)
-        c_norm = F.normalize(assigned, dim=-1)
-        return F.mse_loss(q_norm, c_norm.detach())
-
-    def codebook_loss(
-        self, query_emb: torch.Tensor, hard_assignment: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        centroid를 배정된 쿼리들 방향으로 (commitment_loss의 반대 방향).
-
-        VQ-VAE(van den Oord et al., 2017) 원 손실의 나머지 절반 — 원 논문은
-        codebook loss(‖sg[query]-centroid‖², 이 함수)와 commitment loss
-        (‖query-sg[centroid]‖², 위 commitment_loss)를 항상 같이 쓴다.
-        이 구현은 그동안 commitment 쪽만 있었음 — centroid_emb를 실제로
-        "자기 그룹의 대표"로 만드는 유일한 직접 신호가 없었다(diversity_loss는
-        밀어내기만, task_loss는 간접적이고 대표성과 무관한 방향).
-
-        닫힌 형태 최적해는 배정된 query들의 평균 — Lloyd's iteration의
-        "centroid = 배정된 점들의 평균" 갱신과 동일한 목표를, 이산 argmax
-        선택 아래서도 gradient로 달성한다.
-
-        query_emb 쪽을 detach하는 이유: commitment_loss(반대쪽 detach)와
-        같은 대상(‖query-centroid‖²)을 서로 다른 변수 쪽에서 미는 것이라
-        방향이 대립하지 않음 — 다만 둘 다 detach 없이 대칭으로 두면 매
-        스텝 서로를 향해 동시에 움직여 진동/불안정해질 수 있어(self-supervised
-        학습의 target network류와 같은 이유로) 한쪽씩 번갈아 고정한다.
-
-        [수정] commitment_loss와 동일한 이유로 정규화된 벡터끼리 MSE —
-        라우팅(코사인 유사도, 방향만)과 같은 기준을 최적화하도록 통일.
-        """
-        assigned = self.centroid_emb[hard_assignment]
-        c_norm = F.normalize(assigned, dim=-1)
-        q_norm = F.normalize(query_emb, dim=-1)
-        return F.mse_loss(c_norm, q_norm.detach())
 
     # ─────────────────────────────────────────────────────────
-    # 설명 헬퍼 (기존 tabr.py 호환 + 원본 feature 값 추가)
+    # Explanation helpers
     # ─────────────────────────────────────────────────────────
 
     def explain_routing(
         self,
         hard_assignment: torch.Tensor,   # (B,)
         routing_probs: torch.Tensor,     # (B, P)
-        norm_mean: Optional[np.ndarray] = None,  # 더 이상 안 씀 (centroid_x
-                                                  # 역정규화용이었음) — 호출부
-                                                  # 시그니처 호환을 위해 유지
-        norm_std:  Optional[np.ndarray] = None,  # 위와 동일
-        cos_sim: Optional[torch.Tensor] = None,  # [추가] (B, P) — scale 적용
-            # 전 raw cosine similarity(q_norm @ c_norm.T). routing_confidence는
-            # 이 값에 routing_scale을 곱한 뒤 softmax를 취한 것이라 scale에
-            # 좌우되는데(scale이 크면 1등이 아주 작은 코사인 차이로도 confidence
-            # 가 확 벌어짐), raw cosine을 같이 보여줘야 "기하학적으로 실제로
-            # 얼마나 가까운가"를 scale과 분리해서 판단할 수 있음. None이면
-            # (하위호환) 출력 dict에서 cosine_similarity=None.
+        norm_mean: Optional[np.ndarray] = None,  # unused; kept for caller
+        norm_std:  Optional[np.ndarray] = None,  # signature compatibility
+        cos_sim: Optional[torch.Tensor] = None,  # (B, P) raw cosine
+            # similarity before the scale (q_norm @ c_norm.T).
+            # routing_confidence is a softmax over these values *after*
+            # multiplying by routing_scale, so it depends on the scale: a
+            # large scale makes the top entry pull far ahead on a tiny cosine
+            # difference. Showing the raw cosine alongside separates "how
+            # close is it geometrically" from the scale. When None, the output
+            # dict carries cosine_similarity=None.
     ) -> List[dict]:
         """
-        샘플별 centroid 배정 설명.
+        Per-sample description of the prototype assignment.
 
-        ①의 주 콘텐츠는 target_labels(label_groups_by_target() 결과)
-        — "이 그룹은 대체로 어떤 target(클래스)인가". 배정된 그룹뿐
-        아니라 runner-up 그룹들도 각자의 target_info를 같이 반환한다
-        — runner-up도 결국 "이 샘플이 속할 뻔한 다른 그룹"이라, 그
-        그룹이 어떤 target인지도 같이 봐야 맥락이 온전해진다.
-        group_feature_labels는 그 그룹을 다른 그룹들과 가장 뚜렷이
-        구별시키는 feature들의 실제 그룹 평균값(원값) — 보조 정보로
-        같이 반환한다. 캐싱 전(supervised.py 연결 안 된 경우)이면
-        각각 None/빈 리스트.
+        The main content of explanation layer (1) is target_labels, the output
+        of label_groups_by_target(): which target this group mostly
+        corresponds to. The runner-up groups carry their own target_info as
+        well -- a runner-up is a group the sample nearly belonged to, so
+        knowing its target is part of the context.
 
-        [명명 정정] 반환 dict의 "group_confidence"를 "routing_confidence"로
-        이름 바꿈 — "confidence"만 단독으로 쓰면 사용자가 "모델이 이 예측이
-        맞다고 확신하는 정도"(=classifier softmax)로 오해하기 쉬움. 이 값은
-        그게 아니라 "prototype routing 단계에서, 이 query가 다른 centroid
-        대비 배정된 centroid에 상대적으로 얼마나 우세한가"이고, 최종
-        classifier의 prediction confidence와는 별개(query→routing→context
-        →retrieval→fusion→classifier 파이프라인에서 classifier는 routing
-        외의 정보도 다 씀). margin/others_mass/cosine_similarity를 같이
-        반환해서 "55.6%가 높은 건지"를 절대값 하나만으로 판단 안 해도 되게 함.
+        group_feature_labels adds the group means of the features that most
+        distinguish this group from the others, as raw values. Before the
+        caches are filled (supervised.py not yet wired) these are None and an
+        empty list.
+
+        ⚠ The returned key is "routing_confidence", not "confidence". Used
+          alone the word reads as "how sure the model is that the prediction
+          is right", i.e. the classifier softmax. This is a different
+          quantity: how strongly the query prefers the assigned centroid over
+          the others, at the routing stage. The classifier downstream uses
+          information beyond routing, so the two are independent.
+          margin, others_mass and cosine_similarity come with it so that
+          "is 55.6% high?" does not have to be judged from one absolute
+          number.
         """
         pa   = hard_assignment.detach().cpu().numpy()
         pr   = routing_probs.detach().cpu().numpy()
@@ -1302,22 +1250,26 @@ class CentroidLayer(nn.Module):
                 for i in runner_idx
             ]
 
-            # [추가] margin: 배정된 centroid와 바로 다음(1등 runner-up) 간의
-            # 확신도 차이 — "55% vs 54%"와 "55% vs 10%"를 구분해서 보여주기
-            # 위함. others_mass: 배정된 것 + 화면에 보여주는 runner-up들
-            # (위 2개) 밖에 나머지 전체 centroid가 나눠 갖는 확률 질량 —
-            # "다른 후보들도 꽤 있다"인지 "거의 이 셋이 전부다"인지 구분용.
+            # margin: the confidence gap between the assigned centroid and
+            # the runner-up, so "55% vs 54%" reads differently from
+            # "55% vs 10%".
+            # others_mass: the probability mass held by every centroid outside
+            # the assigned one and the runner-ups shown above, separating
+            # "there are plenty of other candidates" from "these three are
+            # essentially all of it".
             margin = conf - (runners[0]["routing_confidence"] if runners else 0.0)
             others_mass = 1.0 - conf - sum(r["routing_confidence"] for r in runners)
             cosine_similarity = float(cs[b, p]) if cs is not None else None
 
-            # ①의 주 콘텐츠: 이 그룹이 어떤 target(클래스)에 해당하는가
+            # Main content of explanation layer (1): which target this group
+            # corresponds to.
             target_info = (
                 self.target_labels.get(p)
                 if self.target_labels is not None else None
             )
 
-            # 보조 정보: feature별 "매우 높음/높음/보통/..." 요약
+            # Supporting information: the group means of its most
+            # distinctive features.
             group_feature_labels = (
                 self.group_labels.get(p, [])
                 if self.group_labels is not None else []
@@ -1326,21 +1278,22 @@ class CentroidLayer(nn.Module):
             out.append({
                 "assigned_group":       label,
                 "centroid_idx":         p,
-                "routing_confidence":   conf,   # [명명 정정] 예전 group_confidence
+                "routing_confidence":   conf,   # renamed from group_confidence
                 "margin":               margin,
-                "others_mass":          max(0.0, others_mass),  # 부동소수점 오차로 미세 음수 방지
+                "others_mass":          max(0.0, others_mass),  # clamp float error
                 "cosine_similarity":    cosine_similarity,
                 "runners_up":           runners,
-                "target_info":          target_info,          # ← ①의 주 콘텐츠
-                "group_feature_labels": group_feature_labels,  # ← 보조 정보
+                "target_info":          target_info,          # layer (1) main
+                "group_feature_labels": group_feature_labels,  # supporting
             })
         return out
 
     def centroid_summary(self, top_n: int = 3) -> str:
         """
-        전체 centroid의 그룹 크기 + target 분포 + 두드러진 feature
-        평균값 요약 출력.
-        top_n: 그룹당 보여줄 feature 개수 상한.
+        Summarise every prototype: group size, target distribution, and the
+        group means of its most distinctive features.
+
+        top_n bounds how many features are shown per group.
         """
         lines = [f"CentroidLayer — {self.P} centroids", "─" * 44]
 
@@ -1349,7 +1302,7 @@ class CentroidLayer(nn.Module):
                         if self.sample_groups else "?")
             line = f"  [{self.labels[p]}]  n={grp_size}"
 
-            # ①의 콘텐츠: target 분포
+            # Layer (1) content: target distribution
             tinfo = self.target_labels.get(p) if self.target_labels else None
             if tinfo is not None:
                 if tinfo["kind"] == "classification":
@@ -1357,121 +1310,10 @@ class CentroidLayer(nn.Module):
                 else:
                     line += f"  → target≈{tinfo['group_mean']:.3g}(p{tinfo['percentile']:.0f})"
 
-            # 두드러진 feature의 그룹 평균값
+            # Group means of the most distinctive features
             labels_p = self.group_labels.get(p) if self.group_labels else None
             if labels_p:
                 vals = ", ".join(f"{fl.feature_name}={fl.label}" for fl in labels_p[:top_n])
                 line += f"  [{vals}]"
             lines.append(line)
         return "\n".join(lines)
-
-class ResidualCentroidLayer(nn.Module):
-    """[v3] 2단계 residual 양자화의 stage 2.
-
-    stage 1(CentroidLayer)이 cosine 공간에서 coarse code를 정하면,
-    잔차 r = q − sg(c1) 을 **euclidean 공간에서** 다시 양자화한다.
-
-    ⚠ stage 1과 거리 함수가 다른 이유:
-      stage 1은 방향만 보면 되므로 cosine + 단위구 재투영을 쓴다.
-      잔차 공간에서는 **크기도 정보**다 — 같은 방향이어도 ‖r‖=0.01인
-      샘플과 ‖r‖=1.2인 샘플은 cell 안에서 다른 위치를 뜻한다.
-      c2를 정규화하면 그 차이가 지워진다.
-
-    ⚠ 초기화는 residual 분포에 대한 KMeans++로 한다. 랜덤 초기화는
-      ‖r‖ ≪ ‖q‖ 라는 스케일 차이와 맞지 않아 초기부터 dead code가
-      대량 발생한다.
-    """
-
-    def __init__(
-        self,
-        n_prototypes: int,
-        embed_dim: int,
-        dead_reinit_patience: int = 5,
-        dead_reinit_noise_scale: float = 0.01,
-    ) -> None:
-        super().__init__()
-        self.n_prototypes = n_prototypes
-        self.embed_dim    = embed_dim
-        self.dead_reinit_patience    = dead_reinit_patience
-        self.dead_reinit_noise_scale = dead_reinit_noise_scale
-
-        # ⚠ 단위구에 두지 않는다(위 docstring 참고). 초기값은
-        #   initialize_from_residual()이 덮어쓰므로 작은 랜덤으로 시작.
-        self.centroid_emb = nn.Parameter(torch.randn(n_prototypes, embed_dim) * 0.01)
-
-        self.register_buffer("_dead_streak",
-                             torch.zeros(n_prototypes, dtype=torch.long))
-        self._last_counts = None
-
-    # ─────────────────────────────────────────────────────────
-    @torch.no_grad()
-    def initialize_from_residual(self, residual: torch.Tensor) -> None:
-        """잔차 분포에 대한 KMeans++ 시딩."""
-        R = residual.detach().float()
-        N = R.shape[0]
-        P = min(self.n_prototypes, N)
-        idx = [int(torch.randint(0, N, (1,)).item())]
-        d2 = ((R - R[idx[0]]) ** 2).sum(-1)
-        for _ in range(1, P):
-            prob = d2.clamp_min(0)
-            if float(prob.sum()) <= 0:
-                nxt = int(torch.randint(0, N, (1,)).item())
-            else:
-                nxt = int(torch.multinomial(prob / prob.sum(), 1).item())
-            idx.append(nxt)
-            d2 = torch.minimum(d2, ((R - R[nxt]) ** 2).sum(-1))
-        sel = R[torch.tensor(idx, device=R.device)]
-        if P < self.n_prototypes:   # 표본이 모자라면 나머지는 잡음으로
-            pad = sel.mean(0, keepdim=True) + 0.01 * torch.randn(
-                self.n_prototypes - P, self.embed_dim, device=R.device)
-            sel = torch.cat([sel, pad], 0)
-        self.centroid_emb.data.copy_(sel.to(self.centroid_emb.dtype))
-
-    # ─────────────────────────────────────────────────────────
-    def forward(self, residual: torch.Tensor):
-        """잔차를 양자화한다.
-
-        Returns
-        ───────
-        c2        : (B, D)  선택된 residual code (STE 통과)
-        hard      : (B,)    코드 인덱스
-        """
-        # euclidean 거리 — ‖r − c‖²  (정규화 없음)
-        d2 = torch.cdist(residual, self.centroid_emb) ** 2       # (B, P)
-        hard = d2.argmin(-1)                                      # (B,)
-        # ⚠ STE: forward는 hard, backward는 soft.
-        #   부호를 뒤집어 "가까울수록 큰 값"으로 만든 뒤 softmax.
-        soft = torch.softmax(-d2, dim=-1)
-        probs = soft + (F.one_hot(hard, self.n_prototypes).to(soft.dtype)
-                        - soft).detach()
-        c2 = probs @ self.centroid_emb
-        with torch.no_grad():
-            self._last_counts = torch.bincount(
-                hard, minlength=self.n_prototypes)
-        return c2, hard
-
-    # ─────────────────────────────────────────────────────────
-    @torch.no_grad()
-    def dead_reinit_update(self, residual: torch.Tensor) -> int:
-        """배정이 0인 코드를 잔차 표본으로 되살린다.
-
-        ⚠ stage 1과 같은 원리(균등 랜덤 + 노이즈, Jukebox 방식)이나
-          **단위구 재투영을 하지 않는다** — 잔차 공간에서는 크기가 정보다.
-        """
-        if self._last_counts is None:
-            return 0
-        dead = self._last_counts == 0
-        self._dead_streak[dead] += 1
-        self._dead_streak[~dead] = 0
-        fire = self._dead_streak >= self.dead_reinit_patience
-        n = int(fire.sum())
-        if n == 0:
-            return 0
-        R = residual.detach().float()
-        for p_ in torch.nonzero(fire).flatten().tolist():
-            anchor = R[int(torch.randint(0, R.shape[0], (1,)).item())]
-            noise = torch.randn_like(anchor) * self.dead_reinit_noise_scale \
-                    * anchor.norm().clamp_min(1e-6)
-            self.centroid_emb.data[p_] = anchor + noise
-            self._dead_streak[p_] = 0
-        return n
