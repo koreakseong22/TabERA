@@ -1,45 +1,46 @@
 """
 libs/diagnostics.py
 ===================
-TabERA 관찰 계층 (observer).
+The observer layer.
 
-경계선
-──────
+Boundary
+────────
 ```
-tabera.py       predictor   tensor → tensor. 설명을 "만들지" 않는다.
-diagnostics.py  observer    forward output을 "관찰해서" 설명을 재구성한다.
+tabera.py       predictor   tensor -> tensor. It does not *build* explanations.
+diagnostics.py  observer    it *observes* the forward output and reconstructs them.
 ```
 
-이 파일의 모든 함수는 `model`과 `forward()`의 출력 dict만 받는다. 모델
-내부를 고치지 않고, gradient를 만들지 않으며, 학습에 아무 영향이 없다.
+Every function here takes only `model` and the dict returned by `forward()`.
+Nothing mutates the model, nothing builds a gradient, nothing affects training.
 
-왜 이렇게 나누는가
-──────────────────
-설명 계산이 `forward()` 안에 있으면
-  - training/inference API에 설명 요구사항이 섞인다
-  - benchmark/serving 코드가 쓰지도 않을 비용을 낸다
-  - "prediction graph"와 "diagnostic graph"가 한 함수에 공존한다
-  - 모델이 FeatureStore 같은 외부 상태를 알아야 한다
-그래서 forward는 예측 상태만 내보내고, 해석은 전부 여기서 한다.
+Why the split
+─────────────
+If explanation lived inside `forward()`:
+  - explanation requirements would leak into the training/inference API,
+  - benchmark and serving code would pay for work they never use,
+  - the prediction graph and the diagnostic graph would share one function,
+  - the model would have to know about external state such as FeatureStore.
+So forward emits prediction state only, and all interpretation happens here.
 
-⚠ 복원 가능성의 근거 (구현 전 수치로 확인함)
+⚠ What makes reconstruction possible (checked numerically before writing it)
 ```
-이웃 임베딩   memory.keys[topk_idx]                    = retrieve()의 keys_full[idx]
-이웃 유사도   normalize(query_retr)·normalize(위 값)    = retrieve() 내부와 같은 식
-이웃 라벨     memory.labels[topk_idx]
-logit_dev     logits − dev_head(context_emb)           = W·(β·r), bias 상쇄
+neighbour embeddings  memory.keys[topk_idx]                  = keys_full[idx] in retrieve()
+neighbour similarity  normalize(query_emb) . normalize(above) = the same expression retrieve() uses
+neighbour labels      memory.labels[topk_idx]
+logit_dev             logits - dev_head(context_emb)          = W.(beta*r), bias cancels
 ```
-단 **유효성만은 복원 불가능**하다 — 검색이 못 채운 슬롯은 `topk_idx=0`이라
-외부에서는 "0번 이웃"과 구분되지 않는다. 그래서 forward가
-`out["neighbor_mask"]` 하나만 추가로 내보낸다.
+**Validity alone cannot be reconstructed**: a slot retrieval failed to fill has
+`topk_idx = 0`, which is indistinguishable from "neighbour 0" outside the model.
+That is why forward emits exactly one extra key, `out["neighbor_mask"]`.
 
-⚠ 이 파일은 판정을 하지 않는다
+⚠ This file does not judge
 ```
-❌  if ambiguity_ratio > 1.15: ambiguous = True
-✅  {"ambiguity_ratio": 1.02}          ← 값만. 판정은 분석 스크립트에서
+NO   if ambiguity_ratio > 1.15: ambiguous = True
+YES  {"ambiguity_ratio": 1.02}          <- values only; judging belongs to analysis
 ```
-그리고 **자르지 않는다** — 순위 전체를 반환한다. top-N 절단은 표시 계층의
-일이다. 계산 단계에서 자르면 분석 스크립트가 전체 분포를 못 본다.
+And it does not truncate: the full ranking is returned. Top-N cuts are the
+display layer's job. Truncating during computation blinds the analysis
+scripts to the rest of the distribution.
 """
 
 from __future__ import annotations
@@ -50,7 +51,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from libs.tabera import PROTO_DEV_FUSION_MODES
 
 __all__ = [
     "retrieved_neighbors",
@@ -59,16 +59,16 @@ __all__ = [
     "group_relative_feature_stats",
     "feature_gaps",
     "prototype_conditioning_overlap",
-    # ⚠ 아래 둘을 여기 안 넣어서 reproduce.py 에서 AttributeError 가 났다.
-    #   함수는 파일에 있는데 __all__ 에 빠뜨린 경우다. 새 함수를 추가할 때
-    #   여기도 같이 갱신할 것 — smoke_test.py 가 아래 검사로 잡는다.
+    # ⚠ These two were once missing here and reproduce.py raised
+    #   AttributeError: the functions existed in the file but not in __all__.
+    #   Update this list whenever a function is added.
     "prototype_class_alignment",
     "context_space_diversity",
 ]
 
 
 # ─────────────────────────────────────────────────────────────
-# 공통 유틸
+# Shared helpers
 # ─────────────────────────────────────────────────────────────
 
 def _entropy(counts: Sequence[int], total: int) -> float:
@@ -95,7 +95,7 @@ def _cat_num_idx(model, n_features: int):
 
 
 # ─────────────────────────────────────────────────────────────
-# ① 검색된 이웃 복원
+# (1) Reconstruct the retrieved neighbours
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -105,28 +105,33 @@ def retrieved_neighbors(
     feature_store=None,
 ) -> Optional[List[List[dict]]]:
     """
-    forward output에서 이웃 목록을 복원한다.
+    Reconstruct the neighbour list from the forward output.
 
-    반환: [B][유효 이웃 수] 의 dict 리스트. 유사도 내림차순(= topk 순서).
-      {rank, memory_idx, sample_id, similarity, label, features}
+    Returns a list of dicts per sample, ordered by descending similarity
+    (i.e. topk order): {rank, memory_idx, sample_id, similarity, label,
+    features}.
 
-    ⚠ `retrieve()`가 유사도 값을 버리므로 여기서 다시 계산한다. 검색에
-      쓰인 것과 **같은 식**이다: retrieve()도 `q_norm @ self._keys_norm`를
-      쓰고, 반환하는 `nk`는 `keys_full[idx]`이므로 `memory.keys[topk_idx]`와
-      같은 텐서다.
+    ⚠ `retrieve()` discards the similarity values, so they are recomputed
+      here with **the same expression**: retrieve() also uses
+      `q_norm @ self._keys_norm`, and the `nk` it returns is
+      `keys_full[idx]`, the same tensor as `memory.keys[topk_idx]`.
 
-    ⚠ 못 채운 슬롯은 아예 반환하지 않는다. "similarity 0.000인 이웃"으로
-      보이면 없는 사례를 있다고 설명하게 된다.
+    ⚠ Unfilled slots are not returned at all. Showing them as "a neighbour
+      with similarity 0.000" would describe a case that does not exist.
 
-    ⚠ features는 저장 당시 값 그대로다(numeric은 [0,1] quantile). 사람이
-      읽는 단위 역변환은 표시 계층의 몫 — 모델도 이 함수도 dataset의
-      quantile_transformer를 모른다.
+    ⚠ `features` are the stored values as-is (numeric ones are [0,1]
+      quantiles). Converting back to human-readable units is the display
+      layer's job — neither the model nor this function knows the dataset's
+      quantile_transformer.
 
-    feature_store=None이면 model.feature_store를 쓴다. 없으면 features는
-    None으로 채운다(검색 자체는 그대로 복원됨).
+    With feature_store=None, model.feature_store is used; if that is absent,
+    `features` is None and only the retrieval itself is reconstructed.
     """
     topk = out.get("topk_idx")
-    qr   = out.get("query_retr")
+    # ⚠ This used to read out["query_retr"], a retrieval-only representation.
+    #   With retr_proj removed, retrieval runs on query_emb, so recomputing
+    #   the similarity with the same expression requires query_emb here too.
+    qr   = out.get("query_emb")
     if topk is None or qr is None:
         return None
 
@@ -163,31 +168,35 @@ def retrieved_neighbors(
 
 
 # ─────────────────────────────────────────────────────────────
-# ② 지역 라벨 증거 (= ambiguity evidence)
+# (2) Local label evidence (ambiguity evidence)
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def local_label_evidence(model, out: Dict) -> Optional[List[dict]]:
     """
-    이웃의 라벨 구성을 **배정된 prototype 전체 분포와 함께** 반환한다.
+    Return the neighbours' label composition **together with the assigned
+    prototype's full distribution**.
 
-    ⚠ 이웃 다수결을 예측 근거로 쓰면 안 된다. 같은 prototype 안에서는
-      raw feature로도 다수결을 못 넘는다는 것이 측정으로 확인돼 있다 —
-      그러면 "8개 중 6개가 A"는 그룹 분포의 표본 노이즈다.
+    ⚠ A neighbour majority must not be used as evidence for the prediction.
+      Within one prototype, even raw features do not beat the majority
+      baseline — measured. So "6 of 8 are A" is sampling noise around the
+      group distribution.
 
-    ⚠ 그럼에도 의미가 있는 이유는 따로 있다: prototype purity를 통제해도
-      neighbor entropy가 오분류를 유의하게 예측한다. 즉 이웃은 **답**이
-      아니라 **이 지역이 얼마나 섞여 있는가**를 말한다.
+    ⚠ It is still informative, for a different reason: after controlling for
+      prototype purity, neighbour entropy still predicts misclassification
+      significantly. The neighbours state **how mixed this region is**, not
+      **what the answer is**.
 
-    → 그래서 지역 분포를 그룹 분포 없이는 절대 내보내지 않는다. 둘을 같이
-      보지 않으면 "4/6"이 높은지 낮은지조차 알 수 없다(그룹이 82%면
-      4/6=67%는 오히려 낮다).
+    → Hence the local distribution is never emitted without the group
+      distribution. Without both, "4/6" cannot even be called high or low
+      (if the group is 82% A, then 4/6 = 67% is low).
 
-    ⚠ 판정하지 않는다. `ambiguity_ratio` 값만 반환하고, "모호한 지역인가"의
-      기준선은 분석 스크립트가 경험적 분포에서 정한다.
+    ⚠ No judgement is made. Only `ambiguity_ratio` is returned; where the
+      line for "ambiguous region" falls is for the analysis scripts to set
+      from the empirical distribution.
 
-    ⚠ scope: 이 검색은 NN(q, G_p)이지 NN(q, D)가 아니다. 호출부가 문구를
-      틀리게 쓰지 못하도록 필드로 남긴다.
+    ⚠ Scope: this retrieval is NN(q, G_p), not NN(q, D). The field is carried
+      along so the caller cannot describe it wrongly.
     """
     topk = out.get("topk_idx")
     if topk is None:
@@ -227,8 +236,9 @@ def local_label_evidence(model, out: Dict) -> Optional[List[dict]]:
             "group_size":  int(glab.shape[0]),
         }
         if tasktype == "regression":
-            # 회귀는 "라벨 구성"이 없다 — 지역 산포를 그룹 산포와 비교한다
-            # (같은 역할: 이 지역이 얼마나 흔들리는가).
+            # Regression has no "label composition"; compare local spread
+            # against group spread. It answers the same question -- how much
+            # does this region vary.
             d["local_mean"] = float(labs.mean()) if len(labs) else float("nan")
             d["local_std"]  = float(labs.std())  if len(labs) else float("nan")
             d["group_mean"] = float(glab.mean()) if glab.shape[0] else float("nan")
@@ -248,12 +258,13 @@ def local_label_evidence(model, out: Dict) -> Optional[List[dict]]:
                 gc[kk] = gc.get(kk, 0) + 1
             d["label_counts"]       = lc
             d["group_label_counts"] = gc
-            # ⚠ 키 이름에 **출처**를 박는다. 맨 `entropy`는 쓰지 않는다 —
-            #   npz export의 `entropy`가 evidence_w(attention weight) 분포의
-            #   entropy이고 proto_dev에서는 상수 log(k)인데, 이름만 보고
-            #   "이웃 불확실성"으로 읽히는 문제가 실제로 있었다. 같은 이름을
-            #   여기서 다른 뜻으로 또 쓰면 그 혼동이 한 겹 더 쌓인다.
-            #   이 값은 검색된 이웃의 **라벨 분포** entropy = H(Y_N(x))다.
+            # ⚠ The key name carries its source; a bare `entropy` is avoided.
+            #   The `entropy` in the npz export is that of the evidence_w
+            #   (attention weight) distribution -- a constant log(k) here --
+            #   and it really was misread as "neighbour uncertainty" from the
+            #   name alone. Reusing the name with a second meaning would only
+            #   compound that. This is the entropy of the retrieved
+            #   neighbours' **label** distribution, H(Y_N(x)).
             d["label_entropy"]       = _entropy(lc.values(), len(labs))
             d["group_label_entropy"] = _entropy(gc.values(), int(glab.shape[0]))
             d["ambiguity_ratio"] = (
@@ -264,42 +275,43 @@ def local_label_evidence(model, out: Dict) -> Optional[List[dict]]:
 
 
 # ─────────────────────────────────────────────────────────────
-# ③ prototype-relative deviation (정확한 가법 분해)
+# (3) Prototype-relative deviation (exact additive decomposition)
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
     """
-    h = c + d 에서 편차 항 d 의 크기·방향·logit 기여.
+    Magnitude, direction and logit contribution of the correction term d in
+    h = c + d.
 
-    ⚠ 이 분해는 **근사가 아니라 항등식**이다. dev_head가 단일
-      nn.Linear(embed_dim, n_output)이므로
-          logits = W·(c + d) + b = (W·c + b) + W·d
-      이고 두 항의 합이 항상 logits와 정확히 같다. bias는 앞항에
-      흡수되므로 W·d에는 섞이지 않는다. SHAP/IG처럼 baseline을 임의로
-      골라 근사하는 것과 성격이 다르다 — 구조가 이미 가법적이라 나눠 쓸
-      뿐이다.
+    ⚠ This decomposition is an **identity, not an approximation**. dev_head
+      is a single nn.Linear(embed_dim, n_output), so
+          logits = W.(c + d) + b = (W.c + b) + W.d
+      and the two terms always sum exactly to logits. The bias is absorbed
+      into the first term and never mixes into W.d. This differs in kind from
+      SHAP or IG, which pick a baseline and approximate — here the structure
+      is already additive and is simply written out.
 
-    ⚠ d 는 forward와 **글자 그대로 같은 식**으로 재구성한다. 별도 근사식을
-      쓰면 설명과 실제가 어긋난다.
-          proto_dev      d = σ(β_raw) · normalize(q − c)
-          proto_dev_vec  d = σ(β_raw) ⊙ normalize(q − c)      (β는 (D,))
-          proto_dev_agg  d = σ(β_raw)·normalize(q−c) + σ(γ_raw)·normalize(a−c)
-      `context_emb`는 RVQ 적용 후 값이므로 dev_head에 실제로 들어간 c와
-      같다(확인함).
+    ⚠ d is reconstructed with **literally the same expression** as forward.
+      Any separate approximation would make the explanation disagree with the
+      computation.
+          d = sigma(beta_raw) * normalize(q - c)
 
-    ⚠ `dim_contrib`는 **embedding 차원**이지 feature가 아니다. embedder가
-      PLE/PLR + MLP + LayerNorm이라 embedding 차원을 입력 feature로 되돌리는
-      경로가 없고, gradient로 잇는 것도 안 된다(categorical에서 그래프가
-      끊김). 여기서 말할 수 있는 것은 "편차가 몇 개 차원에 몰려 있는가"라는
-      집중도이지 feature 이름이 아니다.
+    ⚠ `dim_contrib` indexes **embedding dimensions**, not features. The
+      embedder is PLE/PLR + MLP + LayerNorm, so there is no path back from an
+      embedding dimension to an input feature, and gradients cannot bridge it
+      either (the graph breaks at the categorical branch). What this supports
+      is a statement about concentration — how few dimensions carry the
+      correction — not about feature names.
 
-    ⚠ 자르지 않는다. 전체 D개 차원의 기여를 그대로 반환한다 — 상위 N개
-      절단은 표시 계층의 일이다.
+    ⚠ No truncation: all D dimensions are returned. Taking the top N is the
+      display layer's job.
     """
-    fm = getattr(model, "fusion_mode", None)
+    # ⚠ This used to branch on fusion_mode. The final model has one path, so
+    #   the only thing worth checking is that dev_head is a single Linear —
+    #   that is the sole condition making the decomposition an identity.
     dev_head = getattr(model, "dev_head", None)
-    if fm not in PROTO_DEV_FUSION_MODES or not isinstance(dev_head, torch.nn.Linear):
+    if not isinstance(dev_head, torch.nn.Linear):
         return None
     q = out.get("query_emb")
     c = out.get("context_emb")
@@ -309,13 +321,11 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
 
     q = q.detach(); c = c.detach(); lg = lg.detach()
     beta = torch.sigmoid(model.dev_beta_raw.detach())
-    dev_q = F.normalize(q - c, dim=-1)
-    if fm == "proto_dev_agg":
-        a = out.get("agg_emb").detach()
-        gamma = torch.sigmoid(model.dev_gamma_raw.detach())
-        d = beta * dev_q + gamma * F.normalize(a - c, dim=-1)
-    else:
-        d = beta * dev_q          # proto_dev(스칼라) / proto_dev_vec((D,) 브로드캐스트)
+    # This must be **literally the same expression** as forward. An
+    # approximation here would make the explanation disagree with the actual
+    # computation, and the disagreement would surface only as a non-zero
+    # residual (which the caller checks).
+    d = beta * F.normalize(q - c, dim=-1)
 
     W        = dev_head.weight.detach()          # (O, D)
     lg_proto = dev_head(c)                       # (B, O) = W·c + b
@@ -326,20 +336,22 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         proto_m = lg_proto.argmax(dim=-1)
         changed = pred_m != proto_m
     else:
-        # ⚠ 이진/회귀는 n_output=1이라 argmax가 항상 0이다. 이진은 부호가
-        #   클래스를 정하므로 부호 변화로 판정한다.
+        # ⚠ Binary and regression have n_output=1, so argmax is always 0. For
+        #   binary the sign decides the class, so a sign flip is the test.
         pred_m  = torch.zeros(lg.shape[0], dtype=torch.long, device=lg.device)
         proto_m = pred_m
         changed = (lg.squeeze(-1) > 0) != (lg_proto.squeeze(-1) > 0)
 
-    # ── 확률 이동 ────────────────────────────────────────────────
-    # ⚠ dev_share(= |ld| / (|lp| + |ld|))는 **로짓 크기 비율**이라 크기를
-    #   과장한다. credit-g 실측: dev_share가 5.6~19.3%로 읽히는데 실제
-    #   확신도는 0.2~1.2%p만 움직였다. 로짓이 ±0.6 구간이라 sigmoid가
-    #   거의 선형이기 때문이다. 사람이 읽는 단위는 확률이므로 그것을 낸다.
+    # ── Probability shift ───────────────────────────────────────
+    # ⚠ dev_share (= |ld| / (|lp| + |ld|)) is a ratio of logit magnitudes and
+    #   overstates the effect. Measured on credit-g: dev_share reads
+    #   5.6-19.3% while the actual confidence moved 0.2-1.2 percentage
+    #   points, because the logits sit in +-0.6 where the sigmoid is nearly
+    #   linear. People read probabilities, so probabilities are what we emit.
     #
-    # ⚠ prototype만의 확률은 "같은 클래스"로 재는 것이 맞다 — 최종 예측
-    #   클래스가 prototype 단계에서 몇 %였는지를 보여야 이동이 읽힌다.
+    # ⚠ The prototype-only probability must be measured on the *same* class:
+    #   showing what the finally predicted class scored at the prototype
+    #   stage is what makes the shift readable.
     tasktype = getattr(model, "tasktype", None)
     if tasktype == "regression":
         prob_proto = prob_final = None
@@ -349,7 +361,7 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         _pp = torch.sigmoid(lg_proto.squeeze(-1))
         _cls = (_pf > 0.5)
         prob_final = torch.where(_cls, _pf, 1 - _pf)
-        prob_proto = torch.where(_cls, _pp, 1 - _pp)   # 최종 예측 클래스 기준
+        prob_proto = torch.where(_cls, _pp, 1 - _pp)   # measured on the final predicted class
         proto_pred = (_pp > 0.5).long()
     else:
         _ar0 = torch.arange(lg.shape[0], device=lg.device)
@@ -357,7 +369,7 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         prob_proto = torch.softmax(lg_proto, -1)[_ar0, pred_m]
         proto_pred = proto_m
 
-    contrib = W[pred_m] * d                      # (B, D), 합 = lg_dev[:, m]
+    contrib = W[pred_m] * d                      # (B, D); sums to lg_dev[:, m]
     d_np       = d.norm(dim=-1).cpu().numpy()
     lgp_np     = lg_proto.cpu().numpy()
     lgd_np     = lg_dev.cpu().numpy()
@@ -374,29 +386,29 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         lp = float(lgp_np[b, m])
         ld = float(lgd_np[b, m])
         result.append({
-            "dev_norm":       float(d_np[b]),      # ‖d‖. proto_dev면 r이 단위라 = β
+            "dev_norm":       float(d_np[b]),      # ||d||; r is a unit vector, so this equals beta
             "logit_proto":    lp,                  # W·c + b
             "logit_dev":      ld,                  # W·d
-            # 예측 채널에서 편차가 차지하는 비중. logit은 부호가 있어 단순
-            # 비율이 발산할 수 있어 |lp|+|ld|로 나눈다 — "크기 대비 비중"
-            # 으로만 읽을 것.
+            # Share of the predicted channel taken by the correction. Logits
+            # are signed, so a plain ratio can diverge; dividing by
+            # |lp| + |ld| keeps it bounded. Read it as a magnitude share only.
             "dev_share":      float(abs(ld) / max(abs(lp) + abs(ld), 1e-12)),
             "argmax_changed": bool(chg_np[b]),
             "pred_channel":   m,
-            # 최종 예측 클래스가 prototype 단계에서 가졌던 확률 → 최종 확률.
-            # 회귀는 None.
+            # Probability of the finally predicted class at the prototype
+            # stage, then after the correction. None for regression.
             "prob_proto":     (float(pp_np[b]) if pp_np is not None else None),
             "prob_final":     (float(pf_np[b]) if pf_np is not None else None),
-            # prototype만으로 예측했다면 어느 클래스였는가(코드).
+            # Which class the prototype term alone would have predicted.
             "proto_pred":     (int(ppred_np[b]) if ppred_np is not None else None),
-            "dim_contrib":    contrib_np[b].tolist(),   # 전체 D개 (절단 없음)
+            "dim_contrib":    contrib_np[b].tolist(),   # all D, untruncated
             "n_dims":         int(contrib_np.shape[1]),
         })
     return result
 
 
 # ─────────────────────────────────────────────────────────────
-# ④ 그룹 대비 feature 통계 (feature 공간, 기술 통계)
+# (4) Group-relative feature statistics (feature space, descriptive)
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -407,34 +419,36 @@ def group_relative_feature_stats(
     feature_store=None,
 ) -> Optional[List[dict]]:
     """
-    "같은 그룹의 전형적 샘플 대비 이 샘플은 무엇이 다른가"를 raw feature로
-    직접 비교한다.
+    Compare a sample against the typical member of its own group, directly in
+    raw feature space.
 
-    ⚠ label_all_groups()와 축이 다르다.
+    ⚠ The axis differs from label_all_groups().
     ```
-    label_all_groups              그룹 A  vs  다른 그룹들   "이 그룹만 유별난 feature"
-    group_relative_feature_stats  샘플 x  vs  자기 그룹 A   "이 샘플만 유별난 feature"
+    label_all_groups              group A  vs  other groups   "features unusual for this group"
+    group_relative_feature_stats  sample x vs  its own group  "features unusual for this sample"
     ```
 
-    ⚠ **attribution이 아니다.** prototype_deviation(embedding 공간의 정확한
-      logit 분해)과 나란히 놓되 인과로 연결하면 안 된다 — embedder가
-      비선형이라 embedding 차원 ↔ feature 대응이 없고, gradient로 잇는
-      것도 막혀 있다. "이 feature 때문에 예측이 이렇게 나왔다"는 문장은
-      이 값으로 만들 수 없다.
+    ⚠ **This is not attribution.** Place it beside prototype_deviation (the
+      exact logit decomposition in embedding space) but do not connect the two
+      causally: the embedder is non-linear, so there is no correspondence
+      between embedding dimensions and features, and gradients cannot bridge
+      it. "The prediction came out this way because of this feature" is not a
+      sentence these values can support.
 
-    ⚠ 그룹 크기로 거르지 않는다. 표본이 작으면 mean/std가 못 믿을 값이지만,
-      그 판단 기준을 여기서 임의로 정하면(예: n<5면 버림) 근거 없는 detector가
-      된다. `group_size`와 `group_std`를 반드시 같이 반환하니 소비자가
-      판단한다. 다만 `std < 1e-6`(그룹 안에서 상수)일 때 z를 건너뛰는 것은
-      판정이 아니라 0으로 나누는 것을 막는 수치 보호다.
+    ⚠ No filtering by group size. mean/std are unreliable for small groups,
+      but choosing the cut-off here (say, drop n < 5) would make this an
+      unjustified detector. `group_size` and `group_std` are always returned
+      so the consumer can decide. Skipping z when `std < 1e-6` (constant
+      within the group) is not a judgement — it avoids dividing by zero.
 
-    ⚠ 자르지 않는다. 전체 feature를 |z| / rarity 내림차순으로 반환한다.
+    ⚠ No truncation: all features are returned, sorted by |z| / rarity.
 
-    반환: [B] 의 dict. {"numeric": [...], "categorical": [...], "group_size": n}
-      numeric     : z = (x − 그룹평균) / 그룹표준편차
-      categorical : rarity = 1 − (그룹 안에서 이 값의 비율)
-                    group_mode / group_mode_freq 동봉 — 최빈값과 같은지는
-                    소비자가 판단한다(여기서 거르지 않는다)
+    Returns one dict per sample:
+    {"numeric": [...], "categorical": [...], "group_size": n}
+      numeric     : z = (x - group mean) / group std
+      categorical : rarity = 1 - (frequency of this value within the group),
+                    with group_mode / group_mode_freq attached so the consumer
+                    can decide whether it matches the mode
     """
     fs = feature_store if feature_store is not None else getattr(model, "feature_store", None)
     sg = getattr(model.prototype_layer, "sample_groups", None)
@@ -473,16 +487,20 @@ def group_relative_feature_stats(
                 col = rows[:, fi].astype(np.float64)
                 mu, sd = float(col.mean()), float(col.std())
                 val = float(Xnp[b, fi])
-                if sd < 1e-6:      # 수치 보호(판정 아님)
+                if sd < 1e-6:      # numerical guard, not a judgement
                     continue
-                # ⚠ 그룹 내 백분위. **단조 변환에 불변**이라 quantile 공간에서
-                #   재도 실공간 백분위와 같다. z는 quantile 공간에서 계산되는데
-                #   화면의 값/대표값은 실단위로 역변환되므로 축이 어긋나고,
-                #   그 결과 "1 (그룹 대표값 1, z=-0.79)"처럼 같아 보이는데
-                #   z만 붙는 상태가 된다(credit-g 20건에서 반복 확인).
-                #   백분위는 그 불일치가 원천적으로 없다.
-                # ⚠ 동점 처리는 midrank(below + equal/2) — 이산형 feature는
-                #   같은 값이 많아 "미만 비율"만 쓰면 위치가 왜곡된다.
+                # ⚠ Within-group percentile. It is invariant to monotone
+                #   transforms, so measuring it in quantile space matches the
+                #   percentile in the original units. z, by contrast, is
+                #   computed in quantile space while the displayed value and
+                #   the group representative are inverse-transformed back to
+                #   real units -- the axes disagree, producing lines like
+                #   "1 (group typical 1, z=-0.79)" where the numbers look the
+                #   same yet a z is attached (seen across 20 credit-g cases).
+                #   A percentile cannot have that mismatch by construction.
+                # ⚠ Ties use midrank (below + equal/2). Discrete features
+                #   repeat values, so a plain "fraction below" would distort
+                #   the position.
                 below = float((col < val).mean())
                 equal = float((col == val).mean())
                 num_out.append({
@@ -492,8 +510,8 @@ def group_relative_feature_stats(
                     "value":        val,
                     "group_mean":   mu,
                     "group_std":    sd,
-                    # z는 화면에서 빠지지만 **분석·정렬용으로 유지**한다
-                    # (feature ranking에는 z가 더 유용할 수 있다).
+                    # z is dropped from the display but kept for analysis and
+                    # sorting -- it can rank features better than a percentile.
                     "z":            (val - mu) / sd,
                     "group_pct":       below + equal / 2.0,   # midrank, 0~1
                     "group_pct_below": below,
@@ -523,28 +541,32 @@ def group_relative_feature_stats(
 
 
 # ─────────────────────────────────────────────────────────────
-# ⑤ query ↔ 이웃 feature 차이 (전체)
+# (5) Query-to-neighbour feature differences (all of them)
 # ─────────────────────────────────────────────────────────────
 
 def feature_gaps(query: Dict[str, float],
                  neighbour: Dict[str, float],
                  cat_names: set) -> List[dict]:
     """
-    query와 한 이웃 사이의 feature별 차이를 **전부** 반환한다.
+    Return the per-feature difference between the query and one neighbour,
+    for **every** feature.
 
-    ⚠ 이전 구현(`_select_query_similar_features`)은 `gap > 0.15`인 feature를
-      후보에서 아예 제외했다. 즉 결과를 보여주기 전에 정보를 삭제했고,
-      "왜 비슷한지"만 보이고 "어디가 다른지"는 숨는 확증편향 표시가 됐다.
-      임계값으로 무엇을 볼지 결정하는 것은 detector와 같은 문제다 —
-      여기서는 자르지 않고, 정렬과 절단은 표시 계층이 한다.
+    ⚠ The previous implementation (`_select_query_similar_features`) dropped
+      any feature with `gap > 0.15` from the candidate set. It deleted
+      information before showing the result, so the display showed only why
+      the cases were similar and hid where they differed — a confirmation
+      bias built into the output. Deciding what may be seen via a threshold
+      is the same problem as building a detector. Nothing is cut here;
+      sorting and truncation belong to the display layer.
 
-    gap 정의는 Gower 방식 그대로다. categorical은 LabelEncoder 정수 코드에
-    순서가 없으므로 뺄셈이 "얼마나 다른가"가 될 수 없어 0/1로 둔다.
-    (`delta`는 표시 계층이 query 값을 복원(qv = neighbour − delta)하는 데만
-    쓴다 — categorical의 delta 자체를 크기로 읽으면 안 된다.)
+    The gap follows the Gower definition. Categorical codes come from
+    LabelEncoder and carry no order, so subtraction cannot express "how
+    different" and the gap is 0/1 instead. (`delta` exists only so the
+    display layer can recover the query value as `neighbour - delta`; the
+    categorical delta must not be read as a magnitude.)
 
-    반환: [{name, kind, query_value, neighbor_value, delta, gap}, ...]
-          입력 feature 순서 그대로. 정렬은 호출부에서.
+    Returns [{name, kind, query_value, neighbor_value, delta, gap}, ...] in
+    input feature order. Sorting is left to the caller.
     """
     rows = []
     for k, v in neighbour.items():
@@ -567,7 +589,7 @@ def feature_gaps(query: Dict[str, float],
 
 
 # ─────────────────────────────────────────────────────────────
-# ⑥ Q1 — prototype conditioning이 실제로 이웃 집합을 바꾸는가
+# (6) Q1 -- does prototype conditioning actually change the neighbour set?
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -579,52 +601,52 @@ def prototype_conditioning_overlap(
     rng_seed: int = 0,
 ) -> Optional[Dict]:
     """
-    같은 모델에서 NN(q, G_p) 와 NN(q, D) 를 비교한다.
+    Compare NN(q, G_p) against NN(q, D) within the same model.
 
-    검증 대상 문장
-    ──────────────
-    문서가 retrieval을 "prototype-conditioned"라고 부른다. 그 수식어가
-    실제 내용을 갖는지 확인한다.
-        겹침이 낮다  → 조건부라는 서술이 필요하고 정확하다
-        겹침이 높다  → 그룹 제약이 사실상 무효. 표현을 고치고, 대신
-                       "그룹 제약이 검색 결과를 거의 안 바꾼다"를 별도
-                       관찰로 보고해야 한다
-    어느 쪽이 나올지 모르는 상태로 잰다.
+    The claim under test
+    ────────────────────
+    The write-up calls the retrieval "prototype-conditioned". This checks
+    whether the modifier has content.
+        low overlap   -> the word "conditioned" is needed and accurate
+        high overlap  -> the group constraint is effectively inert; the
+                         wording must change and "the group constraint barely
+                         changes the retrieved set" becomes a separate finding
+    It is measured without assuming which way it comes out.
 
-    ⚠ 모델을 변형하지 않는다. `model.global_retrieve = True` 같은 속성
-      mutation은 진단 함수가 이후 평가 상태를 조용히 바꾸는 부작용을
-      만든다. 여기서는 MemoryBank.retrieve()에 이미 있는 오버라이드
-      (`hard_assignment=None` → 전체 검색)를 그대로 쓴다 — 인자를 새로
-      추가하면 같은 뜻을 두 가지로 표현하게 되어 모순된 호출이 가능해진다.
+    ⚠ The model is not mutated. Mutating an attribute would let a diagnostic
+      silently change later evaluation state. Instead this uses the override
+      that MemoryBank.retrieve() already has (`hard_assignment=None` gives a
+      global search). Adding a new argument would express one meaning in two
+      ways and make contradictory calls possible.
 
-    ⚠ null baseline이 없으면 숫자를 읽을 수 없다. 그룹 크기 60에서 k=8을
-      뽑으면 우연만으로도 Jaccard가 0.07 근처다. 두 가지를 같이 낸다.
-        analytic   전역 top-k 중 m개가 이 그룹 안에 있을 때
-                   그룹에서 k개를 무작위로 뽑으면 E|A∩B| = k·m/G
-        permutation 실제로 n_permutations회 뽑아 분포를 본다
-      `n_global_in_group`(=m) 자체가 가장 읽기 쉬운 값이다 — 전역 최근접이
-      애초에 전부 그룹 안에 있으면 조건부는 아무것도 바꿀 수 없다.
+    ⚠ The numbers are unreadable without a null baseline: drawing k=8 from a
+      group of 60 lands near Jaccard 0.07 by chance alone. Both baselines are
+      reported.
+        analytic     given that m of the global top-k are inside this group,
+                     k random draws from the group give E|A n B| = k*m/G
+        permutation  actually draw n_permutations times and look at the spread
+      `n_global_in_group` (= m) is the most directly readable value: if the
+      global nearest neighbours were all inside the group already, then
+      conditioning cannot change anything.
 
-    ⚠ 자르지 않고 판정하지 않는다. 샘플별 값을 전부 돌려주고, 요약과
-      해석은 분석 스크립트가 한다. group_size를 반드시 같이 반환한다 —
-      |G|=20과 |G|=500은 같은 Jaccard라도 뜻이 다르다.
+    ⚠ Nothing is truncated and nothing is judged. Every per-sample value is
+      returned; summarising and interpreting belong to the analysis scripts.
+      group_size always comes with it -- the same Jaccard means different
+      things at |G| = 20 and |G| = 500.
 
-    반환: {"per_sample": [...], "meta": {...}} 또는 None
+    Returns {"per_sample": [...], "meta": {...}} or None.
       per_sample: sample_idx, group_id, group_size, k, n_local, n_global,
                   n_intersect, jaccard, top1_match, rank_corr,
                   n_global_in_group, null_jaccard_analytic,
                   null_jaccard_perm_mean, null_jaccard_perm_std,
-                  fallback(bool), local_ids, global_ids
+                  fallback (bool), local_ids, global_ids
     """
-    if getattr(model, "global_retrieve", False):
-        # 이 모델은 이미 전역 검색이라 비교 대상이 없다. 조용히 1.0을
-        # 내면 "조건부가 무효"라는 결론으로 오독된다.
-        raise ValueError(
-            "model.global_retrieve=True인 모델에서는 이 비교가 성립하지 않습니다 "
-            "— out['topk_idx']가 이미 전역 검색 결과입니다.")
 
     topk = out.get("topk_idx")
-    qr   = out.get("query_retr")
+    # ⚠ This used to read out["query_retr"], a retrieval-only representation.
+    #   With retr_proj removed, retrieval runs on query_emb, so recomputing
+    #   the similarity with the same expression requires query_emb here too.
+    qr   = out.get("query_emb")
     if topk is None or qr is None:
         return None
     ha = out.get("hard_group")
@@ -636,18 +658,21 @@ def prototype_conditioning_overlap(
     n_mem = int(model.memory.filled.item())
     k     = int(topk.shape[1])
     if n_mem < k:
-        # 메모리가 k개도 못 채웠으면 group-constrained 경로도 전체 검색
-        # fallback을 탄다 — 겹침이 1.0으로 나오지만 그건 조건부가 무효라는
-        # 뜻이 아니라 조건부가 애초에 적용되지 않았다는 뜻이다.
+        # If memory holds fewer than k entries, the group-constrained path
+        # also falls back to a global search. The overlap then reads 1.0,
+        # which does not mean the conditioning is ineffective -- it means the
+        # conditioning was never applied.
         return {"per_sample": [], "meta": {
-            "skipped": "memory.filled < k — 조건부 검색 자체가 적용되지 않음",
+            "skipped": "memory.filled < k: conditioning was never applied",
             "memory_filled": n_mem, "k": k}}
 
     excl = sample_ids if getattr(model, "exclude_self_retrieval", False) else None
-    # 전역 검색: hard_assignment=None 이 곧 오버라이드다(모델 변경 없음).
+    # Global search: passing hard_assignment=None is the override itself,
+    # so the model is never modified.
     _, _, g_idx = model.memory.retrieve(qr, k, hard_assignment=None, exclude_ids=excl)
 
-    # 같은 축(정규화 cosine)에서 local/global 유사도를 잰다 — distance_gap용.
+    # Measure local and global similarity on one axis (normalised cosine)
+    # so that distance_gap is comparable.
     _keys_n = F.normalize(model.memory.keys[:n_mem].detach(), dim=-1)
     _qn     = F.normalize(qr.detach(), dim=-1)
     _all    = _qn @ _keys_n.T                                   # (B, n_mem)
@@ -666,8 +691,8 @@ def prototype_conditioning_overlap(
     per_sample = []
     for b in range(l_np.shape[0]):
         sel = [j for j in range(k) if msk is None or bool(msk[b, j])]
-        A = l_np[b, sel]                      # 조건부 top-k (유사도 내림차순)
-        B = g_np[b]                           # 전역 top-k
+        A = l_np[b, sel]                      # conditioned top-k, descending similarity
+        B = g_np[b]                           # global top-k
         p = int(ha_np[b])
         if p not in grp_cache:
             ids = (sg[p] if (sg is not None and p < len(sg) and sg[p] is not None) else [])
@@ -681,19 +706,19 @@ def prototype_conditioning_overlap(
         union = setA | setB
         jac = (len(inter) / len(union)) if union else float("nan")
 
-        # 순위 상관: 교집합 원소의 A 내 순위 vs B 내 순위
+        # Rank correlation: rank within A vs rank within B, over the intersection
         if len(inter) >= 2:
             ra = {v: i for i, v in enumerate(A.tolist())}
             rb = {v: i for i, v in enumerate(B.tolist())}
             xs = np.array([ra[v] for v in inter], dtype=float)
             ys = np.array([rb[v] for v in inter], dtype=float)
-            from scipy.stats import spearmanr          # noqa: F401 (선택 의존)
+            from scipy.stats import spearmanr          # noqa: F401 (optional dependency)
             rc = float(spearmanr(xs, ys).statistic)
         else:
             rc = float("nan")
 
-        # null: 전역 top-k 중 m개가 이 그룹 안에 있을 때, 그룹에서 무작위
-        # k개를 뽑으면 얼마나 겹치는가
+        # Null model: given that m of the global top-k fall inside this
+        # group, how much would k random draws from the group overlap?
         m = int(len(setB & set(G.tolist()))) if gsize else 0
         if gsize >= 1:
             exp_i = k * m / gsize
@@ -708,12 +733,13 @@ def prototype_conditioning_overlap(
         else:
             null_a = null_p_mean = null_p_std = float("nan")
 
-        # ⚠ Jaccard만으로는 부족하다. 겹침이 같아도 "그룹 밖 후보가 거의
-        #   비슷했다"와 "그룹 밖에 훨씬 가까운 게 있었다"는 전혀 다른
-        #   상황이고, 후자만이 제약이 실제로 비용을 치렀다는 뜻이다.
-        #   같은 cosine 축에서 local과 global의 1번째/k번째를 직접 뺀다.
-        _sl = sim_l_b                        # 이 샘플의 local 이웃 cosine
-        _sg_ = sim_g[b]                      # 전역 top-k cosine (내림차순)
+        # ⚠ Jaccard alone is not enough. At the same overlap, "the candidates
+        #   outside the group were nearly as close" and "something much closer
+        #   existed outside the group" are entirely different, and only the
+        #   second means the constraint actually cost something. Subtract the
+        #   local and global rank-1 and rank-k values on the same cosine axis.
+        _sl = sim_l_b                        # cosine to this sample's local neighbours
+        _sg_ = sim_g[b]                      # global top-k cosine, descending
         gap_top1 = float(_sg_[0] - _sl.max()) if len(_sl) else float("nan")
         gap_topk = float(_sg_[-1] - _sl.min()) if len(_sl) else float("nan")
 
@@ -732,14 +758,16 @@ def prototype_conditioning_overlap(
             "null_jaccard_analytic":  float(null_a),
             "null_jaccard_perm_mean": null_p_mean,
             "null_jaccard_perm_std":  null_p_std,
-            # 그룹 제약이 치른 유사도 비용(>=0). 0에 가까우면 "그룹 밖에
-            # 더 가까운 후보가 없었다" = 제약이 사실상 공짜였다는 뜻.
+            # Similarity cost paid by the group constraint (>= 0). Near zero
+            # means nothing closer existed outside the group, i.e. the
+            # constraint was effectively free.
             "distance_gap_top1": gap_top1,
             "distance_gap_topk": gap_topk,
-            # ⚠ fallback 샘플은 그룹 확장 검색을 탔으므로 "그룹 제약"이
-            #   이미 느슨하다. 제외 여부는 분석 단계에서 정하되, 제외
-            #   비율 자체가 결과다 — 30%가 fallback이면 "그룹 제약"이라는
-            #   서술이 이미 절반만 사실이다.
+            # ⚠ Fallback samples went through the expanded search, so the
+            #   group constraint was already loose for them. Whether to
+            #   exclude them belongs to the analysis stage, but the exclusion
+            #   rate is itself a result: at 30% fallback, describing the
+            #   retrieval as "group-constrained" is only half true.
             "fallback":    bool(gsize < k or (msk is not None and not msk[b].all())),
             "local_ids":   A.tolist(),
             "global_ids":  B.tolist(),
@@ -753,39 +781,41 @@ def prototype_conditioning_overlap(
 
 
 # ─────────────────────────────────────────────────────────────
-# ⑦ prototype이 무엇을 표현하는가 — density mode vs class anchor
+# (7) What do prototypes represent -- density mode or class anchor?
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def prototype_class_alignment(model) -> Optional[Dict]:
-    """prototype이 클래스를 나눠 맡고 있는지 측정한다.
+    """Measure whether prototypes end up dividing the classes between them.
 
-    왜 필요한가
-    ───────────
-    `P >= C` 는 **필요조건이지 충분조건이 아니다.** prototype 항만으로 낼 수
-    있는 서로 다른 argmax가 최대 P개이므로 P < C면 편차가 떠맡아야 하지만,
-    P = C 여도 C개 centroid가 전부 한 클래스 방향으로 갈 수 있다.
-    P를 늘렸을 때 원하는 것은
-        ✅ predictive anchor  — 클래스를 나눠 맡되 그룹 안에 구조가 남음
-        ❌ class memory       — centroid가 클래스 라벨로 붕괴
-    이고, 둘을 가르는 지표가 alignment 와 H(Y_G) 다.
+    Why this is needed
+    ──────────────────
+    `P >= C` is **necessary but not sufficient**. The prototype term alone can
+    produce at most P distinct argmax values, so P < C forces the correction
+    term to take over -- but even at P = C, all C centroids could point at the
+    same class. What raising P is meant to buy is
+        wanted:   a predictive anchor -- classes are divided up while
+                  structure remains inside each group
+        unwanted: class memory -- centroids collapse onto class labels
+    and the two are told apart by alignment and H(Y_G).
 
-    반환
-    ────
-        alignment        mean_p max_y P(y|p).  1/C ≈ 무작위, 1.0 = 클래스 순수
-        alignment_std    prototype 간 편차
-        group_entropy    mean_p H(Y|p).  0에 붙으면 class memory
-        n_prototypes     설정값 P
-        n_effective      비어있지 않은 prototype 수
-        n_eff_entropy    exp(H(assignment 분포)) — 크기 불균형까지 반영한 유효 개수
-                         (P개 중 12개만 산다는 것과, 살아있어도 하나가 61%를
-                          먹는다는 것은 다른 문제다)
-        dead_ratio       비어있는 비율
+    Returns
+    ───────
+        alignment        mean_p max_y P(y|p). 1/C is chance, 1.0 is pure
+        alignment_std    spread across prototypes
+        group_entropy    mean_p H(Y|p). Near 0 means class memory
+        n_prototypes     the configured P
+        n_effective      number of non-empty prototypes
+        n_eff_entropy    exp(H(assignment distribution)) -- an effective count
+                         that also reflects size imbalance (only 12 of P being
+                         alive and one live group holding 61% are different
+                         problems)
+        dead_ratio       fraction that are empty
         per_prototype    [{p, size, top_class, top_prop, entropy}, ...]
 
-    ⚠ 이 함수는 train 분포(sample_groups + memory.labels)만 본다. test 라벨을
-      쓰지 않으므로 학습 중에도 안전하게 로깅할 수 있다.
-    ⚠ regression에서는 클래스가 없으므로 None을 반환한다.
+    ⚠ Only the training distribution is read (sample_groups + memory.labels).
+      No test label is touched, so this is safe to log during training.
+    ⚠ Regression has no classes, so None is returned.
     """
     if getattr(model, "tasktype", None) == "regression":
         return None
@@ -820,8 +850,9 @@ def prototype_class_alignment(model) -> Optional[Dict]:
 
     sizes_a = np.asarray(sizes, dtype=np.float64)
     tot = sizes_a.sum()
-    # 크기 가중 유효 개수. 살아있는 개수만 세면 "하나가 61%를 먹는" 상황을
-    # 놓친다(phoneme 실측: 65개 중 42개 생존, 그러나 한 그룹이 학습 데이터의 61%).
+    # Size-weighted effective count. Counting only live prototypes misses the
+    # case where one absorbs most of the data (measured on phoneme: 42 of 65
+    # alive, yet a single group held 61% of the training set).
     p_assign = sizes_a[sizes_a > 0] / tot if tot > 0 else np.array([1.0])
     n_eff_H = float(np.exp(-(p_assign * np.log(p_assign)).sum()))
 
@@ -840,43 +871,50 @@ def prototype_class_alignment(model) -> Optional[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# ⑧ context space가 무너졌는가 — prototype vocabulary collapse
+# (8) Has the context space collapsed -- prototype vocabulary collapse?
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def context_space_diversity(model) -> Optional[Dict]:
-    """prototype이 실제로 서로 다른 context를 제공하고 있는지 측정한다.
+    """Measure whether the prototypes actually supply distinct contexts.
 
-    왜 dead ratio 로는 부족한가
-    ───────────────────────────
-    ⚠ prototype이 **균등하게 쓰이는 것**은 목표가 아니다. TabERA의 centroid는
-      uniform partition의 cluster center가 아니라 데이터 manifold의 mode를
-      가리키는 latent context anchor다. 실제 분포가
+    Why dead ratio is not enough
+    ────────────────────────────
+    ⚠ Uniform prototype usage is **not** the goal. A centroid here is not the
+      cluster center of a uniform partition but a latent context anchor
+      pointing at a mode of the data manifold. If the real distribution is
           A 70% / B 20% / C 5% / D 5%
-      라면 좋은 prototype 배치도 그만큼 불균등한 게 맞다. 균등화를 목표로
-      두면(예: KL(usage‖Uniform)) 모델이 clustering 쪽으로 변질된다.
+      then a good prototype allocation is just as uneven. Optimising for
+      uniformity (say KL(usage || Uniform)) would turn the model into a
+      clustering method.
 
-    ⚠ 진짜 문제는 **vocabulary collapse** 다. P=50을 뒀는데 실제 context가
-      12개 방향밖에 못 만들면, `context_emb`는 사실상 "하나의 prototype +
-      약간의 잡음"이 된다. LLM vocabulary가 50k인데 12 token만 쓰이는 것과
-      같다. 이건 균등성 문제가 아니라 **표현 용량을 버리고 있는 것**이다.
+    ⚠ The real failure is **vocabulary collapse**. If P = 50 is configured but
+      the model only ever produces 12 distinct context directions, then
+      `context_emb` is effectively "one prototype plus noise" -- the same
+      situation as an LLM with a 50k vocabulary that uses 12 tokens. That is
+      not an imbalance problem; it is **discarded representational capacity**.
 
-    그래서 재는 것
-    ──────────────
-        usage_entropy_eff   exp(H(사용 분포)).  "몇 개가 실질적으로 쓰이는가"
-        gini                사용 편중도 (0=균등, 1=독점).  참고용이지 목표 아님
-        top1_share          최대 prototype이 먹는 비율
-        context_eff_rank    **핵심.** 학습 샘플이 실제로 받는 context_emb 의
-                            공분산 고유값 스펙트럼 entropy의 exp.
-                            = "context 공간이 실제로 몇 차원을 쓰는가"
+    What is measured
+    ────────────────
+        usage_entropy_eff   exp(H(usage distribution)): how many are in
+                            effective use
+        gini                usage concentration (0 uniform, 1 monopoly).
+                            Reported for reference, not as a target
+        top1_share          fraction taken by the largest prototype
+        context_eff_rank    **the key one.** exp of the entropy of the
+                            eigenvalue spectrum of the covariance of the
+                            context_emb that training samples actually
+                            receive, i.e. how many dimensions the context
+                            space really uses
         context_eff_rank_uniform
-                            사용 분포가 균등했다면 나왔을 eff rank.
-                            둘의 비가 **편중 때문에 잃은 표현 차원**이다.
+                            the effective rank a uniform usage distribution
+                            would have given. The ratio of the two is the
+                            representational dimensionality lost to the skew
         centroid_cos_mean/min
-                            살아있는 centroid 쌍의 cosine.
-                            1에 가까우면 centroid들이 같은 방향으로 뭉친 것.
+                            pairwise cosine among live centroids. Near 1 means
+                            the centroids have bunched into one direction
 
-    ⚠ context_eff_rank 는 embed_dim 이 상한이다. P < embed_dim 이면 P 도 상한.
+    ⚠ context_eff_rank is bounded by embed_dim, and by P when P < embed_dim.
     """
     pl = getattr(model, "prototype_layer", None)
     sg = getattr(pl, "sample_groups", None) if pl is not None else None
@@ -890,7 +928,7 @@ def context_space_diversity(model) -> Optional[Dict]:
     tot = sizes.sum()
     if tot <= 0:
         return None
-    w = sizes / tot                                        # 사용 분포 (P,)
+    w = sizes / tot                                        # usage distribution, shape (P,)
 
     nz = w[w > 0]
     H = float(-(nz * np.log(nz)).sum())
@@ -898,7 +936,8 @@ def context_space_diversity(model) -> Optional[Dict]:
                  / (2 * len(sizes) * sizes.sum())) if tot > 0 else float("nan")
 
     def _eff_rank(weights):
-        # 샘플이 받는 context_emb 의 가중 공분산. context_emb = c_p 이므로
+        # Weighted covariance of the context_emb a sample receives. Since
+        # context_emb = c_p, this is the covariance over prototypes.
         # Cov = Σ_p w_p (c_p - μ)(c_p - μ)^T,  μ = Σ_p w_p c_p
         wt = torch.as_tensor(weights, dtype=C_emb.dtype, device=C_emb.device)
         mu = (wt[:, None] * C_emb).sum(0, keepdim=True)
@@ -912,7 +951,7 @@ def context_space_diversity(model) -> Optional[Dict]:
 
     alive = sizes > 0
     er_actual = _eff_rank(w)
-    er_uniform = _eff_rank(alive / max(alive.sum(), 1))     # 살아있는 것만 균등
+    er_uniform = _eff_rank(alive / max(alive.sum(), 1))     # uniform over the live prototypes only
 
     Cn = F.normalize(C_emb[torch.as_tensor(alive)], dim=-1)
     G = (Cn @ Cn.T).cpu().numpy()
@@ -928,8 +967,9 @@ def context_space_diversity(model) -> Optional[Dict]:
         "top1_share":    float(sizes.max() / tot),
         "context_eff_rank":         er_actual,
         "context_eff_rank_uniform": er_uniform,
-        # 편중 때문에 잃은 표현 차원의 비율. 1에 가까우면 편중이 표현을
-        # 거의 안 깎았다는 뜻 — 불균등해도 collapse는 아니라는 신호다.
+        # Fraction of representational dimensionality lost to the imbalance.
+        # Near 1 means the skew barely cost anything -- uneven usage is not
+        # collapse by itself.
         "eff_rank_ratio": (er_actual / er_uniform) if er_uniform > 0 else float("nan"),
         "centroid_cos_mean": float(np.mean(pair)),
         "centroid_cos_max":  float(np.max(pair)),
