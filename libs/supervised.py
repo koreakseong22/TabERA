@@ -142,6 +142,7 @@ class TabERAWrapper:
         self._best_state = None
         self._data_id    = "?"      # shown in the tqdm bar; set by optimize.py
         self.regroup_history: List[Dict[str, float]] = []
+        self.best_epoch: Optional[int] = None
         self.final_regroup_stats: Optional[Dict[str, float]] = None
         # Filled after fit(): z_top1, z_margin and related values, which the
         # objective in optimize.py can read alongside val_v. Stays None if the
@@ -742,9 +743,21 @@ class TabERAWrapper:
                 >= self.model.prototype_layer.regroup_warmup_epochs
             )
 
+            # ⚠ Attach the validation score to this epoch's regroup record.
+            #   Without it, active_ratio and val live on separate axes and the
+            #   question "what was prototype utilisation at the epoch that got
+            #   selected" cannot be answered at all. That question matters
+            #   here: active_ratio was measured oscillating on a 5-epoch cycle
+            #   (0.73 -> 0.10 -> 0.70 ...), matching dead_reinit_patience, so
+            #   which phase early stopping lands in may decide the outcome.
+            if self.regroup_history and self.regroup_history[-1].get("epoch") == float(epoch):
+                self.regroup_history[-1]["val_score"] = float(val_v)
+
             # Save the best model
             if is_better(val_v, best_val, self.tasktype) and _past_regroup_warmup:
                 best_val   = val_v
+                # Which epoch the returned model actually comes from.
+                self.best_epoch = int(epoch)
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
                 # sample_groups and group_labels are plain Python attributes
                 # of CentroidLayer, and feature_store._store is not an
@@ -865,6 +878,30 @@ class TabERAWrapper:
             # two always describe the same moment.
             if best_sample_groups is not None:
                 self.model.prototype_layer.sample_groups = best_sample_groups
+                # ⚠ INVARIANT: sample_groups and memory._cached_groups must
+                #   describe the **same assignment snapshot**. retrieve() reads
+                #   the cache, not sample_groups, so restoring one without the
+                #   other leaves retrieval searching the groups of whichever
+                #   epoch happened to be last.
+                #
+                #   That is exactly what happened. The line above rolled
+                #   sample_groups back to the best epoch while the cache stayed
+                #   at the final one, and the two agreed on 2 of 15 groups.
+                #   Only 434 of 640 retrieved neighbours came from the assigned
+                #   group; after this call, 640 of 640 do.
+                #
+                #   ⚠ The bug was invisible to accuracy: retrieval is outside
+                #     the prediction path, so every metric was unaffected while
+                #     the explanations cited the wrong group. It survived
+                #     because --refresh_on_best (on by default) rebuilds both
+                #     further below, so only --no-refresh_on_best runs were
+                #     wrong. Re-caching here costs one pass and makes the
+                #     invariant hold regardless of that flag.
+                self.model.memory.cache_sample_groups(
+                    best_sample_groups,
+                    device=torch.device(self.device),
+                    centroid_emb=self.model.prototype_layer.centroid_emb,
+                )
             if best_group_labels is not None:
                 self.model.prototype_layer.group_labels = best_group_labels
             if best_target_labels is not None:
