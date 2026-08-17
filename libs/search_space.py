@@ -47,53 +47,7 @@ through a CLI default. Change this one place and both sides follow.
 
 
 # ─────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────
-# Routing scale, derived from the prototype count
-# ─────────────────────────────────────────────────────────────
-
 DEFAULT_K_NO_TUNE = 8
-
-
-def derived_routing_scale(n_prototypes: int) -> float:
-    """Routing-softmax scale, computed from P rather than searched.
-
-        P = floor(sqrt(N_train))
-        s = sqrt(2) * log(P - 1)
-
-    This is a **deterministic derived quantity, not an HPO search axis.**
-
-    ⚠ Wording. AdaCos (Zhang et al. 2019, CVPR) is a method for scaling a
-      cosine *classifier* by the number of classes. TabERA does not use
-      AdaCos; it borrows the shape of that scaling and applies it to
-      prototype routing with P in place of the class count. The accurate
-      description is "a fixed routing scale in the form of AdaCos's
-      cosine-classifier scaling", never "we use AdaCos".
-
-    Why derive it at all. `routing_scale` used to be searched by Optuna over
-    [1.0, 20.0] -- a range that was itself obtained by substituting the
-    prototype counts this project uses (P = 7..322) into that same formula,
-    which lands in a narrow s = 2.5..8.2. The parameter is therefore not
-    "different per dataset in a way we have to discover" but "different per
-    dataset in a way we can compute".
-
-    This is a different kind of compaction from fixing k: k is fixed because
-    it does not affect prediction at all, whereas this one does affect it but
-    is computable. Removing it from the search space frees that budget for
-    parameters that genuinely vary, such as lr and dropout.
-
-    ⚠ Substituting P for the class count is an analogy, not a derivation. It
-      is a practical approximation and needs an A/B check whenever
-      performance is in question.
-    """
-    # For P <= 2, log(P - 1) <= 0 would drive the scale to zero or below.
-    # Clamp at 1.0 so the cosine softmax keeps a minimum sharpness (this is
-    # the lower bound the old search range used).
-    return max(1.0, math.sqrt(2) * math.log(max(n_prototypes - 1, 1)))
-
-
-# ⚠ Kept so that any caller still importing the old name keeps working. The
-#   name suggested TabERA *uses* AdaCos, which it does not.
-adacos_fixed_scale = derived_routing_scale
 
 
 # ─────────────────────────────────────────────────────────────
@@ -212,6 +166,28 @@ def get_search_space(
 
         # ── Optimisation ────────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+        # ⚠ The range is deliberately **not** narrowed. Log-uniform over four
+        #   orders of magnitude is wide by the usual HPO standards, but wide
+        #   and unnecessarily wide are different claims. Measured over the
+        #   accumulated studies (N = 1,258 best_params):
+        #       min 1.0e-06,  median 9.2e-05,  max 1.0e-02
+        #       24% of selected values exceeded 1e-3
+        #   The maximum sits essentially at the upper bound, so if anything
+        #   the ceiling may be the binding constraint. Capping at 1e-3 -- the
+        #   range other tabular benchmarks tend to use -- would discard a
+        #   quarter of the values the search actually chose.
+        #
+        # ⚠ The lower bound is untouched for a different reason: how often
+        #   1e-6 is actually selected as best has not been measured, and
+        #   raising it to 1e-5 on the assumption that it is rare would repeat
+        #   exactly the mistake documented under embedder_layers above --
+        #   narrowing a range removes the evidence needed to re-check it.
+        #
+        #   ⚠ N = 1,258 counts every study on disk, including ablations,
+        #     multiple seeds and legacy conditions, with some files duplicated.
+        #     It is enough to settle "do not narrow", but a number quoted in
+        #     the paper should be recomputed over the final configuration
+        #     only, after deduplication.
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
 
         # batch_size is fixed at 256 rather than searched.
@@ -298,11 +274,6 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
         "dropout":         params["dropout"],
         "n_output":        n_output,
 
-        # routing_scale is not searched: it is derived from P (see
-        # derived_routing_scale). Older studies that did search it keep their
-        # stored value, so this cannot silently alter an existing checkpoint
-        # or study.
-        "routing_scale":   params.get("routing_scale", derived_routing_scale(params["n_prototypes"])),
     }
     # PLR (lite) hyperparameters are present only when num_embedding was
     # "plr_lite"; pass them through when they exist, otherwise the TabERA
