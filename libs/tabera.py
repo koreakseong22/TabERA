@@ -1151,7 +1151,6 @@ class TabERA(nn.Module):
         exclude_self_retrieval: bool = True,
         tasktype: str = "regression",
         n_classes: Optional[int] = None,
-        routing_scale: float = 1.0,
         use_ema_codebook: bool = True,
         ema_decay: float = 0.99,
         vectorized_fallback: bool = True,
@@ -1208,7 +1207,6 @@ class TabERA(nn.Module):
             prototype_labels=prototype_labels,
             dropout=dropout,
             col_names=column_names,
-            routing_scale=routing_scale,
             regroup_warmup_epochs=regroup_warmup_epochs,
             freeze_centroid_after=freeze_centroid_after,
             dead_reinit_patience=dead_reinit_patience,
@@ -1342,11 +1340,10 @@ class TabERA(nn.Module):
             self.prototype_layer.ema_update(query_emb.detach(), hard_assignment)
 
         # 7. Auxiliary losses
-        # ⚠ All zero under EMA: commitment was removed (section 10), the EMA
-        #   replaces the codebook update, and diversity has nowhere to send a
-        #   gradient because centroid_emb has requires_grad=False. The only
-        #   training signal is cross-entropy. The key remains for caller
-        #   compatibility.
+        # ⚠ Always zero. The EMA replaces the codebook update, commitment was
+        #   removed (section 10), and diversity has nowhere to send a gradient
+        #   because centroid_emb has requires_grad=False. The only training
+        #   signal is cross-entropy. The key remains for caller compatibility.
         aux_loss = torch.zeros((), device=X.device, dtype=logits.dtype)
 
         out = {
@@ -1369,8 +1366,7 @@ class TabERA(nn.Module):
                 c_norm  = F.normalize(
                     self.prototype_layer.centroid_emb.detach(), dim=-1)    # (P, D)
                 cos_sim = q_norm @ c_norm.T                                # (B, P)
-                soft_probs = F.softmax(
-                    cos_sim * self.prototype_layer.routing_scale, dim=-1)
+                soft_probs = F.softmax(cos_sim, dim=-1)
 
             proto_exp = self.prototype_layer.explain_routing(
                 hard_assignment, soft_probs, cos_sim=cos_sim)
