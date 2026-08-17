@@ -159,9 +159,58 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             print(f"     Prediction confidence: {pred_info['pred_confidence']:.1%}  "
                   f"(classifier output — separate from routing confidence below)")
 
+        # ── Where the prediction came from ──────────────────────────
+        # dev_head is a single Linear, so logits = (W*c + b) + W*(beta*r) is an
+        # identity: the region baseline and the sample-specific term are the
+        # two halves of the computation that produced the prediction, not an
+        # attribution fitted to it afterwards.
+        #
+        # ⚠ The two probabilities are shown side by side and never subtracted.
+        #   Each is a separate softmax, and softmax is non-linear, so their
+        #   difference is not the sample's "contribution" in probability space.
+        #   The *direction* is exact, since it is the sign of the logit term.
+        _dv0 = e.get("prototype_deviation")
+        if _dv0 is not None and _dv0.get("prob_final") is not None:
+            _lb = pred_info.get("pred_label", "prediction")
+            print(f"     Region baseline prediction: {_lb} {_dv0['prob_proto']:.1%}"
+                  f"   (shared by every sample in this region)")
+            print(f"     Final prediction:           {_lb} {_dv0['prob_final']:.1%}")
+            # ⚠ The logit term is printed as a number, the two probabilities
+            #   are not subtracted. In logit space the split is exact -- the
+            #   two terms sum to the logit to floating-point error -- so the
+            #   value is a real quantity, not a share inferred from the
+            #   probabilities. Showing only a direction invited the reader to
+            #   fill the gap by subtracting 55.8% from 56.1%, which is the one
+            #   reading the decomposition does not support.
+            _ld = _dv0.get("logit_dev")
+            if _ld is not None:
+                # ⚠ n_output = 1 for binary: the sign of the logit decides the
+                #   class, so a positive term points at the positive class,
+                #   not necessarily at the predicted one.
+                if (tasktype == "binclass" and target_class_names
+                        and len(target_class_names) == 2):
+                    _toward = target_class_names[1] if _ld >= 0 else target_class_names[0]
+                else:
+                    # Multiclass: the value is the term on the predicted
+                    # channel, so its sign is relative to that class directly.
+                    _toward = _lb if _ld >= 0 else f"away from {_lb}"
+                print(f"     Sample-specific logit:      {_ld:+.4f} toward {_toward}"
+                      f"   (region baseline logit {_dv0['logit_proto']:+.4f})")
+            # ⚠ This line belongs here, not in the region profile. It is a
+            #   statement about the prediction, and it is the centre of the
+            #   explanation wherever P < C: on ds=1493 the decision changes for
+            #   70.5% of samples, against 0 of 800 on credit-g.
+            if _dv0.get("argmax_changed"):
+                _pc0 = _dv0.get("proto_pred")
+                _pn0 = (target_class_names[_pc0]
+                        if (target_class_names and _pc0 is not None
+                            and 0 <= _pc0 < len(target_class_names)) else _pc0)
+                print(f"     → the sample-specific component changes the decision: "
+                      f"\"{_pn0}\" → \"{_lb}\"")
+
     # ① Prototype routing (target distribution — which class does this group represent?)
     proto = e["prototype"]
-    print(f"\n  ① Prototype Assignment")
+    print(f"\n  ① Region")
 
     # The group's target distribution, the main content of layer 1
     # (label_groups_by_target(), cached right after regroup_update()). To keep
@@ -266,7 +315,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     #     the most **divergent** features are shown as well.
     _p = le.get("prototype") if le else None
     _scope = f"NN(q, G_{_p})" if _p is not None else "NN(q, G_p)"
-    print(f"\n  ② Similar cases in the same group")
+    print(f"\n  ② Evidence")
     # ⚠ The five lines below are correct but do not belong on every sample.
     #   Across 14 cases they become 70 lines that nobody reads after the
     #   first. A rule for reading the output needs stating once, so it goes
@@ -331,23 +380,31 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             # The label mentions that this is a label-distribution entropy.
             # Printing a bare 'entropy' would be indistinguishable from the
             # evidence_w entropy.
-            if _single:
-                _skip_contrast = True
-                print(f"\n     the k={le['n_neighbors']} nearest are all "
-                      f"{_fmt_label(float(next(iter(_lc))))} — single-class region, no contrasting case")
-            elif _one:
-                # Every neighbour disagrees with the prediction. This is
-                # emphasised rather than collapsed; all of them appear in the
-                # Contrasting list below.
-                print(f"\n     ⚠ the k={le['n_neighbors']} nearest are all "
-                      f"{_fmt_label(float(next(iter(_lc))))} while the prediction is "
-                      f"{(pred_info or {}).get('pred_label', '?')} "
-                      f"— every neighbour contradicts it")
-            else:
-                print(f"\n     neighbourhood (k={le['n_neighbors']})   "
-                      f"{_dist_str(_lc, le['n_neighbors'])}   H(label) {le['label_entropy']:.3f}")
-            print(f"     whole group (n={le['group_size']})       "
+            # ⚠ Both distributions are printed **always**, even when the
+            #   neighbourhood collapses to one class. A previous version
+            #   replaced the neighbourhood line with a sentence in that case,
+            #   which dropped the very comparison this block exists for: with
+            #   only the group line left, "all 8 neighbours disagree" reads as
+            #   a fact about 8 samples when the region is entirely that class
+            #   -- a far stronger statement. The sentence is now a note
+            #   *after* the numbers, not a replacement for them.
+            _skip_contrast = _single
+            print(f"\n     neighbourhood (k={le['n_neighbors']})   "
+                  f"{_dist_str(_lc, le['n_neighbors'])}   H(label) {le['label_entropy']:.3f}")
+            print(f"     region                "
                   f"{_dist_str(_gc, le['group_size'])}   H(label) {le['group_label_entropy']:.3f}")
+            if _single:
+                print(f"     → single-class region, no contrasting case")
+            elif _one:
+                # Every neighbour disagrees with the prediction. Whether the
+                # region as a whole also disagrees changes what this means, so
+                # the note says which of the two it is.
+                _whole = (len(_gc) == 1)
+                print(f"     ⚠ the prediction is "
+                      f"{(pred_info or {}).get('pred_label', '?')} while "
+                      + ("the neighbourhood and the entire region are"
+                         if _whole else "every neighbour is")
+                      + f" {_fmt_label(float(next(iter(_lc))))}")
             _ar = le.get("ambiguity_ratio")
             if (not _single) and _ar is not None and _ar == _ar:
                 # ⚠ No judgement is made. Phrases like "a more mixed region"
@@ -373,7 +430,10 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                 nm = (names_for_col[code] if not isinstance(names_for_col, dict)
                       else names_for_col.get(code))
                 if nm is not None:
-                    return f"{name}={nm} [{code}]"
+                    # ⚠ The LabelEncoder integer is not shown. It is an
+                    #   internal index with no meaning to a reader, and it
+                    #   appeared in every categorical line of layers 2 and 3.
+                    return f"{name}={nm}"
         except (IndexError, KeyError, TypeError):
             pass
         return f"{name}=Category {code}"
@@ -500,7 +560,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     #   (logits = W*c + W*(beta*r)) remains exact.
     dv = e.get("prototype_deviation")
     if dv is not None:
-        print(f"\n  ③ How this sample differs from its group")
+        print(f"\n  ③ Region profile")
         # ⚠ This decomposition is not an approximation. dev_head is a single
         #   Linear, so logits = (W*c + b) + W*(beta*r) is an identity and the
         #   two terms always sum to the actual logits (residual 0.000e+00 in
@@ -531,16 +591,17 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             #   "prototype only" would suggest a per-sample number, so the
             #   name states that it is a group-level baseline. What varies per
             #   sample is the shift.
-            print(f"     prototype-only prediction: {_lab} {_pp:.1%}")
-            print(f"     this sample:              {_lab} {_pf:.1%}"
-                  f"   ({(_pf - _pp) * 100:+.1f}%p)")
-            if dv["argmax_changed"]:
-                _pc = dv.get("proto_pred")
-                _pn = (target_class_names[_pc]
-                       if (target_class_names and _pc is not None
-                           and 0 <= _pc < len(target_class_names)) else _pc)
-                print(f"     the correction changes the decision — prototype alone gives \"{_pn}\", "
-                      f"the query-direction correction flips it to \"{_lab}\"")
+            # ⚠ Printed as two independent predictions, never as an additive
+            #   split. prob_proto is softmax(W*c + b) and prob_final is
+            #   softmax(W*h + b); the decomposition is exact in logit space,
+            #   but softmax is non-linear, so 72.1% + 1.7% = 73.8% does not
+            #   hold. Showing a "+1.7%p contribution" would assert exactly
+            #   that. The direction, by contrast, is exact -- it follows the
+            #   sign of the logit term.
+            if verbose:
+                print(f"     region baseline prediction: {_lab} {_pp:.1%}"
+                      f"   (shared by every sample in this region)")
+                print(f"     final prediction:           {_lab} {_pf:.1%}")
         else:
             # Regression has no probability, so the logit decomposition stands
             print(f"     prototype={dv['logit_proto']:+.4f}"
@@ -557,7 +618,7 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     # (3b) Group contrast in feature space -- the readable axis
     gc = e.get("group_stats")
     if gc and (gc.get("numeric") or gc.get("categorical")):
-        print(f"\n     against the group (feature space, n={gc['group_size']})")
+        print(f"\n     against the region (feature space)")
         if verbose:
             print(f"     (the group typical value is the inverse transform of a mean taken in quantile space, not an arithmetic mean)")
         # ⚠ A **different axis** from layer (3) above, which is the exact
@@ -639,11 +700,27 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             if _pct is None:
                 _pos = f"z={d['z']:+.2f}"
             elif _pct >= 0.5:
-                _pos = f"top {(1 - _pct) * 100:.0f}%"
+                # ⚠ "top 0%" reads as a contradiction. When nothing in the
+                #   group is larger, say so instead of printing a share that
+                #   rounds to zero.
+                _pos = ("highest in the region" if _pct >= 0.9995
+                        else f"top {(1 - _pct) * 100:.0f}%")
             else:
-                _pos = f"bottom {_pct * 100:.0f}%"
+                _pos = ("lowest in the region" if _pct <= 0.0005
+                        else f"bottom {_pct * 100:.0f}%")
+            # ⚠ |group mean - global mean| / global std is printed on every
+            #   line and never used to hide one. Near 0 means this group's
+            #   distribution barely differs from the dataset, so "unusual
+            #   within the group" reads the same as "unusual overall" -- the
+            #   percentile beside it carries no group-specific information.
+            #   Measured range: 0.09 (ds=31, largest group) to 0.71 (ds=1489).
+            #   Gating on it would need a cut-off nobody can justify, and the
+            #   reader could not tell a hidden feature from an absent one.
+            _gvg = d.get("group_vs_global")
+            _gvg_s = ("" if _gvg is None or _gvg != _gvg
+                      else f",  |Δmean|/σ {_gvg:.2f}")
             print(f"       {d['feature_name']}={_v_s}"
-                  f"   (group typical {_mu_s},  {_ratio}{_pos})")
+                  f"   (group typical {_mu_s},  {_ratio}{_pos}{_gvg_s})")
         for d in gc.get("categorical", [])[:max_features]:
             # ⚠ Nothing is filtered. Values equal to the mode used to be
             #   skipped, but when the display layer decides what to hide, the
@@ -654,8 +731,69 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
             # returns "Category N"; the mapping to real names happens here.
             _v  = _fmt_cat_value(d["feature_name"], d["value"]).split("=", 1)[1]
             _mv = _fmt_cat_value(d["feature_name"], d["group_mode"]).split("=", 1)[1]
-            print(f"       {d['feature_name']}={_v} (of the group {d['group_freq']:.0%})"
-                  f"   |   group mode {_mv} ({d['group_mode_freq']:.0%})")
+            # ⚠ No |Δmean|/σ here. A categorical column has no standard
+            #   deviation to divide by, and inventing one would attach a
+            #   number that looks comparable to the numeric lines but is not.
+            #   Prevalence and the group mode are the natural statistics.
+            # ⚠ 0% is a real value, not a rounding artefact: the group is
+            #   made of training rows and this sample is not one of them, so
+            #   "no case in this region holds this value" can happen. Writing
+            #   it as a percentage invites the reader to treat it as a
+            #   vanishing share of something that exists.
+            if d.get("absent_from_group"):
+                _share = "no case in this region"
+            else:
+                _share = f"{d['group_freq']:.0%} of group"
+            if not d.get("differs_from_mode", True):
+                _same = "  (= mode)" if not d.get("ties_mode") else "  (ties the mode)"
+            else:
+                _same = ""
+            print(f"       {d['feature_name']}={_v}"
+                  f"   ({_share}; mode {_mv}, {d['group_mode_freq']:.0%}){_same}")
+
+    # ── Position within the region, in representation space ─────────
+    # The percentiles above answer "where does this sample sit in its region"
+    # in the original columns. This answers the same question in the space the
+    # region was actually formed in. The two can disagree, and that is worth
+    # seeing: a sample can be central in the representation while holding an
+    # extreme raw value, or the reverse.
+    #
+    # ⚠ Only present when the memory keys were refreshed (see the call site).
+    #   Without that, memory holds training-time embeddings taken under a
+    #   dropout mask while the query is deterministic, and the rank would be
+    #   against a different representation.
+    #
+    # ⚠ No typicality verdict. The distance and its rank are shown; whether
+    #   that makes the sample atypical is not decided here, since a cluster
+    #   need not be spherical.
+    _rp = e.get("region_position")
+    if _rp is not None:
+        # ⚠ group_pct is (d_group < d_me).mean(): the share of the region that
+        #   is **closer to the centre than this sample**. A large value
+        #   therefore means this sample is far out, not close in. Reading it
+        #   the other way produced exactly inverted output -- a sample at
+        #   distance 0.393, the farthest in its region, was described as
+        #   "closer to the centre than 100% of the region".
+        _farther = _rp["group_pct"]          # share of the region closer in
+        _closer  = 1.0 - _farther            # share of the region farther out
+        print(f"\n     position in the representation")
+        # ⚠ Strict `<` means the extremes really can reach 0% and 100%. A
+        #   percentage reads oddly there ("farther than 100%"), so the two
+        #   ends are worded instead of numbered.
+        if _farther >= 0.995:
+            _where = "farther from the centre than every other case in this region"
+        elif _closer >= 0.995:
+            _where = "closer to the centre than every other case in this region"
+        elif _farther >= 0.5:
+            _where = f"farther from the centre than {_farther:.0%} of the region"
+        else:
+            _where = f"closer to the centre than {_closer:.0%} of the region"
+        print(f"       distance to region centre {_rp['distance']:.3f}"
+              f"   ({_where})")
+        if verbose:
+            print(f"       region spread: min {_rp['group_min']:.3f}"
+                  f" / median {_rp['group_median']:.3f}"
+                  f" / max {_rp['group_max']:.3f}   (cosine distance)")
 
     # The Representation Magnitude block was removed. beta is a model-level
     # constant and read literally the same on 25 of 25 samples (0.1039), and
@@ -862,17 +1000,16 @@ def run_calibration_analysis(model, X_test, y_test, tasktype: str,
     grid as prediction_confidence, which was wrong. Measured on adult
     (P = 190), all 4,523 test samples landed in the single 0-20% bin -- and
     that must not be read as "routing collapsed". The absolute scale of
-    routing_confidence = softmax(cos(q, c) * routing_scale) depends
-    structurally on the prototype count: the uniform baseline is 1/P, which is
-    0.53% at P = 190. Unlike prediction_confidence, which is a real
+    routing_confidence = softmax(cos(q, c)) depends structurally on the
+    prototype count: the uniform baseline is 1/P. Unlike prediction_confidence, which is a real
     probability where 0-100% means the same thing everywhere, a fixed percent
     grid offers no basis for judging whether a value is low -- neither across
     datasets with different P nor within one dataset. So:
     (a) the distribution itself is reported first (mean, median, std, min,
         max, p90, p99), and
     (b) the bins are **percentiles** (bottom 20%, 20-40%, ..., top 20%) rather
-        than absolute confidence percentages. Whatever P and routing_scale
-        are, this actually answers the intended question: within this test
+        than absolute confidence percentages. Whatever P is, this actually
+        answers the intended question: within this test
         set, is there an accuracy difference between the samples where routing
         was relatively ambiguous and those where it was confident.
     prediction_confidence is a real probability and keeps its fixed bins.
@@ -1190,8 +1327,8 @@ def print_calibration_analysis(result: dict) -> None:
           f"concentrates on particular centroids, close to it means near-uniform):")
     print(f"    mean={rs['mean']:.2%}  median={rs['median']:.2%}  std={rs['std']:.2%}  "
           f"min={rs['min']:.2%}  max={rs['max']:.2%}  p90={rs['p90']:.2%}  p99={rs['p99']:.2%}")
-    print(f"  (binned by percentile, not absolute %: the meaningful scale of routing_confidence")
-    print(f"   depends structurally on n_prototypes, so fixed % bins cannot compare across P)")
+    print(f"  (binned by percentile, not absolute %: routing_confidence depends")
+    print(f"   structurally on n_prototypes, so fixed % bins cannot compare across P)")
 
     print(f"\n  Effective prototype count (N_eff = exp(entropy); {rs['n_prototypes']} if uniform, "
           f"1 if all traffic goes to one centroid):")
@@ -1496,6 +1633,47 @@ def run_single_seed(
         # ── Build the model ────────────────────────────────────
         model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
 
+        # ── Overrides applied to the retrained model ────────────────────
+        # ⚠ These were lost once. The CLI flags stayed defined and the study
+        #   filename still picked up their tags, but nothing reached
+        #   model_kwargs -- so a run with --disable_dead_reinit produced a
+        #   file named "..nodr.." whose contents were byte-identical to the
+        #   default run. Three conditions that looked like an ablation were
+        #   the same experiment. Any new override must be wired here, not
+        #   only into the tag.
+        if args.k_override is not None:
+            print(f"  [--k_override] k: {model_kwargs.get('k')} -> {args.k_override}")
+            model_kwargs["k"] = args.k_override
+        if args.embed_dim_override is not None:
+            print(f"  [--embed_dim_override] embed_dim: "
+                  f"{model_kwargs.get('embed_dim')} -> {args.embed_dim_override}")
+            model_kwargs["embed_dim"] = args.embed_dim_override
+        if args.dropout_override is not None:
+            print(f"  [--dropout_override] dropout: "
+                  f"{model_kwargs.get('dropout')} -> {args.dropout_override}")
+            model_kwargs["dropout"] = args.dropout_override
+        if args.regroup_warmup_epochs_override is not None:
+            print(f"  [--regroup_warmup_epochs_override] regroup_warmup_epochs: "
+                  f"{model_kwargs.get('regroup_warmup_epochs', 0)} -> "
+                  f"{args.regroup_warmup_epochs_override}")
+            model_kwargs["regroup_warmup_epochs"] = args.regroup_warmup_epochs_override
+        if args.disable_dead_reinit:
+            # A patience above any reachable epoch count switches recovery off
+            # without adding a branch to CentroidLayer.
+            model_kwargs["dead_reinit_patience"] = 10 ** 9
+            print(f"  [--disable_dead_reinit] dead-prototype recovery off "
+                  f"(patience=1e9, so no reinit event can fire)")
+        if args.dead_reinit_patience_override is not None:
+            _old_p = model_kwargs.get("dead_reinit_patience", 5)
+            model_kwargs["dead_reinit_patience"] = args.dead_reinit_patience_override
+            print(f"  [--dead_reinit_patience_override] dead_reinit_patience: "
+                  f"{_old_p} -> {args.dead_reinit_patience_override}")
+        if args.dead_reinit_noise_scale_override is not None:
+            _old_n = model_kwargs.get("dead_reinit_noise_scale", 0.01)
+            model_kwargs["dead_reinit_noise_scale"] = args.dead_reinit_noise_scale_override
+            print(f"  [--dead_reinit_noise_scale_override] dead_reinit_noise_scale: "
+                  f"{_old_n} -> {args.dead_reinit_noise_scale_override}")
+
     # ⚠ memory_size must equal n_train. Left at the default (10000), the ring
     #   buffer keeps accumulating each epoch until filled > n_train, and the
     #   slot indices in sample_groups run past the training arrays (measured:
@@ -1504,6 +1682,23 @@ def run_single_seed(
     model_kwargs.update(dict(
         memory_size=len(y_train),
         exclude_self_retrieval=(not args.allow_self_retrieval),
+        # ⚠ Feature encoding. Without these, cat_col_idx is None and the model
+        #   silently takes the raw-encoding path regardless of --cat_combine
+        #   and --num_embedding -- categorical columns go in as LabelEncoder
+        #   integers and the PLE bin edges computed just above are discarded.
+        #
+        #   These were lost once. optimize.py kept passing them while
+        #   reproduce.py did not, so HPO tuned one architecture and the final
+        #   run trained a different one. Nothing raised: cat_col_idx=None is a
+        #   valid configuration, so the model built and trained without
+        #   complaint on features it was never meant to see that way.
+        cat_col_idx=list(dataset.X_cat),
+        num_col_idx=list(dataset.X_num),
+        cat_cardinalities=list(dataset.X_cat_cardinality),
+        cat_combine=args.cat_combine,
+        cat_embed_dim=args.cat_embed_dim,
+        num_embedding=args.num_embedding,
+        num_bin_edges=num_bin_edges,
     ))
 
     # Neighbour label encoding needs the task type to choose between
@@ -2134,6 +2329,13 @@ def run_single_seed(
         _le   = diag.local_label_evidence(model, out)
         _pdv  = diag.prototype_deviation(model, out)
         _gst  = diag.group_relative_feature_stats(model, out, X_show)
+        # ⚠ Only when the memory keys were refreshed. Otherwise memory.keys
+        #   holds embeddings taken during training under a dropout mask while
+        #   the query is deterministic -- a percentile computed across the two
+        #   would rank the sample against a different representation. Measured
+        #   group-structure agreement (ARI) before refresh: 0.006 on ds=1489.
+        _wrp  = (diag.within_region_position(model, out)
+                 if getattr(args, "refresh_on_best", False) else None)
 
         cat_names = {dataset.col_names[i] for i in dataset.X_cat}
         X_show_cpu = X_show.detach().cpu().numpy()
@@ -2144,6 +2346,7 @@ def run_single_seed(
             exp["local_evidence"]      = (_le[b]   if _le   else None)
             exp["prototype_deviation"] = (_pdv[b]  if _pdv  else None)
             exp["group_stats"]         = (_gst[b]  if _gst  else None)
+            exp["region_position"]     = (_wrp[b]  if _wrp  else None)
             for nb in exp["neighbors"]:
                 if nb.get("features"):
                     # Attach every gap; sorting and truncation belong to the
