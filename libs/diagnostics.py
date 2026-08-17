@@ -57,6 +57,7 @@ __all__ = [
     "local_label_evidence",
     "prototype_deviation",
     "group_relative_feature_stats",
+    "within_region_position",
     "feature_gaps",
     "prototype_conditioning_overlap",
     # ⚠ These two were once missing here and reproduce.py raised
@@ -447,6 +448,8 @@ def group_relative_feature_stats(
     {"numeric": [...], "categorical": [...], "group_size": n}
       numeric     : z = (x - group mean) / group std
       categorical : rarity = 1 - (frequency of this value within the group),
+                    plus differs_from_mode, which sorts first: this view is
+                    about where the sample departs from its group,
                     with group_mode / group_mode_freq attached so the consumer
                     can decide whether it matches the mode
     """
@@ -467,6 +470,14 @@ def group_relative_feature_stats(
     cat, num = _cat_num_idx(model, n_feat)
     cols     = _cols(model, n_feat)
     ha_np    = ha.detach().cpu().numpy()
+
+    # ⚠ Global mean and std over the whole store, for the standardised
+    #   group-to-global difference below. Computed once, outside the loop.
+    #   The sigma is the **global** standard deviation of the column, not the
+    #   group's -- so the quantity reads as "how far this group's mean sits
+    #   from the dataset mean, in units of the dataset's own spread".
+    g_mean = store.mean(axis=0) if n_fill else np.zeros(store.shape[1])
+    g_std  = store.std(axis=0)  if n_fill else np.ones(store.shape[1])
 
     cache: Dict[int, np.ndarray] = {}
     result = []
@@ -516,6 +527,18 @@ def group_relative_feature_stats(
                     "group_pct":       below + equal / 2.0,   # midrank, 0~1
                     "group_pct_below": below,
                     "group_pct_equal": equal,
+                    # ⚠ |group mean - global mean| / global std. This is a
+                    #   **descriptive statistic, not a gate**: nothing here
+                    #   filters a feature out for being below some cut-off.
+                    #   It says whether the group's distribution differs from
+                    #   the dataset at all -- near 0 means "unusual within
+                    #   this group" reads the same as "unusual overall", so a
+                    #   within-group percentile carries no group-specific
+                    #   information. Measured range across datasets:
+                    #   0.09 (ds=31, largest group) to 0.71 (ds=1489).
+                    "group_vs_global": (
+                        abs(mu - float(g_mean[fi])) / max(float(g_std[fi]), 1e-9)
+                        if fi < len(g_mean) else float("nan")),
                 })
             for fi in cat:
                 if fi >= n_feat or fi >= rows.shape[1]:
@@ -524,19 +547,133 @@ def group_relative_feature_stats(
                 col  = np.rint(rows[:, fi]).astype(np.int64)
                 freq = float((col == code).sum()) / n_g
                 vals, cnts = np.unique(col, return_counts=True)
+                _mode_n = int(cnts.max())
+                _mode = int(vals[int(cnts.argmax())])
+                # ⚠ Ties matter. np.unique sorts by value, so argmax breaks a
+                #   tie by picking the **smallest LabelEncoder code** -- an
+                #   arbitrary index with no meaning. A sample holding an
+                #   equally common value would then be reported as departing
+                #   from the mode, and sorted to the top for it. Measured on
+                #   credit-g: personal_status at 48% against a "mode" also at
+                #   48%, in a region of 23. So a value that occurs as often as
+                #   the mode does not count as differing from it.
+                _tied = int((col == code).sum()) == _mode_n
                 cat_out.append({
                     "feature_idx":     fi,
                     "feature_name":    cols[fi] if fi < len(cols) else f"f{fi}",
                     "kind":            "categorical",
                     "value":           code,
                     "group_freq":      freq,
-                    "group_mode":      int(vals[int(cnts.argmax())]),
-                    "group_mode_freq": float(int(cnts.max())) / n_g,
+                    "group_mode":      _mode,
+                    "group_mode_freq": float(_mode_n) / n_g,
                     "rarity":          1.0 - freq,
+                    # Whether this sample even holds the group's modal value.
+                    "differs_from_mode": (code != _mode) and not _tied,
+                    # ⚠ True when no group member holds this value at all. The
+                    #   group is drawn from training rows while the sample
+                    #   being explained is not, so 0% is a real possibility --
+                    #   it reads as "no such case in this region", not as a
+                    #   rounding artefact.
+                    "absent_from_group": freq == 0.0,
+                    "ties_mode":       _tied and code != _mode,
                 })
         num_out.sort(key=lambda d: abs(d["z"]), reverse=True)
-        cat_out.sort(key=lambda d: d["rarity"], reverse=True)
+        # ⚠ Rarity alone ranked the wrong things first. A value that **is** the
+        #   group mode can still be uncommon in absolute terms, so it outranked
+        #   features where the sample actually departs from the group -- and
+        #   this view exists to show where it departs. Measured on credit-g:
+        #   of four categorical lines shown, two read
+        #   "employment=1<=X<4 (38%) | group mode 1<=X<4 (38%)", a whole line
+        #   spent saying the sample matches.
+        #   Disagreement with the mode now sorts first, rarity within that.
+        #
+        #   ⚠ Nothing is dropped. Matching the mode pushes a feature down the
+        #     order, never out of the list -- deciding what may be seen is the
+        #     same problem as building a detector, and the reader could not
+        #     tell a hidden feature from an absent one.
+        cat_out.sort(key=lambda d: (d["differs_from_mode"], d["rarity"]),
+                     reverse=True)
         result.append({"numeric": num_out, "categorical": cat_out, "group_size": n_g})
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# (4b) Position within the assigned region, in representation space
+# ─────────────────────────────────────────────────────────────
+
+def within_region_position(model, out: Dict) -> Optional[List[Optional[dict]]]:
+    """Where the sample sits inside its own region, in the space the region
+    was formed in.
+
+    The raw-feature percentile from group_relative_feature_stats() answers the
+    same question in the original columns. This one answers it in the
+    representation, which is where the assignment actually happened -- the two
+    can disagree, and that disagreement is itself informative.
+
+    ⚠ **Requires refreshed memory keys.** memory.keys holds embeddings taken
+      during training, under whatever dropout mask applied at the time; the
+      query here is deterministic in eval mode. Comparing the two before
+      refresh_memory_keys() compares different spaces. Measured group-structure
+      agreement (ARI) before refresh: 0.518 / 0.067 / 0.006 on ds=14 / 46 /
+      1489, against 1.000 after. The caller must pass refreshed keys; there is
+      no flag here to check, so this is stated rather than enforced.
+
+    ⚠ No typicality score. The distance and its rank within the group are
+      returned; whether that makes the sample "atypical" is not decided here.
+      Cluster shape need not be spherical, so a distance alone does not order
+      samples by how well they fit.
+
+    ⚠ Distance is cosine (1 - cos), matching the routing rule. Do not mix it
+      with a Euclidean distance elsewhere.
+
+    Returns one dict per sample, or None where the group is too small:
+      {"distance", "group_pct", "group_n",
+       "group_min", "group_median", "group_max"}
+    """
+    pl = getattr(model, "prototype_layer", None)
+    mem = getattr(model, "memory", None)
+    q = out.get("query_emb")
+    ha = out.get("hard_group")
+    if ha is None:
+        ha = out.get("centroid_id")
+    if pl is None or mem is None or q is None or ha is None:
+        return None
+    sg = getattr(pl, "sample_groups", None)
+    if not sg:
+        return None
+
+    with torch.no_grad():
+        n_fill = int(mem.filled.item())
+        if n_fill == 0:
+            return None
+        keys = F.normalize(mem.keys[:n_fill].detach(), dim=-1)
+        cents = F.normalize(pl.centroid_emb.detach(), dim=-1)
+        qn = F.normalize(q.detach(), dim=-1)
+        ha_np = ha.detach().cpu().numpy()
+
+        cache: Dict[int, torch.Tensor] = {}
+        result: List[Optional[dict]] = []
+        for b in range(qn.shape[0]):
+            p = int(ha_np[b])
+            if p not in cache:
+                ids = [i for i in (sg[p] if p < len(sg) and sg[p] is not None else [])
+                       if 0 <= i < n_fill]
+                cache[p] = (1.0 - keys[ids] @ cents[p]) if ids else keys[:0, 0]
+            d_group = cache[p]
+            # A rank needs something to rank against. Below this the percentile
+            # is noise, so None is returned rather than a misleading number.
+            if d_group.numel() < 5:
+                result.append(None)
+                continue
+            d_me = float(1.0 - (qn[b] @ cents[p]))
+            result.append({
+                "distance":     d_me,
+                "group_pct":    float((d_group < d_me).float().mean()),
+                "group_n":      int(d_group.numel()),
+                "group_min":    float(d_group.min()),
+                "group_median": float(d_group.median()),
+                "group_max":    float(d_group.max()),
+            })
     return result
 
 
