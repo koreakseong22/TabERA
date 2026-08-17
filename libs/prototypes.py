@@ -11,7 +11,7 @@ What it does
     are reinitialised from observed embeddings. Neither step reads labels.
 
 (2) Hard routing with a straight-through estimator
-    a = argmax_p cos(q, c_p), scaled by routing_scale before the softmax.
+    a = argmax_p cos(q, c_p).
     Forward takes the hard argmax; backward passes the softmax gradient
     (Bengio et al. 2013; the hard-assignment trick from VQ-VAE,
     van den Oord et al. 2017). This single assignment fixes both the
@@ -376,7 +376,6 @@ class CentroidLayer(nn.Module):
                                             # Gaussian noise"; 0.01 is unverified.
         dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
-        routing_scale: float = 1.0,
         use_ema_codebook: bool = False,
         ema_decay: float = 0.99,   # van den Oord et al. (2017), Appendix, and
                                    # VQ-VAE-2(Razavi et al. 2019), Jukebox/SoundStream
@@ -414,17 +413,10 @@ class CentroidLayer(nn.Module):
         self.dead_reinit_patience  = dead_reinit_patience
         self.dead_reinit_noise_scale = dead_reinit_noise_scale
         self.col_names         = col_names or [f"f{i}" for i in range(n_features)]
-        # Scale factor for the routing softmax. Cosine-similarity softmax
-        # methods (ArcFace, CosFace, AdaCos, von Mises-Fisher losses) all note
-        # the same issue: cosine similarity is confined to [-1, 1], so feeding
-        # it to a softmax unscaled gives a flat distribution and a weak
-        # gradient through the STE backward pass. This is a fixed multiplier,
-        # not a learned parameter -- a plain attribute, so the state_dict is
-        # unchanged. It is derived from P rather than searched (see
-        # derived_routing_scale in search_space.py). TabERA does not use
-        # AdaCos itself; it borrows the shape of that scaling with the
-        # prototype count P in place of the class count.
-        self.routing_scale     = routing_scale
+        # ⚠ Cosine similarity, not a scaled logit. argmax(s*cos) == argmax(cos)
+        #   for any s > 0, so a temperature cannot change which prototype is
+        #   chosen -- only how peaked the straight-through gradient is, which
+        #   the learning rate already covers.
 
         # ── Buffers: saved in the state_dict, no gradient ──
         self.register_buffer("current_epoch", torch.tensor(0, dtype=torch.long))
@@ -1105,7 +1097,13 @@ class CentroidLayer(nn.Module):
         # Cosine similarity logits
         q = F.normalize(query_emb, dim=-1)               # (B, D)
         c = F.normalize(self.centroid_emb, dim=-1)        # (P, D)
-        logits = (q @ c.T) * self.routing_scale           # (B, P), scaled
+        # ⚠ No temperature. argmax(s*cos) == argmax(cos) for any s > 0, so a
+        #   scale cannot change the assignment, the baseline c, or the logits.
+        #   It only rescales the straight-through gradient -- an effect the
+        #   learning rate already covers, and lr is searched. Measured on
+        #   synthetic data, adding one changed nothing at convergence and was
+        #   slightly worse early in training.
+        logits = q @ c.T                                  # (B, P)
 
         # ── Full softmax; carries the straight-through backward gradient ─
         soft = F.softmax(logits, dim=-1)                  # (B, P)
@@ -1192,14 +1190,12 @@ class CentroidLayer(nn.Module):
         routing_probs: torch.Tensor,     # (B, P)
         norm_mean: Optional[np.ndarray] = None,  # unused; kept for caller
         norm_std:  Optional[np.ndarray] = None,  # signature compatibility
-        cos_sim: Optional[torch.Tensor] = None,  # (B, P) raw cosine
-            # similarity before the scale (q_norm @ c_norm.T).
-            # routing_confidence is a softmax over these values *after*
-            # multiplying by routing_scale, so it depends on the scale: a
-            # large scale makes the top entry pull far ahead on a tiny cosine
-            # difference. Showing the raw cosine alongside separates "how
-            # close is it geometrically" from the scale. When None, the output
-            # dict carries cosine_similarity=None.
+        cos_sim: Optional[torch.Tensor] = None,  # (B, P) q_norm @ c_norm.T.
+            # The quantity the assignment is actually made on. A softmax over
+            # it compresses the range -- with P prototypes every value sits
+            # near 1/P -- so the raw cosine and the cosine margin are reported
+            # alongside. When None, cosine_similarity and cosine_margin are
+            # None in the output dict.
     ) -> List[dict]:
         """
         Per-sample description of the prototype assignment.
@@ -1261,6 +1257,19 @@ class CentroidLayer(nn.Module):
             others_mass = 1.0 - conf - sum(r["routing_confidence"] for r in runners)
             cosine_similarity = float(cs[b, p]) if cs is not None else None
 
+            # ⚠ cosine_margin is the quantity the assignment is actually made
+            #   on: cos to the assigned centroid minus cos to the runner-up.
+            #   The softmax-based margin above depends on a temperature, and
+            #   the assignment does not -- argmax(s*cos) == argmax(cos) for any
+            #   s > 0. So a softmax confidence describes the temperature as
+            #   much as the geometry, while this describes only the geometry.
+            cosine_margin = None
+            if cs is not None and cs.shape[1] > 1:
+                _row = cs[b].copy()
+                _top = float(_row[p])
+                _row[p] = -np.inf
+                cosine_margin = _top - float(_row.max())
+
             # Main content of explanation layer (1): which target this group
             # corresponds to.
             target_info = (
@@ -1282,6 +1291,7 @@ class CentroidLayer(nn.Module):
                 "margin":               margin,
                 "others_mass":          max(0.0, others_mass),  # clamp float error
                 "cosine_similarity":    cosine_similarity,
+                "cosine_margin":        cosine_margin,
                 "runners_up":           runners,
                 "target_info":          target_info,          # layer (1) main
                 "group_feature_labels": group_feature_labels,  # supporting
