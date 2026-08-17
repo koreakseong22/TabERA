@@ -30,16 +30,37 @@ x ─→ Encoder ─→ q ─→ argmax cos(q, C) ─→ prototype a
 
 ## What an explanation shows
 
-Three views, printed by `reproduce.py --explain`. Region and deviation are read
-off the computation that produced the prediction; evidence runs beside it.
+Printed by `reproduce.py --explain`. The region and the prediction split are
+read off the computation that produced the prediction; evidence runs beside it.
 
 | | Question | Source |
 |---|---|---|
+| Prediction | Where did the prediction come from? | `W·c + b` vs `z` |
 | ① Region | Where does this sample belong? | assignment `a` |
 | ② Evidence | Which real cases are nearest within that region? | `NN(q, G(a))` |
-| ③ Deviation | How does it differ from the region baseline? | `W·c` vs `z` |
+| ③ Region profile | What is this region like, and where in it is this sample? | group feature statistics |
 
 Example: `credit-g`, predicting loan default.
+
+### Prediction
+
+```
+Region baseline prediction   bad 72.1%   (shared by every sample in this region)
+Final prediction             bad 73.8%
+Sample-specific component    strengthens "bad" relative to "good"
+```
+
+`W·c + b` is identical for every sample in the region; the sample-specific term
+is what separates them. Where `P < C` it does the classifying instead — on a
+100-class dataset with 35 prototypes, setting `β = 0` drops accuracy from 0.725
+to 0.256.
+
+⚠ The two probabilities are shown side by side, never subtracted. The
+decomposition is exact in logit space, but each probability is a separate
+softmax, so their difference is not a contribution in probability space. The
+*direction* is exact, being the sign of the logit term — and it is reported for
+binary tasks only, since with more classes a single term shifts all of them at
+once and naming one "main alternative" would be a choice with no basis.
 
 ### ① Region
 
@@ -73,16 +94,38 @@ descriptive, not predictive — TabERA does not vote over neighbours. The local
 distribution is always shown against the group distribution, since `7/8` means
 nothing without knowing the group is already `78%`.
 
-### ③ Deviation
+### ③ Region profile
+
+Translates the assigned region into the original feature space and locates the
+sample within it.
 
 ```
-prototype alone   W·c → "bad" 72.1%
-after correction  z   → "bad" 73.8%     decision unchanged
+against the group (n=160)
+  credit_amount = 5,951   (group typical 2,382,  2.5x, top 9%,  |Δmean|/σ 0.71)
+  duration      = 48      (group typical 18,     2.7x, top 4%,  |Δmean|/σ 0.09)
+
+position in the representation (n=160)
+  distance to region centre 0.043   (closer to the centre than 60% of the region)
 ```
 
-`W·c` is identical for every sample in the region; the correction is what
-separates them. Where `P < C`, it does the classifying instead — on a 100-class
-dataset with 35 prototypes, setting `β = 0` drops accuracy from 0.725 to 0.256.
+`|Δmean|/σ` is the standardised difference between the region mean and the
+global mean, taken in units of the **global** feature standard deviation. It is
+a descriptive statistic, not a threshold: it appears on every line and hides
+nothing. Near 0 means the region's distribution barely differs from the
+dataset, so "unusual within this region" reads the same as "unusual overall" —
+the percentile beside it then carries no region-specific information. Gating on
+it would need a cut-off nobody can justify, and a reader could not tell a
+hidden feature from an absent one.
+
+The representation position is a cosine distance to the region centre and its
+rank within the region — not a confidence, and not a typicality score. Whether
+that makes the sample atypical is left to the reader, since a region need not
+be spherical. It appears only when `--refresh_on_best` is on: otherwise memory
+holds training-time embeddings taken under a dropout mask while the query is
+deterministic, and the rank would be against a different representation.
+
+⚠ This is descriptive statistics, not attribution. "The prediction came out
+this way because of this feature" is not a sentence these values support.
 
 ---
 
