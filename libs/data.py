@@ -7,7 +7,7 @@ TabERA 데이터 로더 — MultiTab 원본 파이프라인 기준.
 논문에서 MultiTab 계열 baseline(TabM 등)과 공정 비교하려면 동일한
 train/val/test 분할이 필요함. 기존에는 TabERA 자체 80/10/10 stratified
 split(QuantileTransformer, mean imputation)을 썼는데, MultiTab은
-StratifiedKFold(10-fold) 분할에 NaN 행 제거 방식을 씀 — 두 파이프라인이
+KFold(10-fold) 분할에 NaN 행 제거 방식을 씀 — 두 파이프라인이
 달라서 초기 TabM 비교(id=41027)가 무효였던 사건이 있었음. 이후
 `libs/data_multitab.py` + `optimize_multitab_split.py`를 별도로 만들어
 검증했고, 이제 이 파이프라인을 본 실험 기본값으로 승격.
@@ -20,7 +20,31 @@ eval.py가 정수 라벨을 전제로 하기 때문 — 원-핫 → argmax는 �
 없는 역변환).
 
 split_data()의 seed 의미: "몇 번째 fold를 test로 쓸지"
-(StratifiedKFold random_state=42로 고정, seed는 fold 인덱스 선택용).
+(KFold random_state=42로 고정, seed는 fold 인덱스 선택용).
+
+[2026-08 프로토콜 정정] split이 StratifiedKFold였음 -> KFold로 되돌림.
+─────────────────────────────────────────────────────────────────
+이 파일은 "MultiTab과 동일한 분할"을 목적으로 만들어졌는데, 실제
+MultiTab libs/data.py:105는 **층화하지 않는 평범한 KFold**를 쓴다:
+
+    kf = KFold(n_splits=10, shuffle=True, random_state=42)
+    fold_idx = list(kf.split(X))
+
+여기에는 StratifiedKFold가 들어가 있었고 주석은 "MultiTab 기준 통일"
+이라고 적혀 있었다. random_state=42가 같아도 층화 여부가 다르면 fold
+구성 자체가 달라지므로, 그 상태로 얻은 TabERA 결과는 MultiTab과 같은
+분할에서 나온 값이 아니다. 실측 영향이 큰 쪽은 소형/불균형 데이터셋
+이었다 - lymph(N=148, C=4)에서 MultiTab 로그는 test AUROC가 19.9%의
+trial에서 NaN(=test fold에 빠진 클래스가 있음)인 반면 층화 분할에서는
+그 구조가 나타나지 않는다.
+
+⚠ 방법론적으로는 층화가 더 낫다. 하지만 벤치마크 비교에서는 "더 나은
+  분할"이 아니라 "같은 분할"이 요구된다. 층화가 필요한 별도 연구를
+  한다면 이 파일을 고치지 말고 그 실험 전용 로더를 따로 두어야 한다.
+
+⚠ 이 변경으로 기존 optim_logs는 전부 무효다. HPO도 새 분할에서 다시
+  돌려야 한다(탐색이 fold 구성에 의존하므로 최종 평가만 다시 하는 것
+  으로는 부족하다).
 """
 
 from sklearn.model_selection import train_test_split, KFold
@@ -31,6 +55,10 @@ import pandas as pd
 import sklearn.datasets
 import scipy.stats
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
+
+
+# load_data()가 마지막 호출에서 관측한 값. parity test가 읽는다.
+_LAST_LOAD_DIAG: dict = {}
 
 
 def get_batch_size(n):
@@ -130,8 +158,14 @@ def load_data(openml_id):
                 X[:, col] = X[:, col].astype(np.float32)
             except (ValueError, TypeError):
                 invalid_num_cols.append(col)
+    # ⚠ MultiTab libs/data.py:81-83 에는 이 try/except 와 컬럼 제거가 없다.
+    #   원본은 변환 실패 시 그대로 예외를 낸다. 즉 이 분기가 실제로
+    #   발동하면 TabERA의 feature set이 MultiTab보다 좁아지고, 분할이
+    #   같아도 벤치마크는 이미 달라진다. parity test가 반드시 확인해야
+    #   하므로 진단으로 남긴다(아래 _LAST_LOAD_DIAG).
     if invalid_num_cols:
-        print(f"  [data.py] categorical_indicator 미반영 문자열 컬럼 제거: {invalid_num_cols}")
+        print(f"  [data.py] ⚠ PROTOCOL: categorical_indicator 미반영 문자열 "
+              f"컬럼 제거 (MultiTab에는 없는 동작): {invalid_num_cols}")
         keep_mask = [i for i in range(X.shape[1]) if i not in invalid_num_cols]
         X = X[:, keep_mask]
         num_cols = [keep_mask.index(i) for i in num_cols if i not in invalid_num_cols]
@@ -143,15 +177,53 @@ def load_data(openml_id):
     X = X.astype(np.float32)
 
     y = y.values
-    labelencoder = LabelEncoder()
-    y = labelencoder.fit_transform(y)
-    # [수정] categorical feature와 같은 문제: 원래 target 라벨 문자열
-    # (예: "good"/"bad")이 정수 코드(0/1)로 바뀐 뒤 매핑이 버려졌음.
-    # classification(binclass/multiclass)에서만 의미 있고, regression은
-    # 호출부(label_groups_by_target)에서 애초에 이 값을 안 씀.
-    target_class_names = [str(c) for c in labelencoder.classes_]
+    # [2026-08 프로토콜 정정] LabelEncoder를 무조건 적용하고 있었으나,
+    # MultiTab libs/data.py:86-88 은 **y가 문자열/불리언일 때만** 적용한다:
+    #
+    #     if isinstance(y[0], str) or isinstance(y[0], (bool, np.bool_)):
+    #         y = LabelEncoder().fit_transform(y)
+    #
+    # 차이가 드러나는 경우: target이 이미 정수 코드인 데이터셋. MultiTab은
+    # 원래 값을 그대로 두고 TabERA는 0..C-1로 다시 매긴다. 분할 인덱스는
+    # KFold가 y를 보지 않으므로 영향이 없지만, **어느 클래스가 1번이 되는지**
+    # 가 달라질 수 있다. MultiTab의 이진 F1은 average='binary'(pos_label=1)
+    # 이므로 양성 클래스가 뒤바뀌면 값 자체가 달라진다.
+    # 따라서 조건을 MultiTab과 일치시킨다.
+    #
+    # ⚠ 조건이 거짓이어서 인코딩을 건너뛰면 y가 0..C-1 이라는 보장이 없다.
+    #   binclass에서 BCEWithLogitsLoss는 {0,1}을 전제하므로, 아래에서
+    #   실제 값 집합을 확인하고 어긋나면 즉시 실패시킨다 - 조용히 잘못된
+    #   라벨로 학습하는 것보다 낫다.
+    if isinstance(y[0], str) or isinstance(y[0], (bool, np.bool_)):
+        labelencoder = LabelEncoder()
+        y = labelencoder.fit_transform(y)
+        target_class_names = [str(c) for c in labelencoder.classes_]
+    else:
+        target_class_names = [str(c) for c in np.unique(y)]
+    y = np.asarray(y)
+    _uniq = np.unique(y)
+    if not np.array_equal(_uniq, np.arange(len(_uniq))):
+        raise ValueError(
+            f"[data.py] target 라벨이 0..{len(_uniq)-1} 연속 정수가 아닙니다: "
+            f"{_uniq[:10]}{'...' if len(_uniq) > 10 else ''}\n"
+            f"  MultiTab과 동일한 조건부 LabelEncoder를 쓰기 때문에 발생할 수 "
+            f"있습니다. 이 데이터셋(openml_id={openml_id})은 프로토콜 예외로 "
+            f"별도 처리하거나 비교 대상에서 제외해야 합니다.")
 
     print("full data size", X.shape)
+    # parity test / 재현성 점검용 진단. 반환 시그니처를 바꾸면 reproduce.py
+    # 까지 손대야 하므로 모듈 레벨에 남긴다(호출 직후에만 유효).
+    _LAST_LOAD_DIAG.clear()
+    _LAST_LOAD_DIAG.update({
+        "openml_id":        openml_id,
+        "n_rows":           int(X.shape[0]),
+        "n_features":       int(X.shape[1]),
+        "n_cat":            len(cat_cols),
+        "n_num":            len(num_cols),
+        "invalid_num_cols": list(invalid_num_cols),
+        "col_names":        list(valid_cols),
+        "target_classes":   list(target_class_names),
+    })
     return X, y, cat_cols, cat_cardinality, num_cols, valid_cols, cat_category_names, target_class_names
 
 
@@ -167,11 +239,12 @@ def split_data(X, y, tasktype, num_indices=[], seed=0, device='cuda'):
     if tasktype == "multiclass":
         y = one_hot(y)
 
-    # StratifiedKFold: 클래스 비율 보존 (TabZilla/MultiTab 벤치마크 기준 통일)
-    from sklearn.model_selection import StratifiedKFold
-    y_for_split = np.argmax(y, axis=1) if y.ndim > 1 else y
-    kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
-    fold_idx = list(kf.split(X, y_for_split))
+    # MultiTab libs/data.py:105 와 완전히 동일해야 한다. 층화하지 않는
+    # KFold이므로 fold 구성은 len(X)에만 의존하고 y와는 무관하다
+    # (parity test가 이 성질을 이용해 인덱스 해시를 대조한다).
+    # ⚠ StratifiedKFold로 바꾸지 말 것 - 이유는 파일 상단 참조.
+    kf = KFold(n_splits=10, shuffle=True, random_state=42)
+    fold_idx = list(kf.split(X))
     tr_idx, te_idx = fold_idx[seed]
     val_split_idx = (seed + 1) % 10
     _, val_idx = fold_idx[val_split_idx]
@@ -254,6 +327,8 @@ class TabularDataset(torch.utils.data.Dataset):
         X, y, self.X_cat, self.X_cat_cardinality, self.X_num, raw_col_names, \
             self.cat_category_names, self.target_class_names = load_data(openml_id)
         self.tasktype = tasktype
+        # load_data()가 관측한 진단(제거된 컬럼 등)을 인스턴스에 붙여 둔다.
+        self.load_diag = dict(_LAST_LOAD_DIAG)
 
         (self.X_train, self.y_train), (self.X_val, self.y_val), (self.X_test, self.y_test), self.y_std, \
             self.quantile_transformer = \
