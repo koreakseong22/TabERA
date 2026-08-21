@@ -46,6 +46,13 @@ parser.add_argument("--cat_combine", type=str, default="onehot", choices=["sum",
                     ))
 parser.add_argument("--cat_embed_dim", type=int, default=16,
                     help="Per-column embedding width when cat_combine=concat.")
+parser.add_argument("--batch_size", type=int, default=None,
+                    help=("Override the batch size. Default (None) follows "
+                          "MultiTab's get_batch_size(len(X_train)), which is "
+                          "the benchmark protocol -- do not set this for the "
+                          "main runs. It exists for the batch-size pilot: the "
+                          "study filename gets a ..B{n} tag so a pilot cannot "
+                          "overwrite or resume a protocol study."))
 parser.add_argument("--num_embedding", type=str, default="ple",
                     choices=["linear", "ple", "plr_lite"],
                     help=(
@@ -77,9 +84,10 @@ args = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # same position as upstream
 
 import optuna, torch, json, joblib, datetime, math, gc
+import numpy as np
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
-from libs.search_space import (get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE, DEFAULT_K_NO_TUNE)
+from libs.search_space import (get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE, DEFAULT_K_NO_TUNE, PROTOCOL_TAG)
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
 import warnings
@@ -117,6 +125,7 @@ _ablation_tag = study_pkl_tag(
     disable_dead_reinit=args.disable_dead_reinit,
     num_bins=args.num_bins,
     cat_embed_dim=args.cat_embed_dim,
+    batch_size=args.batch_size,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -256,17 +265,32 @@ if train:
             f"  -> pass --n_prototypes {n_proto_default} to get a separate "
             f"study (..P{n_proto_default}), or move the existing study aside.")
 
-    global best_so_far
-    best_so_far = study.best_value if completed_trials_count > 0 else None
+    # 기준별 best validation 값. objective()가 test 확률을 언제 덮어쓸지
+    # 판단하는 데만 쓰인다. 재개(resume) 시에는 비어 있으므로 첫 trial이
+    # 무조건 한 번 쓰고, 이후로는 정상 동작한다 -- 남는 파일은 항상
+    # "이번 프로세스에서 본 best"이며, study 전체 best와 어긋날 수 있다는
+    # 점만 주의하면 된다(재개 없이 한 번에 돌리면 일치).
+    _BEST_VAL: dict = {}
 
     # ── Objective (upstream MultiTab structure) ────────────
     def objective(trial):
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id,
-                                        num_embedding=args.num_embedding)
+                                        num_embedding=args.num_embedding,
+                                        # batch_size = get_batch_size(n_train)
+                                        # (MultiTab 정책). 빠지면 예외.
+                                        n_train=len(y_train),
+                                        batch_size=args.batch_size)
         # n_prototypes comes from the sqrt(N) rule, not from the search.
         params["n_prototypes"] = n_proto_default
         trial.set_user_attr("n_prototypes_actual", n_proto_default)
+        # ⚠ batch_size 는 space dict 에 직접 써넣는 값이라(trial.suggest_* 가
+        #   아님) study.best_params 에 남지 않는다 -- n_prototypes 와 같은
+        #   상황이다. 기록해 두지 않으면 reproduce.py 가 값을 알 방법이 없어
+        #   기본값으로 되돌아가고, HPO 는 B=64 로 탐색했는데 최종 학습은
+        #   B=256 으로 도는 mismatch 가 생긴다(HPO_TRAINING_SCHEDULE
+        #   docstring 이 경고하는 바로 그 유형).
+        trial.set_user_attr("batch_size_actual", int(params["batch_size"]))
         model_kwargs = params_to_model_kwargs(params, dataset.n_features, output_dim)
 
         model = TabERA(
@@ -349,60 +373,96 @@ if train:
         print(f"### Optimization time for trial {trial.number}: {duration.total_seconds():.0f} secs")
         trial.set_user_attr("training_time", duration.total_seconds())
 
-        # Objective: minimise rmse_val for regression, maximise acc_val otherwise.
+        # Objective: minimise rmse_val for regression, maximise acc_val
+        # otherwise -- identical to MultiTab optimize.py.
         result = val_metrics["rmse_val"] if tasktype == "regression" else val_metrics["acc_val"]
 
-        # ── Centroid margin penalty (percentile-based, no threshold) ──
-        # routing_scale does not affect the forward pass (STE makes the hard
-        # assignment invariant to a positive scale), but it does affect how
-        # peaked the STE backward gradient is. Measured: trials that landed on
-        # a low routing_scale tended to end with a routing structure no better
-        # than random (credit-g: scale 1.49, margin_percentile ~0%, against
-        # socmob 19.8 and SpeedDating 13.77, both ~100%).
+        # ── Centroid margin diagnostics (logged, NOT in the objective) ──
         #
-        # Design choice: leave the search range alone and let Optuna learn to
-        # avoid the side effect through the objective itself.
+        # [2026-08 프로토콜 정정] 이 페널티는 목적함수에 곱해지고 있었다:
+        #     result = result * (1.0 - penalty_frac)      # penalty_cap = 0.05
+        # MultiTab의 목적함수는 순수 val accuracy이므로, 이 상태로는 두 쪽이
+        # 같은 기준으로 hyperparameter를 고르지 않는다. 실제 로그에서
+        # `value`와 `acc_val`이 trial의 24%에서 어긋났고, study.best_params
+        # -- reproduce.py가 그대로 집어가는 값 -- 도 달라졌다. 부작용이
+        # 하나 더 있었다: stop_when_reached_optimal 이 study.best_value >= 1.0
+        # 를 보는데 페널티가 붙으면 val accuracy가 1.0이어도 value < 1.0이라
+        # 조기 종료가 걸리지 않는다(ds=25 seed=1에서 실제로 발생: MultiTab
+        # 이었으면 멈췄을 자리에서 100 trial을 모두 소진).
         #
-        # Why a percentile rather than a z-score threshold: a threshold on the
-        # z-score needs a magic number, and picking one kept going wrong. At
-        # -2.0 it caught only actively-bad cases and missed mfeat-zernike
-        # (z_margin = -0.15, indistinguishable from random). Raising it to 2.0
-        # only borrowed a display convention. The penalty is continuous
-        # anyway, so the binary "is this significant" judgement a threshold
-        # exists for is not needed — the rank against the null is enough.
+        # 그래서 페널티는 목적함수에서 빼고 진단으로만 남긴다. margin_percentile
+        # 과 penalty_frac 이 계속 기록되므로, "페널티를 넣었다면 어떤 config가
+        # 뽑혔을까"는 study.trials_dataframe() 위에서 재선택으로 사후에 계산할
+        # 수 있다 -- 재학습이 필요 없다.
         #
-        # So the penalty uses the measured margin's percentile against the 50
-        # null samples already computed in supervised.py: 100% (better than
-        # every random draw) gives no penalty, 50% gives half the cap, 0%
-        # gives the full cap. No threshold appears anywhere.
-        # penalty_cap (0.05) was set from credit-g / mfeat-zernike / jasmine;
-        # margin_percentile keeps accumulating in the user attributes below,
-        # so the cap itself can be re-derived from data later.
+        # ⚠ 페널티를 연구 기여로 주장하려면 이 파일을 되돌리지 말고 **별도
+        #   study**로 돌린 뒤 두 study를 비교할 것. 목적함수를 되돌리는 순간
+        #   벤치마크 비교 가능성이 다시 깨진다.
+        #
+        # 원래 근거(유효하므로 남긴다): routing_scale은 forward pass를 바꾸지
+        # 않지만(STE의 hard assignment는 양의 scale에 불변) STE backward
+        # gradient가 얼마나 뾰족한지에는 영향을 준다. 낮은 routing_scale에
+        # 안착한 trial은 random보다 나을 것 없는 routing 구조로 끝나는 경향이
+        # 있었다(credit-g: scale 1.49, margin_percentile ~0%; socmob 19.8과
+        # SpeedDating 13.77은 둘 다 ~100%). percentile을 쓰는 이유는 z-score
+        # 임계값이 매직 넘버를 요구하고 그 선택이 계속 틀렸기 때문이다.
         diag = wrapper.centroid_geometry_diag
         if diag is not None:
             trial.set_user_attr("centroid_z_top1",            diag["z_top1"])
             trial.set_user_attr("centroid_z_margin",           diag["z_margin"])
             trial.set_user_attr("centroid_margin_percentile",  diag["margin_percentile"])
-            # Logged only; not fed into the penalty. These two describe the
-            # stability of the whole run rather than the final snapshot. The
-            # three metrics above look at the end state and miss cases like
-            # credit-g trial #47, where margin_percentile was 1.0 yet
-            # reinitialisation never settled during training. Whether they
-            # actually correlate with bad outcomes (reproducibility, test
-            # score) should be checked across many trials via
-            # study.trials_dataframe() before either enters the objective.
+            # Logged only. These two describe the stability of the whole run
+            # rather than the final snapshot; the three above look at the end
+            # state and miss cases like credit-g trial #47, where
+            # margin_percentile was 1.0 yet reinitialisation never settled.
             if "reinit_per_epoch" in diag:
                 trial.set_user_attr("centroid_reinit_per_epoch", diag["reinit_per_epoch"])
             if "active_ratio_std" in diag:
                 trial.set_user_attr("centroid_active_ratio_std", diag["active_ratio_std"])
             penalty_cap  = 0.05
             penalty_frac = penalty_cap * (1.0 - diag["margin_percentile"])
-            if penalty_frac > 0.0:
-                if tasktype == "regression":
-                    result = result * (1.0 + penalty_frac)   # higher rmse is worse
-                else:
-                    result = result * (1.0 - penalty_frac)   # higher acc is better
-                trial.set_user_attr("centroid_penalty_frac", penalty_frac)
+            trial.set_user_attr("centroid_penalty_frac", penalty_frac)
+            # 페널티를 적용했다면 나왔을 값. 목적함수에는 쓰지 않는다.
+            trial.set_user_attr(
+                "value_penalized",
+                result * (1.0 + penalty_frac) if tasktype == "regression"
+                else result * (1.0 - penalty_frac))
+
+        # ── Save test predictions/probabilities for the best trials ────
+        #
+        # 지표 정의를 바꿀 때마다 100 trial을 다시 돌리는 일을 없애기 위한
+        # 것이다. 확률만 남아 있으면 F1의 average, log loss의 확률 변환,
+        # multiclass AUROC의 클래스 subsetting 같은 규약 차이는 전부 오프라인
+        # 재계산으로 해결된다.
+        #
+        # 세 기준(acc / auroc / logloss)의 best를 따로 남기는 이유: 선택 기준을
+        # 바꾸면 뽑히는 trial이 달라지는데, 그 trial의 확률이 없으면 사후
+        # 재선택 분석을 test 지표까지 끌고 갈 수 없다. 매 trial 저장은 용량이
+        # 낭비이고, 기준별 best 3개면 충분하다.
+        _sel = {"acc":     (val_metrics.get("acc_val"),     True),
+                "auroc":   (val_metrics.get("auroc_val"),   True),
+                "logloss": (val_metrics.get("logloss_val"), False)}
+        for _crit, (_v, _higher_better) in _sel.items():
+            if _v is None or _v != _v:      # None / NaN
+                continue
+            _prev = _BEST_VAL.get(_crit)
+            if _prev is None or (_v > _prev if _higher_better else _v < _prev):
+                _BEST_VAL[_crit] = _v
+                np.savez_compressed(
+                    os.path.join(savepath,
+                                 f"data={args.openml_id}{_ablation_tag}"
+                                 f"..seed={args.seed}..model=tabera..best_{_crit}.npz"),
+                    y_test=y_test.detach().cpu().numpy(),
+                    probs_test=probs_test.detach().cpu().numpy(),
+                    preds_test=preds_test.detach().cpu().numpy(),
+                    y_val=y_val.detach().cpu().numpy(),
+                    probs_val=probs_val.detach().cpu().numpy(),
+                    trial_number=trial.number,
+                    tasktype=tasktype,
+                    params=json.dumps({k: v for k, v in params.items()}, default=str),
+                    val_metrics=json.dumps(val_metrics),
+                    test_metrics=json.dumps(test_metrics),
+                )
 
         # Release GPU memory between trials. Each trial builds a fresh model
         # and optimizer; if PyTorch keeps the previous trial's allocation in
