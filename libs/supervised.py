@@ -427,15 +427,56 @@ class TabERAWrapper:
         es         = EarlyStopping(patience=self.patience)
 
         # ── Seed the prototype memory ─────────────────────────
+        #
+        # [2026-08] 이전에는 `min(len(X_train), 5000)` 으로 잘라
+        # `X_train[:n_init]` 를 넘겼다. 두 가지가 문제였다.
+        #
+        # (1) 슬라이스는 무작위 표본이 아니다. libs/data.py 의 split 이
+        #     `np.setdiff1d(tr_idx, val_idx)` 를 쓰는데 이 함수는 **정렬된**
+        #     배열을 반환하므로, KFold(shuffle=True) 를 거쳤더라도 최종
+        #     tr_idx 는 오름차순이고 X_train 은 원본 행 순서를 그대로
+        #     유지한다. 따라서 X_train[:5000] 은 "원본 데이터의 앞부분"이다.
+        #     electricity(id=151, N_train=36,250)에서 실측하면 원본 인덱스
+        #     2~6331, 즉 전체의 앞쪽 14% 구간만 뽑힌다. ELEC2 는 시간순
+        #     정렬된 시계열(concept drift 벤치마크의 표준 사례)이라, 190개
+        #     프로토타입이 가장 이른 구간 하나에서만 초기화되고 있었다.
+        #     첫 regroup 이 active=25%, alive=47/190, reinit=24 로 시작하던
+        #     것과 부합한다.
+        #
+        # (2) 캡이 아끼는 비용이 없다. initialize_from_data() 는
+        #     `torch.randperm(N)[:P]` 로 P개를 뽑아 복사할 뿐이다
+        #     (k-means++ 는 이미 제거됨 -- libs/prototypes.py:554 의 ablation
+        #     참조). 남는 비용은 임베더 forward 한 번인데, regroup_update()
+        #     는 **매 epoch** 전체 학습 임베딩(memory_size = N_train)에 대해
+        #     돌고 있다. 초기화 1회가 이미 92회 도는 작업보다 쌀 수 없다.
+        #
+        # 그래서 전체 X_train 을 넘긴다. 표본 추출은 initialize_from_data()
+        # 안의 randperm 이 이미 담당하므로 여기서 섞을 필요가 없다.
+        #
+        # ⚠ 캡이 걸리지 않던 데이터셋(N_train <= 5000, 27개 중 22개)에서는
+        #   넘기는 텐서가 이전과 완전히 동일하고 randperm 의 N 도 같으므로
+        #   난수 소비량까지 같다 -- 결과가 비트 단위로 보존된다. 재실행이
+        #   필요한 것은 캡이 걸리던 5개뿐이다(electricity, jungle_chess,
+        #   nomao, elevators, artificial characters).
+        #
+        # ⚠ 임베더 forward 는 청크로 나눈다. nomao 는 118 feature 에 PLE 가
+        #   붙어 한 번에 27,572 행을 태우면 peak memory 가 불필요하게 커진다.
+        #   초기화는 no_grad 이므로 청크 경계가 결과를 바꾸지 않는다.
         if (not skip_centroid_init and hasattr(self.model, 'prototype_layer')
                 and hasattr(self.model.prototype_layer, 'initialize_from_data')):
             with torch.no_grad():
-                n_init   = min(len(X_train), 5000)
-                init_emb = self.model.embedder(X_train[:n_init])
-                init_x   = X_train[:n_init]
-                init_y   = y_train[:n_init]
+                _CHUNK = 4096
+                if len(X_train) <= _CHUNK:
+                    init_emb = self.model.embedder(X_train)
+                else:
+                    init_emb = torch.cat(
+                        [self.model.embedder(X_train[s:s + _CHUNK])
+                         for s in range(0, len(X_train), _CHUNK)],
+                        dim=0)
+                # X_raw / y_labels 는 initialize_from_data 가 쓰지 않는다
+                # (시그니처 호환용). 그래도 계약대로 넘겨 둔다.
                 self.model.prototype_layer.initialize_from_data(
-                    init_emb, init_x, y_labels=init_y
+                    init_emb, X_train, y_labels=y_train
                 )
 
 
