@@ -13,6 +13,8 @@ from __future__ import annotations
 import math
 import optuna
 
+from libs.data import get_batch_size   # MultiTab과 동일한 batch size 정책
+
 
 # ─────────────────────────────────────────────────────────────
 # Single source of truth for the HPO <-> reproduce training schedule
@@ -47,6 +49,29 @@ through a CLI default. Change this one place and both sides follow.
 
 
 # ─────────────────────────────────────────────────────────────
+# Protocol version tag
+# ─────────────────────────────────────────────────────────────
+
+PROTOCOL_TAG = "..mtsplit"
+"""Tag marking the benchmark protocol a study was produced under.
+
+Bump this whenever a change makes old studies incomparable to new ones, so
+that optimize.py cannot silently resume a study built under the previous
+protocol. Without it, optimize.py finds the existing .pkl, computes
+`remaining_trials = max(0, 100 - 100) = 0`, runs no trial at all, and
+rewrites the CSV from the *old* trials -- no error, no new results.
+
+"..mtsplit" (2026-08) marks the run where three things were aligned to
+MultiTab at once:
+  * split      : StratifiedKFold -> KFold(10, shuffle=True, random_state=42)
+  * batch size : fixed 256 -> get_batch_size(len(X_train))
+  * objective  : penalised acc_val -> plain acc_val
+Studies without this tag came from a different protocol and must not be
+mixed in, resumed, or compared against.
+"""
+
+
+# ─────────────────────────────────────────────────────────────
 DEFAULT_K_NO_TUNE = 8
 
 
@@ -61,6 +86,7 @@ def study_pkl_tag(
     disable_dead_reinit: bool = False,
     num_bins: int = 8,
     cat_embed_dim: int = 16,
+    batch_size: "int | None" = None,
 ) -> str:
     """Build the tag embedded in the study .pkl filename written by optimize.py.
 
@@ -77,7 +103,8 @@ def study_pkl_tag(
       under those conditions came from legacy/v3ema2_full/ and keep the
       filenames they were written with.
     """
-    return "..v3ema2" \
+    return PROTOCOL_TAG \
+        + "..v3ema2" \
         + ("..cat_concat" if cat_combine == "concat" else "") \
         + ("..cat_sum" if cat_combine == "sum" else "") \
         + ("..num_ple" if num_embedding == "ple" else "") \
@@ -85,7 +112,8 @@ def study_pkl_tag(
         + (f"..P{int(n_prototypes)}" if n_prototypes is not None else "") \
         + ("..nodr" if disable_dead_reinit else "") \
         + (f"..bins{int(num_bins)}" if int(num_bins) != 8 else "") \
-        + (f"..catdim{int(cat_embed_dim)}" if int(cat_embed_dim) != 16 else "")
+        + (f"..catdim{int(cat_embed_dim)}" if int(cat_embed_dim) != 16 else "") \
+        + (f"..B{int(batch_size)}" if batch_size is not None else "")
 
 
 def suggest_initial_trial() -> dict:
@@ -117,6 +145,15 @@ def get_search_space(
     num_embedding: str = "ple",
     # optimize.py always passes num_embedding explicitly, so this default only
     # affects direct callers (tests, notebooks). It matches the CLI default.
+    n_train: int = 0,
+    batch_size: "int | None" = None,
+    # None이면 MultiTab 정책 get_batch_size(n_train)을 따른다(본 실험 기본값).
+    # 정수를 주면 그 값으로 고정한다 -- batch size pilot 전용이며, 이 경우
+    # study 파일명에 ..B{n} 태그가 붙어 본 실험 study와 섞이지 않는다.
+    # Size of the training split. Required: batch_size is derived from it with
+    # MultiTab's get_batch_size(). optimize.py and reproduce.py must both pass
+    # len(y_train); a caller that forgets raises rather than silently falling
+    # back to a different batch size than the benchmark uses.
 ) -> dict:
     """Sample TabERA hyperparameters from an Optuna trial.
 
@@ -133,6 +170,12 @@ def get_search_space(
     -------
     dict: every parameter needed to construct and train the model.
     """
+    if n_train <= 0:
+        raise ValueError(
+            "get_search_space()에 n_train이 전달되지 않았습니다. batch_size가 "
+            "MultiTab의 get_batch_size(len(X_train))에서 나오므로 필수입니다 "
+            "-- 호출부에서 n_train=len(y_train)을 넘겨 주세요.")
+
     space = {
         # ── Architecture ────────────────────────────────
         "embed_dim":       trial.suggest_categorical("embed_dim",   [64, 128, 256]),
@@ -190,47 +233,55 @@ def get_search_space(
         #     only, after deduplication.
         "weight_decay":    trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
 
-        # batch_size is fixed at 256 rather than searched.
+        # batch_size follows MultiTab's get_batch_size(len(X_train)) and is
+        # not searched.
         #
-        # Original grounds (gradient-codebook era): RandomForest importance
-        # ranked it 7th-8th of 9 (0.037), and a direct sweep over
-        # {64,128,256,512} on profb / credit-g / vehicle / jasmine found no
-        # reliable size-to-batch relationship — vehicle went 0.847 at 256 and
-        # 0.671 at 512, a drop between adjacent values that is better
-        # explained by this architecture's own noise (STE plus dead-centroid
-        # reinitialisation amplify small early-training differences, the same
-        # effect that motivated regroup_warmup_epochs) than by batch size.
+        #   n_train      B
+        #   > 50,000     1024
+        #   > 10,000     512
+        #   >  5,000     256
+        #   >  1,000     128
+        #   otherwise    64
         #
-        # Under EMA prototype memory the parameter gained a second path:
+        # [2026-08 프로토콜 정정] 이전에는 256 고정이었다. MultiTab의 모든
+        # 신경망 baseline은 supervised.py / modernnca.py / saint.py 안에서
+        # get_batch_size(len(X_train))를 부르므로, 256 고정은 27개 벤치마크
+        # 데이터셋 중 25개에서 baseline과 다른 최적화 조건을 의미했다
+        # (N_train<=1000 인 13개에서 MultiTab 64 vs TabERA 256).
         #
-        #     B  ->  gradient noise                          (the old path)
-        #     B  ->  samples per prototype per batch  ->  EMA update stability
+        # 이 값이 여기서 자유롭지 않은 이유(원래 주석의 논지는 유효하다):
+        # EMA prototype memory에서 `c_p <- m_p / N_p`의 N_p는 배치 안에서
+        # 프로토타입 p에 배정된 샘플 수이므로, 봐야 하는 양은 N_train이
+        # 아니라 **B/P**이고 빈 프로토타입 확률은 (1 - 1/P)^B 이다.
+        # P = floor(sqrt(N_train)) 하에서 두 정책을 실측 비교하면:
         #
-        # In `c_p <- m_p / N_p`, N_p is how many samples in the batch were
-        # assigned to prototype p, so the quantity to watch is **B/P, not
-        # N_train**:
+        #   ds              N_train    P    B=256  P(empty)   B=auto  P(empty)
+        #   lymph               118   10      256      0.0%       64      0.1%
+        #   vehicle             676   26      256      0.0%       64      8.1%
+        #   socmob              924   30      256      0.0%       64     11.4%
+        #   phoneme           4,323   65      256      1.9%      128     13.7%
+        #   nomao            27,572  166      256     21.3%      512      4.5%
+        #   electricity      36,249  190      256     25.9%      512      6.7%
         #
-        #   ds     N     P    B/P    P(empty prototype) = (1 - 1/P)^B
-        #   54    676   26    9.8    0.0%
-        #   31    800   28    9.1    0.0%
-        #   14   1600   40    6.4    0.2%
-        #   1043 3649   60    4.3    1.4%
-        #   1489 4322   65    3.9    1.9%
+        # 즉 전환은 한 방향의 손해가 아니다. 소형에서는 빈 프로토타입 확률이
+        # 오르지만(최악 phoneme 13.7%, 원래 주석이 경고한 ds=54 B=32의 29%
+        # 보다는 낮다) **대형에서는 오히려 크게 개선된다** - 256 고정은
+        # electricity/jungle_chess에서 B/P≈1.3, 빈 프로토타입 확률 26%로,
+        # 전 구간에 좋은 선택이 아니었다.
         #
-        # Because P = sqrt(N), B = 256 keeps B/P in a narrow 3.9-9.8 band.
-        # ⚠ A rule like "small dataset, so drop B to 32" is therefore
-        #   actively harmful: on ds=54 that gives B/P = 1.2 and a 29% chance
-        #   of an empty prototype, i.e. roughly one prototype in three goes
-        #   un-updated every batch.
+        # optimizer update budget 쪽도 같은 방향이다. lymph는 B=256에서
+        # epoch당 0.5 step(100 epoch 동안 optimizer가 50번 움직인다)이고
+        # B=64에서 1.8 step이 된다.
         #
-        # ⚠ This is a fixed benchmark protocol, not a claim that 256 is
-        #   optimal. Revisiting it means watching two axes together:
-        #     (1) B/P             EMA update stability
-        #     (2) (N/B) x epochs  optimizer update budget
-        #   (1) is currently healthy; (2) varies a lot across datasets
-        #   (2-16 steps/epoch). Early stopping absorbs some of (2) but does
-        #   not control it.
-        "batch_size":      256,
+        # ⚠ 이것은 고정된 벤치마크 프로토콜이지 256/auto 중 무엇이 최적이라는
+        #   주장이 아니다. 전환 시 pilot에서 active_ratio_std 와
+        #   reinit_per_epoch 를 반드시 함께 볼 것(둘 다 이미 user_attr로
+        #   기록된다). 소형에서 EMA가 실제로 무너지면 그때 256을 유지할
+        #   근거가 생기며, 그 경우 논문에는 "모든 방법이 동일한 training
+        #   protocol에서 평가되었다"고 쓸 수 없고 batch size sensitivity
+        #   실험을 함께 실어야 한다.
+        "batch_size":      (get_batch_size(n_train) if batch_size is None
+                            else int(batch_size)),
     }
 
     if num_embedding == "plr_lite":
