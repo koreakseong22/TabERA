@@ -28,6 +28,7 @@ from pathlib import Path
 from libs.data         import TabularDataset
 from libs import diagnostics as diag
 from libs.search_space import params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE
+from libs.data         import get_batch_size
 from libs.supervised   import TabERAWrapper
 from libs.tabera         import TabERA
 from libs.prototypes     import inverse_transform_numeric
@@ -1492,6 +1493,8 @@ def run_single_seed(
               + (f"..do{args.dropout_override:g}" if args.dropout_override is not None else "") \
               + (f"..bs{args.batch_size_override}" if args.batch_size_override is not None else "") \
               + (f"..rwe{args.regroup_warmup_epochs_override}" if args.regroup_warmup_epochs_override is not None else "") \
+              + ("..defersel" if args.defer_early_stopping else "") \
+              + (f"..me{args.min_epochs}" if args.min_epochs else "") \
               + ("..nodr" if args.disable_dead_reinit else "") \
               + (f"..drp{args.dead_reinit_patience_override}" if args.dead_reinit_patience_override is not None else "") \
               + (f"..drn{args.dead_reinit_noise_scale_override:g}" if args.dead_reinit_noise_scale_override is not None else "") \
@@ -1565,6 +1568,11 @@ def run_single_seed(
         if args.regroup_warmup_epochs_override is not None:
             print(f"  ⚠️  --regroup_warmup_epochs_override only applies when retraining; "
                   f"--from_saved_state skips training, so the flag is ignored.")
+        if args.defer_early_stopping or args.min_epochs:
+            print(f"  ⚠️  --defer_early_stopping / --min_epochs only apply when "
+                  f"retraining; --from_saved_state skips training, so they are "
+                  f"ignored (the checkpoint already fixes which epoch was "
+                  f"selected).")
         if args.dead_reinit_patience_override is not None:
             print(f"  ⚠️  --dead_reinit_patience_override only applies when retraining; "
                   f"--from_saved_state skips training, so the flag is ignored.")
@@ -1594,6 +1602,9 @@ def run_single_seed(
             disable_dead_reinit=args.disable_dead_reinit,
             num_bins=args.num_bins,
             cat_embed_dim=args.cat_embed_dim,
+            # optimize.py --batch_size 로 만든 pilot study 를 가리킬 때만 준다.
+            # 본 실험 study 는 태그가 없으므로 기본값 None 이 맞다.
+            batch_size=args.study_batch_size,
         )
         fname = os.path.join(log_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
         if not os.path.exists(fname):
@@ -1620,7 +1631,24 @@ def run_single_seed(
         # user_attrs.
         best_params["n_prototypes"] = study.best_trial.user_attrs["n_prototypes_actual"]
         print(f"  n_prototypes (from optimize.py): {best_params['n_prototypes']}")
-        best_params.setdefault("batch_size", 256)
+        # ⚠ batch_size 는 optimize.py 가 space dict 에 직접 써넣는 값이라
+        #   trial.suggest_* 를 거치지 않고, 따라서 study.best_params 에 없다
+        #   (n_prototypes / k 와 같은 상황). 여기 기본값이 틀리면 HPO 와 최종
+        #   학습이 서로 다른 batch size 로 돌게 된다.
+        #
+        #   [2026-08 프로토콜 정정] 예전 기본값은 256 이었다. 이제 batch size 는
+        #   MultiTab 과 동일하게 get_batch_size(len(X_train)) 을 따르므로
+        #   256 고정은 27개 벤치마크 중 25개에서 mismatch 를 만든다
+        #   (예: credit-g -- HPO 는 B=64 로 탐색, 최종 학습은 B=256).
+        #
+        #   순서: optimize.py 가 기록한 실제 값이 있으면 그것을 쓰고, 없으면
+        #   (프로토콜 태그 이전의 옛 study) 같은 규칙으로 다시 계산한다.
+        _bs_actual = study.best_trial.user_attrs.get("batch_size_actual")
+        if _bs_actual is None:
+            _bs_actual = get_batch_size(len(X_train))
+            print(f"  !  study에 batch_size_actual이 없습니다(옛 형식). "
+                  f"get_batch_size(len(X_train))={_bs_actual} 로 재계산합니다.")
+        best_params.setdefault("batch_size", int(_bs_actual))
         print(f"  Params: {best_params}")
 
         # PLE bin edges come from the train split only, to avoid leakage.
@@ -1719,6 +1747,10 @@ def run_single_seed(
     wrapper = TabERAWrapper(
         model, best_params, tasktype,
         device=str(device), epochs=args.epochs, patience=args.patience,
+        # Checkpoint-selection timing. Defaults (False / 0) reproduce the
+        # previous behaviour exactly.
+        defer_early_stopping=args.defer_early_stopping,
+        min_epochs=args.min_epochs,
         # Needed for group text labelling: the group description in layer (1)
         # is a text summary rather than a medoid, and this cache backs it.
         cat_cols=list(dataset.X_cat), num_cols=list(dataset.X_num),
@@ -2143,6 +2175,17 @@ def run_single_seed(
         # regroup_history is recorded every epoch and can be zipped by epoch
         # with any other per-epoch series.
         "regroup_history": wrapper.regroup_history,
+        # ⚠ Which epoch the returned weights come from. This had to be
+        #   re-derived by scanning regroup_history for the max val_score,
+        #   which only works when that series was recorded and breaks as soon
+        #   as ties or a changed selection rule enter. It is the single most
+        #   load-bearing number for the ds=46 / ds=31 selection analysis
+        #   (best_epoch vs. the trajectory maximum of active_centroids), so it
+        #   is recorded directly. selection_open_epoch is the first epoch that
+        #   was eligible at all, which separates "nothing better existed" from
+        #   "better existed but could not be selected".
+        "best_epoch": getattr(wrapper, "best_epoch", None),
+        "selection_open_epoch": getattr(wrapper, "selection_open_epoch", None),
         # ── Axis 2: prototype behaviour ──────────────────────────────
         # Metrics supporting the claim that a prototype is a density-driven
         # anchor rather than a class prototype, with a granularity that adapts
@@ -2170,6 +2213,10 @@ def run_single_seed(
                 "beta_lr_mult":  args.beta_lr_mult,
                 # The update-rule condition must be identifiable from meta.pkl alone
                 "disable_dead_reinit": args.disable_dead_reinit,
+                # Selection timing changes which checkpoint is returned, so a
+                # results table cannot be read without knowing it.
+                "defer_early_stopping": args.defer_early_stopping,
+                "min_epochs":    args.min_epochs,
                 "epochs":        args.epochs,
                 "patience":      args.patience,
                 "num_bins":      args.num_bins,
@@ -2178,6 +2225,7 @@ def run_single_seed(
             }.items()
             if v != {"n_prototypes": None, "beta_lr_mult": 1.0,
                      "disable_dead_reinit": False,
+                     "defer_early_stopping": False, "min_epochs": 0,
                      "epochs": HPO_TRAINING_SCHEDULE["epochs"],
                      "patience": HPO_TRAINING_SCHEDULE["patience"],
                      # ⚠ Changed from 0.005 to 0.0 when the default moved.
@@ -2470,6 +2518,38 @@ def main():
                         ))
     parser.add_argument("--patience",  type=int, default=HPO_TRAINING_SCHEDULE["patience"],
                         help="default taken from HPO_TRAINING_SCHEDULE; see --epochs above.")
+    parser.add_argument("--defer_early_stopping", action="store_true",
+                        help=(
+                            "[2026-08] Delay BOTH best_state selection and the "
+                            "early-stopping patience counter until selection is "
+                            "actually open (past regroup warmup and past "
+                            "--min_epochs). Off by default so existing studies "
+                            "reproduce unchanged.\n"
+                            "Why: best_state was already gated on warmup, but "
+                            "es.step() ran from epoch 1, so a warmup score that "
+                            "later epochs could not beat spent patience on epochs "
+                            "that were never selectable. Measured on ds=46: all "
+                            "five low-utilisation runs reached active=50 at some "
+                            "epoch, yet best_epoch landed at 8-13 with "
+                            "active=14-24 and the run ended ~20 epochs later. "
+                            "credit-g (31) has the same shape (best at epoch 9 "
+                            "with active=2, trajectory max 28).\n"
+                            "⚠ Not a fix for every low-utilisation run. On ds=934 "
+                            "some runs have assign_change_rate falling to "
+                            "0.01-0.04 with active decaying after the best epoch "
+                            "and no later recovery -- there the best epoch really "
+                            "is the best available. Check that a run's trajectory "
+                            "max exceeds its active@best before expecting this to "
+                            "help."))
+    parser.add_argument("--min_epochs", type=int, default=0,
+                        help=(
+                            "[2026-08] Hard floor on the epoch at which checkpoint "
+                            "selection may open, independent of "
+                            "regroup_warmup_epochs (a short warmup does not "
+                            "exclude the best_epoch=1 runs seen on ds=934). "
+                            "Applies to best_state on its own; combine with "
+                            "--defer_early_stopping to gate patience on the same "
+                            "epoch. Ignored with --from_saved_state."))
     parser.add_argument("--n_explain", type=int, default=3,
                         help="number of test samples to explain")
     parser.add_argument("--n_prototypes", type=int, default=None,
@@ -2646,6 +2726,14 @@ def main():
                             "routing churn -- the repeated dead/reinit cycle of "
                             "centroids. No effect with --from_saved_state."
                         ))
+    parser.add_argument("--study_batch_size", type=int, default=None,
+                        help=("Point at a study produced by "
+                              "`optimize.py --batch_size N` (filename tag "
+                              "..B{N}). Selects **which study file to load**; "
+                              "it does not change training. Leave unset for "
+                              "protocol runs -- those studies carry no ..B tag. "
+                              "Do not confuse with --batch_size_override, which "
+                              "changes the batch size used when retraining."))
     parser.add_argument("--batch_size_override", type=int, default=None,
                         help=(
                             "override batch_size from best_params and retrain with "
