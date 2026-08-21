@@ -507,6 +507,15 @@ class CentroidLayer(nn.Module):
         #   the first epoch after resuming from a checkpoint.
         self._diag_prev_centroid = None    # (P, D)  centroids at end of last epoch
         self._diag_prev_assign   = None    # (N,)    assignments of last epoch
+        # Same thing keyed by X_train row instead of MemoryBank slot. See the
+        # aligned-churn block in regroup_update for why the slot-keyed version
+        # cannot be compared across epochs.
+        self._diag_prev_assign_sid = None  # (max_sid+1,) -1 = not seen
+        # Previous epoch's normalised embeddings, also keyed by X_train row.
+        # Needed to hold q fixed while varying the centroids and vice versa;
+        # without it only the joint change is observable.
+        self._diag_prev_q_sid    = None    # (max_sid+1, D)
+        self._diag_prev_q_seen   = None    # (max_sid+1,) bool
         self._diag_prev_active   = None    # (P,)    bool
         self._diag_prev_sizes    = None    # (P,)    long
         self._diag_reinit_mask   = None    # (P,)    reinitialised last epoch
@@ -635,6 +644,7 @@ class CentroidLayer(nn.Module):
         X_emb: torch.Tensor,        # (N, D) all training embeddings, for assignment
         X_raw: Optional[torch.Tensor] = None,   # (N, F) raw features; unused, kept for caller compatibility
         assignments: Optional[torch.Tensor] = None,  # (N,) hard assignment
+        sample_ids: Optional[torch.Tensor] = None,   # (N,) X_train row held by each slot
     ) -> Dict[str, float]:
         """
         Called at the end of an epoch to refresh sample_groups.
@@ -877,12 +887,193 @@ class CentroidLayer(nn.Module):
             _diag["assign_change_rate"] = float(
                 (_assign_final != self._diag_prev_assign).float().mean()
             )
+            # ⚠ assign_change_rate counts label mismatches, so it also counts
+            #   a pure renumbering of centroids: the identical partition with
+            #   prototypes 3 and 7 swapped reads as 100% churn. It also rises
+            #   simply because there are more regions -- with 48 live regions
+            #   instead of 5 there is far more boundary for a sample to sit
+            #   near. Both effects were live on ds=46: churn stayed at
+            #   0.81-0.93 while active_centroids climbed 21 -> 48, which
+            #   cannot be read as "the partition got less stable".
+            #
+            #   ARI/AMI compare the two partitions as set structures, so the
+            #   index permutation drops out. They separate the two readings
+            #   that assign_change_rate alone conflates:
+            #     ARI high, churn high -> same partition, samples moving at
+            #                             the boundaries (or renumbering)
+            #     ARI low,  churn high -> a genuinely different partition
+            #                             each epoch
+            #   That distinction is what decides whether rising utilisation
+            #   means "new regions are being found" or "the centroids never
+            #   settle", and no existing metric answers it.
+
+        # ── Partition stability, aligned by sample ────────────────────
+        # ⚠ assign_change_rate above compares slot i of this epoch against
+        #   slot i of the previous one, and MemoryBank is a ring buffer
+        #   written in shuffled batch order -- slot i holds a different
+        #   training row each epoch. So that number is a comparison between
+        #   two different sets of samples and cannot be read as churn at all.
+        #   Measured consequence on ds=46: assign_change_rate sat at 0.94 and
+        #   slot-keyed ARI at 0.000 (i.e. unrelated partitions) for 248
+        #   epochs, while n_eff_entropy rose monotonically 6 -> 23.6 and
+        #   top1_share fell 0.36 -> 0.10. A partition redrawn at random every
+        #   epoch cannot produce monotone structure, so the metric was wrong,
+        #   not the model. assign_change_centroid_only stayed at 0.001-0.03
+        #   over the same period, which is what actual centroid movement
+        #   looks like.
+        #
+        #   sample_ids records which X_train row each slot holds, so keying
+        #   the assignment by row makes consecutive epochs comparable. Only
+        #   rows present in both epochs are compared; the rest are ignored
+        #   rather than counted as changes.
+        #
+        #   ARI/AMI are reported alongside the aligned churn because churn
+        #   alone conflates two things: a renumbering of centroids reads as
+        #   total change, and more live regions means more boundary for
+        #   samples to sit near. ARI compares the partitions as set
+        #   structures, so both effects drop out.
+        #     ARI high + churn high -> same partition, boundary movement
+        #     ARI low  + churn high -> a different partition each epoch
+        if sample_ids is not None and sample_ids.numel() == _assign_final.numel():
+            _sid = sample_ids.detach().cpu().long()
+            _valid = _sid >= 0
+            if bool(_valid.any()):
+                _n_sid = int(_sid[_valid].max()) + 1
+                _cur_by_sid = torch.full((_n_sid,), -1, dtype=torch.long)
+                _cur_by_sid[_sid[_valid]] = _assign_final.detach().cpu().long()[_valid]
+                _prev = self._diag_prev_assign_sid
+                if _prev is not None:
+                    _m = min(_prev.numel(), _n_sid)
+                    _both = (_prev[:_m] >= 0) & (_cur_by_sid[:_m] >= 0)
+                    _n_both = int(_both.sum())
+                    _diag["assign_overlap_n"] = _n_both
+                    if _n_both >= 2:
+                        _a, _b = _prev[:_m][_both], _cur_by_sid[:_m][_both]
+                        _diag["assign_change_rate_aligned"] = float(
+                            (_a != _b).float().mean())
+                        try:
+                            from sklearn.metrics import (
+                                adjusted_rand_score, adjusted_mutual_info_score)
+                            _an, _bn = _a.numpy(), _b.numpy()
+                            _diag["assign_ari"] = float(adjusted_rand_score(_an, _bn))
+                            _diag["assign_ami"] = float(
+                                adjusted_mutual_info_score(_an, _bn))
+                        except Exception:
+                            # A diagnostic must not be able to stop training.
+                            pass
+
+                # ── 2x2: is it the centroids moving or the encoder? ──────
+                # An assignment flips when the centroid moves, when q moves,
+                # or both, and the observed churn alone cannot say which.
+                # Holding one side at its previous value isolates each:
+                #
+                #                        centroid_prev   centroid_cur
+                #        q_prev             a00 (base)      a01  -> C
+                #        q_cur              a10  -> E       a11 (observed)
+                #
+                # assign_change_centroid_only below is the C cell but
+                # evaluated on this epoch's q and in slot order, so it does
+                # not pair with the aligned churn. These four are computed on
+                # the same aligned sample set, so C, E and the observed churn
+                # are directly comparable and the remainder is interaction.
+                #
+                # ⚠ a11 is recomputed by argmax rather than taken from
+                #   _assign_final, which differs on epochs where reinit fired
+                #   (reinit rewrites assignments outside the argmax). The
+                #   four cells have to come from one rule to be comparable;
+                #   assign_change_rate_aligned above is the value that
+                #   includes reinit effects.
+                try:
+                    _qc_slot = F.normalize(X_emb.float(), dim=-1).detach()
+                    _dev = _qc_slot.device
+                    _sid_d = _sid.to(_dev); _val_d = _valid.to(_dev)
+                    _q_by_sid = torch.zeros(_n_sid, _qc_slot.shape[1], device=_dev)
+                    _q_seen   = torch.zeros(_n_sid, dtype=torch.bool, device=_dev)
+                    _q_by_sid[_sid_d[_val_d]] = _qc_slot[_val_d]
+                    _q_seen[_sid_d[_val_d]]   = True
+
+                    _pq, _ps = self._diag_prev_q_sid, self._diag_prev_q_seen
+                    if (_pq is not None and self._diag_prev_centroid is not None):
+                        _pm2 = min(_pq.shape[0], _n_sid)
+                        _ov = _ps[:_pm2].to(_dev) & _q_seen[:_pm2]
+                        if int(_ov.sum()) >= 2:
+                            _qp = _pq[:_pm2].to(_dev)[_ov]
+                            _qn = _q_by_sid[:_pm2][_ov]
+                            _Cp = F.normalize(self._diag_prev_centroid.float(), dim=-1)
+                            _Cc = F.normalize(self.centroid_emb.detach().float(), dim=-1)
+                            _s00 = _qp @ _Cp.T
+                            _a00 = _s00.argmax(-1)
+                            _a01 = (_qp @ _Cc.T).argmax(-1)
+                            _a10 = (_qn @ _Cp.T).argmax(-1)
+                            _s11 = _qn @ _Cc.T
+                            _a11 = _s11.argmax(-1)
+                            _cC = float((_a01 != _a00).float().mean())
+                            _cE = float((_a10 != _a00).float().mean())
+                            _cT = float((_a11 != _a00).float().mean())
+                            _diag["churn_centroid_only"] = _cC
+                            _diag["churn_encoder_only"]  = _cE
+                            _diag["churn_total_2x2"]     = _cT
+                            _diag["churn_interaction"]   = _cT - _cC - _cE
+
+                            # How far each side actually moved, so a small
+                            # churn from a large movement (regions far apart)
+                            # reads differently from a small churn from no
+                            # movement at all.
+                            _diag["q_drift_cos"] = float(
+                                (1.0 - (_qp * _qn).sum(-1)).mean())
+
+                            # Routing margin: top1 - top2 cosine. If flips
+                            # concentrate in the low-margin half, the samples
+                            # moving are the ones sitting on a boundary,
+                            # which is not the same failure as a partition
+                            # being redrawn.
+                            _t2 = _s11.topk(2, dim=-1).values
+                            _mg = _t2[:, 0] - _t2[:, 1]
+                            _diag["margin_mean"] = float(_mg.mean())
+                            _diag["margin_p10"]  = float(
+                                torch.quantile(_mg, 0.10))
+                            _t2p = _s00.topk(2, dim=-1).values
+                            _mp  = _t2p[:, 0] - _t2p[:, 1]
+                            _flip = (_a11 != _a00).float()
+                            _med = _mp.median()
+                            _lo, _hi = _mp <= _med, _mp > _med
+                            if bool(_lo.any()):
+                                _diag["margin_flip_low"] = float(_flip[_lo].mean())
+                            if bool(_hi.any()):
+                                _diag["margin_flip_high"] = float(_flip[_hi].mean())
+                    self._diag_prev_q_sid  = _q_by_sid.cpu()
+                    self._diag_prev_q_seen = _q_seen.cpu()
+                except Exception:
+                    # Diagnostics must never be able to stop training.
+                    pass
+
+                self._diag_prev_assign_sid = _cur_by_sid
         if self._diag_prev_centroid is not None:
             with torch.no_grad():
                 _q = F.normalize(X_emb.float(), dim=-1)
                 _a_prev = (_q @ F.normalize(self._diag_prev_centroid.float(), dim=-1).T).argmax(-1)
                 _a_cur  = (_q @ F.normalize(self.centroid_emb.detach().float(), dim=-1).T).argmax(-1)
                 _diag["assign_change_centroid_only"] = float((_a_prev != _a_cur).float().mean())
+
+        # ── Usage concentration ────────────────────────────────────
+        # active_centroids counts how many prototypes received anything at
+        # all, which a prototype holding a single sample satisfies. On ds=46
+        # active went 22 -> 44 while n_eff went 5.24 -> 11.06: the count
+        # doubled and the *effective* number doubled too, but the two are
+        # not the same measurement and only the pair shows that the growth
+        # was real rather than a tail of near-empty prototypes.
+        #
+        # These were previously computed once at the end from the final
+        # checkpoint (prototype_alignment / context_diversity), so the shape
+        # of the curve over training was unavailable -- exactly what is
+        # needed to compare the convergence time of prototype usage against
+        # that of validation loss.
+        _p_share = _sizes_t.float() / _sizes_t.sum().clamp_min(1)
+        _nz = _p_share[_p_share > 0]
+        _diag["n_eff_entropy"] = float(torch.exp(-(_nz * _nz.log()).sum()))
+        _diag["n_eff_inv_simpson"] = float(1.0 / (_p_share ** 2).sum().clamp_min(1e-12))
+        _diag["top1_share"] = float(_p_share.max())
+        _diag["dead_ratio"] = float((~_active).float().mean())
 
         # active_delta: did the membership change even when the count did not?
         # (24 -> 24 with A and B dying while C and D appear is a different

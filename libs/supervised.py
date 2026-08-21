@@ -102,6 +102,35 @@ class TabERAWrapper:
         device: str = "cpu",
         epochs: int = 100,
         patience: int = 20,
+        # ── Checkpoint-selection timing ────────────────────────────────
+        # Measured problem this addresses (2026-08): on dataset 46 all five
+        # low-utilisation runs reached active=50 at some epoch, yet their
+        # best_epoch landed at 8-13 with active=14-24. The selected snapshot
+        # came from the unstable phase the EMA codebook passes through before
+        # it settles, and patience=20 then ended the run about 20 epochs
+        # later, removing the chance to recover. The same interval that
+        # produces a bad snapshot also cuts the run short -- two failures out
+        # of one cause. credit-g (31) shows the same shape: best at epoch 9
+        # with active=2, while that run later reached 28.
+        #
+        # defer_early_stopping gates BOTH best_state selection and the
+        # patience counter on the same epoch, so patience measures "no
+        # improvement since selection opened" instead of "no improvement
+        # since epoch 1". Off by default: turning it on changes which
+        # checkpoint every existing study returns, so old results stay
+        # reproducible unless the flag is passed.
+        #
+        # ⚠ Not a fix for every low-utilisation run. Dataset 934 has runs
+        #   whose assign_change_rate falls to 0.01-0.04 and whose active
+        #   count decays after the best epoch with no later recovery. There
+        #   the best epoch really is the best available and deferring
+        #   selection picks something worse. Check that a run's trajectory
+        #   max exceeds its active@best before expecting this to help.
+        defer_early_stopping: bool = False,
+        # Hard floor on when selection may open, independent of
+        # regroup_warmup_epochs. 934 produced best_epoch=1 runs, which a
+        # warmup gate alone does not exclude when warmup is short.
+        min_epochs: int = 0,
         cat_cols: Optional[List[int]] = None,
         num_cols: Optional[List[int]] = None,
         col_names: Optional[List[str]] = None,
@@ -130,6 +159,11 @@ class TabERAWrapper:
         self.device   = device
         self.epochs   = epochs
         self.patience = patience
+        self.defer_early_stopping = bool(defer_early_stopping)
+        self.min_epochs = max(0, int(min_epochs))
+        # Epoch at which best_state selection actually opened, so a run can be
+        # audited afterwards without re-deriving it from the flags.
+        self.selection_open_epoch = None
         # max(1, ...) would turn 0 into 1 and print every epoch, which is
         # the opposite of what 0 asks for. Clamp only negatives.
         self.regroup_log_every = max(0, int(regroup_log_every))
@@ -559,7 +593,15 @@ class TabERAWrapper:
                         )
                         self._tick("feature_store -> GPU copy", _t0)
                         _t0 = self._t()
-                        regroup_stats = self.model.prototype_layer.regroup_update(emb_regroup, x_regroup)
+                        # sample_ids makes the per-epoch partition comparable
+                        # across epochs: MemoryBank slot i holds a different
+                        # training row each epoch, so a slot-keyed comparison
+                        # measures nothing. See the aligned-churn block in
+                        # regroup_update.
+                        _sids = getattr(self.model.memory, "sample_ids", None)
+                        regroup_stats = self.model.prototype_layer.regroup_update(
+                            emb_regroup, x_regroup,
+                            sample_ids=(_sids[:n_mem] if _sids is not None else None))
                         self._tick("regroup_update", _t0)
                         # label_all_groups and label_groups_by_target are
                         # read-only text caching for explanations and do not
@@ -752,9 +794,30 @@ class TabERAWrapper:
             #   which phase early stopping lands in may decide the outcome.
             if self.regroup_history and self.regroup_history[-1].get("epoch") == float(epoch):
                 self.regroup_history[-1]["val_score"] = float(val_v)
+                # ⚠ Only the *selection* metric used to be recorded here, so
+                #   the question "which epoch would AUROC (or logloss) have
+                #   chosen, and what did the prototype partition look like
+                #   there" could not be answered without retraining once per
+                #   metric. That question is now load-bearing: on ds=46 the
+                #   run selected at epoch 13 by accuracy and the run selected
+                #   at epoch 65 differ by test logloss 0.42 vs 0.19 and
+                #   dead_ratio 56% vs 12%, while test accuracy moves the other
+                #   way (0.962 -> 0.956). Different criteria select
+                #   qualitatively different prototype states, so all of them
+                #   are stored and the comparison is done afterwards on one
+                #   run instead of one run per criterion.
+                for _mk, _mv in val_m.items():
+                    self.regroup_history[-1][f"val_{_mk}"] = float(_mv)
+
+            # Whether this epoch may contribute a checkpoint at all. The same
+            # predicate gates the patience counter below: when selection is
+            # not open, "no improvement" is not yet a meaningful statement.
+            _selection_open = _past_regroup_warmup and (epoch >= self.min_epochs)
+            if _selection_open and self.selection_open_epoch is None:
+                self.selection_open_epoch = int(epoch)
 
             # Save the best model
-            if is_better(val_v, best_val, self.tasktype) and _past_regroup_warmup:
+            if is_better(val_v, best_val, self.tasktype) and _selection_open:
                 best_val   = val_v
                 # Which epoch the returned model actually comes from.
                 self.best_epoch = int(epoch)
@@ -848,9 +911,14 @@ class TabERAWrapper:
             if self._timing_on:
                 self._timing["n_epoch"] = self._timing.get("n_epoch", 0) + 1
 
-            if es.step(val_v, higher_is_better):
-                tqdm.write(f"Early stopping at epoch {epoch}")
-                break
+            # With defer_early_stopping the counter starts when selection
+            # opens. Seeding es.best_value during warmup is the specific
+            # failure being avoided: a warmup score later epochs cannot beat
+            # spends patience on epochs that were never selectable.
+            if (not self.defer_early_stopping) or _selection_open:
+                if es.step(val_v, higher_is_better):
+                    tqdm.write(f"Early stopping at epoch {epoch}")
+                    break
 
         pbar.close()
 
@@ -863,6 +931,7 @@ class TabERAWrapper:
             tqdm.write(
                 f"  !  best_state was never updated. "
                 f"regroup_warmup_epochs({self.model.prototype_layer.regroup_warmup_epochs}) "
+                f"/ min_epochs({self.min_epochs}) "
                 f"may have outlasted the early-stopping point. Retry with a "
                 f"shorter warmup or a larger patience."
             )
