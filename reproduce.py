@@ -1948,8 +1948,11 @@ def run_single_seed(
                           f"reinit={regroup_stats.get('reinit_count', 0)})")
         else:
             print(f"  [--from_saved_state] restored (no retraining from epoch 0)")
+        _fit_time = float("nan")   # 재학습을 안 했으므로 학습 시간이 없다
     else:
+        _fit_st = time.time()
         wrapper.fit(X_train, y_train, X_val, y_val)
+        _fit_time = time.time() - _fit_st
 
     # ── Evaluate ──────────────────────────────────────────
     preds_val  = wrapper.predict(X_val)
@@ -1967,6 +1970,48 @@ def run_single_seed(
     print(f"\n  {env_info}  {openml_id}  {dataset_info['name']}  tabera  {log_dir}")
     print(f"  val  : {val_metrics}")
     print(f"  test : {test_metrics}")
+
+    # ── MultiTab 규약으로 결과 저장 ────────────────────────────
+    #
+    # 이전에는 test_metrics 를 print 만 하고 파일로 남기지 않았다. 그러면
+    # baseline 과 나란히 놓고 집계할 때 콘솔 로그를 파싱해야 하는데, 로그
+    # 형식이 바뀌면 조용히 깨진다.
+    #
+    # MultiTab reproduce.py:90,160,166 과 **같은 경로 규칙과 같은 키**로
+    # 저장한다. 그래야 분석 스크립트가 경로 패턴 하나로 baseline 13개와
+    # TabERA 를 모두 읽는다:
+    #     reproduce_logs/seed={S}/data={D}/model={m}..init_hps=False..deep=0..hyper=0.npy
+    #     -> {"Prediction", "Probability", "time", "Performance"}
+    #
+    # ⚠ Probability 는 **확률**이다. MultiTab 은 predict_proba(logit=True) 로
+    #   logit 을 담지만, 여기 wrapper.predict_proba() 는 이미 sigmoid/softmax 를
+    #   거친 확률을 돌려준다. 두 파일의 Performance 값은 어느 쪽이든 동일하게
+    #   계산되므로(양쪽 다 최종적으로 정상 확률에서 지표를 낸다) 집계에는
+    #   문제가 없지만, Probability 를 직접 다시 쓸 때는 변환 여부를 확인할 것.
+    #
+    # ⚠ 기존 저장물(_preds.npy = test logits, meta pickle, model state)은
+    #   그대로 둔다. 이 블록은 추가일 뿐 대체가 아니다.
+    try:
+        _mt_dir = os.path.join(args.savepath, 'reproduce_logs',
+                               f'seed={args.seed}', f'data={openml_id}')
+        os.makedirs(_mt_dir, exist_ok=True)
+        _mt_fname = os.path.join(
+            _mt_dir, 'model=tabera..init_hps=False..deep=0..hyper=0.npy')
+        _to_np = lambda t: (t.detach().cpu().numpy()
+                            if isinstance(t, torch.Tensor) else
+                            (None if t is None else np.asarray(t)))
+        np.save(_mt_fname, {
+            "Prediction":  _to_np(preds_test),
+            "Probability": _to_np(probs_test),
+            "time":        float(_fit_time),
+            "Performance": {k: float(v) for k, v in test_metrics.items()},
+            # TabERA 전용 추가 정보. MultiTab 쪽에는 없으므로 집계 시 무시된다.
+            "Performance_val": {k: float(v) for k, v in val_metrics.items()},
+            "best_params": best_params,
+        })
+        print(f"  saved: {_mt_fname}")
+    except Exception as _e:
+        print(f"  !  reproduce_logs 저장 실패: {type(_e).__name__}: {_e}")
 
 
     # ── Linear Probe ───────────────────────────────────────────
