@@ -3,7 +3,7 @@ libs/eval.py
 ============
 MultiTab 스타일 평가 지표.
 
-calculate_metric : val/test split 별 dict 반환 (ModernNCA 동일 지표 포함)
+calculate_metric : val/test split 별 dict 반환
 compute_metric   : 내부 학습 루프용 단순 버전
 is_study_todo    : 최적화 재개 여부 판단
 """
@@ -29,13 +29,41 @@ def calculate_metric(
     split: str,   # 'val' or 'test'
 ) -> Dict[str, float]:
     """
-    ModernNCA와 동일한 지표 세트를 반환합니다.
+    MultiTab optimize.py 경로가 기록하는 지표에 bacc 와 비교용 _mt_ 키를
+    더해 반환합니다.
 
     classification:
-        acc_{split}, bacc_{split},
-        auroc_{split}, f1_{split}, logloss_{split}
+        acc_{split}, auroc_{split}, f1_{split}, logloss_{split}
+                                                     (MultiTab과 같은 4개)
+        bacc_{split}                                 (TabERA 진단용 추가)
+        f1_mt_{split}                                (MultiTab 규약 F1)
+        logloss_mt_{split}, auroc_mt_{split}         (multiclass 전용)
     regression:
         rmse_{split}
+
+    ⚠ 이 함수는 한때 "ModernNCA와 동일한 지표 세트를 반환한다"고 적혀
+      있었는데 사실이 아니다. 확인 결과:
+
+      (1) MultiTab 의 optimize.py -> eval.py 경로가 내는 것은
+          acc / auroc / f1 / logloss **4개뿐**이고 bacc 는 없다. 저장소
+          전체에서 balanced_accuracy_score 는 libs/utils_modernnca.py 에만
+          있는데, 그 파일은 ModernNCA 내부 유틸이라 optimize.py 나
+          reproduce.py 어디서도 import 되지 않는다. 실제로 배포된 baseline
+          로그 CSV 에 bacc 컬럼이 없다.
+
+      (2) 그 ModernNCA 유틸의 지표 세트와도 같지 않다. 유틸은
+          (Accuracy, Avg_Recall, Avg_Precision, F1, LogLoss, AUC) 6개를
+          내는데, 여기에는 Avg_Precision 이 없고 이진 F1 의 average 도
+          다르다(유틸은 'binary', 여기는 'macro' -- 그래서 f1_mt 가 따로
+          필요하다).
+
+      즉 bacc 는 **비교 대상이 없는 TabERA 전용 진단 지표**다. 논문 표에
+      baseline 과 나란히 올릴 수 없다. 다만 내부 분석에는 유용하다 --
+      (acc, bacc, f1) 삼중항으로 이진 데이터셋의 클래스 사전확률을 역산해
+      f1 의 average 규약이 MultiTab 과 다르다는 것을 특정한 것이 이 값이다.
+
+    ⚠ 반환 순서에서 acc_{split} 이 첫 키라는 계약은 compute_metric() 의
+      checkpoint selection 이 의존한다. 앞쪽에 키를 끼워 넣지 말 것.
     """
     y_np = (y_true.detach().cpu().numpy()
             if isinstance(y_true, torch.Tensor) else np.array(y_true))
@@ -90,6 +118,8 @@ def calculate_metric(
     metrics[f"acc_{split}"]  = float(accuracy_score(y_np, p_np))
 
     # Balanced Accuracy
+    # ⚠ MultiTab 에는 없는 지표다(위 docstring 참조). baseline 과 비교하지
+    #   말고 TabERA 내부 분석에만 쓸 것.
     try:
         metrics[f"bacc_{split}"] = float(balanced_accuracy_score(y_np, p_np))
     except Exception:
@@ -107,13 +137,36 @@ def calculate_metric(
                 present = sorted(np.unique(y_np).tolist())
                 pr_sub  = pr_np[:, present]
                 pr_sub  = pr_sub / pr_sub.sum(axis=1, keepdims=True).clip(1e-8)
-                metrics[f"auroc_{split}"] = float(
-                    roc_auc_score(
-                        y_np, pr_sub,
-                        multi_class="ovr", average="macro",
-                        labels=present,
+                if len(present) == 2:
+                    # [수정] subsetting 결과 클래스가 2개만 남으면
+                    # roc_auc_score 는 multi_class 인자를 무시하고 **binary
+                    # 경로로 라우팅**한다(type_of_target(y_true)=='binary').
+                    # binary 경로는 1차원 점수를 기대하므로 (N,2) 배열을 주면
+                    #     ValueError: y should be a 1d array, got (N, 2)
+                    # 가 나고, 아래 except 가 이를 삼켜 auroc 가 통째로 nan 이
+                    # 된다. 모델 문제가 아니라 지표 계산 경로 문제다.
+                    #
+                    # 실측(lymph, id=10): 클래스 분포 [2, 81, 61, 4] 에 fold
+                    # 크기 14 이므로 fold 의 55%에서 클래스가 2개 이하만
+                    # 등장한다 -- 비층화 KFold 를 쓰는 한 구조적으로 발생한다.
+                    # 여기서 나가떨어지면 그 데이터셋의 AUROC 가 사실상 전부
+                    # 사라지므로, 남은 두 클래스에 대한 이진 AUROC 로 계산한다.
+                    #
+                    # ⚠ 이 값은 "K개 클래스 중 2개만 등장한 split 에서의 이진
+                    #   AUROC" 다. 다른 fold 의 macro-OVR 값과 같은 축에 있지
+                    #   않으므로, 이런 fold 가 많은 데이터셋(lymph)의 AUROC 는
+                    #   평균 내어 해석하지 말 것.
+                    metrics[f"auroc_{split}"] = float(
+                        roc_auc_score(y_np, pr_sub[:, 1])
                     )
-                )
+                else:
+                    metrics[f"auroc_{split}"] = float(
+                        roc_auc_score(
+                            y_np, pr_sub,
+                            multi_class="ovr", average="macro",
+                            labels=present,
+                        )
+                    )
         else:
             metrics[f"auroc_{split}"] = float("nan")
     except Exception as e:
@@ -140,6 +193,103 @@ def calculate_metric(
     except Exception as e:
         metrics[f"logloss_{split}"] = float("nan")
 
+    # ─────────────────────────────────────────────────────────
+    # MultiTab 호환 지표 (비교 전용)
+    # ─────────────────────────────────────────────────────────
+    #
+    # 위의 f1_/logloss_/auroc_ 는 **올바른 값**이다. 논문 본문에서 TabERA
+    # 자신의 수치를 말할 때는 그쪽을 쓴다. 아래 _mt_ 접미사 키는 MultiTab이
+    # 실제로 계산하는 방식을 그대로 재현한 값으로, 오직 baseline과 같은 축
+    # 위에 올려놓기 위한 것이다.
+    #
+    # 왜 필요한가 (MultiTab libs/eval.py 확인 결과):
+    #
+    #  (1) F1 — MultiTab은 binclass에서 average='binary'(양성 클래스만),
+    #      multiclass에서 average='weighted'를 쓴다. 여기는 둘 다 'macro'다.
+    #      불균형 이진에서 차이가 크다: profb(양성 33%)에서 macro 0.601 vs
+    #      binary 0.262, credit-g(양성=다수 70%)에서는 반대로 macro 0.649 vs
+    #      binary 0.846. 정의만으로 최대 0.34가 갈리므로 그대로 비교할 수 없다.
+    #      (로그의 acc/bacc/f1 삼중항에서 클래스 사전확률을 역산해 확인:
+    #       이진 19개 전부 macro로 재현되며 잔차 1e-4 수준.)
+    #
+    #  (2) LogLoss/AUROC — MultiTab optimize.py:88은 model.predict_proba()의
+    #      결과(=이미 확률)를 calculate_metric(..., prob=False)로 넘기고,
+    #      MultiTab eval.py가 거기에 expit()/softmax()를 **한 번 더** 적용한다.
+    #      multiclass에서는 이 변환이 14개 baseline 전부에 예외 없이 걸린다.
+    #      이중 softmax의 이론 하한 ln(1+(K-1)/e)와 로그의 실측 최솟값을
+    #      대조하면 r = 0.9986 (balance scale K=3: 0.551 vs 0.552,
+    #      cnae-9 K=9: 1.372 vs 1.373, 100-plants K=100: 3.622 vs 3.722).
+    #      즉 모델별로 다른 게 아니라 하나의 결정적 함수이므로, 우리 확률에
+    #      같은 변환을 걸면 multiclass log loss와 AUROC가 비교 가능해진다.
+    #
+    #      ⚠ binclass는 재현하지 않는다. 이진에서는 변환 결과가 모델 계열마다
+    #        다르다(test logloss 하한 실측: 트리 0.313 / TabM 0.419 /
+    #        SAINT 0.404 / ModernNCA 0.685 / MLP·ResNet·EmbedMLP·MLP-PLR·
+    #        T2G 0.000). 공통 함수가 아니므로 재현해도 일부 모델과만 맞는다.
+    #        이진 log loss는 변환이 걸리지 않은 5개 모델과만 비교하고,
+    #        논문에는 각주로 그 사실을 밝힌다.
+    #
+    #      ⚠ MultiTab reproduce.py:159는 predict_proba(..., logit=True)로
+    #        불러서 정상이다. 즉 이 왜곡은 **튜닝 로그에만** 존재하며,
+    #        MultiTab 논문 수치 자체는 멀쩡하다. baseline을 reproduce.py로
+    #        다시 돌릴 수 있게 되면 _mt_ 키는 더 이상 필요 없다.
+    #
+    # ⚠ _mt_ 키를 model selection이나 objective에 쓰지 말 것. 의도적으로
+    #   왜곡된 값이며 오직 비교표를 채우기 위한 것이다.
+    # ⚠ 이 블록은 반드시 dict의 맨 뒤에 있어야 한다 — compute_metric()의
+    #   "첫 키 = acc_val" 계약을 건드리지 않기 위해서다.
+    try:
+        mt_average = "binary" if tasktype == "binclass" else "weighted"
+        metrics[f"f1_mt_{split}"] = float(
+            f1_score(y_np, p_np, average=mt_average, zero_division=0)
+        )
+    except Exception:
+        metrics[f"f1_mt_{split}"] = float("nan")
+
+    if tasktype == "multiclass" and pr_np is not None and pr_np.ndim == 2:
+        from scipy.special import softmax as _softmax
+        pr_mt = _softmax(pr_np, axis=1)
+        try:
+            metrics[f"logloss_mt_{split}"] = float(
+                log_loss(y_np, pr_mt, labels=list(range(pr_np.shape[1])))
+            )
+        except Exception:
+            metrics[f"logloss_mt_{split}"] = float("nan")
+        try:
+            # MultiTab calculate_multi_auroc()와 순서를 맞춘다: softmax를 먼저
+            # 걸고, split에 없는 클래스가 있으면 그때 열을 골라 재정규화한다.
+            #
+            # ⚠ 순서가 중요하다. softmax는 행 전체를 보고 정규화하므로
+            #   "subset 후 softmax"와 "softmax 후 subset"은 다른 값이 된다.
+            #   MultiTab optimize.py는 eval.py 진입 시점에 이미 softmax를
+            #   적용하므로 subsetting은 그 뒤에 온다.
+            #
+            # ⚠ 참고: MultiTab **원본** calculate_multi_auroc()에는 이
+            #   subsetting이 없어서 클래스가 빠진 split에서는 ValueError ->
+            #   None을 반환한다. 지금 배포된 baseline optim_logs가 그 상태이며
+            #   lymph에서 test AUROC의 19.9%가 NaN인 이유다. 즉 이 키를 기존
+            #   로그와 맞댈 때는 baseline 쪽 결측을 그대로 두고 짝지어야 한다
+            #   (수정된 MultiTab eval.py로 baseline을 다시 돌리면 양쪽이
+            #    동일한 규약이 된다).
+            # ⚠ 여기는 auroc_{split} 과 달리 2-클래스 폴백을 **넣지 않는다**.
+            #   MultiTab 쪽도 같은 ValueError 를 맞고 None 을 반환하므로,
+            #   폴백을 넣으면 baseline 이 결측인 자리에 우리만 값이 생겨
+            #   "같은 규약" 이라는 이 키의 존재 이유가 무너진다. 결측은 결측
+            #   대로 두고 pairwise 비교에서 함께 빠지는 것이 맞다.
+            #   (TabERA 자신의 AUROC 는 위 auroc_{split} 을 쓴다.)
+            present = sorted(np.unique(y_np).tolist())
+            pr_mt_sub = pr_mt
+            if len(present) < pr_mt.shape[1]:
+                pr_mt_sub = pr_mt[:, present]
+                _rs = pr_mt_sub.sum(axis=1, keepdims=True)
+                pr_mt_sub = pr_mt_sub / np.where(_rs > 0, _rs, 1.0)
+            metrics[f"auroc_mt_{split}"] = float(
+                roc_auc_score(y_np, pr_mt_sub, multi_class="ovr",
+                              average="macro", labels=present)
+            )
+        except Exception:
+            metrics[f"auroc_mt_{split}"] = float("nan")
+
     return metrics
 
 
@@ -151,20 +301,58 @@ def compute_metric(
     logits: torch.Tensor,
     y: torch.Tensor,
     tasktype: str,
+    full: bool = True,
 ) -> Dict[str, float]:
+    """학습 루프에서 epoch마다 호출된다.
+
+    [2026-08] 예전에는 accuracy(회귀는 rmse) 하나만 계산했다. 그 값이
+    checkpoint selection에 쓰이는 값이라 그것만 있으면 충분해 보였지만,
+    "AUROC로 골랐다면 어느 epoch이 뽑혔고 그때 prototype 파티션은 어떤
+    상태였나"를 묻는 순간 지표당 재학습이 한 번씩 필요해진다. ds=46에서
+    accuracy로 뽑힌 epoch 13과 더 늦게 뽑힌 epoch 148은 test logloss가
+    0.42 대 0.14로 갈리고 dead_ratio도 56%와 22%로 갈린다 — 어떤 기준으로
+    고르느냐가 질적으로 다른 모델을 선택한다. 그래서 전체 지표를 매 epoch
+    기록해 두고 비교는 사후에 한 번의 실행으로 끝낸다.
+
+    ⚠ 반환 dict의 **첫 번째 키는 그대로 acc_val / rmse_val**이다. 호출부가
+      list(val_m.values())[0]으로 selection 값을 집으므로 순서가 바뀌면
+      선택 기준 자체가 조용히 바뀐다. calculate_metric도 같은 순서로
+      만들지만, 이 계약이 깨지지 않도록 아래에서 다시 첫 키로 세운다.
+      (MultiTab 호환 지표 _mt_ 는 calculate_metric의 맨 뒤에 붙으므로 이
+       계약에 영향이 없다.)
+
+    full=False면 예전 동작(지표 하나)으로 돌아간다 — sklearn 호출이 epoch마다
+    부담되는 상황을 위한 탈출구.
+    """
     with torch.no_grad():
         if tasktype == "regression":
             preds = logits.squeeze(-1)
             rmse  = torch.sqrt(nn.MSELoss()(preds, y.float())).item()
             return {"rmse_val": rmse}
-        elif tasktype == "binclass":
-            preds = (torch.sigmoid(logits.squeeze(-1)) > 0.5).float()
-            acc   = (preds == y.float()).float().mean().item()
-            return {"acc_val": acc}
-        else:
+        if not full:
+            if tasktype == "binclass":
+                preds = (torch.sigmoid(logits.squeeze(-1)) > 0.5).float()
+                return {"acc_val": (preds == y.float()).float().mean().item()}
             preds = logits.argmax(dim=-1)
-            acc   = (preds == y).float().mean().item()
-            return {"acc_val": acc}
+            return {"acc_val": (preds == y).float().mean().item()}
+
+        # 빠른 경로로 계산한 accuracy를 첫 키로 먼저 넣는다. 이렇게 하면
+        # calculate_metric 쪽 키 순서가 바뀌더라도 selection 값은 안 바뀐다.
+        if tasktype == "binclass":
+            _p = (torch.sigmoid(logits.squeeze(-1)) > 0.5).float()
+            out: Dict[str, float] = {"acc_val": (_p == y.float()).float().mean().item()}
+        else:
+            _p = logits.argmax(dim=-1)
+            out = {"acc_val": (_p == y).float().mean().item()}
+        try:
+            preds, probs = get_preds_and_probs(logits, tasktype)
+            for k, v in calculate_metric(y, preds, probs, tasktype, "val").items():
+                if k != "acc_val":
+                    out[k] = v
+        except Exception:
+            # 진단용 부가 지표 때문에 학습이 멈추면 안 된다.
+            pass
+        return out
 
 
 def get_preds_and_probs(logits: torch.Tensor, tasktype: str):
