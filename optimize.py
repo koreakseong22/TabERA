@@ -152,7 +152,12 @@ remaining_trials = max(0, args.n_trials - completed_trials_count)
 # ─────────────────────────────────────────────────────────────
 
 if train:
-    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+    # ⚠ 84행에서 CUDA_VISIBLE_DEVICES=args.gpu_id 를 이미 설정했다. 그러면 이
+    #   프로세스에는 그 물리 GPU 하나만 보이고 논리 인덱스는 항상 0 이다.
+    #   여기서 cuda:{args.gpu_id} 를 요청하면 --gpu_id 1 일 때
+    #   "invalid device ordinal" 로 죽는다. --gpu_id 는 물리 GPU 선택용이고
+    #   내부 device 는 언제나 cuda:0 이다. env_info 에는 물리 인덱스를 남긴다.
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     import platform
     env_info = "{0}:{1}".format(platform.node(), args.gpu_id)
     print(env_info, device)
