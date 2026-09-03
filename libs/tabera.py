@@ -1149,6 +1149,46 @@ class TabERA(nn.Module):
         dropout: float = 0.1,
         column_names: Optional[List[str]] = None,
         exclude_self_retrieval: bool = True,
+        # A–D mechanism ablation. 기본값은 현행 동작과 동일하므로
+        # 기존 checkpoint의 model_kwargs와 호환된다.
+        r_normalize: bool = False,
+        split_head: bool = False,
+        # E1: correction 억제 경로를 차단하는 개입.
+        #   w2_norm_mode="match_w1" → W2 = α·W̃2/‖W̃2‖_F,  α = stopgrad(‖W1‖_F)
+        #     방향은 학습하고 scale만 고정한다. α에 detach를 걸어야 W1을 줄여
+        #     W2 scale을 우회로 낮추는 gradient path가 생기지 않는다.
+        #   beta_fixed=0.8 → β를 상수로. W2를 묶어도 β가 대신 줄면 같은 억제가
+        #     일어나므로 두 경로를 함께 막는 조건이 필요하다.
+        w2_norm_mode: str = "free",          # "free" | "match_w1"
+        beta_fixed: Optional[float] = None,
+        # Phase 3-i: partition-coupled training의 비용 측정용 대조군.
+        #   True 이면 routing/prototype/retrieval을 모두 우회하고
+        #   z = W·q + b 로 학습한다. encoder까지는 완전히 동일한 객체를
+        #   재사용하고 그 이후만 분기하므로 전처리·PLE·인코더 차이가
+        #   실수로 생길 여지가 없다.
+        # ⚠ encoder의 objective가 clustering이 되는 것이 아니다. CE 하나뿐이고,
+        #   차이는 gradient가 hard prototype routing으로 제약된 예측 경로를
+        #   통과하느냐 아니냐다.
+        no_partition: bool = False,
+        # ── prediction geometry variants (fixed-HPO diagnostic) ──
+        #   current          h = c + β·norm(q − c)            현재. ‖h−c‖ = β 고정
+        #   raw_interp   D′  h = c + β(q − c)                 radial 최대 보존(진단)
+        #   scaled_interp D″ h = c + β(q̄ − c),  q̄ = q/s       scale만 정렬(진단)
+        #   bounded_distance D‴ h = c + β·tanh(d)·r, d=‖q̄−c‖  주력 후보
+        # τ는 첫 실험에서 1로 고정한다. 작은 d에서 tanh(d/τ)≈d/τ 이므로
+        # β와 τ가 β/τ 로만 식별되어 두 파라미터의 해석이 흐려진다.
+        pred_mode: str = "current",
+        q_scale_decay: float = 0.99,       # running median EMA
+        q_scale_warmup: int = 100,         # 이 step까지는 batch median을 직접 대입
+        # τ (bounded_distance 전용). gradient로 학습하지 않는다 —
+        # 작은 d에서 tanh(d/τ)≈d/τ 이므로 β와 τ가 β/τ 로만 식별된다.
+        # "fixed" 는 tau_value 를 그대로 쓰고, "running_median" 은 d 의 running
+        # median 으로 잡아 tanh(d/τ) 중앙값이 tanh(1)=0.762 가 되게 한다.
+        # ⚠ τ=1 고정은 중립이 아니다. 실측 cos(q,c)=0.93~0.99 에서 d=0.14~0.37 이라
+        #   tanh(d)≈d 이고 β·tanh(d) 가 β 의 1/3~1/7 로 눌린다. 그러면 D‴은
+        #   current 의 변위 크기에 도달조차 못 한다.
+        tau_mode: str = "running_median",   # "running_median" | "fixed"
+        tau_value: float = 1.0,
         tasktype: str = "regression",
         n_classes: Optional[int] = None,
         use_ema_codebook: bool = True,
@@ -1206,6 +1246,9 @@ class TabERA(nn.Module):
             n_features=n_features,
             prototype_labels=prototype_labels,
             dropout=dropout,
+            # [Step 1] centroid에는 dropout을 적용하지 않는다(기하 정합성).
+            # encoder dropout(위)과는 별개의 손잡이. ablation 시에만 >0.
+            context_dropout=0.0,
             col_names=column_names,
             regroup_warmup_epochs=regroup_warmup_epochs,
             freeze_centroid_after=freeze_centroid_after,
@@ -1237,9 +1280,69 @@ class TabERA(nn.Module):
         #   identity. Adding a hidden layer turns explanation layer (3) into
         #   an approximation like SHAP or IG, with a baseline to choose.
         self.dev_head = nn.Linear(embed_dim, n_output)
+        # ── A–D mechanism ablation (진단용, 최종 아키텍처 제안 아님) ──
+        # r_normalize : r = normalize(q̂ − c) 로 바꾼다. ‖q‖≫‖c‖=1이라
+        #   현재 r ≈ q̂ ≈ c_a 로 퇴화하는데, q를 단위구에 올리면
+        #   r = √((1−s)/2)·c_a + √((1+s)/2)·e 가 되어 ‖r_⊥‖이 커진다.
+        #   배정은 cos 기반이라 불변(§3.3 증명). 다만 예측은 바뀐다.
+        # split_head : z = W1·c + β·W2·r 로 head를 분리한다. 공유 W가
+        #   query 직교 방향의 사용을 제한하는지 본다. β와 W2 사이에
+        #   scale ambiguity가 생기지만 진단 실험이므로 감수한다.
+        self.r_normalize = bool(r_normalize)
+        self.split_head = bool(split_head)
+        self.dev_head_q = nn.Linear(embed_dim, n_output, bias=False) \
+            if self.split_head else None
+        assert w2_norm_mode in ("free", "match_w1"), w2_norm_mode
+        if w2_norm_mode == "match_w1" and not self.split_head:
+            raise ValueError("w2_norm_mode='match_w1'은 split_head=True에서만 "
+                             "의미가 있습니다 (W2가 없으면 묶을 대상이 없음).")
+        self.w2_norm_mode = w2_norm_mode
+        self.beta_fixed = None if beta_fixed is None else float(beta_fixed)
+        self.no_partition = bool(no_partition)
+        assert pred_mode in ("current", "raw_interp", "scaled_interp",
+                             "bounded_distance"), pred_mode
+        self.pred_mode = pred_mode
+        self.q_scale_decay = float(q_scale_decay)
+        self.q_scale_warmup = int(q_scale_warmup)
+        # ‖q‖의 running median. mean은 heavy-tailed ‖q‖에서 큰 값에 끌린다.
+        # ⚠ 현재 batch의 median을 그 batch의 forward에 쓰지 않는다 —
+        #   같은 x의 예측이 batch 구성에 의존하면 설명의 h−c도 batch마다 변한다.
+        #   순서: (1) 기존 s로 forward → (2) backward → (3) detached q로 s 갱신.
+        # eval에서는 갱신하지 않고 freeze.
+        self.register_buffer("q_scale", torch.ones(()))
+        self.register_buffer("q_scale_steps", torch.zeros((), dtype=torch.long))
+        assert tau_mode in ("running_median", "fixed"), tau_mode
+        self.tau_mode = tau_mode
+        self.register_buffer("tau", torch.tensor(float(tau_value)))
+        if self.no_partition and (split_head or r_normalize
+                                  or w2_norm_mode != "free" or beta_fixed is not None):
+            raise ValueError("no_partition=True 는 correction ablation 플래그와 "
+                             "함께 쓸 수 없습니다 (correction 경로 자체가 없음).")
         # Starts at sigma(-2.197) ~ 0.1. beta must be learned: fixing it
         # collapses wherever W*c cannot reach every class (section 12-6).
         self.dev_beta_raw = nn.Parameter(torch.tensor([-2.197]))
+
+    # ─────────────────────────────────────────────────────────
+    def effective_W2(self) -> torch.Tensor:
+        """forward가 실제로 쓰는 correction head 가중치.
+
+        w2_norm_mode="match_w1" 이면
+            W2 = α · W̃2/‖W̃2‖_F,   α = stopgrad(‖W1‖_F)
+        방향만 학습되고 scale은 W1에 묶인다. α의 detach가 핵심 — 걸지 않으면
+        W1을 줄여 W2 scale을 낮추는 우회 gradient path가 생긴다.
+        진단은 반드시 이 함수를 통해 W2를 읽어야 한다.
+        """
+        if not self.split_head:
+            return self.dev_head.weight
+        W2 = self.dev_head_q.weight
+        if self.w2_norm_mode == "match_w1":
+            alpha = self.dev_head.weight.norm().detach()
+            W2 = alpha * W2 / W2.norm().clamp_min(1e-12)
+        return W2
+
+    def effective_beta(self) -> torch.Tensor:
+        return (torch.sigmoid(self.dev_beta_raw) if self.beta_fixed is None
+                else torch.full_like(self.dev_beta_raw, self.beta_fixed))
 
     # ─────────────────────────────────────────────────────────
     @staticmethod
@@ -1267,6 +1370,21 @@ class TabERA(nn.Module):
         # 1. Embed
         query_emb = self.embedder(X)                                   # (B, D)
 
+        # [Phase 3-i] no_partition: 인코더까지는 완전히 동일하고 그 이후만 분기.
+        # routing / prototype / retrieval 을 전부 우회하고 z = W·q + b 로 간다.
+        if self.no_partition:
+            logits = self.dev_head(query_emb)
+            return {
+                "logits": logits,
+                "query_emb": query_emb,
+                "context_emb": query_emb,      # 파티션이 없으므로 q 자신
+                "centroid_id": torch.zeros(len(X), dtype=torch.long,
+                                           device=query_emb.device),
+                "routing": None, "topk_idx": None, "neighbor_mask": None,
+                "aux_loss": torch.zeros((), device=query_emb.device),
+                "dev_diag": {}, "no_partition": True,
+            }
+
         # 2. Route: one assignment fixes both the prediction baseline and G(a)
         context_emb, hard_assignment, routing_probs, _, _, top1_confidence = \
             self.prototype_layer(query_emb)
@@ -1292,23 +1410,87 @@ class TabERA(nn.Module):
                                          device=X.device)
 
         # 4. Predict
-        _beta  = torch.sigmoid(self.dev_beta_raw)
-        _dev   = query_emb - context_emb
-        _dev_n = F.normalize(_dev, dim=-1)
-        _h     = context_emb + _beta * _dev_n
-        logits = self.dev_head(_h)
+        _beta = (torch.sigmoid(self.dev_beta_raw) if self.beta_fixed is None
+                 else torch.full_like(self.dev_beta_raw, self.beta_fixed))
+        # [ablation] r_normalize: q를 단위구에 올린 뒤 변위를 잡는다.
+        _q_eff = F.normalize(query_emb, dim=-1) if self.r_normalize else query_emb
+
+        _geo: Dict[str, torch.Tensor] = {}
+        if self.pred_mode == "current":
+            _dev_n = F.normalize(_q_eff - context_emb, dim=-1)
+            _h = context_emb + _beta * _dev_n
+            _corr_dir, _corr_mag = _dev_n, _beta.expand(len(_q_eff))
+        elif self.pred_mode == "raw_interp":                       # D′
+            _v = _q_eff - context_emb
+            _h = context_emb + _beta * _v
+            _d = _v.norm(dim=-1)
+            _corr_dir = _v / _d.clamp_min(1e-8).unsqueeze(-1)
+            _corr_mag = _beta * _d
+        else:                                                       # D″ / D‴
+            _qb = _q_eff / self.q_scale.clamp_min(1e-8)
+            _v = _qb - context_emb
+            _d = _v.norm(dim=-1)
+            _corr_dir = _v / _d.clamp_min(1e-8).unsqueeze(-1)
+            if self.pred_mode == "scaled_interp":                   # D″
+                _h = context_emb + _beta * _v
+                _corr_mag = _beta * _d
+            else:                                                   # D‴
+                _g = torch.tanh(_d / self.tau.clamp_min(1e-6))
+                _corr_mag = _beta * _g
+                _h = context_emb + _corr_mag.unsqueeze(-1) * _corr_dir
+                _geo["g_d"] = _g
+            _geo["d"] = _d
+            _geo["q_bar_norm"] = _qb.norm(dim=-1)
+        _dev_n = _corr_dir
+        _geo["delta"] = (_h - context_emb).norm(dim=-1)
+        _geo["q_norm"] = query_emb.norm(dim=-1)
+
+        if self.split_head:
+            logits = self.dev_head(context_emb) + \
+                (_corr_mag.unsqueeze(-1) * F.linear(_corr_dir, self.effective_W2()))
+        else:
+            logits = self.dev_head(_h)
+
+        # running median 갱신은 forward **이후**, detached q로만. eval에서는 안 함.
+        if self.training:
+            with torch.no_grad():
+                m = query_emb.detach().norm(dim=-1).median()
+                warm = int(self.q_scale_steps) < self.q_scale_warmup
+                dec = self.q_scale_decay
+                if warm:
+                    self.q_scale.copy_(m)          # warmup: 직접 대입
+                else:                              # 학습 후 ‖q‖가 초기값과 크게
+                    self.q_scale.mul_(dec).add_(m, alpha=1 - dec)  # 다르므로 필요
+                if (self.pred_mode == "bounded_distance"
+                        and self.tau_mode == "running_median" and "d" in _geo):
+                    dm = _geo["d"].detach().median().clamp_min(1e-6)
+                    if warm:
+                        self.tau.copy_(dm)
+                    else:
+                        self.tau.mul_(dec).add_(dm, alpha=1 - dec)
+                self.q_scale_steps += 1
 
         # 5. Decomposition diagnostics. The logit decomposition is the ground
         #    truth: what the prototype said and how much the correction moved
         #    it is observed directly, on every forward, without retraining.
-        with torch.no_grad():
+        # [Step 1] eval 전용으로 변경. 학습 중에는 (a) float() 호출이 배치마다
+        # GPU sync를 강제하고, (b) context_dropout>0 ablation 시 손상된 c 기준
+        # 값이라 어차피 해석 불가하므로 계산하지 않는다. 소비는
+        # scripts/step0_diagnose.py의 eval pass가 담당한다.
+        _diag: Dict[str, float] = {}
+        if self.training:
+            pass
+        else:
+         with torch.no_grad():
             _lg_c = self.dev_head(context_emb)          # W*c + b, prototype only
             _diag = {
                 "dev_beta": float(_beta),
                 "dev_residual_ratio": float(
-                    (_beta * _dev_n).norm(dim=-1).mean()
+                    _geo["delta"].mean()
                     / context_emb.norm(dim=-1).mean().clamp_min(1e-8)),
-                "dev_raw_norm": float(_dev.norm(dim=-1).mean()),
+                # 원래 _dev = q − c 였다. pred_mode마다 변위 정의가 다르므로
+                # 실제 correction 크기(‖h − c‖)를 기록한다.
+                "dev_raw_norm": float(_geo["delta"].mean()),
                 # W*c can produce at most P distinct predictions. When that
                 # count falls below the number of classes an accuracy ceiling
                 # appears, and only then does the beta term do any work
@@ -1358,6 +1540,8 @@ class TabERA(nn.Module):
             "query_emb":          query_emb,
             "context_emb":        context_emb,
             "dev_diag":           _diag,
+            "geo":                _geo,
+            "pred_mode":          self.pred_mode,
         }
 
         if return_explanations:

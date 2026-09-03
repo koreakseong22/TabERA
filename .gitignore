@@ -3,6 +3,9 @@ optim_logs/
 data_cache/
 eda_output/
 figures/
+diagnostics/
+reproduce_logs/
+scripts/
 
 # Python
 __pycache__/

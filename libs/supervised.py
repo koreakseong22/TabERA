@@ -1194,6 +1194,152 @@ class TabERAWrapper:
             "null_margin_mean":  null_margin_mean,
         }
 
+    # ── Post-training readout refinement ─────────────────────
+
+    def refine_readout(
+        self,
+        X_train: torch.Tensor,
+        y_train: torch.Tensor,
+        X_val: torch.Tensor,
+        y_val: torch.Tensor,
+        lr: float = 1e-2,
+        weight_decay: float = 0.0,
+        epochs: int = 500,
+        patience: int = 50,
+        include_null: bool = True,
+    ) -> dict:
+        """Refit the linear readout on the frozen final representation.
+
+        This is a **post-training procedure**, not part of the forward
+        definition and not a hyperparameter search dimension. The encoder,
+        the centroids, the routing and beta are all frozen; only the shared
+        readout (W, b) moves. Therefore
+
+            z = (W c_a + b) + beta * W r
+
+        remains an exact additive decomposition of the logits, and the
+        bounded anchoring ||h - c_a|| = beta < 1 = ||c_a|| is untouched.
+
+        Why: on one diagnostic dataset (kc1) the jointly trained readout
+        reached AUROC 0.473 while a linear probe on the same frozen h reached
+        0.819. Refitting W, b recovered about 90% of that gap. Across the
+        eight diagnostic datasets the change was +0.31 AUROC there and at
+        worst -0.007 elsewhere, which met the pre-registered
+        non-degradation criterion.
+
+        ``include_null`` puts the incoming (W_0, b_0) into the validation
+        early-stopping candidate set. Without it the first validation
+        measurement happens *after* an optimizer step, so the procedure
+        cannot fall back to "no refinement" even when refitting hurts on
+        validation. This guarantees CE_val(selected) <= CE_val(original);
+        it does **not** guarantee test AUROC non-degradation, so per-dataset
+        deltas must be reported.
+
+        Returns metadata for auditing (null_selected, selected_epoch,
+        val_loss_before/after, ...).
+        """
+        head = self.model.dev_head
+        W0 = head.weight.detach().clone()
+        b0 = head.bias.detach().clone()
+        criterion = get_criterion(self.tasktype)
+        binary = self.tasktype == "binclass"
+
+        # Freeze everything, harvest the final h once.
+        self.model.eval()
+        was_grad = {n: p.requires_grad for n, p in self.model.named_parameters()}
+        for p_ in self.model.parameters():
+            p_.requires_grad_(False)
+
+        bs = self.params.get("batch_size", 512)
+        try:
+            return self._refine_readout_inner(
+                X_train, y_train, X_val, y_val, W0, b0, criterion, binary,
+                bs, lr, weight_decay, epochs, patience, include_null)
+        finally:
+            # identity guard 등에서 예외가 나도 원래 상태로 되돌린다.
+            for n, p_ in self.model.named_parameters():
+                p_.requires_grad_(was_grad.get(n, True))
+
+    def _refine_readout_inner(self, X_train, y_train, X_val, y_val, W0, b0,
+                              criterion, binary, bs, lr, weight_decay,
+                              epochs, patience, include_null):
+        head = self.model.dev_head
+
+        @torch.no_grad()
+        def _h(X):
+            beta = self.model.effective_beta()
+            outs = []
+            for st in range(0, len(X), bs):
+                o = self.model(X[st:st + bs])
+                ce_ = o["context_emb"]
+                q = o["query_emb"]
+                if getattr(self.model, "r_normalize", False):
+                    q = F.normalize(q, dim=-1)
+                outs.append(ce_ + beta * F.normalize(q - ce_, dim=-1))
+            return torch.cat(outs, 0)
+
+        h_tr, h_va = _h(X_train), _h(X_val)
+        # The reconstructed h must be the one the forward pass actually used.
+        with torch.no_grad():
+            z_ref = self._forward_batched(X_val)
+            err = float((F.linear(h_va, W0, b0) - z_ref).abs().max())
+        if err > 1e-4:
+            raise RuntimeError(
+                f"refine_readout: reconstructed h disagrees with forward "
+                f"(max|delta|={err:.2e}); the refinement would not act on the "
+                f"representation the model actually predicts from.")
+
+        def _ce(W, b, H, Y):
+            z = F.linear(H, W, b)
+            return (criterion(z.squeeze(-1), Y.float()) if binary
+                    else criterion(z, Y.long()))
+
+        W = W0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        opt = torch.optim.AdamW([{"params": [W, b],
+                                  "weight_decay": weight_decay}], lr=lr)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+        with torch.no_grad():
+            vl0 = float(_ce(W0, b0, h_va, y_val))
+        best, state, sel_ep, bad = float("inf"), None, -1, 0
+        if include_null:
+            best, state, sel_ep = vl0, (W0.clone(), b0.clone()), 0
+
+        ep = -1
+        for ep in range(epochs):
+            opt.zero_grad()
+            _ce(W, b, h_tr, y_train).backward()
+            opt.step(); sch.step()
+            with torch.no_grad():
+                vl = float(_ce(W, b, h_va, y_val))
+            if vl < best - 1e-6:
+                best, sel_ep, bad = vl, ep + 1, 0
+                state = (W.detach().clone(), b.detach().clone())
+            else:
+                bad += 1
+                if bad >= patience:
+                    break
+
+        if state is not None:
+            with torch.no_grad():
+                head.weight.copy_(state[0]); head.bias.copy_(state[1])
+
+        info = {
+            "enabled": True, "lr": lr, "weight_decay": weight_decay,
+            "max_epochs": epochs, "patience": patience,
+            "include_null": include_null,
+            "null_selected": bool(include_null and sel_ep == 0),
+            "selected_epoch": int(sel_ep), "epochs_run": int(ep + 1),
+            "val_loss_before": vl0, "val_loss_after": float(best),
+            "W_fro_before": float(W0.norm()),
+            "W_fro_after": float(head.weight.detach().norm()),
+        }
+        print(f"  [readout refine] val CE {vl0:.5f} -> {best:.5f}  "
+              f"epoch={sel_ep}/{ep + 1}  null={'yes' if info['null_selected'] else 'no'}"
+              f"  ||W|| {info['W_fro_before']:.3f} -> {info['W_fro_after']:.3f}")
+        return info
+
     # ── predict ─────────────────────────────────────────────
 
     @torch.no_grad()

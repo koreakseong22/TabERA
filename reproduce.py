@@ -1436,10 +1436,38 @@ def print_calibration_analysis(result: dict) -> None:
 
 
 
+REFINE_V1 = dict(lr=1e-2, wd=0.0, epochs=500, patience=50, null=True)
+
+
+def _readout_refine_tag(args) -> str:
+    """Filename tag for the post-training readout refinement.
+
+    The final benchmark uses exactly one setting (REFINE_V1), tagged
+    ``..readoutRefineV1``. Any other combination gets its values spelled out
+    so two settings can never write to the same file -- the CLI exposes
+    --refine_lr / --refine_wd / --refine_epochs / --refine_patience /
+    --refine_no_null, and without this an lr=1e-2 run and an lr=1e-3 run
+    would overwrite each other.
+    """
+    if not getattr(args, "final_readout_refine", False):
+        return ""
+    cur = dict(lr=args.refine_lr, wd=args.refine_wd, epochs=args.refine_epochs,
+               patience=args.refine_patience, null=not args.refine_no_null)
+    if cur == REFINE_V1:
+        return "..readoutRefineV1"
+    t = "..readoutRefine"
+    if cur["lr"] != REFINE_V1["lr"]:            t += f"_lr{cur['lr']:g}"
+    if cur["wd"] != REFINE_V1["wd"]:            t += f"_wd{cur['wd']:g}"
+    if cur["epochs"] != REFINE_V1["epochs"]:    t += f"_ep{cur['epochs']}"
+    if cur["patience"] != REFINE_V1["patience"]: t += f"_pat{cur['patience']}"
+    if not cur["null"]:                          t += "_noNull"
+    return t
+
+
 def run_single_seed(
     dataset, X_train, y_train, X_val, y_val, X_test, y_test, y_std,
     output_dim, tasktype, openml_id, dataset_info, device, log_dir, env_info,
-    args, train_seed, do_analysis,
+    args, train_seed, do_analysis, study_dir=None,
 ):
     """Train, evaluate and optionally analyse for one train_seed, given a
     dataset and HPO study that are both independent of train_seed and loaded
@@ -1483,6 +1511,9 @@ def run_single_seed(
     # ⚠ Tags for removed components (fusion_mode / L_nbr / aggregator /
     #   retr_proj ...) are absent; those outputs come from
     #   legacy/v3ema2_full/.
+    # final benchmark 는 V1 설정 하나만 쓴다. 다른 설정으로 돌리면 파일명이
+    # 갈라져서 서로 덮어쓰지 않는다 (lr=1e-2/null 과 lr=1e-3/noNull 이 같은
+    # 파일을 쓰던 문제).
     _save_tag = (f"..k{args.k_override}" if args.k_override is not None else "") \
               + ("..allowSelfRet" if args.allow_self_retrieval else "") \
               + ("..cat_concat" if args.cat_combine == "concat" else "") \
@@ -1498,6 +1529,7 @@ def run_single_seed(
               + ("..nodr" if args.disable_dead_reinit else "") \
               + (f"..drp{args.dead_reinit_patience_override}" if args.dead_reinit_patience_override is not None else "") \
               + (f"..drn{args.dead_reinit_noise_scale_override:g}" if args.dead_reinit_noise_scale_override is not None else "") \
+              + _readout_refine_tag(args) \
               + (f"..trainseed{train_seed}" if train_seed != args.seed else "") \
               + ("..deterministic" if args.deterministic else "") \
               + (f"..{args.run_tag}" if args.run_tag is not None else "")
@@ -1606,7 +1638,11 @@ def run_single_seed(
             # 본 실험 study 는 태그가 없으므로 기본값 None 이 맞다.
             batch_size=args.study_batch_size,
         )
-        fname = os.path.join(log_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
+        # [--params_seed] study 는 params_seed 폴더에서 읽고, 산출물은 현재
+        # seed 폴더(log_dir)에 쓴다. log_dir 를 통째로 바꾸면 fold-2 결과가
+        # seed-1 폴더에 섞여 충돌한다.
+        _study_dir = study_dir or log_dir
+        fname = os.path.join(_study_dir, f"data={openml_id}{_study_tag}..model=tabera.pkl")
         if not os.path.exists(fname):
             _hint_flags = ""
             if args.num_embedding != "ple":
@@ -1650,6 +1686,23 @@ def run_single_seed(
                   f"get_batch_size(len(X_train))={_bs_actual} 로 재계산합니다.")
         best_params.setdefault("batch_size", int(_bs_actual))
         print(f"  Params: {best_params}")
+        # [--params_seed] P 와 batch_size 는 HPO 가 고른 값이 아니라
+        # 프로토콜 규칙(P=floor(sqrt(N_train)), get_batch_size(N_train))에서
+        # 나온다. 다른 fold 의 study 를 쓰면 두 값이 현재 fold 규칙과
+        # 어긋날 수 있으므로 확인한다. KFold 라 보통 같다.
+        if study_dir is not None and study_dir != log_dir:
+            _P_rule = int(len(X_train) ** 0.5)
+            _B_rule = int(get_batch_size(len(X_train)))
+            _P_used, _B_used = int(best_params["n_prototypes"]), int(best_params["batch_size"])
+            print(f"  [params_seed] protocol rule for this fold: "
+                  f"P={_P_rule} B={_B_rule}  |  loaded: P={_P_used} B={_B_used}")
+            if (_P_used, _B_used) != (_P_rule, _B_rule) and not args.allow_pb_mismatch:
+                raise RuntimeError(
+                    f"[params_seed] P/batch_size mismatch: loaded (P={_P_used}, "
+                    f"B={_B_used}) vs this fold's protocol rule (P={_P_rule}, "
+                    f"B={_B_rule}). 이 둘은 HPO 로 고른 값이 아니라 N_train 에서 "
+                    f"유도되는 값이므로, 다른 fold 의 값을 그대로 쓰면 프로토콜이 "
+                    f"어긋납니다. --allow_pb_mismatch 로 강행할 수 있습니다.")
 
         # PLE bin edges come from the train split only, to avoid leakage.
         num_bin_edges = None
@@ -1954,6 +2007,41 @@ def run_single_seed(
         wrapper.fit(X_train, y_train, X_val, y_val)
         _fit_time = time.time() - _fit_st
 
+    # ── Post-training readout refinement ──────────────────
+    # Frozen-h refit of the shared linear readout. Not a hyperparameter
+    # search dimension: lr / wd / epochs / patience / null-inclusion are all
+    # fixed here and are never re-selected per dataset. The encoder, the
+    # centroids, the routing and beta do not move, so
+    #     z = (W c_a + b) + beta * W r
+    # stays an exact decomposition of the logits.
+    _refine_info = {"enabled": False}
+    _refine_time = 0.0
+    if getattr(args, "final_readout_refine", False):
+        if tasktype == "regression":
+            print("  [readout refine] skipped (regression)")
+        else:
+            _rst = time.time()
+            # Raw predictions are recorded first for the ablation row. The
+            # main benchmark uses the refined model, fixed in advance; the raw
+            # numbers are for auditing, never for picking between the two.
+            _raw_preds_test = wrapper.predict(X_test)
+            _raw_probs_test = wrapper.predict_proba(X_test)
+            _refine_info = wrapper.refine_readout(
+                X_train, y_train, X_val, y_val,
+                lr=args.refine_lr, weight_decay=args.refine_wd,
+                epochs=args.refine_epochs, patience=args.refine_patience,
+                include_null=not args.refine_no_null,
+            )
+            _refine_info["raw_test_metrics"] = calculate_metric(
+                y_test, _raw_preds_test, _raw_probs_test, tasktype, "test")
+            _refine_time = time.time() - _rst
+    # 최종 procedure 가 refinement 를 포함하므로 보고 시간도 합쳐야 공정하다.
+    _base_fit_time = _fit_time
+    _fit_time = _base_fit_time + _refine_time
+    _refine_info["base_fit_time"] = float(_base_fit_time)
+    _refine_info["readout_refine_time"] = float(_refine_time)
+    _refine_info["total_fit_time"] = float(_fit_time)
+
     # ── Evaluate ──────────────────────────────────────────
     preds_val  = wrapper.predict(X_val)
     preds_test = wrapper.predict(X_test)
@@ -1995,8 +2083,14 @@ def run_single_seed(
         _mt_dir = os.path.join(args.savepath, 'reproduce_logs',
                                f'seed={args.seed}', f'data={openml_id}')
         os.makedirs(_mt_dir, exist_ok=True)
+        # ⚠ 이 경로에는 원래 refinement 여부가 들어가지 않아 refined run 이
+        #   raw 결과를 덮어썼다. 최종 TabERA 가 refinement 를 포함하므로
+        #   'model=tabera' 는 최종(refined) 결과로 두고, raw 는 별도 이름으로
+        #   같이 남겨 ablation 을 보존한다.
+        _mt_variant = ""
         _mt_fname = os.path.join(
-            _mt_dir, 'model=tabera..init_hps=False..deep=0..hyper=0.npy')
+            _mt_dir, f'model=tabera{_mt_variant}'
+                     '..init_hps=False..deep=0..hyper=0.npy')
         _to_np = lambda t: (t.detach().cpu().numpy()
                             if isinstance(t, torch.Tensor) else
                             (None if t is None else np.asarray(t)))
@@ -2008,8 +2102,24 @@ def run_single_seed(
             # TabERA 전용 추가 정보. MultiTab 쪽에는 없으므로 집계 시 무시된다.
             "Performance_val": {k: float(v) for k, v in val_metrics.items()},
             "best_params": best_params,
+            "readout_refinement": _refine_info,
         })
         print(f"  saved: {_mt_fname}")
+        # raw(refinement 직전) 결과를 별도 이름으로 보존한다. ablation/audit 용
+        # 이며 model selection 에는 절대 쓰지 않는다.
+        if _refine_info.get("enabled") and _refine_info.get("raw_test_metrics"):
+            _raw_fname = os.path.join(
+                _mt_dir, 'model=tabera_raw..init_hps=False..deep=0..hyper=0.npy')
+            np.save(_raw_fname, {
+                "Prediction":  _to_np(_raw_preds_test),
+                "Probability": _to_np(_raw_probs_test),
+                "time":        float(_refine_info["base_fit_time"]),
+                "Performance": {k: float(v) for k, v
+                                in _refine_info["raw_test_metrics"].items()},
+                "best_params": best_params,
+                "note": "pre-refinement TabERA. ablation only, not for selection.",
+            })
+            print(f"  saved: {_raw_fname}")
     except Exception as _e:
         print(f"  !  reproduce_logs 저장 실패: {type(_e).__name__}: {_e}")
 
@@ -2203,6 +2313,7 @@ def run_single_seed(
         "openml_id":   openml_id,
         "tasktype":    tasktype,
         "best_params": best_params,
+        "readout_refinement": _refine_info,
         "val_metrics": val_metrics,
         "test_metrics":test_metrics,
         "seed":        args.seed,
@@ -2358,6 +2469,7 @@ def run_single_seed(
         "state_dict":     model.state_dict(),
         "model_kwargs":   model_kwargs,
         "best_params":    best_params,
+        "readout_refinement": _refine_info,
         "sample_groups":  model.prototype_layer.sample_groups,
         "group_labels":   model.prototype_layer.group_labels,
         "target_labels":  model.prototype_layer.target_labels,
@@ -2631,6 +2743,36 @@ def main():
                               "is omitted -- the rules need reading once, and 14 samples of it exceed 100 lines."))
     parser.add_argument("--explain",   action="store_true",
                         help="print the feature explanation after training")
+    parser.add_argument("--final_readout_refine", action="store_true",
+                        help=(
+                            "학습 후 frozen-h 상태에서 shared readout(W,b)만 "
+                            "다시 적합한다. HPO 축이 아니라 고정된 post-training "
+                            "procedure 다 — lr/wd/epochs/patience/null 포함 여부를 "
+                            "dataset 마다 다시 고르지 않는다. encoder·centroid·"
+                            "routing·beta 는 움직이지 않으므로 "
+                            "z=(Wc_a+b)+beta*Wr 분해가 그대로 유지된다. "
+                            "출력 파일에는 ..readoutRefine 태그가 붙어 raw 결과를 "
+                            "덮어쓰지 않는다."))
+    parser.add_argument("--refine_lr", type=float, default=1e-2)
+    parser.add_argument("--refine_wd", type=float, default=0.0)
+    parser.add_argument("--refine_epochs", type=int, default=500)
+    parser.add_argument("--refine_patience", type=int, default=50)
+    parser.add_argument("--refine_no_null", action="store_true",
+                        help="null candidate(W0,b0) 를 val 후보에서 제외. 기본은 포함")
+    parser.add_argument("--params_seed", type=int, default=None,
+                        help=(
+                            "HPO study 를 어느 seed 폴더에서 읽을지만 정한다. "
+                            "--seed 는 data fold 와 training RNG 를 정하고, "
+                            "--params_seed 는 hyperparameter 출처만 바꾼다. "
+                            "예: --seed 2 --params_seed 1 → fold 2 데이터에 "
+                            "seed-1 이 고른 config 로 재학습. 산출물은 "
+                            "optim_logs/seed=2 에 저장된다. "
+                            "mechanism diagnostic 에서 fold 마다 HPO 를 다시 하면 "
+                            "hyperparameter 선택 차이가 섞이므로, config 를 고정하고 "
+                            "fold 만 바꾸는 쪽이 더 강한 confirmation 이다."))
+    parser.add_argument("--allow_pb_mismatch", action="store_true",
+                        help=("--params_seed 사용 시 P/batch_size 가 현재 fold 의 "
+                              "프로토콜 규칙과 달라도 진행한다. 기본은 중단."))
     parser.add_argument("--from_saved_state", type=str, default=None,
                         help=(
                             "give the *_model_state.pt path saved by an earlier run to "
@@ -2923,7 +3065,12 @@ def main():
               f"use_deterministic_algorithms(True, warn_only={args.deterministic_warn_only})"
               + (f" -- CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG', '(unset!)')}"
                  if torch.cuda.is_available() else " (no CUDA; on CPU most operations are deterministic anyway)"))
-    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+    # ⚠ 위(파일 상단)에서 CUDA_VISIBLE_DEVICES=args.gpu_id 를 이미 설정했다.
+    #   그러면 이 프로세스에는 그 물리 GPU 하나만 보이고 논리 인덱스는 항상 0 이다.
+    #   여기서 cuda:{args.gpu_id} 를 요청하면 --gpu_id 1 일 때
+    #   "invalid device ordinal" 로 죽는다. --gpu_id 는 물리 GPU 선택용이고
+    #   내부 device 는 언제나 cuda:0 이다.
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     import platform
     env_info = "{0}:{1}".format(platform.node(), args.gpu_id)
     print(env_info, device)
@@ -2959,6 +3106,20 @@ def main():
         log_dir = os.path.join(args.savepath, "optim_logs", f"seed={args.seed}")
     else:
         log_dir = args.savepath
+    # 산출물 폴더가 없으면 만든다. 평소에는 optimize.py 가 study 를 쓰면서
+    # 이미 만들어 두므로 no-op 이지만, --params_seed 로 study 를 다른 seed
+    # 폴더에서 읽으면 현재 seed 폴더가 존재하지 않는다.
+    os.makedirs(log_dir, exist_ok=True)
+
+    # [--params_seed] study 출처만 분리. 산출물 경로(log_dir)는 그대로 둔다.
+    if args.params_seed is not None and args.params_seed != args.seed:
+        if args.savepath.endswith("optim_logs"):
+            raise ValueError("--params_seed 는 --savepath 가 optim_logs 로 끝나는 "
+                             "형태에서는 seed 폴더를 분리할 수 없습니다.")
+        study_dir = os.path.join(args.savepath, "optim_logs", f"seed={args.params_seed}")
+        print(f"  [params_seed] study 출처: {study_dir}  |  산출물: {log_dir}")
+    else:
+        study_dir = log_dir
 
     # --train_seeds support: like optimize.py, the dataset and study load once
     # in main() and only run_single_seed() repeats per seed. The training,
@@ -2994,7 +3155,7 @@ def main():
         result = run_single_seed(
             dataset, X_train, y_train, X_val, y_val, X_test, y_test, y_std,
             output_dim, tasktype, openml_id, dataset_info, device, log_dir, env_info,
-            args, _ts, do_analysis,
+            args, _ts, do_analysis, study_dir=study_dir,
         )
         results.append(result)
 

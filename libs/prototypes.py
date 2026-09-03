@@ -375,6 +375,11 @@ class CentroidLayer(nn.Module):
                                             # The literature says only "small
                                             # Gaussian noise"; 0.01 is unverified.
         dropout: float = 0.0,
+        # [Step 1 정합성 수정] context(=선택된 centroid)에 적용되던 dropout을
+        # encoder dropout에서 분리. 기본 0.0 — ‖c‖=1 단위구 전제를 학습 중에도
+        # 유지한다. dropout 인자는 하위호환을 위해 시그니처에 남기지만
+        # context에는 더 이상 쓰지 않는다(아래 context_dropout만 사용).
+        context_dropout: float = 0.0,
         col_names: Optional[List[str]] = None,
         use_ema_codebook: bool = False,
         ema_decay: float = 0.99,   # van den Oord et al. (2017), Appendix, and
@@ -492,7 +497,10 @@ class CentroidLayer(nn.Module):
         # ── Labels ────────────────────────────────────────────
         self.labels = prototype_labels or [f"Centroid_{i}" for i in range(n_prototypes)]
 
-        self.dropout = nn.Dropout(dropout)
+        # [Step 1] context dropout은 기하 객체 c_a를 직접 변형하므로 encoder
+        # dropout(dropout 인자)과 분리한다. 기본 0.0 = train/eval에서 동일한
+        # correction geometry(r = normalize(q − c), ‖c‖=1)를 보장.
+        self.dropout = nn.Dropout(context_dropout)
 
         # ── State for the stability diagnostics ─────────────────
         # Observation variables used to check whether centroid drift -- the
