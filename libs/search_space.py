@@ -52,7 +52,7 @@ through a CLI default. Change this one place and both sides follow.
 # Protocol version tag
 # ─────────────────────────────────────────────────────────────
 
-PROTOCOL_TAG = "..mtsplit"
+PROTOCOL_TAG = "..mtsplit2"
 """Tag marking the benchmark protocol a study was produced under.
 
 Bump this whenever a change makes old studies incomparable to new ones, so
@@ -61,13 +61,21 @@ protocol. Without it, optimize.py finds the existing .pkl, computes
 `remaining_trials = max(0, 100 - 100) = 0`, runs no trial at all, and
 rewrites the CSV from the *old* trials -- no error, no new results.
 
-"..mtsplit" (2026-08) marks the run where three things were aligned to
+"..mtsplit" (2026-08) marked the run where three things were aligned to
 MultiTab at once:
   * split      : StratifiedKFold -> KFold(10, shuffle=True, random_state=42)
   * batch size : fixed 256 -> get_batch_size(len(X_train))
   * objective  : penalised acc_val -> plain acc_val
-Studies without this tag came from a different protocol and must not be
-mixed in, resumed, or compared against.
+
+"..mtsplit2" (2026-09) keeps all of the above and additionally fixes the EMA
+write ordering: centroid_emb is no longer mutated inside TabERA.forward();
+TabERAWrapper applies ema_update() only after loss.backward()/optimizer.step().
+This matters because the hard-STE context path uses
+`routing_probs @ centroid_emb`, whose backward must see the centroid values
+from the same forward pass.
+
+Studies from different protocol tags must not be mixed, resumed, or compared
+as if they came from the same training algorithm.
 """
 
 

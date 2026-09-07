@@ -1739,8 +1739,13 @@ class TabERA(nn.Module):
                 #   the slot indices 1:1 (asserted in refresh_memory_keys).
                 self._feature_store.update(X, sample_ids)
 
-        if self.training and self.prototype_layer.use_ema_codebook:
-            self.prototype_layer.ema_update(query_emb.detach(), hard_assignment)
+        # EMA is intentionally NOT applied inside forward().  The hard-STE
+        # routing path computes context_emb = routing_probs @ centroid_emb, so
+        # backward needs the centroid values from this forward.  Mutating
+        # centroid_emb here (before loss.backward()) makes the STE encoder
+        # gradient depend on the *next* EMA centroid instead.  TabERAWrapper
+        # applies ema_update() after backward/optimizer.step(), using the
+        # detached query_emb and hard_assignment returned below.
 
         # 7. Auxiliary losses
         # ⚠ Always zero. The EMA replaces the codebook update, commitment was

@@ -422,14 +422,13 @@ class TabERAWrapper:
     ) -> None:
         criterion  = get_criterion(self.tasktype)
 
-        # centroid_emb is not excluded from weight decay. It follows the
-        # ArcFace / CosFace convention instead: a parameter used through a
-        # normalisation is not exempted from decay but reprojected to norm 1
-        # after every step. With that, weight decay can stay on as usual and
-        # the centroid directions do not wander. Routing only ever uses
-        # F.normalize(centroid_emb), so keeping the raw parameter on the unit
-        # sphere is the consistent choice. The reprojection happens right
-        # after optimizer.step() in the training loop below.
+        # centroid_emb is an nn.Parameter for state_dict compatibility, but
+        # under the default EMA codebook it has requires_grad=False and is
+        # therefore excluded from AdamW entirely.  In the non-EMA ablation it
+        # is trainable and is reprojected to the unit sphere after each step.
+        # The training loop below also performs the EMA write only *after*
+        # loss.backward(), so the hard-STE backward sees the same centroid
+        # values that were used by the corresponding forward pass.
         centroid_param = self.model.prototype_layer.centroid_emb
 
         # Profiling showed AdamW.step() as a larger single cost than the whole
@@ -679,10 +678,26 @@ class TabERAWrapper:
                         self._beta_grad_signed += float(_bp.grad.sum())
                         self._beta_grad_n += 1
                 optimizer.step()
+
+                # EMA codebook update MUST happen after backward.  In the
+                # hard-STE route, context_emb = routing_probs @ centroid_emb;
+                # backward with respect to routing_probs needs the centroid
+                # values from this exact forward.  Updating centroid_emb inside
+                # TabERA.forward() used to overwrite that storage before
+                # loss.backward(), silently changing the encoder gradient.
+                # query_emb / centroid_id are from the just-finished forward
+                # and are detached explicitly: EMA itself carries no gradient.
+                if (self.model.prototype_layer.use_ema_codebook
+                        and not out.get("no_partition", False)):
+                    self.model.prototype_layer.ema_update(
+                        out["query_emb"].detach(),
+                        out["centroid_id"].detach(),
+                    )
+
                 # CosFace convention: reproject centroid_emb to unit norm
-                # after every step. Weight decay then only affects direction,
-                # since the magnitude is reset to 1 each time, so routing
-                # cannot destabilise through a norm collapse.
+                # after every step. Under EMA this is redundant because
+                # ema_update() already normalises, but keeping the invariant
+                # here also covers the non-EMA ablation path.
                 with torch.no_grad():
                     centroid_param.data = F.normalize(centroid_param.data, dim=-1)
 
