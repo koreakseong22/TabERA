@@ -52,7 +52,7 @@ through a CLI default. Change this one place and both sides follow.
 # Protocol version tag
 # ─────────────────────────────────────────────────────────────
 
-PROTOCOL_TAG = "..mtsplit2"
+PROTOCOL_TAG = "..mtsplit3"
 """Tag marking the benchmark protocol a study was produced under.
 
 Bump this whenever a change makes old studies incomparable to new ones, so
