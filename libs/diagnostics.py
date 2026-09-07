@@ -27,7 +27,8 @@ So forward emits prediction state only, and all interpretation happens here.
 neighbour embeddings  memory.keys[topk_idx]                  = keys_full[idx] in retrieve()
 neighbour similarity  normalize(query_emb) . normalize(above) = the same expression retrieve() uses
 neighbour labels      memory.labels[topk_idx]
-logit_dev             logits - dev_head(context_emb)          = W.(beta*r), bias cancels
+logit_dev             logits - dev_head(γ·context_emb)        = W_eff.d, bias cancels  (W_eff = γ·W, γ=1 legacy)
+correction d          out["correction"]                       = h - c, as forward applied it
 ```
 **Validity alone cannot be reconstructed**: a slot retrieval failed to fill has
 `topk_idx = 0`, which is indistinguishable from "neighbour 0" outside the model.
@@ -287,16 +288,22 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
 
     ⚠ This decomposition is an **identity, not an approximation**. dev_head
       is a single nn.Linear(embed_dim, n_output), so
-          logits = W.(c + d) + b = (W.c + b) + W.d
+          logits = W_eff.(c + d) + b = (W_eff.c + b) + W_eff.d,   W_eff = γ·W
+      (γ = 1 in the legacy configuration; see model.effective_W())
       and the two terms always sum exactly to logits. The bias is absorbed
       into the first term and never mixes into W.d. This differs in kind from
       SHAP or IG, which pick a baseline and approximate — here the structure
       is already additive and is simply written out.
 
-    ⚠ d is reconstructed with **literally the same expression** as forward.
-      Any separate approximation would make the explanation disagree with the
-      computation.
+    ⚠ d is **read from the forward pass**, never recomputed here:
+          d = out["correction"]                    # == h - c
+      Recomputing it duplicates the geometry in two places, and the two
+      silently diverge the moment a correction_geometry other than "additive"
+      is selected. The old expression here
           d = sigma(beta_raw) * normalize(q - c)
+      was already wrong for beta_fixed, r_normalize and every pred_mode other
+      than "current"; those combinations produced an explanation that did not
+      describe the computation, visible only as a non-zero residual.
 
     ⚠ `dim_contrib` indexes **embedding dimensions**, not features. The
       embedder is PLE/PLR + MLP + LayerNorm, so there is no path back from an
@@ -321,16 +328,33 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         return None
 
     q = q.detach(); c = c.detach(); lg = lg.detach()
-    beta = torch.sigmoid(model.dev_beta_raw.detach())
-    # This must be **literally the same expression** as forward. An
-    # approximation here would make the explanation disagree with the actual
-    # computation, and the disagreement would surface only as a non-zero
-    # residual (which the caller checks).
-    d = beta * F.normalize(q - c, dim=-1)
+    # Single source of truth: the correction the forward pass actually applied.
+    d = out.get("correction")
+    if d is not None:
+        d = d.detach()
+    else:
+        # Checkpoints and callers predating out["correction"]. Only the legacy
+        # geometry can be reconstructed, so refuse rather than describe the
+        # wrong thing: an explanation that disagrees with the prediction is
+        # worse than no explanation.
+        if (getattr(model, "correction_geometry", "additive") != "additive"
+                or getattr(model, "pred_mode", "current") != "current"):
+            return None
+        # effective_beta() 가 beta_fixed 와 beta_param 을 모두 처리한다.
+        beta = model.effective_beta().detach()
+        q_eff = (F.normalize(q, dim=-1)
+                 if getattr(model, "r_normalize", False) else q)
+        d = beta * F.normalize(q_eff - c, dim=-1)
 
-    W        = dev_head.weight.detach()          # (O, D)
-    lg_proto = dev_head(c)                       # (B, O) = W·c + b
-    lg_dev   = lg - lg_proto                     # (B, O) = W·d
+    # ⚠ Design Lock v1: forward 는 z = W(γh)+b 이므로 설명이 보는 head 는
+    #   W_eff = γW 이고 baseline 은 dev_head(γc) 다. dev_head.weight 와
+    #   dev_head(c) 를 직접 쓰면 γ≠1 에서 항등식이 조용히 깨진다. 모델 API 만
+    #   읽는다 (γ==1 이면 두 식은 legacy 와 동일).
+    _gamma   = model.effective_gamma() if hasattr(model, "effective_gamma") else 1.0
+    W        = (model.effective_W().detach() if hasattr(model, "effective_W")
+                else dev_head.weight.detach())  # (O, D) = γ·W
+    lg_proto = dev_head(c if _gamma == 1.0 else _gamma * c)   # (B, O) = W_eff·c + b
+    lg_dev   = lg - lg_proto                     # (B, O) = W_eff·d
 
     if lg.shape[-1] > 1:
         pred_m  = lg.argmax(dim=-1)
@@ -387,9 +411,13 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         lp = float(lgp_np[b, m])
         ld = float(lgd_np[b, m])
         result.append({
-            "dev_norm":       float(d_np[b]),      # ||d||; r is a unit vector, so this equals beta
-            "logit_proto":    lp,                  # W·c + b
-            "logit_dev":      ld,                  # W·d
+            # ‖d‖. ⚠ This equals beta only under the additive/chord geometry,
+            # where the correction direction is a unit vector. Under tangent it
+            # is beta*sin(theta) and under unit_tangent beta*min(s/eps, 1), so
+            # do not read it as "the learned beta".
+            "dev_norm":       float(d_np[b]),
+            "logit_proto":    lp,                  # W_eff·c + b
+            "logit_dev":      ld,                  # W_eff·d
             # Share of the predicted channel taken by the correction. Logits
             # are signed, so a plain ratio can diverge; dividing by
             # |lp| + |ld| keeps it bounded. Read it as a magnitude share only.

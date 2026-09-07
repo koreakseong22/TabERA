@@ -14,9 +14,9 @@ Forward
     ▼                          ▼
   c = prototype[a]        G(a) = its members
     ▼                          ▼
-  h = c + beta*normalize(q-c)  NN(q, G(a)), k
+  h = c + d                    NN(q, G(a)), k
     ▼                          ▼
-  z = W*h                    explanation layers (1)(2)(3)
+  z = W*(γ*h)                explanation layers (1)(2)(3)
  prediction
 
 The single assignment `a` fixes both the prediction baseline `c` and the
@@ -24,11 +24,18 @@ retrieval pool `G(a)`.
 
 Invariant
 ─────────
-    logits = (W*c + b) + W*(beta*r),   r = normalize(q - c)
+    logits = W*(γ*h) + b = (W_eff*c + b) + W_eff*d,   W_eff = γ*W,  d = h - c
+    (γ = 1 in the legacy configuration, in which case this reads (W*c+b)+W*d)
 
 dev_head is a single Linear, so this decomposition is an identity rather than
 an approximation (measured residual ~1e-08). Explanation layer (3) depends on
 it.
+
+d is produced by _compute_correction() and its form depends on
+correction_geometry (Phase A). The identity above holds for every arm, but
+||d|| does not: it is beta for additive/chord, beta*sin(theta) for tangent,
+and beta*min(s/eps, 1) for unit_tangent. The legacy expression
+d = beta*normalize(q - c) is the additive arm, which is the default.
 
 ⚠ Retrieval is not on the prediction path. Neighbours never appear in the
   `logits` expression. Retrieval is explanation-only, and that is a settled
@@ -52,6 +59,7 @@ are frozen in legacy/v3ema2_full/ and are not reproduced here.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -1178,6 +1186,28 @@ class TabERA(nn.Module):
         # τ는 첫 실험에서 1로 고정한다. 작은 d에서 tanh(d/τ)≈d/τ 이므로
         # β와 τ가 β/τ 로만 식별되어 두 파라미터의 해석이 흐려진다.
         pred_mode: str = "current",
+        # ── Phase A: correction geometry ──────────────────────────────
+        # d = h − c 의 방향/크기만 바꾼다. h = c + d 이고 dev_head 는 그대로
+        # 단일 shared Linear 이므로 z = (W·c + b) + W·d 는 모든 arm 에서
+        # 항등식으로 유지된다. pred_mode="current" 에서만 정의된다.
+        #   additive      d = β·p            p = normalize(q − c)   (legacy)
+        #   chord         d = β·normalize(q̂ − c)   (== legacy r_normalize=True)
+        #   tangent       d = β·p_⊥          p_⊥ = p − (pᵀc)c
+        #   unit_tangent  d = β·p_⊥/‖p_⊥‖
+        # ⚠ β 는 arm 간 비교 불가. additive/chord/unit_tangent 에서는 유클리드
+        #   변위 길이지만 tangent 에서는 p_⊥ 에 곱해지는 계수다.
+        correction_geometry: str = "additive",
+        # ── Design Lock v1: β parameterization / head input scale ──────
+        # 둘 다 correction_geometry="unit_tangent" 에서만 허용된다 (아래 guard).
+        #   beta_param  "sigmoid"  β=σ(r),  r0=logit(.1), β0=.1      (legacy)
+        #               "centered" β=2σ(r), r0=0,          β0=1
+        #   head_input_scale "unit" γ=1                          (legacy)
+        #                    "auto" γ=sqrt(D/(1+β0²))  → ‖γh0‖=sqrt(D)
+        # γ 는 초기화 시점의 β0 로 정해지는 고정 상수다. 학습 중 β 가 움직여도
+        # 변하지 않는다. z = W(γh)+b 이므로 W_eff = γW 이고 분해 항등식
+        # z = (W_eff c + b) + W_eff d 는 그대로 성립한다 (effective_W()).
+        beta_param: str = "sigmoid",
+        head_input_scale: str = "unit",
         q_scale_decay: float = 0.99,       # running median EMA
         q_scale_warmup: int = 100,         # 이 step까지는 batch median을 직접 대입
         # τ (bounded_distance 전용). gradient로 학습하지 않는다 —
@@ -1289,6 +1319,14 @@ class TabERA(nn.Module):
         #   query 직교 방향의 사용을 제한하는지 본다. β와 W2 사이에
         #   scale ambiguity가 생기지만 진단 실험이므로 감수한다.
         self.r_normalize = bool(r_normalize)
+        # ── Phase A: correction geometry ─────────────────────────────
+        assert correction_geometry in (
+            "additive", "chord", "tangent", "unit_tangent"), correction_geometry
+        self.correction_geometry = correction_geometry
+        # ε는 p_⊥ 정규화의 가드다. 이 아래에서는 p_⊥ = p − (pᵀc)c 가 부동소수점
+        # 상쇄에 지배되어 **방향 자체가 잡음**이므로, 0 나눗셈 회피가 아니라
+        # 방향 품질 기준이다. Pr(s < ε) 를 로그로 남겨 실데이터에서 확인한다.
+        self.correction_eps = 1e-6
         self.split_head = bool(split_head)
         self.dev_head_q = nn.Linear(embed_dim, n_output, bias=False) \
             if self.split_head else None
@@ -1318,9 +1356,92 @@ class TabERA(nn.Module):
                                   or w2_norm_mode != "free" or beta_fixed is not None):
             raise ValueError("no_partition=True 는 correction ablation 플래그와 "
                              "함께 쓸 수 없습니다 (correction 경로 자체가 없음).")
-        # Starts at sigma(-2.197) ~ 0.1. beta must be learned: fixing it
-        # collapses wherever W*c cannot reach every class (section 12-6).
-        self.dev_beta_raw = nn.Parameter(torch.tensor([-2.197]))
+        if correction_geometry != "additive":
+            # 하나의 knob 이 두 경로로 설정되면 안 된다: chord 가 곧 legacy
+            # r_normalize=True 이므로 둘을 동시에 켜는 설정은 의미가 중복된다.
+            if r_normalize:
+                raise ValueError(
+                    "correction_geometry != 'additive' 는 r_normalize=True 와 함께 "
+                    "쓸 수 없습니다. chord 가 곧 legacy r_normalize=True 입니다.")
+            # Phase A arm 은 다른 ablation 축을 모두 끈 상태에서만 비교한다.
+            if split_head or no_partition or beta_fixed is not None:
+                raise ValueError(
+                    "Phase A arm 은 split_head / no_partition / beta_fixed 없이 "
+                    "돌립니다 (교란 축 차단).")
+            if pred_mode != "current":
+                raise ValueError(
+                    f"correction_geometry 는 pred_mode='current' 에서만 정의됩니다 "
+                    f"(받은 값: {pred_mode}).")
+        # ── Design Lock v1 guards ─────────────────────────────────────
+        assert beta_param in ("sigmoid", "centered"), beta_param
+        assert head_input_scale in ("unit", "auto", "matched"), head_input_scale
+        self.beta_param = beta_param
+        self.head_input_scale = head_input_scale
+        # ── geometry × scale 허용 조합 (대칭 guard) ────────────────────
+        #   auto    : UT 의 ‖h0‖² = 1+β0² 에서 **유도된** scale. UT 전용.
+        #   matched : auto 와 **수치는 같지만** 근거가 다르다. Additive 를
+        #             normalize 하는 공식이 아니라, H 에 가한 것과 동일한
+        #             numerical intervention 을 Additive 에 복제해
+        #             S_A = A_matched − A_unit 와 S_UT = UT_auto − UT_unit 가
+        #             같은 크기의 개입이 되게 하려는 것이다. 그래야
+        #             I = S_UT − S_A 를 geometry × scale interaction 으로
+        #             읽을 수 있다. Additive 전용.
+        if head_input_scale == "auto" and correction_geometry != "unit_tangent":
+            raise ValueError(
+                f"head_input_scale='auto' 는 correction_geometry='unit_tangent' "
+                f"에서만 정의됩니다 (받은 값: {correction_geometry!r}). Additive 에는 "
+                f"'matched' 를 쓰십시오.")
+        if head_input_scale == "matched" and correction_geometry != "additive":
+            raise ValueError(
+                f"head_input_scale='matched' 는 correction_geometry='additive' "
+                f"에서만 정의됩니다 (받은 값: {correction_geometry!r}). Unit Tangent 에는 "
+                f"'auto' 를 쓰십시오.")
+        if beta_param != "sigmoid":
+            # β0=1 이 scale-neutral 이라는 근거는 c⊥u, ‖u‖=1 일 때만 정확하다.
+            if correction_geometry != "unit_tangent":
+                raise ValueError(
+                    f"beta_param={beta_param!r} 는 correction_geometry="
+                    f"'unit_tangent' 에서만 정의됩니다 (받은 값: {correction_geometry!r}).")
+        if beta_param != "sigmoid" or head_input_scale != "unit":
+            if split_head:
+                raise ValueError("split_head 는 beta_param/head_input_scale 의 "
+                                 "비기본값과 함께 쓸 수 없습니다.")
+            if beta_fixed is not None:
+                raise ValueError("beta_fixed 는 beta_param/head_input_scale 의 "
+                                 "비기본값과 함께 쓸 수 없습니다 (auto γ 의 β0 가 "
+                                 "모호해짐).")
+        # ── β raw parameter ───────────────────────────────────────────
+        # sigmoid : starts at sigma(-2.197) ~ 0.1. beta must be learned: fixing
+        #           it collapses wherever W*c cannot reach every class (§12-6).
+        # centered: starts at 2*sigma(0) = 1. Not a performance prior -- with
+        #           ‖c‖=‖u‖=1 and c⊥u it is the scale-neutral start where
+        #           neither the region term nor the sample term is suppressed.
+        self.dev_beta_raw = nn.Parameter(torch.tensor(
+            [-2.197] if beta_param == "sigmoid" else [0.0]))
+        # ── head input scale γ ────────────────────────────────────────
+        # ⚠ non-persistent: γ 는 model_kwargs 로부터 재구성되므로 state_dict 에
+        #   넣지 않는다. persistent 로 두면 새 키가 생겨 legacy checkpoint 의
+        #   strict=True 로드가 깨진다.
+        # ⚠ β0 는 문서의 근사값 .1 이 아니라 **실제** 초기값 σ(-2.197)=0.1000202 를
+        #   쓴다. 그래야 ‖γh0‖=√D 가 정확히 성립한다 (unit 경로는 무관하므로
+        #   legacy bit-identity 는 유지). 차이는 D=128 에서 γ 상대 2e-6.
+        _beta0 = ((1.0 / (1.0 + math.exp(2.197))) if beta_param == "sigmoid"
+                  else 1.0)
+        # ⚠ auto 와 matched 는 수식이 같지만 일부러 합치지 않는다. 값이 같아도
+        #   semantic provenance 가 다르고, 나중에 한쪽만 바꿀 수 있어야 한다.
+        if head_input_scale == "unit":
+            _gamma = 1.0
+        elif head_input_scale == "auto":       # UT: ‖h0‖² = 1+β0² 에서 유도
+            _gamma = math.sqrt(embed_dim / (1.0 + _beta0 ** 2))
+        elif head_input_scale == "matched":    # Additive: H 와 동일한 개입량 복제
+            _gamma = math.sqrt(embed_dim / (1.0 + _beta0 ** 2))
+        else:
+            raise ValueError(head_input_scale)
+        # ⚠ Python scalar, buffer 아님. buffer 로 두면 (a) persistent 시 state_dict
+        #   키가 생겨 legacy strict-load 가 깨지고, (b) CUDA 로 옮긴 뒤
+        #   float(tensor) 가 forward 마다 GPU→CPU sync 를 만든다. γ 는 학습되지
+        #   않고 device 연산도 필요 없는 상수다.
+        self._head_input_gamma = float(_gamma)
 
     # ─────────────────────────────────────────────────────────
     def effective_W2(self) -> torch.Tensor:
@@ -1341,8 +1462,96 @@ class TabERA(nn.Module):
         return W2
 
     def effective_beta(self) -> torch.Tensor:
-        return (torch.sigmoid(self.dev_beta_raw) if self.beta_fixed is None
-                else torch.full_like(self.dev_beta_raw, self.beta_fixed))
+        """β 의 유일한 계산 지점. 코드 어디서도 sigmoid(dev_beta_raw) 를 직접 쓰지 않는다."""
+        if self.beta_fixed is not None:
+            return torch.full_like(self.dev_beta_raw, self.beta_fixed)
+        s = torch.sigmoid(self.dev_beta_raw)
+        return s if self.beta_param == "sigmoid" else 2.0 * s
+
+    def effective_gamma(self) -> float:
+        """head 입력 스케일 γ. unit 이면 정확히 1.0. Python scalar 라 sync 없음."""
+        return self._head_input_gamma
+
+    def effective_W(self) -> torch.Tensor:
+        """설명이 보는 head: W_eff = γ·W.  z = (W_eff c + b) + W_eff d 가 항등식."""
+        g = self.effective_gamma()
+        W = self.dev_head.weight
+        return W if g == 1.0 else g * W
+
+    # ─────────────────────────────────────────────────────────
+    def _compute_correction(self, query_emb, context_emb, beta):
+        """d = h − c 를 correction_geometry 에 따라 계산한다. 유일한 계산 지점.
+
+        Returns
+        ───────
+            d        (B, D)  correction. forward 는 h = c + d 만 한다.
+            corr_dir (B, D)  d 의 단위 방향 (split_head 소비용)
+            corr_mag (B,)    ‖d‖
+            log      dict    진단값. gradient 없음.
+
+        전제
+        ────
+        ‖c‖ = 1. CentroidLayer 가 init / EMA 재정규화 / 재투영 전부에서 unit 을
+        유지하므로 성립한다. 직교성 p_⊥ ⊥ c 가 전적으로 여기에 의존한다.
+
+        ‖d‖ bound — **arm 마다 다르다. 하나로 뭉뚱그려 서술하지 말 것**
+            additive / chord   ‖d‖ = β
+            tangent            ‖d‖ = β·s          ≤ β     (s = ‖p_⊥‖ = sinθ)
+            unit_tangent       ‖d‖ = β·min(s/ε, 1) ≤ β
+        공통으로 말할 수 있는 것은 β→0 이면 d→0 이라는 것뿐이다.
+        """
+        geometry = self.correction_geometry
+        eps = self.correction_eps
+
+        # ── p: legacy correction direction ──────────────────────────
+        # ⚠ additive 는 아래 두 줄이 기존 코드와 **문자 그대로 같은 연산**이어야
+        #   한다. 분기는 q_eff 에서 한 번만 일어나고 F.normalize 호출과 그
+        #   순서는 건드리지 않는다. 이것이 bit-identical 회귀 테스트의 근거다.
+        use_unit_q = self.r_normalize or geometry == "chord"
+        q_eff = F.normalize(query_emb, dim=-1) if use_unit_q else query_emb
+        p = F.normalize(q_eff - context_emb, dim=-1)              # (B, D), ‖p‖=1
+
+        log: Dict[str, torch.Tensor] = {}
+        if geometry in ("additive", "chord"):
+            d        = beta * p
+            corr_dir = p
+            # ⚠ beta.expand(B) 가 아니라 실제 노름이다. p 가 단위벡터인 한 두
+            #   값은 같지만, q == c 인 지점에서 F.normalize 는 영벡터를
+            #   돌려주므로 ‖d‖ = 0 인데 beta 를 기록하게 된다. corr_mag 의
+            #   계약은 ‖d‖ 이므로 그대로 계산한다. d 와 h 는 건드리지 않으므로
+            #   additive 의 bit-identical 예측 경로에는 영향이 없다.
+            corr_mag = d.norm(dim=-1)
+        else:
+            # ⚠ y 를 clamp 하면 안 된다. clamp 하면 p_⊥ = p − y·c 에 c 성분이
+            #   남아 (p_⊥ᵀc = y − y_clamped ≠ 0) 직교성이 깨진다.
+            y      = (p * context_emb).sum(-1, keepdim=True)       # (B,1) = cosθ
+            p_perp = p - y * context_emb                           # (B,D) ⊥ c
+            s      = p_perp.norm(dim=-1, keepdim=True)             # (B,1) = sinθ
+
+            if geometry == "tangent":
+                d = beta * p_perp
+            else:                                                  # unit_tangent
+                # ⚠ torch.where 가 아니라 clamp_min. where 는 선택되지 않는
+                #   가지도 forward 에서 계산하므로 s=0 에서 0·inf 가 만들어지고
+                #   backward 에 NaN 이 전파된다.
+                d = beta * (p_perp / s.clamp_min(eps))
+
+            corr_mag = d.norm(dim=-1)                              # (B,)
+            corr_dir = d / corr_mag.clamp_min(1e-12).unsqueeze(-1)
+
+            with torch.no_grad():
+                log["s"]           = s.squeeze(-1)
+                log["cos_theta_p"] = y.squeeze(-1)
+                log["n_small"]     = (s.squeeze(-1) < eps).sum()
+                # θ≈0 (수학적 극한, coef → β) 과 θ≈π (geodesic 방향이 정의되지
+                # 않음) 는 전혀 다른 경우다. 후자는 nearest-centroid routing 에서
+                # 나오지 않아야 하므로 fallback 하지 않고 세기만 한다.
+                log["n_antipodal"] = ((s.squeeze(-1) < eps)
+                                      & (y.squeeze(-1) < 0)).sum()
+                qh = F.normalize(query_emb.detach(), dim=-1)
+                log["cos_p_qhat"]  = (p.detach() * qh).sum(-1)
+
+        return d, corr_dir, corr_mag, log
 
     # ─────────────────────────────────────────────────────────
     @staticmethod
@@ -1410,23 +1619,29 @@ class TabERA(nn.Module):
                                          device=X.device)
 
         # 4. Predict
-        _beta = (torch.sigmoid(self.dev_beta_raw) if self.beta_fixed is None
-                 else torch.full_like(self.dev_beta_raw, self.beta_fixed))
+        # ⚠ effective_beta() 가 유일한 계산 지점. 여기서 sigmoid 를 직접 쓰면
+        #   beta_param="centered" 가 forward 에서 조용히 무시된다.
+        _beta = self.effective_beta()
         # [ablation] r_normalize: q를 단위구에 올린 뒤 변위를 잡는다.
-        _q_eff = F.normalize(query_emb, dim=-1) if self.r_normalize else query_emb
+        # ⚠ pred_mode="current" 는 _compute_correction() 이 q_eff 분기를 안에서
+        #   처리한다 (correction geometry 와 한 곳에서 결정되어야 하므로).
+        #   나머지 세 갈래만 여기서 q_eff 를 만든다.
 
         _geo: Dict[str, torch.Tensor] = {}
         if self.pred_mode == "current":
-            _dev_n = F.normalize(_q_eff - context_emb, dim=-1)
-            _h = context_emb + _beta * _dev_n
-            _corr_dir, _corr_mag = _dev_n, _beta.expand(len(_q_eff))
+            _corr, _corr_dir, _corr_mag, _clog = self._compute_correction(
+                query_emb, context_emb, _beta)
+            _h = context_emb + _corr
+            _geo.update(_clog)
         elif self.pred_mode == "raw_interp":                       # D′
+            _q_eff = F.normalize(query_emb, dim=-1) if self.r_normalize else query_emb
             _v = _q_eff - context_emb
             _h = context_emb + _beta * _v
             _d = _v.norm(dim=-1)
             _corr_dir = _v / _d.clamp_min(1e-8).unsqueeze(-1)
             _corr_mag = _beta * _d
         else:                                                       # D″ / D‴
+            _q_eff = F.normalize(query_emb, dim=-1) if self.r_normalize else query_emb
             _qb = _q_eff / self.q_scale.clamp_min(1e-8)
             _v = _qb - context_emb
             _d = _v.norm(dim=-1)
@@ -1441,7 +1656,6 @@ class TabERA(nn.Module):
                 _geo["g_d"] = _g
             _geo["d"] = _d
             _geo["q_bar_norm"] = _qb.norm(dim=-1)
-        _dev_n = _corr_dir
         _geo["delta"] = (_h - context_emb).norm(dim=-1)
         _geo["q_norm"] = query_emb.norm(dim=-1)
 
@@ -1449,7 +1663,10 @@ class TabERA(nn.Module):
             logits = self.dev_head(context_emb) + \
                 (_corr_mag.unsqueeze(-1) * F.linear(_corr_dir, self.effective_W2()))
         else:
-            logits = self.dev_head(_h)
+            # γ==1 이면 곱셈 자체를 우회한다 -- legacy bit-identity 를 부동소수점
+            # 논증 없이 보장. γ≠1 이면 z = W(γh)+b.
+            _g = self.effective_gamma()
+            logits = self.dev_head(_h if _g == 1.0 else _g * _h)
 
         # running median 갱신은 forward **이후**, detached q로만. eval에서는 안 함.
         if self.training:
@@ -1482,7 +1699,11 @@ class TabERA(nn.Module):
             pass
         else:
          with torch.no_grad():
-            _lg_c = self.dev_head(context_emb)          # W*c + b, prototype only
+            # ⚠ γ-aware. forward 가 z = W(γh)+b 이므로 baseline 도 dev_head(γc).
+            #   빼먹으면 prototype_deviation() 은 맞는데 out["dev_diag"] 만 틀린다.
+            _g_diag = self.effective_gamma()
+            _lg_c = self.dev_head(context_emb if _g_diag == 1.0
+                                  else _g_diag * context_emb)   # W_eff*c + b
             _diag = {
                 "dev_beta": float(_beta),
                 "dev_residual_ratio": float(
@@ -1539,6 +1760,14 @@ class TabERA(nn.Module):
             "neighbor_mask":      _neighbor_mask,
             "query_emb":          query_emb,
             "context_emb":        context_emb,
+            # ⚠ d = h − c. **예측이 실제로 사용한** correction 이다.
+            #   diagnostics.py / visualize_tabera.py 는 이 값을 읽어야 하고,
+            #   beta * normalize(q − c) 로 재구성해서는 안 된다 — geometry 가
+            #   additive 가 아니면 설명이 예측과 조용히 어긋난다 (증상은
+            #   decomposition residual 이 0 이 아닌 것뿐이라 놓치기 쉽다).
+            "correction":         _h - context_emb,
+            "correction_dir":     _corr_dir,
+            "correction_mag":     _corr_mag,
             "dev_diag":           _diag,
             "geo":                _geo,
             "pred_mode":          self.pred_mode,
@@ -1556,7 +1785,7 @@ class TabERA(nn.Module):
                 hard_assignment, soft_probs, cos_sim=cos_sim)
 
             with torch.no_grad():
-                _beta_scalar = float(torch.sigmoid(self.dev_beta_raw.detach()).mean())
+                _beta_scalar = float(self.effective_beta().detach().mean())
                 _query_norm_ps = query_emb.detach().norm(dim=-1).cpu().numpy()
 
             out["explanations"] = [
@@ -1634,14 +1863,17 @@ class TabERA(nn.Module):
 
     def summary(self, n_train: Optional[int] = None) -> str:
         total = sum(p.numel() for p in self.parameters())
-        beta  = float(torch.sigmoid(self.dev_beta_raw.detach()).mean())
+        beta  = float(self.effective_beta().detach().mean())
         lines = [
             "=" * 48, "TabERA", "=" * 48,
             f"  Parameters     : {total:,}",
             f"  Embed dim      : {self.embed_dim}",
             f"  Prototypes     : {self.prototype_layer.P}",
             f"  Retrieval k    : {self.k}  (explanation only)",
-            f"  Prediction     : h = c + b*normalize(q-c),  z = W*h   (W shared)",
+            f"  Prediction     : h = c + d,  z = W*(gamma*h) + b = (W_eff*c + b) + W_eff*d,  W_eff = gamma*W  (W shared)",
+            f"  Correction geom: {self.correction_geometry}",
+            f"  beta_param     : {self.beta_param}  (beta0 = {0.1 if self.beta_param == 'sigmoid' else 1.0})",
+            f"  head scale     : {self.head_input_scale}  (gamma = {self.effective_gamma():.4f})",
             f"  beta           : {beta:.4f}  (learned)",
             f"  Prototype mem  : EMA (decay={self.prototype_layer.ema_decay})"
             if self.prototype_layer.use_ema_codebook else

@@ -6,6 +6,8 @@ figures/
 diagnostics/
 reproduce_logs/
 scripts/
+_archive/
+results/
 
 # Python
 __pycache__/

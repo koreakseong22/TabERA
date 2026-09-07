@@ -71,6 +71,49 @@ parser.add_argument("--num_embedding", type=str, default="ple",
                     ))
 parser.add_argument("--num_bins", type=int, default=8,
                     help="Bins per column when num_embedding=ple.")
+parser.add_argument("--correction_geometry", type=str, default="additive",
+                    choices=["additive", "chord", "tangent", "unit_tangent"],
+                    help=(
+                        "Phase A arm: the geometry of d = h - c. h = c + d and "
+                        "dev_head stays one shared Linear, so "
+                        "z = (W*c + b) + W*d remains an identity in every arm.\n"
+                        "  additive      d = beta*p,  p = normalize(q - c)   [legacy]\n"
+                        "  chord         d = beta*normalize(q_hat - c)   [== legacy "
+                        "r_normalize=True]\n"
+                        "  tangent       d = beta*p_perp,  p_perp = p - (p.c)c\n"
+                        "  unit_tangent  d = beta*p_perp/||p_perp||\n"
+                        "This is a **structural** variable, so a non-default value "
+                        "goes into the study filename (..geom=NAME) and cannot be "
+                        "mixed into an existing study."))
+parser.add_argument("--beta_param", type=str, default="sigmoid",
+                    choices=["sigmoid", "centered"],
+                    help="β parameterization (unit_tangent 전용). structural: "
+                         "비기본값은 study 파일명에 ..bp=NAME 으로 들어간다.")
+parser.add_argument("--head_input_scale", type=str, default="unit",
+                    choices=["unit", "auto"],
+                    help=("head 입력 스케일 γ. 'auto' 는 correction_geometry="
+                          "'unit_tangent' 전용이며 structural 이므로 비기본값은 "
+                          "study 파일명에 ..hs=NAME 으로 들어간다. 'matched' 는 "
+                          "여기서 받지 않는다 -- legacy additive study 위에 얹는 "
+                          "reproduce 전용 controlled intervention 이라 HPO 대상이 "
+                          "아니다."))
+parser.add_argument("--tie_rule", type=str, default="first",
+                    choices=["first", "latest"],
+                    help="accuracy 동률 시 반환 checkpoint. structural: 비기본값은 "
+                         "..tie=NAME. early-stopping horizon 은 바뀌지 않는다.")
+parser.add_argument("--early_stop_metric", type=str, default="accuracy",
+                    choices=["accuracy", "logloss", "auroc", "bacc"],
+                    help=(
+                        "Validation metric that selects best_state and drives the "
+                        "patience counter INSIDE a trial. The HPO objective itself "
+                        "stays val accuracy either way, so comparability with the "
+                        "MultiTab baselines is unaffected. Default 'accuracy' is the "
+                        "legacy behaviour. On an imbalanced dataset accuracy can sit "
+                        "flat at the majority rate from epoch 1 (ds=1067: acc_val "
+                        "identical for epochs 1-10 while AUROC went 0.354 -> 0.708), "
+                        "which both selects the epoch-1 checkpoint and spends the "
+                        "whole patience budget. Structural: a non-default value goes "
+                        "into the study filename (..esm=NAME)."))
 # --plr_n_frequencies / --plr_freq_scale / --plr_out_dim were removed here.
 # For num_embedding=plr_lite these are now searched per trial by
 # get_search_space() (the approach Gorishniy et al. 2022 recommend). As fixed
@@ -126,6 +169,11 @@ _ablation_tag = study_pkl_tag(
     num_bins=args.num_bins,
     cat_embed_dim=args.cat_embed_dim,
     batch_size=args.batch_size,
+    correction_geometry=args.correction_geometry,
+    early_stop_metric=args.early_stop_metric,
+    beta_param=args.beta_param,
+    head_input_scale=args.head_input_scale,
+    tie_rule=args.tie_rule,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
@@ -270,6 +318,53 @@ if train:
             f"  -> pass --n_prototypes {n_proto_default} to get a separate "
             f"study (..P{n_proto_default}), or move the existing study aside.")
 
+    # ── Same guard for the Phase A arm ────────────────────────────────
+    # The geometry tag keeps a non-default arm in its own file, but a legacy
+    # study written before this flag existed carries no marker at all. Trials
+    # from before the flag have no "correction_geometry_actual" attribute, and
+    # those are treated as "additive" -- which they were, since that is the
+    # only geometry the code could produce then.
+    _prev_G = {t.user_attrs.get("correction_geometry_actual", "additive")
+               for t in study.trials
+               if t.state == optuna.trial.TrialState.COMPLETE}
+    if _prev_G and _prev_G != {args.correction_geometry}:
+        raise SystemExit(
+            f"\n[stopped] The existing study has correction_geometry="
+            f"{sorted(_prev_G)}, this run would use "
+            f"'{args.correction_geometry}'.\n"
+            f"  file: {fname}\n"
+            f"  The four arms are different models; mixing them in one study "
+            f"makes the comparison meaningless.\n"
+            f"  -> move the existing study aside, or pass a different "
+            f"--correction_geometry.")
+
+    for _attr, _cli, _dflt, _flag in (
+            ("beta_param_actual", args.beta_param, "sigmoid", "--beta_param"),
+            ("head_input_scale_actual", args.head_input_scale, "unit", "--head_input_scale"),
+            ("tie_rule_actual", args.tie_rule, "first", "--tie_rule")):
+        _prev = {t.user_attrs.get(_attr, _dflt) for t in study.trials
+                 if t.state == optuna.trial.TrialState.COMPLETE}
+        if _prev and _prev != {_cli}:
+            raise SystemExit(
+                f"\n[stopped] The existing study has {_attr}={sorted(_prev)}, "
+                f"this run would use '{_cli}'.\n  file: {fname}\n"
+                f"  -> move the study aside, or pass a different {_flag}.")
+
+    _prev_E = {t.user_attrs.get("early_stop_metric_actual", "accuracy")
+               for t in study.trials
+               if t.state == optuna.trial.TrialState.COMPLETE}
+    if _prev_E and _prev_E != {args.early_stop_metric}:
+        raise SystemExit(
+            f"\n[stopped] The existing study has early_stop_metric="
+            f"{sorted(_prev_E)}, this run would use "
+            f"'{args.early_stop_metric}'.\n"
+            f"  file: {fname}\n"
+            f"  The selection metric decides which checkpoint each trial "
+            f"returns, so trials chosen under different metrics are not "
+            f"comparable.\n"
+            f"  -> move the existing study aside, or pass a different "
+            f"--early_stop_metric.")
+
     # 기준별 best validation 값. objective()가 test 확률을 언제 덮어쓸지
     # 판단하는 데만 쓰인다. 재개(resume) 시에는 비어 있으므로 첫 trial이
     # 무조건 한 번 쓰고, 이후로는 정상 동작한다 -- 남는 파일은 항상
@@ -296,6 +391,21 @@ if train:
         #   B=256 으로 도는 mismatch 가 생긴다(HPO_TRAINING_SCHEDULE
         #   docstring 이 경고하는 바로 그 유형).
         trial.set_user_attr("batch_size_actual", int(params["batch_size"]))
+        # ⚠ Same situation as n_prototypes / batch_size: written into the space
+        #   dict directly, so it never reaches study.best_params. Without the
+        #   user_attr, reproduce.py would reload the study and silently rebuild
+        #   the model with the default geometry -- HPO on one arm, final run on
+        #   another. The resume guard above reads this attribute too.
+        params["correction_geometry"] = args.correction_geometry
+        params["beta_param"] = args.beta_param
+        params["head_input_scale"] = args.head_input_scale
+        trial.set_user_attr("correction_geometry_actual", args.correction_geometry)
+        trial.set_user_attr("beta_param_actual", args.beta_param)
+        trial.set_user_attr("head_input_scale_actual", args.head_input_scale)
+        trial.set_user_attr("tie_rule_actual", args.tie_rule)
+        # The selection metric decides which checkpoint every trial returns, so
+        # it must be identifiable from the study alone -- same reason as the arm.
+        trial.set_user_attr("early_stop_metric_actual", args.early_stop_metric)
         model_kwargs = params_to_model_kwargs(params, dataset.n_features, output_dim)
 
         model = TabERA(
@@ -343,7 +453,9 @@ if train:
         )
 
         wrapper = TabERAWrapper(model, params, tasktype,
-                                  device=str(device), **HPO_TRAINING_SCHEDULE)
+                                  device=str(device), **HPO_TRAINING_SCHEDULE,
+                                  early_stop_metric=args.early_stop_metric,
+                                  tie_rule=args.tie_rule)
         wrapper._data_id = args.openml_id   # shown in the epoch progress bar
         wrapper.fit(X_train, y_train, X_val, y_val)
 

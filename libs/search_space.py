@@ -87,6 +87,11 @@ def study_pkl_tag(
     num_bins: int = 8,
     cat_embed_dim: int = 16,
     batch_size: "int | None" = None,
+    correction_geometry: str = "additive",
+    early_stop_metric: str = "accuracy",
+    beta_param: str = "sigmoid",
+    head_input_scale: str = "unit",
+    tie_rule: str = "first",
 ) -> str:
     """Build the tag embedded in the study .pkl filename written by optimize.py.
 
@@ -103,6 +108,13 @@ def study_pkl_tag(
       under those conditions came from legacy/v3ema2_full/ and keep the
       filenames they were written with.
     """
+    # ⚠ correction_geometry is a **structural** variable, like n_prototypes:
+    #   the four arms are different models, so their trials must never land in
+    #   one study file. Without this tag optimize.py finds the existing .pkl,
+    #   computes remaining_trials = max(0, 100 - 100) = 0, runs nothing, and
+    #   rewrites the CSV from the other arm's trials -- no error, no result.
+    #   "additive" stays untagged on purpose so every study written before
+    #   Phase A still resolves under its original filename.
     return PROTOCOL_TAG \
         + "..v3ema2" \
         + ("..cat_concat" if cat_combine == "concat" else "") \
@@ -113,7 +125,14 @@ def study_pkl_tag(
         + ("..nodr" if disable_dead_reinit else "") \
         + (f"..bins{int(num_bins)}" if int(num_bins) != 8 else "") \
         + (f"..catdim{int(cat_embed_dim)}" if int(cat_embed_dim) != 16 else "") \
-        + (f"..B{int(batch_size)}" if batch_size is not None else "")
+        + (f"..B{int(batch_size)}" if batch_size is not None else "") \
+        + (f"..geom={correction_geometry}"
+           if correction_geometry != "additive" else "") \
+        + (f"..esm={early_stop_metric}"
+           if early_stop_metric != "accuracy" else "") \
+        + (f"..bp={beta_param}" if beta_param != "sigmoid" else "") \
+        + (f"..hs={head_input_scale}" if head_input_scale != "unit" else "") \
+        + (f"..tie={tie_rule}" if tie_rule != "first" else "")
 
 
 def suggest_initial_trial() -> dict:
@@ -332,4 +351,14 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
     for key in ("plr_freq_scale", "plr_n_frequencies", "plr_out_dim"):
         if key in params:
             kwargs[key] = params[key]
+    # ⚠ correction_geometry is not searched -- it is the Phase A arm, set once
+    #   per study by the CLI. It is written into params by optimize.py /
+    #   reproduce.py the same way n_prototypes is, so it does not appear in
+    #   study.best_params; the default keeps legacy studies on "additive".
+    kwargs["correction_geometry"] = params.get("correction_geometry", "additive")
+    # ⚠ 여기서 채우는 것은 **source study** 가 기록한 값이다. controlled
+    #   intervention 에서는 reproduce.py 가 이 dict 를 받은 **뒤** CLI target 으로
+    #   덮어쓴다. 그 순서가 바뀌면 provenance 와 실제 모델이 어긋난다.
+    kwargs["beta_param"] = params.get("beta_param", "sigmoid")
+    kwargs["head_input_scale"] = params.get("head_input_scale", "unit")
     return kwargs

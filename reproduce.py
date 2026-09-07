@@ -1475,7 +1475,7 @@ def run_single_seed(
 
     optimize.py loads the dataset once and reuses it across 100 trials. This
     file used to reload it in every process run -- once per seed -- paying the
-    OpenML fetch, NaN preprocessing, StratifiedKFold and QuantileTransformer
+    OpenML fetch, NaN preprocessing, KFold and QuantileTransformer
     cost five times for --train_seeds with five values. That logic (about
     2,400 lines inline in main()) moved here unchanged, so main() loads the
     dataset and study once and calls this function per seed, the same pattern
@@ -1514,6 +1514,14 @@ def run_single_seed(
     # final benchmark 는 V1 설정 하나만 쓴다. 다른 설정으로 돌리면 파일명이
     # 갈라져서 서로 덮어쓰지 않는다 (lr=1e-2/null 과 lr=1e-3/noNull 이 같은
     # 파일을 쓰던 문제).
+    # ⚠ correction_geometry is resolved **after** the branch below, because
+    #   --from_saved_state takes it from the checkpoint's model_kwargs, not
+    #   from the CLI. Appending it here would name a tangent checkpoint's
+    #   outputs "additive" whenever the flag was omitted. The suffix is added
+    #   to _save_tag once `actual_geometry` is known.
+    actual_geometry = args.correction_geometry
+    actual_beta_param = args.beta_param
+    actual_head_input_scale = args.head_input_scale
     _save_tag = (f"..k{args.k_override}" if args.k_override is not None else "") \
               + ("..allowSelfRet" if args.allow_self_retrieval else "") \
               + ("..cat_concat" if args.cat_combine == "concat" else "") \
@@ -1575,10 +1583,33 @@ def run_single_seed(
         # one setting still leaves the default in meta. A correct result was
         # once misread as "wrong checkpoint" because of this.
         _key_cfg = {k: model_kwargs.get(k) for k in
-                    ("k", "embed_dim", "n_prototypes")
+                    ("k", "embed_dim", "n_prototypes", "correction_geometry")
                     if k in model_kwargs}
         print(f"  [from_saved_state] actual checkpoint settings: "
               + ", ".join(f"{k}={v}" for k, v in _key_cfg.items()))
+        # ⚠ The model comes from the checkpoint, so the checkpoint decides the
+        #   geometry -- filenames and meta.pkl must follow the model, not the
+        #   CLI. Without this a tangent checkpoint reopened without the flag
+        #   would write its results under the additive name and record
+        #   "additive" in freeze_deviations. That is the failure the comment
+        #   above describes, applied to a structural variable.
+        # ⚠ γ 는 state_dict 에 없다 (non-persistent). 따라서 centered/auto
+        #   체크포인트를 legacy sigmoid/unit 모델에 strict-load 하면 **성공**하고
+        #   함수만 완전히 달라진다 -- strict=True 가 잡지 못하는 silent failure.
+        #   구조는 반드시 checkpoint 의 model_kwargs 에서 복구한다.
+        actual_beta_param = model_kwargs.get("beta_param", "sigmoid")
+        actual_head_input_scale = model_kwargs.get("head_input_scale", "unit")
+        for _nm, _got, _cli in (("beta_param", actual_beta_param, args.beta_param),
+                                ("head_input_scale", actual_head_input_scale,
+                                 args.head_input_scale)):
+            if _got != _cli:
+                print(f"  [from_saved_state] --{_nm} {_cli} ignored; using "
+                      f"{_got} from the checkpoint.")
+        actual_geometry = model_kwargs.get("correction_geometry", "additive")
+        if actual_geometry != args.correction_geometry:
+            print(f"  [from_saved_state] --correction_geometry "
+                  f"{args.correction_geometry} ignored; using "
+                  f"{actual_geometry} from the checkpoint.")
         best_params  = _saved_state.get("best_params", {})
         if best_params:
             print(f"  Params (as saved): {best_params}")
@@ -1637,6 +1668,25 @@ def run_single_seed(
             # optimize.py --batch_size 로 만든 pilot study 를 가리킬 때만 준다.
             # 본 실험 study 는 태그가 없으므로 기본값 None 이 맞다.
             batch_size=args.study_batch_size,
+            # [--params_geometry] study 출처만 바꾼다. 학습 geometry 는 아래에서
+            # args.correction_geometry 로 덮는다.
+            correction_geometry=(args.params_geometry
+                                 if args.params_geometry is not None
+                                 else args.correction_geometry),
+            # ⚠ source 값이지 target 값이 아니다. params_variant='legacy' 면
+            #   study 는 sigmoid/unit/first 로 만들어진 것을 찾는다. target 구조
+            #   (CLI) 는 아래 model_kwargs override 와 wrapper 에서만 쓰인다.
+            beta_param=("sigmoid" if args.params_variant == "legacy"
+                        else args.beta_param),
+            # ⚠ source 값. params_variant=legacy 면 unit study 를 읽는다.
+            #   그 외에도 'matched' 는 **target 전용 개입**이므로 source 로
+            #   쓰지 않는다 -- 그러면 존재하지 않는 ..hs=matched study 를 찾는다.
+            head_input_scale=("unit" if (args.params_variant == "legacy"
+                                         or args.head_input_scale == "matched")
+                              else args.head_input_scale),
+            tie_rule=("first" if args.params_variant == "legacy"
+                      else args.tie_rule),
+            early_stop_metric=args.early_stop_metric,
         )
         # [--params_seed] study 는 params_seed 폴더에서 읽고, 산출물은 현재
         # seed 폴더(log_dir)에 쓴다. log_dir 를 통째로 바꾸면 fold-2 결과가
@@ -1653,6 +1703,20 @@ def run_single_seed(
                 _hint_flags += f" --n_prototypes {args.n_prototypes}"
             if args.disable_dead_reinit:
                 _hint_flags += " --disable_dead_reinit"
+            # Without this the suggested command creates an *additive* study,
+            # and the next reproduce run stops on the arm-mismatch guard.
+            if args.correction_geometry != "additive":
+                _hint_flags += f" --correction_geometry {args.correction_geometry}"
+            if args.early_stop_metric != "accuracy":
+                _hint_flags += f" --early_stop_metric {args.early_stop_metric}"
+            # source study 를 만드는 명령이므로 target 구조 플래그는 붙이지 않는다.
+            if args.params_variant is None:
+                if args.beta_param != "sigmoid":
+                    _hint_flags += f" --beta_param {args.beta_param}"
+                # ⚠ matched 는 reproduce 전용이고 source study 는 unit 이다.
+                #   여기에 넣으면 optimize.py 가 거부하는 명령을 안내하게 된다.
+                if args.head_input_scale not in ("unit", "matched"):
+                    _hint_flags += f" --head_input_scale {args.head_input_scale}"
             _hint_cmd = f"optimize.py --openml_id {openml_id} --seed {args.seed}{_hint_flags}"
             raise FileNotFoundError(
                 f"no optimisation log at: {fname}\n"
@@ -1685,6 +1749,59 @@ def run_single_seed(
             print(f"  !  study에 batch_size_actual이 없습니다(옛 형식). "
                   f"get_batch_size(len(X_train))={_bs_actual} 로 재계산합니다.")
         best_params.setdefault("batch_size", int(_bs_actual))
+        # ⚠ correction_geometry 도 같은 상황이다: optimize.py 가 space dict 에
+        #   직접 써넣으므로 best_params 에 없다. 여기서 채우지 않으면 HPO 는
+        #   한 arm 으로 탐색했는데 최종 학습은 additive 로 도는 mismatch 가
+        #   조용히 생긴다 -- cat_col_idx 가 빠졌을 때와 같은 유형의 사고다.
+        #   태그 이전의 옛 study 에는 이 attr 이 없고, 그 시절 코드가 만들 수
+        #   있었던 geometry 는 additive 뿐이므로 그렇게 해석한다.
+        _geom_actual = study.best_trial.user_attrs.get(
+            "correction_geometry_actual", "additive")
+        _geom_expected = (args.params_geometry if args.params_geometry is not None
+                          else args.correction_geometry)
+        if _geom_actual != _geom_expected:
+            raise SystemExit(
+                f"\n[stopped] The study was built with correction_geometry="
+                f"'{_geom_actual}', but this run expected '{_geom_expected}'.\n"
+                f"  file: {fname}\n"
+                f"  Reproducing the tuned configuration under a different "
+                f"geometry trains a different model than the one HPO selected."
+                f"\n  -> pass --correction_geometry {_geom_actual}, or "
+                f"--params_geometry {_geom_actual} to borrow its "
+                f"hyperparameters on purpose.")
+        if args.params_geometry is not None:
+            # Controlled intervention: hyperparameters from one arm's study,
+            # geometry from the CLI. Everything downstream names the run after
+            # the geometry that is actually trained.
+            print(f"  [params_geometry] hyperparameters from the "
+                  f"'{_geom_actual}' study; training with "
+                  f"correction_geometry='{args.correction_geometry}'.")
+        best_params["correction_geometry"] = args.correction_geometry
+        actual_geometry = args.correction_geometry
+        actual_beta_param = args.beta_param
+        actual_head_input_scale = args.head_input_scale
+        if args.params_variant == "legacy":
+            print(f"  [params_variant=legacy] hyperparameters from a "
+                  f"sigmoid/unit/first study; training with "
+                  f"beta_param={args.beta_param}, "
+                  f"head_input_scale={args.head_input_scale}, "
+                  f"tie_rule={args.tie_rule}.")
+        # 같은 이유로 selection metric 도 study 가 기록한 값을 따라야 한다.
+        # 다른 값으로 재학습하면 HPO 가 고른 것과 다른 checkpoint 가 나온다.
+        _esm_actual = study.best_trial.user_attrs.get(
+            "early_stop_metric_actual", "accuracy")
+        if _esm_actual != args.early_stop_metric:
+            raise SystemExit(
+                f"\n[stopped] The study was built with early_stop_metric="
+                f"'{_esm_actual}', but this run was given "
+                f"'{args.early_stop_metric}'.\n"
+                f"  file: {fname}\n"
+                f"  The selection metric decides which checkpoint the run "
+                f"returns; reproducing under a different one yields a "
+                f"different model than HPO selected.\n"
+                f"  -> pass --early_stop_metric {_esm_actual}.")
+        print(f"  early_stop_metric (from optimize.py): {_esm_actual}")
+        print(f"  correction_geometry (from optimize.py): {_geom_actual}")
         print(f"  Params: {best_params}")
         # [--params_seed] P 와 batch_size 는 HPO 가 고른 값이 아니라
         # 프로토콜 규칙(P=floor(sqrt(N_train)), get_batch_size(N_train))에서
@@ -1713,6 +1830,16 @@ def run_single_seed(
 
         # ── Build the model ────────────────────────────────────
         model_kwargs = params_to_model_kwargs(best_params, dataset.n_features, output_dim)
+
+        # ── Structural target override (MUST be after params_to_model_kwargs) ──
+        # source study 는 hyperparameter 만 제공한다. 구조는 CLI 가 정하며, 그
+        # 대입이 params_to_model_kwargs() **뒤**에 와야 한다. 앞에 두면
+        # provenance 는 B 라고 쓰고 모델은 source 의 sigmoid/unit 으로 만들어지는
+        # silent failure 가 된다. tie_rule 은 여기 넣지 않는다 -- TabERA 구조가
+        # 아니라 TabERAWrapper 의 selection semantics 다.
+        model_kwargs["correction_geometry"] = args.correction_geometry
+        model_kwargs["beta_param"] = args.beta_param
+        model_kwargs["head_input_scale"] = args.head_input_scale
 
         # ── Overrides applied to the retrained model ────────────────────
         # ⚠ These were lost once. The CLI flags stayed defined and the study
@@ -1755,6 +1882,113 @@ def run_single_seed(
             print(f"  [--dead_reinit_noise_scale_override] dead_reinit_noise_scale: "
                   f"{_old_n} -> {args.dead_reinit_noise_scale_override}")
 
+    # ── Training provenance: source (어느 study 의 HPO params 인가) vs actual
+    #    (무엇을 학습했나). 체크포인트와 meta 양쪽에 같은 dict 를 저장한다.
+    #    --from_saved_state 로 열면 아래에서 체크포인트의 값으로 덮인다 -- 재실행
+    #    시 준 CLI 가 원 checkpoint 의 선택 규칙으로 기록되면 안 되기 때문.
+    _training_provenance = {
+        "correction_geometry_actual": actual_geometry,
+        "beta_param_actual": actual_beta_param,
+        "head_input_scale_actual": actual_head_input_scale,
+        "tie_rule_actual": args.tie_rule,
+        "early_stop_metric_actual": args.early_stop_metric,
+        "params_geometry": args.params_geometry,
+        "params_variant": args.params_variant,
+        # ⚠ HPO study 를 어느 seed 디렉터리에서 읽었는가. 모델/학습 동작에는
+        #   영향이 없지만 (split·RNG 는 --seed 가 정한다) run identity 에는
+        #   반드시 들어가야 한다: params_seed=1 로 돌린 run 과 params_seed=s 로
+        #   돌린 run 이 같은 이름을 쓰면 서로 다른 hyperparameter 의 결과가
+        #   구분되지 않는다.
+        "params_seed": args.params_seed,
+        "params_correction_geometry_source": (args.params_geometry
+                                              if args.params_geometry is not None
+                                              else actual_geometry),
+        "params_beta_param_source": ("sigmoid" if args.params_variant == "legacy"
+                                     else actual_beta_param),
+        # ⚠ study lookup 과 **같은 규칙**이어야 한다. lookup 은
+        #     "unit" if (params_variant == "legacy" or head_input_scale == "matched")
+        #   이므로 matched 는 params_variant 없이도 항상 unit study 를 읽는다.
+        #   여기서 그 조건을 빠뜨리면 "읽은 study 는 unit 인데 source 는 matched"
+        #   로 기록되어 provenance 가 거짓이 된다.
+        "params_head_input_scale_source": (
+            "unit" if (args.params_variant == "legacy"
+                       or actual_head_input_scale == "matched")
+            else actual_head_input_scale),
+        "params_tie_rule_source": ("first" if args.params_variant == "legacy"
+                                   else args.tie_rule),
+    }
+    if args.from_saved_state:
+        _tp_ckpt = _saved_state.get("training_provenance")
+        if _tp_ckpt:
+            _training_provenance = dict(_tp_ckpt)
+            _training_provenance["restored_from_checkpoint"] = True
+        else:
+            # 이 필드가 생기기 전의 체크포인트. 선택 규칙/출처는 알 수 없다 --
+            # legacy 로 추정하되 그 사실을 남긴다.
+            _training_provenance = {k: "unknown_legacy_assumed" for k in _training_provenance}
+            _training_provenance["restored_from_checkpoint"] = False
+
+    # ── Run identity: provenance 에서 읽는다, CLI 가 아니라 ──────────────
+    # ⚠ actual_geometry / actual_beta_param / actual_head_input_scale 은 이미
+    #   checkpoint 에서 복구되지만, source 축(params_geometry/params_variant)과
+    #   selection 축(tie_rule/early_stop_metric)까지 CLI 를 다시 읽으면
+    #   --from_saved_state 산출물의 이름이 원 training run 과 달라진다. 예: B+H
+    #   체크포인트를 플래그 없이 열면 ..paramsgeom/..paramsvar 가 사라진다.
+    #   학습 경로에서는 _training_provenance 가 CLI 로 채워지므로 동일하다.
+    _actual_tie_rule = _training_provenance.get("tie_rule_actual", args.tie_rule)
+    _actual_esm = _training_provenance.get("early_stop_metric_actual",
+                                           args.early_stop_metric)
+    _actual_params_seed = _training_provenance.get("params_seed", args.params_seed)
+    _actual_params_geometry = _training_provenance.get("params_geometry",
+                                                       args.params_geometry)
+    _actual_params_variant = _training_provenance.get("params_variant",
+                                                      args.params_variant)
+    # 옛 checkpoint 는 전 필드가 "unknown_legacy_assumed" 다. 그 문자열이 파일명에
+    # 들어가면 안 되므로 legacy 기본값으로 되돌린다.
+    if _actual_tie_rule == "unknown_legacy_assumed":        _actual_tie_rule = "first"
+    if _actual_esm == "unknown_legacy_assumed":             _actual_esm = "accuracy"
+    if _actual_params_seed == "unknown_legacy_assumed":     _actual_params_seed = None
+    if _actual_params_geometry == "unknown_legacy_assumed": _actual_params_geometry = None
+    if _actual_params_variant == "unknown_legacy_assumed":  _actual_params_variant = None
+
+    # ── Now that the arm is known, name the outputs after it ──────────
+    # Both branches above have set `actual_geometry`: from the study on the
+    # training path, from the checkpoint's model_kwargs under
+    # --from_saved_state. Everything downstream (filenames, meta.pkl,
+    # reproduce_logs) reads this one variable, never args.correction_geometry.
+    # ⚠ hyperparameter 출처도 이름에 들어가야 한다. 없으면 같은 seed 에서
+    #   (additive params + unit_tangent geometry) 와 (unit_tangent params +
+    #   unit_tangent geometry) 가 둘 다 ..geom=unit_tangent 로 저장되어 뒤의
+    #   것이 앞의 것을 덮어쓴다. freeze_deviations 에 params_geometry 가
+    #   남아도 파일이 덮이면 소용없다.
+    if _actual_params_seed is not None:
+        _save_tag += f"..paramsseed={_actual_params_seed}"
+    if _actual_params_geometry is not None:
+        _save_tag += f"..paramsgeom={_actual_params_geometry}"
+    if actual_geometry != "additive":
+        _save_tag += f"..geom={actual_geometry}"
+    # ⚠ --from_saved_state 는 학습을 하지 않으므로 selection metric 이 결과에
+    #   영향을 주지 않는다. 그때 접미사를 붙이면 같은 체크포인트의 분석
+    #   산출물이 CLI 값에 따라 다른 이름으로 흩어진다.
+    if actual_beta_param != "sigmoid":
+        _save_tag += f"..bp={actual_beta_param}"
+    if actual_head_input_scale != "unit":
+        _save_tag += f"..hs={actual_head_input_scale}"
+    # ⚠ tie_rule 은 logits 를 바꾸지 않지만 **반환되는 checkpoint** 를 바꾸므로
+    #   run identity 에 포함되어야 한다. --from_saved_state 는 학습이 없어 무관.
+    if _actual_tie_rule != "first":
+        _save_tag += f"..tie={_actual_tie_rule}"
+    # source override 를 실제로 쓴 run 에만 붙인다 -- 기본 legacy run 의
+    # filename invariant 를 깨지 않기 위해.
+    if _actual_params_variant is not None:
+        _save_tag += f"..paramsvar={_actual_params_variant}"
+    if _actual_esm != "accuracy":
+        _save_tag += f"..esm={_actual_esm}"
+    # ⚠ beta_lr_mult 는 β 의 optimizer timescale 을 바꾸므로 반환되는 checkpoint 가
+    #   달라진다. 이름에 없으면 sweep 의 30/100/300 이 서로 덮어쓴다.
+    if args.beta_lr_mult != 1.0 and not args.from_saved_state:
+        _save_tag += f"..blrm{args.beta_lr_mult:g}"
+
     # ⚠ memory_size must equal n_train. Left at the default (10000), the ring
     #   buffer keeps accumulating each epoch until filled > n_train, and the
     #   slot indices in sample_groups run past the training arrays (measured:
@@ -1795,6 +2029,13 @@ def run_single_seed(
     )
 
     model = TabERA(**model_kwargs, column_names=dataset.col_names)
+    # β 의 실제 출발점. beta_history 는 첫 epoch 종료 후부터 기록되므로 그것만으로는
+    # "초기값에서 얼마나 이동했는가" 를 알 수 없다. ⚠ 이 줄은 state 를 load 하기
+    # 전에 실행되므로 --from_saved_state 에서도 새로 생성된 모델의 초기값(-2.197)을
+    # 읽는다 -- 체크포인트의 값이 아니다. 그 경우 학습이 없으므로 meta 에
+    # beta_init_is_training_start=False 로 표시되고 분석기는 이 값을 쓰지 않는다.
+    _beta_raw_init = float(model.dev_beta_raw.detach().mean())
+    _beta_init = float(model.effective_beta().detach().mean())
 
     # ── Train (skipped and restored under --from_saved_state) ───
     wrapper = TabERAWrapper(
@@ -1820,6 +2061,9 @@ def run_single_seed(
         log_beta=args.log_beta,
         beta_lr_mult=args.beta_lr_mult,
         refresh_on_best=args.refresh_on_best,
+        early_stop_metric=args.early_stop_metric,
+        # ⚠ wrapper 전용. TabERA(**model_kwargs) 에는 들어가지 않는다.
+        tie_rule=args.tie_rule,
     )
     wrapper._data_id = args.openml_id
     if _saved_state is not None:
@@ -2087,7 +2331,38 @@ def run_single_seed(
         #   raw 결과를 덮어썼다. 최종 TabERA 가 refinement 를 포함하므로
         #   'model=tabera' 는 최종(refined) 결과로 두고, raw 는 별도 이름으로
         #   같이 남겨 ablation 을 보존한다.
-        _mt_variant = ""
+        # ⚠ Phase A arm 도 같은 이유로 이름에 들어가야 한다. 넣지 않으면
+        #   additive/chord/tangent/unit_tangent 를 차례로 reproduce 할 때 네
+        #   번 모두 같은 파일에 쓰여 마지막 arm 이 앞의 셋을 덮어쓴다
+        #   (_save_tag 는 _preds/meta/model_state 에만 들어가고 이 경로에는
+        #   들어가지 않는다). additive 는 접미사 없이 두어 기존 집계
+        #   스크립트의 경로 패턴을 그대로 유지한다.
+        _mt_variant = ("" if actual_geometry == "additive"
+                       else f"_geom-{actual_geometry}")
+        # ⚠ train_seed 도 같은 이유로 필요하다. _save_tag 에는
+        #   "..trainseed{N}" 이 들어가서 meta/preds/model_state 는 갈리는데,
+        #   이 경로에는 없어서 `--train_seeds 1 2 3 4 5` 를 한 번에 돌리면
+        #   다섯 번 모두 같은 파일에 쓰이고 마지막 것만 남는다 (geometry 와
+        #   무관한, 원래부터 있던 문제다). train_seed == args.seed 인 기본
+        #   경우에는 접미사가 붙지 않으므로 기존 파일명은 그대로다.
+        if _actual_params_seed is not None:
+            _mt_variant += f"_paramsseed-{_actual_params_seed}"
+        if _actual_params_geometry is not None:
+            _mt_variant += f"_paramsgeom-{_actual_params_geometry}"
+        if actual_beta_param != "sigmoid":
+            _mt_variant += f"_bp-{actual_beta_param}"
+        if actual_head_input_scale != "unit":
+            _mt_variant += f"_hs-{actual_head_input_scale}"
+        if _actual_tie_rule != "first":
+            _mt_variant += f"_tie-{_actual_tie_rule}"
+        if _actual_params_variant is not None:
+            _mt_variant += f"_paramsvar-{_actual_params_variant}"
+        if _actual_esm != "accuracy":
+            _mt_variant += f"_esm-{_actual_esm}"
+        if args.beta_lr_mult != 1.0 and not args.from_saved_state:
+            _mt_variant += f"_blrm-{args.beta_lr_mult:g}"
+        if train_seed != args.seed:
+            _mt_variant += f"_trainseed-{train_seed}"
         _mt_fname = os.path.join(
             _mt_dir, f'model=tabera{_mt_variant}'
                      '..init_hps=False..deep=0..hyper=0.npy')
@@ -2109,7 +2384,8 @@ def run_single_seed(
         # 이며 model selection 에는 절대 쓰지 않는다.
         if _refine_info.get("enabled") and _refine_info.get("raw_test_metrics"):
             _raw_fname = os.path.join(
-                _mt_dir, 'model=tabera_raw..init_hps=False..deep=0..hyper=0.npy')
+                _mt_dir, f'model=tabera{_mt_variant}_raw'
+                         '..init_hps=False..deep=0..hyper=0.npy')
             np.save(_raw_fname, {
                 "Prediction":  _to_np(_raw_preds_test),
                 "Probability": _to_np(_raw_probs_test),
@@ -2342,6 +2618,18 @@ def run_single_seed(
         #   "better existed but could not be selected".
         "best_epoch": getattr(wrapper, "best_epoch", None),
         "selection_open_epoch": getattr(wrapper, "selection_open_epoch", None),
+        # ── Design Lock v1 §4: selection resolution ────────────────────
+        # n_best_ties 가 크면 (1067: 21/21) accuracy 가 checkpoint 를 구분하지
+        # 못한 run 이다. tie_rule 은 그 중 어느 것을 반환했는지의 convention.
+        "tie_rule": _training_provenance.get("tie_rule_actual"),
+        # source vs actual. 체크포인트 payload 와 같은 dict -- 단일 소스.
+        "training_provenance": _training_provenance,
+        "best_correct": getattr(wrapper, "best_correct", None),
+        "n_val": getattr(wrapper, "n_val", None),
+        "n_best_ties": getattr(wrapper, "n_best_ties", None),
+        # γ 실제값. model_kwargs 로부터 재구성되므로 state_dict 에는 없다.
+        "head_input_gamma": (model.effective_gamma()
+                             if hasattr(model, "effective_gamma") else 1.0),
         # ── Axis 2: prototype behaviour ──────────────────────────────
         # Metrics supporting the claim that a prototype is a density-driven
         # anchor rather than a class prototype, with a granularity that adapts
@@ -2357,6 +2645,13 @@ def run_single_seed(
         #   later, so it goes into meta as well.
         "beta_history": getattr(wrapper, "beta_history", []),
         "beta_lr_mult": getattr(wrapper, "beta_lr_mult", 1.0),
+        # dev_beta_raw / effective β at model construction, before fit() and
+        # before any state is loaded. ⚠ Under --from_saved_state this is the
+        # fresh-construction default, not the checkpoint's value, and there is
+        # no training start point at all -- hence the flag below.
+        "beta_raw_init": _beta_raw_init,
+        "beta_init": _beta_init,
+        "beta_init_is_training_start": args.from_saved_state is None,
         # ── Config freeze: did this run deviate from the defaults? ──────
         # ⚠ A static check can only inspect the **defaults in the code**; it
         #   cannot see a flag overriding them at run time. Recording what
@@ -2378,6 +2673,22 @@ def run_single_seed(
                 "num_bins":      args.num_bins,
                 "cat_combine":   args.cat_combine,
                 "num_embedding": args.num_embedding,
+                # The Phase A arm changes the model, so a results table cannot
+                # be read without it. ⚠ actual_geometry, not
+                # args.correction_geometry: under --from_saved_state the
+                # checkpoint decides, and recording the CLI default there
+                # would label a tangent run "additive".
+                "correction_geometry": actual_geometry,
+                "beta_param": actual_beta_param,
+                "head_input_scale": actual_head_input_scale,
+                # ⚠ CLI 가 아니라 provenance. --from_saved_state 로 B+H 를
+                #   플래그 없이 열면 CLI 는 전부 기본값이라 meta 가 "이 run 은
+                #   legacy" 라고 잘못 기록한다.
+                "tie_rule": _actual_tie_rule,
+                "params_seed": _actual_params_seed,
+                "params_geometry": _actual_params_geometry,
+                "params_variant": _actual_params_variant,
+                "early_stop_metric": _actual_esm,
             }.items()
             if v != {"n_prototypes": None, "beta_lr_mult": 1.0,
                      "disable_dead_reinit": False,
@@ -2387,7 +2698,13 @@ def run_single_seed(
                      # ⚠ Changed from 0.005 to 0.0 when the default moved.
                      #   Afterwards 0 is the default and not a deviation.
                      "num_bins": 8,
-                     "cat_combine": "onehot", "num_embedding": "ple"}[k]
+                     "cat_combine": "onehot", "num_embedding": "ple",
+                     "correction_geometry": "additive",
+                     "beta_param": "sigmoid", "head_input_scale": "unit",
+                     "tie_rule": "first",
+                     "params_seed": None,
+                     "params_geometry": None, "params_variant": None,
+                     "early_stop_metric": "accuracy"}[k]
         },
         # The --time_epoch measurements are stored for the same reason.
         "epoch_timing": getattr(wrapper, "_timing", {}),
@@ -2398,8 +2715,12 @@ def run_single_seed(
         #   eightfold gap). Early stopping absorbs some of this but does not
         #   control it, so the actual update count is recorded. It is needed
         #   whenever batch_size is revisited.
+        # ⚠ ceil, not floor. The training loop is
+        #   `for start in range(0, len(y_train), batch_size)`, so the final
+        #   partial batch also takes an optimizer step (1067: 1687/128 → 14,
+        #   not 13). This number feeds the beta-timescale budget estimate.
         "steps_per_epoch": (
-            (len(X_train) // best_params["batch_size"])
+            -(-len(X_train) // best_params["batch_size"])
             if best_params.get("batch_size") else None),
         "deterministic": args.deterministic,
         "deterministic_warn_only": args.deterministic_warn_only if args.deterministic else None,
@@ -2407,8 +2728,9 @@ def run_single_seed(
         # The learned beta, so meta.pkl alone shows how much query-direction
         # correction this run settled on. It ranges from 0.10 to 0.73 across
         # datasets (section 12-6) and must be read alongside any reproduction.
-        "dev_beta_final": float(
-            torch.sigmoid(model.dev_beta_raw.detach()).mean().item()),
+        # ⚠ effective_beta(): beta_param="centered" 면 2σ(r) 이고 beta_fixed 도
+        #   여기서 처리된다. sigmoid 직접 계산은 두 경우 모두 틀린 값을 남긴다.
+        "dev_beta_final": float(model.effective_beta().detach().mean().item()),
         # Diagnostic fields kept for meta.pkl compatibility. The fusion modes
         # they described were removed, so they stay None here.
                 # Residual-fusion coefficients; that mode was removed, so None.
@@ -2485,6 +2807,10 @@ def run_single_seed(
         "seed":         args.seed,
         "train_seed":   train_seed,
         "deterministic": args.deterministic,
+        # ⚠ model_kwargs 는 함수를 복원하지만 selection 규칙과 HPO 출처는 담지
+        #   않는다. 이 dict 가 없으면 --from_saved_state 재실행의 meta 가 원
+        #   checkpoint 가 아니라 재실행 CLI 를 기록한다.
+        "training_provenance": _training_provenance,
     }, str(state_path))
     print(f"  saved: {state_path}")
 
@@ -2584,10 +2910,13 @@ def main():
     parser.add_argument("--savepath",  type=str, default=".",
                         help="parent directory containing optim_logs")
     parser.add_argument("--seed",      type=int, default=1,
-                        help="use the same seed as optimize.py. It selects the data "
-                             "split only: with KFold(random_state=42) fixed in "
-                             "libs/data.py, it decides which fold becomes test, and "
-                             "has no effect on init or batch order")
+                        help="evaluation seed. It selects the data split -- with "
+                             "KFold(random_state=42) fixed in libs/data.py it decides "
+                             "which fold becomes test -- and, when --train_seed / "
+                             "--train_seeds are not given, it is ALSO used for training "
+                             "initialization and batch order (train_seed defaults to "
+                             "--seed). Use --train_seed to vary training randomness "
+                             "while holding the data split fixed.")
     parser.add_argument("--train_seed", type=int, default=None,
                         help=(
                             "seed for training init and batch order only: it is passed "
@@ -2770,6 +3099,47 @@ def main():
                             "mechanism diagnostic 에서 fold 마다 HPO 를 다시 하면 "
                             "hyperparameter 선택 차이가 섞이므로, config 를 고정하고 "
                             "fold 만 바꾸는 쪽이 더 강한 confirmation 이다."))
+    parser.add_argument("--beta_param", type=str, default="sigmoid",
+                        choices=["sigmoid", "centered"],
+                        help=("β parameterization. sigmoid: β=σ(r), β0=.1 (legacy). "
+                              "centered: β=2σ(r), β0=1 -- .1 이라는 비대칭 prior 를 "
+                              "제거한 scale-neutral 초기화. correction_geometry="
+                              "'unit_tangent' 에서만 허용."))
+    parser.add_argument("--head_input_scale", type=str, default="unit",
+                        choices=["unit", "auto", "matched"],
+                        help=("head 입력 스케일 γ. unit: γ=1 (legacy). auto: "
+                              "γ=sqrt(D/(1+β0²)) 로 ‖γh0‖=sqrt(D) -- LayerNorm 출력을 "
+                              "받는 일반 head 와 같은 좌표. z=W(γh)+b 이므로 "
+                              "W_eff=γW 이고 분해 항등식은 그대로. unit_tangent 전용.\n"
+                              "matched: auto 와 수치는 같지만 Additive 전용이며, "
+                              "Additive 를 normalize 하는 공식이 아니라 H 에 가한 것과 "
+                              "동일한 개입량을 복제해 S_A 와 S_UT 를 같은 크기로 만드는 "
+                              "것이 목적이다 (interaction I = S_UT − S_A 를 읽기 위해)."))
+    parser.add_argument("--tie_rule", type=str, default="first",
+                        choices=["first", "latest"],
+                        help=("validation accuracy 동률일 때 어느 checkpoint 를 "
+                              "반환할지. first: legacy(가장 이른 epoch). latest: "
+                              "eligible epoch 중 최댓값을 달성한 마지막. early-stopping "
+                              "horizon 은 두 규칙에서 동일하다. classification + "
+                              "early_stop_metric=accuracy 에서만 정의."))
+    parser.add_argument("--params_variant", type=str, default=None,
+                        choices=["legacy"],
+                        help=("HPO params 를 **어느 study 에서 읽을지**만 정한다 -- "
+                              "구조를 legacy 로 되돌리는 플래그가 아니다. 'legacy' 면 "
+                              "beta_param=sigmoid, head_input_scale=unit, "
+                              "tie_rule=first 로 만들어진 study 를 읽고, 학습은 CLI 값 "
+                              "그대로 한다. H/B/B+H controlled intervention 용."))
+    parser.add_argument("--params_geometry", type=str, default=None,
+                        choices=["additive", "chord", "tangent", "unit_tangent"],
+                        help=(
+                            "HPO study 를 어느 geometry 의 study 에서 읽을지만 정한다. "
+                            "학습은 --correction_geometry 로 한다. --params_seed 와 "
+                            "같은 원리: 예 --params_geometry additive "
+                            "--correction_geometry unit_tangent → additive 가 고른 "
+                            "hyperparameter 를 그대로 두고 geometry 하나만 바꾼 "
+                            "controlled intervention. geometry 별로 HPO 를 새로 하면 "
+                            "geometry 효과와 hyperparameter 선택 차이가 섞인다. "
+                            "산출물은 --correction_geometry 이름으로 저장된다."))
     parser.add_argument("--allow_pb_mismatch", action="store_true",
                         help=("--params_seed 사용 시 P/batch_size 가 현재 fold 의 "
                               "프로토콜 규칙과 달라도 진행한다. 기본은 중단."))
@@ -2861,6 +3231,25 @@ def main():
     parser.add_argument("--num_bins", type=int, default=8,
                         help="bins per column when num_embedding=ple (default 8, changed "
                              "from 48 after better calibration was observed on several datasets).")
+    parser.add_argument("--correction_geometry", type=str, default="additive",
+                        choices=["additive", "chord", "tangent", "unit_tangent"],
+                        help=(
+                            "Phase A arm: the geometry of d = h - c. Must match the "
+                            "value optimize.py ran with -- it selects the study file "
+                            "(..geom=NAME) and, if the study records a different arm, "
+                            "this run stops rather than train a different model than "
+                            "the one that was tuned. Ignored with --from_saved_state, "
+                            "where the value stored in the checkpoint's model_kwargs "
+                            "applies."))
+    parser.add_argument("--early_stop_metric", type=str, default="accuracy",
+                        choices=["accuracy", "logloss", "auroc", "bacc"],
+                        help=(
+                            "Validation metric that selects best_state and drives the "
+                            "patience counter. Must match what optimize.py ran with: "
+                            "it selects the study file (..esm=NAME) and this run stops "
+                            "if the study recorded a different one. Default 'accuracy' "
+                            "is the legacy behaviour. No effect with "
+                            "--from_saved_state, which skips training."))
     parser.add_argument("--plr_n_frequencies", type=int, default=16,
                         help="number of periodic frequencies per column when num_embedding=plr_lite (default 16).")
     parser.add_argument("--plr_freq_scale", type=float, default=0.01,
@@ -3087,7 +3476,7 @@ def main():
     # Separates data-loading time from training time. optimize.py loads the
     # dataset once outside objective() and 100 trials reuse it, whereas
     # reproduce.py loads it afresh in every process. The OpenML fetch, NaN
-    # preprocessing, StratifiedKFold and QuantileTransformer costs all land
+    # preprocessing, KFold and QuantileTransformer costs all land
     # here, so this tells apart whether "reproduce.py feels slower than an
     # optimize.py trial" is training itself or this loading cost.
     _t_data_start = time.time()

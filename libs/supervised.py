@@ -152,6 +152,52 @@ class TabERAWrapper:
         # retrieval robustness, validation and test scores can move. Compare
         # A/B on a dataset before making it the default. Not in the HPO search
         # space.
+        early_stop_metric: str = "accuracy",
+        tie_rule: str = "first",
+        # ── Which checkpoint to return among epochs with equal selection score ──
+        # "first"  : legacy. Strict `>` only, so the earliest epoch that reached
+        #            the maximum is kept.
+        # "latest" : an epoch that *ties* the maximum also replaces best_state.
+        #            Returned checkpoint = the last eligible epoch at the max.
+        # ⚠ Defined only for classification + early_stop_metric="accuracy"; the
+        #   comparison is on the integer #correct. Regression has no #correct
+        #   and AUROC/logloss ties have measure zero, so no generic float tie
+        #   semantics are invented -- other combinations raise.
+        # ⚠ The early-stopping horizon is unchanged: EarlyStopping.step() is
+        #   strict and consumes patience on a tie under both rules. Only the
+        #   returned checkpoint differs.
+        # Why (measured, ds=1067 seed 1): val has 211 rows, majority = 177
+        # correct. With β lr ×30 and ×300 accuracy was 177/211 for every epoch,
+        # so "first" returned epoch 1 (head at init, AUROC .33) although epoch
+        # 21 had AUROC .75. "latest" returns epoch 21 (×30) / epoch 9 (×300)
+        # from the identical run.
+        # ── Which validation metric selects best_state and drives patience ──
+        # "accuracy" is the legacy behaviour and the default, so every existing
+        # study reproduces unchanged.
+        #
+        # ⚠ The legacy code read `list(val_m.values())[0]`: the selection
+        #   criterion was decided by a dict insertion order, and libs/eval.py
+        #   carries a comment pinning acc_val to first place purely to hold
+        #   that up. Naming the metric removes the coupling; the order contract
+        #   in eval.py can stay as a second line of defence.
+        #
+        # Why it is needed (measured, ds=1067 seed 1): the positive class is
+        # 15.6%, so predicting the majority class scores acc_val = 0.8389 from
+        # the first epoch and never improves. Accuracy is flat across epochs
+        # 1-10 while AUROC climbs 0.354 -> 0.708 and logloss falls
+        # 0.606 -> 0.493. best_epoch came out as 1: ||W|| stayed at its
+        # initialisation scale (0.578 vs 1/sqrt(3) = 0.577), beta never moved
+        # (0.100124 vs 0.100020 at init) and every logit was negative. The flat
+        # metric also spent the whole patience budget, ending the run at epoch
+        # 21 of 100 with logloss still falling. Worse, when the model finally
+        # predicted the minority class (epoch 11: bacc 0.598, F1 0.327) plain
+        # accuracy *dropped* to 0.8246 -- accuracy actively rejects the
+        # checkpoint that started working.
+        #
+        # ⚠ A non-default value changes which checkpoint every run returns.
+        #   Treat it as a separate experiment with its own study file, not as
+        #   a fix applied in place.
+        # ⚠ Regression ignores this: compute_metric returns rmse_val only.
     ) -> None:
         self.model    = model.to(device)
         self.params   = params
@@ -161,6 +207,33 @@ class TabERAWrapper:
         self.patience = patience
         self.defer_early_stopping = bool(defer_early_stopping)
         self.min_epochs = max(0, int(min_epochs))
+        # name -> (key in compute_metric's dict, higher_is_better)
+        _SEL = {"accuracy": ("acc_val",     True),
+                "logloss":  ("logloss_val", False),
+                "auroc":    ("auroc_val",   True),
+                "bacc":     ("bacc_val",    True)}
+        if early_stop_metric not in _SEL:
+            raise ValueError(f"early_stop_metric must be one of {sorted(_SEL)}, "
+                             f"got {early_stop_metric!r}")
+        self.early_stop_metric = early_stop_metric
+        if tie_rule not in ("first", "latest"):
+            raise ValueError(f"tie_rule must be 'first' or 'latest', got {tie_rule!r}")
+        if tie_rule == "latest" and (self.tasktype == "regression"
+                                     or early_stop_metric != "accuracy"):
+            raise ValueError(
+                "tie_rule='latest' 는 classification + early_stop_metric='accuracy' "
+                f"에서만 정의됩니다 (tasktype={self.tasktype}, "
+                f"early_stop_metric={early_stop_metric}).")
+        self.tie_rule = tie_rule
+        # 채워지는 값: best_correct / n_val / n_best_ties (meta 에 기록)
+        self.best_correct = None
+        self.n_val = None
+        self.n_best_ties = 0
+        if self.tasktype == "regression":
+            self._sel_key, self._sel_higher_better = "rmse_val", False
+        else:
+            self._sel_key, self._sel_higher_better = _SEL[early_stop_metric]
+        self._sel_fallback_warned = False
         # Epoch at which best_state selection actually opened, so a run can be
         # audited afterwards without re-deriving it from the flags.
         self.selection_open_epoch = None
@@ -480,10 +553,20 @@ class TabERAWrapper:
                 )
 
 
-        higher_is_better = (self.tasktype != "regression")
+        # ⚠ Not `tasktype != "regression"` any more: logloss is a
+        #   classification metric where **lower** is better, so the direction
+        #   follows the selected metric, not the task.
+        higher_is_better = self._sel_higher_better
+
+        def _sel_is_better(new, old):
+            """Replaces is_better(new, old, tasktype), for the same reason."""
+            if old is None:
+                return True
+            return new > old if higher_is_better else new < old
 
         best_state = None
         best_val   = None
+        best_correct = None          # tie_rule 비교용 정수 (#correct)
         best_sample_groups = None
         best_feature_store = None
         best_group_labels  = None
@@ -581,9 +664,11 @@ class TabERAWrapper:
                 #         at the initial value
                 #   If (b), then the initial value we chose decides the result,
                 #   which is not defensible in the paper.
-                # ⚠ Must be read **before** clip_grad_norm_ and
-                #   optimizer.step(); afterwards the gradient is clipped or
-                #   cleared.
+                # ⚠ Read **after** clip_grad_norm_ (called above) and before
+                #   optimizer.step(). So grad_abs_mean is the *clipped*
+                #   magnitude, not the raw CE gradient. The sign is unaffected
+                #   by clipping, so grad_signed_mean and the derived
+                #   frac_grad_toward_beta_up remain valid as direction signals.
                 # ⚠ Off by default (--log_beta). Enabling it adds an .item()
                 #   per batch and therefore a CUDA sync, so normal training
                 #   is unaffected.
@@ -804,7 +889,37 @@ class TabERAWrapper:
                 _val_perm  = torch.randperm(len(X_val), device=self.device)
                 val_logits = self._forward_batched(X_val[_val_perm])
                 val_m  = compute_metric(val_logits, y_val[_val_perm], self.tasktype)
-            val_v = list(val_m.values())[0]
+                # #correct as an integer. Float accuracy k/n is deterministic for
+                # equal k, but the integer makes `==` unambiguous and is what
+                # tie_rule compares. Regression: None.
+                if self.tasktype != "regression":
+                    _yv = y_val[_val_perm]
+                    _pred = (val_logits.squeeze(-1) > 0).long() if val_logits.shape[-1] == 1 \
+                            else val_logits.argmax(dim=-1)
+                    n_correct = int((_pred == _yv.long().view(-1)).sum().item())
+                    self.n_val = int(_yv.numel())
+                else:
+                    n_correct = None
+            # ⚠ Was `list(val_m.values())[0]`, which made a dict insertion
+            #   order the model-selection criterion. The key is now named.
+            #   Fallback to the legacy first value is reachable when
+            #   compute_metric ran its reduced path (accuracy only) or when a
+            #   metric is NaN -- AUROC does that on a fold where a class is
+            #   absent. Falling back silently would change the criterion
+            #   mid-run, so it is announced once.
+            _sel = val_m.get(self._sel_key)
+            if _sel is None or _sel != _sel:               # missing or NaN
+                if not self._sel_fallback_warned:
+                    tqdm.write(
+                        f"  !  early_stop_metric={self.early_stop_metric} "
+                        f"({self._sel_key}) unavailable at epoch {epoch}"
+                        f"{' (NaN)' if _sel is not None else ''}; falling back "
+                        f"to {next(iter(val_m))}. If this repeats, the "
+                        f"selection criterion is not the one requested.")
+                    self._sel_fallback_warned = True
+                val_v = list(val_m.values())[0]
+            else:
+                val_v = float(_sel)
 
 
 
@@ -835,6 +950,11 @@ class TabERAWrapper:
             #   which phase early stopping lands in may decide the outcome.
             if self.regroup_history and self.regroup_history[-1].get("epoch") == float(epoch):
                 self.regroup_history[-1]["val_score"] = float(val_v)
+                # ⚠ val_score is whichever metric early_stop_metric named, so
+                #   the name travels with it. Every metric is stored below
+                #   anyway; without this a reader cannot tell which one drove
+                #   selection on this run.
+                self.regroup_history[-1]["val_score_metric"] = self._sel_key
                 # ⚠ Only the *selection* metric used to be recorded here, so
                 #   the question "which epoch would AUROC (or logloss) have
                 #   chosen, and what did the prototype partition look like
@@ -849,17 +969,60 @@ class TabERAWrapper:
                 #   run instead of one run per criterion.
                 for _mk, _mv in val_m.items():
                     self.regroup_history[-1][f"val_{_mk}"] = float(_mv)
+                # ── Design Lock v1 §5d: head trajectory, independent of selection ──
+                # raw = optimizer coordinate; effective = ‖γW‖ = function-space
+                # scale. Under head_input_scale=auto a small raw norm is a
+                # mechanical consequence of W_eff = γW and is not evidence by
+                # itself -- compare `effective` across runs.
+                with torch.no_grad():
+                    _Wraw = self.model.dev_head.weight
+                    self.regroup_history[-1]["head_weight_norm_raw"] = float(_Wraw.norm())
+                    self.regroup_history[-1]["head_weight_norm_effective"] = float(
+                        self.model.effective_W().norm()
+                        if hasattr(self.model, "effective_W") else _Wraw.norm())
+                    self.regroup_history[-1]["head_bias_norm"] = float(self.model.dev_head.bias.norm())
+                    if n_correct is not None:
+                        self.regroup_history[-1]["val_n_correct"] = int(n_correct)
+                        self.regroup_history[-1]["val_frac_pos"] = (
+                            float(_pred.float().mean()) if val_logits.shape[-1] == 1 else float("nan"))
 
-            # Whether this epoch may contribute a checkpoint at all. The same
-            # predicate gates the patience counter below: when selection is
-            # not open, "no improvement" is not yet a meaningful statement.
+            # Whether this epoch may contribute a checkpoint at all.
+            # ⚠ It does NOT gate the patience counter unconditionally. Below:
+            #     if (not self.defer_early_stopping) or _selection_open: es.step(...)
+            #   so with defer_early_stopping=False (the default) ineligible
+            #   epochs still consume patience -- legacy behaviour. Only with
+            #   defer_early_stopping=True does the counter start when selection
+            #   opens. tie_rule changes neither branch.
             _selection_open = _past_regroup_warmup and (epoch >= self.min_epochs)
             if _selection_open and self.selection_open_epoch is None:
                 self.selection_open_epoch = int(epoch)
+            # eligible 여부를 epoch 기록에 남긴다 -- 사후에 tie 규칙을 소급 적용할
+            # 때 E 를 정확히 재구성하기 위해.
+            if self.regroup_history and self.regroup_history[-1].get("epoch") == epoch:
+                self.regroup_history[-1]["selection_open"] = bool(_selection_open)
 
-            # Save the best model
-            if is_better(val_v, best_val, self.tasktype) and _selection_open:
+            # Save the best model.
+            # ⚠ eligible epoch (E) 판정은 _selection_open 하나다. tie 규칙도 이
+            #   안에서만 작동하므로 warmup/min_epochs 이전 epoch 은 tie 후보가
+            #   되지 않는다. es.step() 은 아래에서 별도로, 변경 없이 호출된다.
+            _improved = _sel_is_better(val_v, best_val)
+            # ── tie counting 과 checkpoint 저장을 분리한다 ──────────────────
+            # n_best_ties 는 **validation resolution 진단**이다: eligible epoch
+            # 중 최종 최댓값을 달성한 epoch 수이며 tie_rule 과 무관하다. 30× 처럼
+            # 21 epoch 이 전부 177/211 이면 first 든 latest 든 21 이어야 한다.
+            # tie_rule 은 그중 어느 checkpoint 를 반환할지만 정한다.
+            _same_best_correct = (n_correct is not None and best_correct is not None
+                                  and n_correct == best_correct)
+            if _improved and _selection_open and n_correct is not None:
+                self.n_best_ties = 1          # 새 최댓값: 카운트 리셋
+            elif _same_best_correct and _selection_open:
+                self.n_best_ties += 1
+            _tied_for_save = (self.tie_rule == "latest" and _same_best_correct)
+            if (_improved or _tied_for_save) and _selection_open:
                 best_val   = val_v
+                if n_correct is not None:
+                    best_correct = n_correct
+                    self.best_correct = n_correct
                 # Which epoch the returned model actually comes from.
                 self.best_epoch = int(epoch)
                 best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
@@ -935,7 +1098,10 @@ class TabERAWrapper:
                     self.beta_history.append({
                         "epoch": int(epoch),
                         "raw": float(_bp.detach().mean()),
-                        "beta": float(torch.sigmoid(_bp.detach()).mean()),
+                        # ⚠ effective_beta(): beta_param="centered" 면 2σ(r) 다.
+                        #   sigmoid(_bp) 를 직접 쓰면 B/B+H 의 β 궤적이 정확히
+                        #   절반으로 기록된다 (초기 1.0 → 0.5).
+                        "beta": float(self.model.effective_beta().detach().mean()),
                         # Batch means. |grad| is magnitude, signed is
                         # direction. A signed near 0 with a large |grad| means
                         # the direction keeps flipping, i.e. the term is
