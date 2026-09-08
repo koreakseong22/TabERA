@@ -3,6 +3,7 @@
 ## Based on: MultiTab (Kyungeun Lee, kyungeun.lee@lgresearch.ai)
 
 import os, argparse
+from libs.benchmark_config import FINAL_CONFIG
 
 # ── Set CUDA_VISIBLE_DEVICES before torch is imported ──────────
 # Same placement as upstream MultiTab: right after argparse, before torch.
@@ -71,7 +72,7 @@ parser.add_argument("--num_embedding", type=str, default="ple",
                     ))
 parser.add_argument("--num_bins", type=int, default=8,
                     help="Bins per column when num_embedding=ple.")
-parser.add_argument("--correction_geometry", type=str, default="additive",
+parser.add_argument("--correction_geometry", type=str, default=FINAL_CONFIG["correction_geometry"],
                     choices=["additive", "chord", "tangent", "unit_tangent"],
                     help=(
                         "Phase A arm: the geometry of d = h - c. h = c + d and "
@@ -89,7 +90,7 @@ parser.add_argument("--beta_param", type=str, default="sigmoid",
                     choices=["sigmoid", "centered"],
                     help="β parameterization (unit_tangent 전용). structural: "
                          "비기본값은 study 파일명에 ..bp=NAME 으로 들어간다.")
-parser.add_argument("--head_input_scale", type=str, default="unit",
+parser.add_argument("--head_input_scale", type=str, default=FINAL_CONFIG["head_input_scale"],
                     choices=["unit", "auto"],
                     help=("head 입력 스케일 γ. 'auto' 는 correction_geometry="
                           "'unit_tangent' 전용이며 structural 이므로 비기본값은 "
@@ -130,6 +131,7 @@ import optuna, torch, json, joblib, datetime, math, gc
 import numpy as np
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
+from libs.benchmark import build_wrapper, contract
 from libs.search_space import (get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE, DEFAULT_K_NO_TUNE, PROTOCOL_TAG)
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
@@ -205,7 +207,7 @@ if train:
     #   여기서 cuda:{args.gpu_id} 를 요청하면 --gpu_id 1 일 때
     #   "invalid device ordinal" 로 죽는다. --gpu_id 는 물리 GPU 선택용이고
     #   내부 device 는 언제나 cuda:0 이다. env_info 에는 물리 인덱스를 남긴다.
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if args.gpu_id >= 0 and torch.cuda.is_available() else "cpu")
     import platform
     env_info = "{0}:{1}".format(platform.node(), args.gpu_id)
     print(env_info, device)
@@ -373,7 +375,15 @@ if train:
     _BEST_VAL: dict = {}
 
     # ── Objective (upstream MultiTab structure) ────────────
+    run_config = {key: getattr(args, key) for key in FINAL_CONFIG}
+    run_contract = contract(run_config, dataset)
+    for previous in study.trials:
+        recorded = previous.user_attrs.get("benchmark_contract")
+        if recorded is not None and recorded != run_contract:
+            raise ValueError("HPO implementation/data/config changed; use a new --savepath")
+
     def objective(trial):
+        trial.set_user_attr("benchmark_contract", run_contract)
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id,
                                         num_embedding=args.num_embedding,
@@ -406,56 +416,7 @@ if train:
         # The selection metric decides which checkpoint every trial returns, so
         # it must be identifiable from the study alone -- same reason as the arm.
         trial.set_user_attr("early_stop_metric_actual", args.early_stop_metric)
-        model_kwargs = params_to_model_kwargs(params, dataset.n_features, output_dim)
-
-        model = TabERA(
-            **model_kwargs,
-            column_names=dataset.col_names,
-            # tasktype is required so that neighbour labels are encoded as
-            # nn.Embedding for classification and nn.Linear for regression,
-            # matching upstream TabR. Without it, nominal class labels would
-            # be fed in as raw integers.
-            tasktype=tasktype,
-            n_classes=(output_dim if tasktype == "multiclass" else (2 if tasktype == "binclass" else None)),
-            # The old min(2N, 10_000) cap meant MemoryBank could not hold all
-            # of X_train once N_train > 10,000, so sample_groups reflected as
-            # little as 28% of the real group (id=41027). Holding the whole
-            # split costs ~73MB at N=35,855 and D=256, so the cap is gone and
-            # group-constrained retrieval works as designed.
-            memory_size=len(y_train),
-            # ⚠ This argument used to be omitted here, so the constructor
-            #   default (False) applied while reproduce.py passed True. HPO and
-            #   the reproduce run were using different retrieval rules.
-            #   Prediction was unaffected (measured max difference 0.000e+00)
-            #   because retrieval is outside the prediction path, but the
-            #   mismatch was real, so both sides now agree.
-            exclude_self_retrieval=(not args.allow_self_retrieval),
-            # Dead-prototype recovery is disabled by setting patience far
-            # above the epoch count, the same way reproduce.py does it, rather
-            # than by adding a separate branch. The value (1e9) must match.
-            **({"dead_reinit_patience": 10 ** 9} if args.disable_dead_reinit else {}),
-            # Categorical / numeric encoding. Without these, cat_col_idx is
-            # None and the model silently falls back to raw encoding
-            # regardless of cat_combine and num_embedding -- HPO would then
-            # tune a different architecture than the one reproduce.py trains.
-            cat_col_idx=list(dataset.X_cat),
-            num_col_idx=list(dataset.X_num),
-            cat_cardinalities=list(dataset.X_cat_cardinality),
-            cat_combine=args.cat_combine,
-            cat_embed_dim=args.cat_embed_dim,
-            num_embedding=args.num_embedding,
-            num_bin_edges=num_bin_edges,
-            # plr_* are deliberately not passed here: for plr_lite they are
-            # already inside model_kwargs (searched per trial and routed
-            # through params_to_model_kwargs), and passing them again would
-            # be a duplicate keyword argument. For other encodings they are
-            # never read.
-        )
-
-        wrapper = TabERAWrapper(model, params, tasktype,
-                                  device=str(device), **HPO_TRAINING_SCHEDULE,
-                                  early_stop_metric=args.early_stop_metric,
-                                  tie_rule=args.tie_rule)
+        wrapper = build_wrapper(dataset, params, run_config, device, num_bin_edges)
         wrapper._data_id = args.openml_id   # shown in the epoch progress bar
         wrapper.fit(X_train, y_train, X_val, y_val)
 
@@ -591,7 +552,7 @@ if train:
         # (id=41027, N=35,855) the per-trial residue is invisible, but on
         # larger ones (id=41150, N=104,050) with heavy hyperparameters the GPU
         # filled up gradually until the guard misfired around trial 7.
-        del model, wrapper
+        del wrapper
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()

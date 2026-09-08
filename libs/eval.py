@@ -70,6 +70,8 @@ def calculate_metric(
     # ── Regression ───────────────────────────────────────────
     if tasktype == "regression":
         metrics[f"rmse_{split}"] = float(np.sqrt(np.mean((y_np - p_np) ** 2)))
+        from sklearn.metrics import r2_score
+        metrics[f"r2_{split}"] = float(r2_score(y_np, p_np))
         return metrics
 
     from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score

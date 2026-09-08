@@ -75,7 +75,7 @@ def get_batch_size(n):
         return 64
 
 
-def load_data(openml_id):
+def load_data(openml_id, tasktype=None):
     if openml_id == 999999:
         dataset = sklearn.datasets.fetch_california_housing()
         X = pd.DataFrame(dataset['data'])
@@ -202,7 +202,7 @@ def load_data(openml_id):
         target_class_names = [str(c) for c in np.unique(y)]
     y = np.asarray(y)
     _uniq = np.unique(y)
-    if not np.array_equal(_uniq, np.arange(len(_uniq))):
+    if tasktype != "regression" and not np.array_equal(_uniq, np.arange(len(_uniq))):
         raise ValueError(
             f"[data.py] target 라벨이 0..{len(_uniq)-1} 연속 정수가 아닙니다: "
             f"{_uniq[:10]}{'...' if len(_uniq) > 10 else ''}\n"
@@ -325,7 +325,7 @@ class TabularDataset(torch.utils.data.Dataset):
 
     def __init__(self, openml_id, tasktype, device, seed=1):
         X, y, self.X_cat, self.X_cat_cardinality, self.X_num, raw_col_names, \
-            self.cat_category_names, self.target_class_names = load_data(openml_id)
+            self.cat_category_names, self.target_class_names = load_data(openml_id, tasktype=tasktype)
         self.tasktype = tasktype
         # load_data()가 관측한 진단(제거된 컬럼 등)을 인스턴스에 붙여 둔다.
         self.load_diag = dict(_LAST_LOAD_DIAG)

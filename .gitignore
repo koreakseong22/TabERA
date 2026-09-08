@@ -25,3 +25,4 @@ venv/
 
 # Optuna DB
 *.db
+*.md
