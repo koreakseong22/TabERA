@@ -1,0 +1,17 @@
+betaema1 recipe freeze commit: bbd63c35b9b282b424417af1a393e368c4100e61 (branch tabera-new, 2026-09-10)
+implementation_id prefix at freeze: f88f55a69a3c (matches ds=31 pilot study contract)
+Do not edit libs/{benchmark,benchmark_config,data,eval,search_space,supervised,tabera,prototypes}.py until all dynamics2d pilots (31, 54, 1067, 1493, 151) are complete.
+
+2026-09-10 03:05  All five dynamics2d pilots complete (31, 54, 1067, 1493, 151; seed 1, 25 trials each, 125 trials).
+Decision: betaema1 kept unchanged. beta_lr_mult upper bound 30 not binding (only 1493 favours 11-26 and 28-30 is worse there);
+no EMA candidate consistently dominant across datasets; hl_05/hl_1 reduce reinit/epoch everywhere but validation is mixed.
+Joint read-out: python pilot_dynamics2d/pilot_joint.py   Backup: pilot_dynamics2d_betaema1_20260910_all5.tar.gz
+Next: final 7D joint HPO, 100 trials, run_final_benchmark.py --run_hpo (not validation_only).
+
+2026-09-10 03:25  Logging-only change to libs/supervised.py (removed the [beta_lr_mult] run-log print)
+and optimize.py (compact final summary instead of dumping best_trial.user_attrs).
+Training behaviour is unchanged, but implementation_id moved f88f55a69a3c -> 382a14b8a375.
+Consequences: the five dynamics2d pilot studies keep their recorded contract (analysis via pilot_joint.py
+still works) but can no longer be resumed; the one final-HPO study made before this change (data=29,
+savepath '.') was moved to optim_logs/seed=1/_pre_logfix_f88f55a6/ and must be re-run.
+The final 7D HPO must be run entirely under 382a14b8a375.

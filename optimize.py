@@ -634,11 +634,48 @@ if train:
     study.set_user_attr("total_training_time", total_training_time)
 
     # ── Save results (same as upstream MultiTab) ───────────
-    print("#############################################")
-    print(env_info)
-    print(study.best_trial.user_attrs)
+    # ⚠ This block used to print study.best_trial.user_attrs in full. That
+    #   dict carries epoch_history and beta_epoch_history, so the "summary" ran
+    #   to thousands of lines and buried the numbers it exists to show. Nothing
+    #   is lost: every value removed here is still in the study .pkl and in the
+    #   trials CSV written just below.
     df = study.trials_dataframe()
-    df.to_csv(os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..seed={args.seed}..model=tabera.csv"), index=False)
+    csv_path = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..seed={args.seed}..model=tabera.csv")
+    df.to_csv(csv_path, index=False)
     joblib.dump(study, fname)
-    print(fname)
-    print("#############################################")
+
+    _best = study.best_trial
+    _done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    # Searched hyperparameters, in a fixed reading order rather than dict order.
+    _HP = ("embed_dim", "embedder_layers", "dropout", "lr", "weight_decay",
+           "beta_lr_mult", "ema_timescale",
+           "plr_freq_scale", "plr_n_frequencies", "plr_out_dim")
+    # Not searched, but part of the configuration the best trial actually ran:
+    # n_prototypes / batch_size follow protocol rules, and beta_lr / ema_decay
+    # are what resolve_dynamics() derived from the two recipe parameters.
+    _DERIVED = (("n_prototypes", "n_prototypes_actual"), ("batch_size", "batch_size_actual"),
+                ("beta_lr", "beta_lr_actual"), ("ema_decay", "ema_decay_actual"))
+    _METRICS = ("acc_val", "auroc_val", "f1_val", "logloss_val", "rmse_val", "r2_val",
+                "acc_test", "auroc_test", "f1_test", "logloss_test", "rmse_test", "r2_test")
+
+    def _line(label, value, fmt):
+        print(f"    {label:<18}" + (format(value, fmt) if isinstance(value, float) else str(value)))
+
+    print("=" * 60)
+    print(f"  Best trial : #{_best.number} of {_done} completed  |  objective "
+          f"{study.best_value:.6f} ({'rmse_val' if tasktype == 'regression' else 'acc_val'})")
+    print("  Hyperparameters")
+    for _k in _HP:
+        if _k in _best.params:
+            _line(_k, _best.params[_k], ".6g")
+    for _label, _key in _DERIVED:
+        if _best.user_attrs.get(_key) is not None:
+            _line(_label, _best.user_attrs[_key], ".6g")
+    print("  Performance")
+    for _k in _METRICS:
+        if _k in _best.user_attrs:
+            _line(_k, _best.user_attrs[_k], ".4f")
+    print("  Saved")
+    print(f"    study             {fname}")
+    print(f"    trials            {csv_path}")
+    print("=" * 60)

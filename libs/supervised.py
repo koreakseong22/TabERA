@@ -507,9 +507,10 @@ class TabERAWrapper:
         _beta_lr = self.params["lr"] * float(self.beta_lr_mult)
         _pg = [{"params": _decay, "weight_decay": self.params["weight_decay"]},
                {"params": _no_decay, "weight_decay": 0.0, "lr": _beta_lr}]
-        if abs(float(self.beta_lr_mult) - 1.0) > 1e-9:
-            print(f"  [beta_lr_mult] lr for dev_beta_raw/gamma_raw = "
-                  f"{_beta_lr:.6f}  (base {self.params['lr']:.6f} x {self.beta_lr_mult})")
+        # ⚠ The applied value is not printed here. It is recorded as
+        #   dynamics_provenance["beta_lr_actual"] by build_wrapper() and lands
+        #   in every trial's user_attrs, so the run log stays readable while
+        #   the number stays auditable from the study.
         try:
             optimizer = torch.optim.AdamW(
                 _pg,
