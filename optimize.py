@@ -655,27 +655,26 @@ if train:
     # are what resolve_dynamics() derived from the two recipe parameters.
     _DERIVED = (("n_prototypes", "n_prototypes_actual"), ("batch_size", "batch_size_actual"),
                 ("beta_lr", "beta_lr_actual"), ("ema_decay", "ema_decay_actual"))
-    _METRICS = ("acc_val", "auroc_val", "f1_val", "logloss_val", "rmse_val", "r2_val",
-                "acc_test", "auroc_test", "f1_test", "logloss_test", "rmse_test", "r2_test")
+    _VAL = ("acc_val", "auroc_val", "f1_val", "logloss_val", "rmse_val", "r2_val")
+    _TEST = ("acc_test", "auroc_test", "f1_test", "logloss_test", "rmse_test", "r2_test")
 
-    def _line(label, value, fmt):
-        print(f"    {label:<18}" + (format(value, fmt) if isinstance(value, float) else str(value)))
+    def _fmt(value, spec):
+        return format(value, spec) if isinstance(value, float) else str(value)
+
+    _params = [f"{_k}={_fmt(_best.params[_k], '.6g')}" for _k in _HP if _k in _best.params]
+    _params += [f"{_label}={_fmt(_best.user_attrs[_key], '.6g')}"
+                for _label, _key in _DERIVED if _best.user_attrs.get(_key) is not None]
+    _val = [f"{_k}={_fmt(_best.user_attrs[_k], '.4f')}" for _k in _VAL if _k in _best.user_attrs]
+    # Empty under --validation_only, which computes no test metrics at all.
+    _test = [f"{_k}={_fmt(_best.user_attrs[_k], '.4f')}" for _k in _TEST if _k in _best.user_attrs]
 
     print("=" * 60)
-    print(f"  Best trial : #{_best.number} of {_done} completed  |  objective "
+    print(f"  best trial : #{_best.number} of {_done} completed  |  objective "
           f"{study.best_value:.6f} ({'rmse_val' if tasktype == 'regression' else 'acc_val'})")
-    print("  Hyperparameters")
-    for _k in _HP:
-        if _k in _best.params:
-            _line(_k, _best.params[_k], ".6g")
-    for _label, _key in _DERIVED:
-        if _best.user_attrs.get(_key) is not None:
-            _line(_label, _best.user_attrs[_key], ".6g")
-    print("  Performance")
-    for _k in _METRICS:
-        if _k in _best.user_attrs:
-            _line(_k, _best.user_attrs[_k], ".4f")
-    print("  Saved")
-    print(f"    study             {fname}")
-    print(f"    trials            {csv_path}")
+    print("  params : " + ", ".join(_params))
+    print("  val    : " + ", ".join(_val))
+    if _test:
+        print("  test   : " + ", ".join(_test))
+    print("  study  : " + str(fname))
+    print("  trials : " + str(csv_path))
     print("=" * 60)
