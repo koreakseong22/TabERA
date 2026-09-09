@@ -13,119 +13,189 @@ x ─→ Encoder ─→ q ─→ argmax cos(q, C) ─→ prototype a
                           ┌───────────────┴───────────────┐
                   c = C[a]                        G(a) = its members
                           │                               │
-          h = c + β·normalize(q − c)          NN(q, G(a)), k = 8
-                 z = W·h + b                              │
+                h = c + d                     NN(q, G(a)), k = 8
+              z = W·(γh) + b                              │
                           ▼                               ▼
                      prediction                       explanation
 ```
 
 | | |
 |---|---|
-| Prediction | `z = W·h + b`, `h = c + β·normalize(q − c)` |
-| Decomposition | `z = (W·c + b) + W·(β·r)` — exact, since `W` is shared |
+| Prediction | `z = W·(γh) + b`, `h = c + d` |
+| Correction | `d = β · p⊥ / max(‖p⊥‖, ε)`, where `p = normalize(q − c)` and `p⊥ = p − (p·c)c` — the unit tangent direction at `c` toward `q` (`correction_geometry="unit_tangent"`). `‖d‖ = β` for every non-degenerate sample (`‖p⊥‖ ≥ ε`, `ε = 1e-6`); the distance from `c` does not enter `d`, only the direction does. `β = σ(β_raw)` is one learned scalar; `γ` is the head input scale (`head_input_scale="auto"`) |
+| Decomposition | `z = (W_eff·c + b) + W_eff·d`, `W_eff = γW` — exact in logit space, since `W` is shared |
 | Retrieval | k-NN inside `G(a)`, self excluded. Not an input to `z` |
 | Objective | cross-entropy only; prototypes carry no loss |
+
+The legacy `additive` arm, `d = β·normalize(q − c)`, is still selectable but is
+not the final configuration (`libs/benchmark_config.py`).
 
 ---
 
 ## What an explanation shows
 
-Printed by `reproduce.py --explain`. The region and the prediction split are
-read off the computation that produced the prediction; evidence runs beside it.
+Printed by `analyze.py --explain` (`--from_saved_state <…_model_state.pt>` skips
+training; `--explain_verbose` adds the researcher diagnostics). The region and
+the prediction split are read off the computation that produced the
+prediction; evidence and position run beside it and are not inputs to it.
+
+`--explain_figure <prefix>` writes the explanation as a paper figure —
+`<prefix>_sample<i>.png` at 300 dpi and a vector `.pdf` — drawn from the same
+observer outputs and the same formatter as the text. Prediction, ① and ③ match
+the text exactly; the figure's ② panel still shows the older contrast-only
+comparison rather than the per-case cards, so do not cite it as identical
+until it is updated.
+
+Analysing a saved checkpoint is deterministic: the post-refresh resync only
+re-derives `sample_groups` from the clean embeddings against the centroids as
+saved (`CentroidLayer.reassign_groups`). It used to call the training-epoch
+`regroup_update`, whose random dead-prototype reinit altered the restored
+model before evaluation and made two analyses of one checkpoint disagree.
 
 | | Question | Source |
 |---|---|---|
-| Prediction | Where did the prediction come from? | `W·c + b` vs `z` |
+| Prediction | How did the region baseline become the final prediction? | `W_eff·c + b` vs `z` |
 | ① Region | Where does this sample belong? | assignment `a` |
 | ② Evidence | Which real cases are nearest within that region? | `NN(q, G(a))` |
-| ③ Region profile | What is this region like, and where in it is this sample? | group feature statistics |
+| ③ Position | Where does this sample sit relative to the members of its region? | region feature statistics, cosine distance to `c` |
 
-Example: `credit-g`, predicting loan default.
+Example: `credit-g`, predicting loan default. This is the verbatim output of
+`analyze.py --openml_id 31 --seed 1 --explain --from_saved_state …` for the
+first test sample.
 
 ### Prediction
 
 ```
-Region baseline prediction   bad 72.1%   (shared by every sample in this region)
-Final prediction             bad 73.8%
-Sample-specific component    strengthens "bad" relative to "good"
+Prediction
+   → good — 58.1%
+   Region baseline:  good 63.9%
+   Final prediction: good 58.1%
+   Correction:       weakens "good" relative to "bad"
 ```
 
-`W·c + b` is identical for every sample in the region; the sample-specific term
-is what separates them. Where `P < C` it does the classifying instead — on a
-100-class dataset with 35 prototypes, setting `β = 0` drops accuracy from 0.725
-to 0.256.
+`Region baseline` is `σ(W_eff·c + b)` and `Final prediction` is `σ(z)`, both
+read on the finally predicted class. `W_eff·c + b` is identical for every
+sample in the region; the correction `W_eff·d` is what separates them. Where
+`P < C` it does the classifying instead — on a 100-class dataset with 35
+prototypes, setting `β = 0` drops accuracy from 0.725 to 0.256.
 
 ⚠ The two probabilities are shown side by side, never subtracted. The
 decomposition is exact in logit space, but each probability is a separate
-softmax, so their difference is not a contribution in probability space. The
-*direction* is exact, being the sign of the logit term — and it is reported for
-binary tasks only, since with more classes a single term shifts all of them at
-once and naming one "main alternative" would be a choice with no basis.
+sigmoid/softmax, so their difference is not a contribution in probability
+space. The `Correction:` line is the *direction* only — the sign of the
+correction logit — and it is printed for binary tasks only, since with more
+classes a single term shifts all of them at once and naming one "main
+alternative" would be a choice with no basis. `--explain_verbose` prints the
+three logits themselves:
+
+```
+Logit decomposition (exact in logit space; binary logit, + favours "good"):
+  region baseline +0.5723 · correction -0.2458 · final +0.3265
+```
 
 ### ① Region
 
 ```
-Assigned prototype: "Centroid_6"
-Label distribution: "bad" 124/160 (78%), "good" 36/160 (22%)
-Routing:  Centroid_6 14.6% (assigned) · Centroid_20 13.6% · others 62.2%
-Characteristic: installment_commitment = 4, other_parties = none (95%)
+① Predictive region
+   Region 5 — 93 training cases
+   Outcomes: good 70/93 (75%) · bad 23/93 (25%)
 ```
 
-The routing spread is a diagnostic of assignment ambiguity — the prediction
-uses the hard assignment, not a mixture. A prototype is a regional anchor, not
-a learned class representative: assignment and the EMA update are both
-class-agnostic. Read it as "this group holds 160 samples, 78% of which
-defaulted", not "this group means default".
+A prototype is a regional anchor, not a learned class representative:
+assignment and the EMA update are both class-agnostic. Read it as "this group
+holds 93 training samples, 75% of which were good", not "this group means
+good". The prediction uses the hard assignment, not a mixture; the routing
+spread (`--explain_verbose`) is a diagnostic of assignment ambiguity.
 
 ### ② Evidence
 
 ```
-neighbourhood (k=8)   bad 7/8 (88%)      H(label) 0.377
-whole group (n=160)   bad 124/160 (78%)  H(label) 0.533
-→ relative ambiguity 0.71
+② Similar past cases — evidence only
+   Retrieved: good 7/8 (88%) · bad 1/8 (12%)
+   Closest cases:
+     #269    good  ·  similarity 1.000
+       matches: job = unskilled resident · purpose = furniture/equipment
+       differs: checking_status: <0 ↔ 0<=X<200
 
-Outcome-matched      #2  sim 0.984 → bad   [train #400]
-Outcome-contrasting  #1  sim 0.985 → good  [train #293]
-                         differs: purpose business → furniture, duration 48 → 18
+     #507    good  ·  similarity 0.999
+       matches: personal_status = male single · credit_history = existing paid
+       differs: checking_status: <0 ↔ 0<=X<200
+
+   Closest contrasting case:
+     #577    bad  ·  similarity 0.999 · contrast
+       matches: own_telephone = yes · personal_status = male single
+       differs: checking_status: <0 ↔ >=200 · credit_history: existing paid ↔ no credits/all paid
+
+   Similarity is measured in the embedding; shown feature values are descriptive.
 ```
 
 The partition selects the pool, the query orders it. Retrieved labels are
-descriptive, not predictive — TabERA does not vote over neighbours. The local
-distribution is always shown against the group distribution, since `7/8` means
-nothing without knowing the group is already `78%`.
+descriptive, not predictive — TabERA does not vote over neighbours, and
+nothing in ② enters `z`. The local distribution is always shown against the
+group distribution, since `7/8` means nothing without knowing the group is
+already `75%`. Without a contrasting case the first line says so
+(`· no contrast among 8`).
 
-### ③ Region profile
+The display policy is visible in the headings: the two closest cases, plus
+the closest case with a different label as an extra slot when it falls outside
+that budget — so counter-evidence is never hidden by presentation, and the
+evidence block stays a minority of the explanation. Each case carries a small
+card so it reads as an example rather than an id. The rows are ranked, never
+thresholded, and none is padded to its budget: `differs` is reserved first
+(largest Gower gap; two for the contrast case), `matches` are exact equalities
+with exact categorical matches ordered by how rare the shared value is in the
+region (a match on a value 2% of the region holds says more than a match on
+the mode), and `closest values` appears only when there is no exact match at
+all — rank language on purpose, since without a threshold nothing certifies
+that the smallest gap is "similar". The gap is measured where the model saw the
+values, the quantile space held in `FeatureStore`; only the displayed numbers
+are mapped back to original units. The card describes values the two cases
+hold; it does not explain why their embedding cosine is high.
 
-Translates the assigned region into the original feature space and locates the
-sample within it.
+### ③ Position
 
 ```
-against the group (n=160)
-  credit_amount = 5,951   (group typical 2,382,  2.5x, top 9%,  |Δmean|/σ 0.71)
-  duration      = 48      (group typical 18,     2.7x, top 4%,  |Δmean|/σ 0.09)
-
-position in the representation (n=160)
-  distance to region centre 0.043   (closer to the centre than 60% of the region)
+③ Position relative to the region
+   Values that stand out:
+     • installment_commitment = 1
+       region reference: 4
+       lower than 85% of region cases · equal to 15%
+     • duration = 6
+       region reference: 12
+       lower than 91% of region cases · equal to 9%
+     • checking_status = <0
+       17% in region · most common: no checking 32%
+   Distance from region centre:
+     Farther than 66% of region training cases
 ```
 
-`|Δmean|/σ` is the standardised difference between the region mean and the
-global mean, taken in units of the **global** feature standard deviation. It is
-a descriptive statistic, not a threshold: it appears on every line and hides
-nothing. Near 0 means the region's distribution barely differs from the
-dataset, so "unusual within this region" reads the same as "unusual overall" —
-the percentile beside it then carries no region-specific information. Gating on
-it would need a cut-off nobody can justify, and a reader could not tell a
-hidden feature from an absent one.
+Locates the sample among the training members of its own region, in two
+spaces.
 
-The representation position is a cosine distance to the region centre and its
-rank within the region — not a confidence, and not a typicality score. Whether
-that makes the sample atypical is left to the reader, since a region need not
-be spherical. It appears only when `--refresh_on_best` is on: otherwise memory
-holds training-time embeddings taken under a dropout mask while the query is
-deterministic, and the rank would be against a different representation.
+*Values that stand out* is raw feature space. Numeric features are ranked by
+within-region |z| and stated as exact shares of region training cases
+(`higher/lower than X% · equal to Y%`) rather than a midrank percentile, so the
+sentence stays true when a discrete feature ties. `region reference` is the
+region mean taken in quantile space and mapped back to original units — it is
+a representative value, not the arithmetic mean of the original column.
+Categorical features show the value's frequency in the region and the region
+mode; values equal to the mode are not shown in this section.
+
+*Distance from region centre* is representation space: the cosine distance
+`1 − cos(q̂, ĉ)` and its rank among the region's training cases — the space the
+assignment was made in. It is not a confidence and not a typicality score;
+whether the sample is "atypical" is left to the reader, since a region need not
+be spherical. The distance does not enter the prediction either: `d` is a unit
+tangent direction scaled by the single scalar `β`, so only the *direction* from
+`c` toward `q` reaches `z`, never how far `q` is from `c`. It appears only when
+`--refresh_on_best` is on (the default): otherwise memory holds training-time
+embeddings taken under a dropout mask while the query is deterministic, and the
+rank would be against a different representation.
 
 ⚠ This is descriptive statistics, not attribution. "The prediction came out
-this way because of this feature" is not a sentence these values support.
+this way because of this feature" is not a sentence these values support, and
+nothing in ③ explains the shift shown under Prediction — only the correction
+term does.
 
 ---
 
@@ -204,11 +274,14 @@ pip install -r requirements.txt
 
 python optimize.py  --openml_id 31 --seed 1 --n_trials 100
 python reproduce.py --openml_id 31 --seed 1 --deterministic --train_seeds 1 2 3 4 5
-python reproduce.py --openml_id 31 --seed 1 --deterministic --explain
+python analyze.py   --openml_id 31 --seed 1 --deterministic --explain
 ```
 
 `optimize.py` writes the study file `reproduce.py` reads back, so it runs
-first. Defaults reproduce the architecture above; no flags needed.
+first. Both scripts default to the final architecture (`unit_tangent`,
+`head_input_scale=auto`) through one shared `FINAL_CONFIG`; no flags needed.
+Pass `--correction_geometry additive --head_input_scale unit` only to run the
+legacy arm.
 `--calibration_analysis` and `--linear_probe` add diagnostics.
 
 **Searched** — 100 TPE trials per dataset and seed.
@@ -246,6 +319,37 @@ partition, per-prototype profiles, and the pairwise prototype geometry.
 
 ---
 
+## Controlled dynamics pilot
+
+The current `betaema1` controlled pilot fixes width 128, layers 2, dropout
+0.1, lr 3e-4 and weight decay 1e-5. Only `beta_lr_mult` (continuous log
+1–30) and `ema_timescale` (`legacy_099`, `hl_05`, `hl_1`, `hl_3`, `hl_10`)
+are searched. These are the same dynamics ranges as the final seven-dimensional
+recipe; the pilot does not change that recipe.
+
+```bash
+python optimize.py --openml_id 31 --seed 1 --n_trials 25 --validation_only --pilot_space dynamics2d --savepath pilot_dynamics2d
+```
+
+The five constants are direct model parameters, recorded as study/trial
+`fixed_hyperparameters`, not one-choice Optuna distributions. Trial 0 uses
+multiplier 1 and legacy decay 0.99. Names include
+`..validation_only..pilot=dynamics2d`, separate from the joint pilot and
+final HPO. The mode requires validation-only evaluation and the fixed final
+architecture. Omitting `--pilot_space dynamics2d` searches all seven HPs.
+
+A proposed small panel is 31, 54, 1067, 1493 and 151 (electricity), with
+seed 1 and 20–30 trials each. Compare validation improvement over trial 0,
+beta trajectories, reinit/churn/utilization and class-margin diagnostics.
+This is an adequacy check around one common anchor, not a proof of the
+globally optimized benefit of the two axes. Do not fix the pilot's winning
+beta/EMA values in final HPO or expand bounds based only on boundary frequency.
+
+No test predictions or metrics are computed in validation-only mode. The
+loader still creates all splits and the provenance contract hashes them;
+this is not a claim that the test split is never loaded. Use only validation
+evidence for the one-time adequacy check, then freeze the final ranges.
+
 ## Layout
 
 ```
@@ -263,20 +367,3 @@ visualize_tabera.py per-dataset diagnostic panels
 legacy/v3ema2_full/ frozen pre-cleanup code, for reproducing the ablations
 tools/              golden regression, structural audit, smoke harnesses
 ```
-
-`TABERA_V3_ARCHITECTURE.md` records the measurement behind each design
-decision. `REFERENCES.md` lists prior work by the component it supports.
-
----
-
-## References
-
-| | |
-|---|---|
-| Gorishniy et al. (2022), *NeurIPS* | piecewise-linear embeddings |
-| van den Oord et al. (2017), *NeurIPS* | hard assignment with straight-through gradient, EMA codebook |
-| Razavi et al. (2019), *NeurIPS* | EMA as the default update |
-| Bengio et al. (2013), *arXiv:1308.3432* | straight-through estimator |
-| Dhariwal et al. (2020), *arXiv:2005.00341* | restarting unused codes |
-| Chen et al. (2019), *NeurIPS* | prototype-based prediction rather than post-hoc explanation |
-| Kim et al. (2016), *NeurIPS* | why contrasting cases belong beside supporting ones |

@@ -82,6 +82,34 @@ as if they came from the same training algorithm.
 # ─────────────────────────────────────────────────────────────
 DEFAULT_K_NO_TUNE = 8
 
+# Search recipe version, separate from the unchanged benchmark protocol.
+RECIPE_TAG = "..recipe=betaema1"
+EMA_TIMESCALES = ("legacy_099", "hl_05", "hl_1", "hl_3", "hl_10")
+EMA_HALF_LIVES = {"hl_05": 0.5, "hl_1": 1.0, "hl_3": 3.0, "hl_10": 10.0}
+LEGACY_ANCHOR = dict(embed_dim=128, embedder_layers=2, dropout=0.1,
+                     lr=3e-4, weight_decay=1e-5)
+
+
+def resolve_dynamics(params: dict, n_train: int) -> dict:
+    """Resolve the recipe using the actual number of training updates/epoch."""
+    batch_size = int(params["batch_size"])
+    if n_train <= 0 or batch_size <= 0:
+        raise ValueError("n_train and batch_size must be positive")
+    steps = math.ceil(n_train / batch_size)  # fit() retains the final short batch
+    timescale = params.get("ema_timescale", "legacy_099")
+    if timescale not in EMA_TIMESCALES:
+        raise ValueError(f"Unknown ema_timescale: {timescale}")
+    decay = (0.99 if timescale == "legacy_099"
+             else 2.0 ** (-1.0 / (EMA_HALF_LIVES[timescale] * steps)))
+    multiplier = float(params.get("beta_lr_mult", 1.0))
+    lr = float(params["lr"])
+    if not math.isfinite(multiplier) or multiplier <= 0 or not math.isfinite(lr) or lr <= 0:
+        raise ValueError("lr and beta_lr_mult must be finite and positive")
+    return dict(beta_lr_mult_requested=multiplier, beta_lr_actual=lr * multiplier,
+                ema_timescale=timescale, ema_decay_actual=decay,
+                steps_per_epoch=steps,
+                ema_half_life_epochs_actual=math.log(0.5) / (steps * math.log(decay)))
+
 
 # ─────────────────────────────────────────────────────────────
 # Study file naming
@@ -124,6 +152,7 @@ def study_pkl_tag(
     #   "additive" stays untagged on purpose so every study written before
     #   Phase A still resolves under its original filename.
     return PROTOCOL_TAG \
+        + RECIPE_TAG \
         + "..v3ema2" \
         + ("..cat_concat" if cat_combine == "concat" else "") \
         + ("..cat_sum" if cat_combine == "sum" else "") \
@@ -143,7 +172,7 @@ def study_pkl_tag(
         + (f"..tie={tie_rule}" if tie_rule != "first" else "")
 
 
-def suggest_initial_trial() -> dict:
+def suggest_initial_trial(pilot_space: str = "joint") -> dict:
     """Defaults enqueued as the first trial.
 
     ⚠ Include **only keys that get_search_space() actually searches**. Optuna
@@ -152,13 +181,10 @@ def suggest_initial_trial() -> dict:
       while the model always used DEFAULT_K_NO_TUNE (8). `k` and
       `batch_size` are fixed, so they do not belong here.
     """
-    return {
-        "embed_dim":        128,
-        "embedder_layers":  2,
-        "dropout":          0.1,
-        "lr":               3e-4,
-        "weight_decay":     1e-5,
-    }
+    if pilot_space not in ("joint", "dynamics2d"):
+        raise ValueError(f"Unknown pilot_space: {pilot_space}")
+    initial = dict(beta_lr_mult=1.0, ema_timescale="legacy_099")
+    return dict(LEGACY_ANCHOR, **initial) if pilot_space == "joint" else initial
 
 
 # ─────────────────────────────────────────────────────────────
@@ -174,6 +200,7 @@ def get_search_space(
     # affects direct callers (tests, notebooks). It matches the CLI default.
     n_train: int = 0,
     batch_size: "int | None" = None,
+    pilot_space: str = "joint",
     # None이면 MultiTab 정책 get_batch_size(n_train)을 따른다(본 실험 기본값).
     # 정수를 주면 그 값으로 고정한다 -- batch size pilot 전용이며, 이 경우
     # study 파일명에 ..B{n} 태그가 붙어 본 실험 study와 섞이지 않는다.
@@ -203,6 +230,14 @@ def get_search_space(
             "MultiTab의 get_batch_size(len(X_train))에서 나오므로 필수입니다 "
             "-- 호출부에서 n_train=len(y_train)을 넘겨 주세요.")
 
+    if pilot_space == "dynamics2d":
+        if num_embedding != "ple" or batch_size is not None:
+            raise ValueError("dynamics2d requires PLE and the MultiTab batch-size rule")
+        return dict(LEGACY_ANCHOR, k=DEFAULT_K_NO_TUNE, batch_size=get_batch_size(n_train),
+                    beta_lr_mult=trial.suggest_float("beta_lr_mult", 1.0, 30.0, log=True),
+                    ema_timescale=trial.suggest_categorical("ema_timescale", list(EMA_TIMESCALES)))
+    if pilot_space != "joint":
+        raise ValueError(f"Unknown pilot_space: {pilot_space}")
     space = {
         # ── Architecture ────────────────────────────────
         "embed_dim":       trial.suggest_categorical("embed_dim",   [64, 128, 256]),
@@ -236,6 +271,8 @@ def get_search_space(
 
         # ── Optimisation ────────────────────────────────
         "lr":              trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+        "beta_lr_mult":    trial.suggest_float("beta_lr_mult", 1.0, 30.0, log=True),
+        "ema_timescale":   trial.suggest_categorical("ema_timescale", list(EMA_TIMESCALES)),
         # ⚠ The range is deliberately **not** narrowed. Log-uniform over four
         #   orders of magnitude is wide by the usual HPO standards, but wide
         #   and unnecessarily wide are different claims. Measured over the

@@ -26,3 +26,4 @@ venv/
 # Optuna DB
 *.db
 *.md
+*.tar.gz

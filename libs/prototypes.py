@@ -647,6 +647,42 @@ class CentroidLayer(nn.Module):
         self._centroid_frozen = True
         return True
 
+    @torch.no_grad()
+    def reassign_groups(self, X_emb: torch.Tensor) -> Dict[str, float]:
+        """Recompute sample_groups against the current centroids, without
+        modifying them. Nothing else.
+
+        The post-training resync used to call regroup_update(), which is the
+        per-epoch training step: it advances current_epoch, updates the dead
+        streaks and, once a streak reaches dead_reinit_patience, moves a
+        centroid to a random embedding plus torch.randn noise. Run after the
+        best checkpoint was restored, that mutated the very model about to be
+        evaluated -- and did so from the global RNG, so two analyses of one
+        checkpoint could differ (observed: reinit=1 vs reinit=2 on identical
+        runs, single-threaded). A resync has no business changing the model.
+
+        This is the assignment rule of regroup_update() -- argmax cosine
+        against normalised centroids, the same rule forward() routes with --
+        and only that. centroid_emb, dead_streak, current_epoch and the EMA
+        state are untouched, so the evaluated model is exactly the saved one.
+        The caller still refreshes the retrieval cache and group labels, which
+        are derived from sample_groups.
+        """
+        q = F.normalize(X_emb.float(), dim=-1)
+        c = F.normalize(self.centroid_emb, dim=-1)
+        assignments = (q @ c.T).argmax(dim=-1).cpu()
+        P = self.P
+        new_groups: List[List[int]] = [
+            (assignments == p).nonzero(as_tuple=True)[0].tolist() for p in range(P)]
+        self.sample_groups = new_groups
+        sizes = [len(g) for g in new_groups]
+        return {
+            "active_ratio":     sum(1 for s in sizes if s > 0) / max(P, 1),
+            "min_cluster_size": int(min(sizes)) if sizes else 0,
+            "max_cluster_size": int(max(sizes)) if sizes else 0,
+            "reinit_count":     0,     # by construction; kept for log compatibility
+        }
+
     def regroup_update(
         self,
         X_emb: torch.Tensor,        # (N, D) all training embeddings, for assignment

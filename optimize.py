@@ -13,6 +13,10 @@ parser.add_argument("--openml_id", type=int, default=45068,  help="dataset index
 parser.add_argument("--seed",      type=int, default=1,      help="seed for dataset split (cross-validation)")
 parser.add_argument("--savepath",  type=str, default=".",    help="path to save the results")
 parser.add_argument("--n_trials",  type=int, default=100,    help="Number of optimization trials")
+parser.add_argument("--validation_only", action="store_true",
+                    help="pilot mode: skip all test inference, metrics and prediction artifacts; use a separate study")
+parser.add_argument("--pilot_space", choices=["joint", "dynamics2d"], default="joint",
+                    help="dynamics2d fixes the five legacy anchor HPs and searches beta/EMA only; requires --validation_only")
 # ⚠ Any flag that changes the architecture must also appear in
 #   study_pkl_tag(), so that the study file is separated. Forgetting that
 #   makes reproduce.py load the baseline study and train the new structure
@@ -102,13 +106,13 @@ parser.add_argument("--tie_rule", type=str, default="first",
                     choices=["first", "latest"],
                     help="accuracy 동률 시 반환 checkpoint. structural: 비기본값은 "
                          "..tie=NAME. early-stopping horizon 은 바뀌지 않는다.")
-parser.add_argument("--early_stop_metric", type=str, default="accuracy",
-                    choices=["accuracy", "logloss", "auroc", "bacc"],
+parser.add_argument("--early_stop_metric", type=str, default=FINAL_CONFIG["early_stop_metric"],
+                    choices=["val_loss", "accuracy", "logloss", "auroc", "bacc"],
                     help=(
                         "Validation metric that selects best_state and drives the "
                         "patience counter INSIDE a trial. The HPO objective itself "
                         "stays val accuracy either way, so comparability with the "
-                        "MultiTab baselines is unaffected. Default 'accuracy' is the "
+                        "MultiTab baselines is unaffected. Default val_loss is the MultiTab protocol (batch-averaged validation loss, patience 20, terminal checkpoint, no restore). 'accuracy' is the earlier TabERA rule, now an ablation arm: the "
                         "legacy behaviour. On an imbalanced dataset accuracy can sit "
                         "flat at the majority rate from epoch 1 (ds=1067: acc_val "
                         "identical for epochs 1-10 while AUROC went 0.354 -> 0.708), "
@@ -124,6 +128,12 @@ parser.add_argument("--early_stop_metric", type=str, default="accuracy",
 # flags remain there; whatever HPO found is stored in best_params and picked
 # up automatically when reproduce.py reloads the study.
 args = parser.parse_args()
+if args.pilot_space == "dynamics2d":
+    if not args.validation_only:
+        parser.error("--pilot_space dynamics2d requires --validation_only")
+    changed = [k for k, v in FINAL_CONFIG.items() if getattr(args, k) != v]
+    if changed or args.batch_size is not None or args.n_prototypes is not None:
+        parser.error("dynamics2d requires the fixed betaema1 architecture and automatic P/batch size")
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)   # same position as upstream
 
@@ -131,7 +141,7 @@ import optuna, torch, json, joblib, datetime, math, gc
 import numpy as np
 from libs.data import TabularDataset
 from libs.eval import calculate_metric, is_study_todo, check_if_fname_exists_in_error, get_preds_and_probs
-from libs.benchmark import build_wrapper, contract
+from libs.benchmark import build_wrapper, contract, script_sha256, training_diagnostics
 from libs.search_space import (get_search_space, suggest_initial_trial, params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE, DEFAULT_K_NO_TUNE, PROTOCOL_TAG)
 from libs.supervised import TabERAWrapper
 from libs.tabera import TabERA
@@ -178,6 +188,11 @@ _ablation_tag = study_pkl_tag(
     tie_rule=args.tie_rule,
 )
 fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
+if args.validation_only:
+    _ablation_tag += "..validation_only"
+    if args.pilot_space != "joint":
+        _ablation_tag += f"..pilot={args.pilot_space}"
+    fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tabera.pkl")
 
 # ─────────────────────────────────────────────────────────────
 # Skip work already done (same as upstream MultiTab)
@@ -186,13 +201,20 @@ fname = os.path.join(savepath, f"data={args.openml_id}{_ablation_tag}..model=tab
 train = True
 if os.path.exists(fname):
     study = joblib.load(fname)
+    if bool(study.user_attrs.get("validation_only", False)) != args.validation_only:
+        raise ValueError("Study evaluation mode differs; use a separate pilot study")
+    if study.user_attrs.get("pilot_space", "joint") != args.pilot_space:
+        raise ValueError("Study pilot space differs; use a separate study")
     train = is_study_todo(study, tasktype)
 else:
     study = (optuna.create_study(direction="minimize") if tasktype == "regression"
              else optuna.create_study(direction="maximize"))
-    initial_trial = suggest_initial_trial()
+    initial_trial = suggest_initial_trial(args.pilot_space)
     study.enqueue_trial(initial_trial)
     train = check_if_fname_exists_in_error(fname)
+
+study.set_user_attr("validation_only", args.validation_only)
+study.set_user_attr("pilot_space", args.pilot_space)
 
 completed_trials_count = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
 remaining_trials = max(0, args.n_trials - completed_trials_count)
@@ -383,6 +405,8 @@ if train:
             raise ValueError("HPO implementation/data/config changed; use a new --savepath")
 
     def objective(trial):
+        trial.set_user_attr("validation_only", args.validation_only)
+        trial.set_user_attr("pilot_space", args.pilot_space)
         trial.set_user_attr("benchmark_contract", run_contract)
         params       = get_search_space(trial, num_features=X_train.size(1),
                                         data_id=args.openml_id,
@@ -390,10 +414,24 @@ if train:
                                         # batch_size = get_batch_size(n_train)
                                         # (MultiTab 정책). 빠지면 예외.
                                         n_train=len(y_train),
-                                        batch_size=args.batch_size)
+                                        batch_size=args.batch_size,
+                                        pilot_space=args.pilot_space)
+        if args.pilot_space == "dynamics2d":
+            fixed = {k: params[k] for k in ("embed_dim", "embedder_layers", "dropout", "lr", "weight_decay")}
+            trial.set_user_attr("fixed_hyperparameters", fixed)
+            study.set_user_attr("fixed_hyperparameters", fixed)
         # n_prototypes comes from the sqrt(N) rule, not from the search.
         params["n_prototypes"] = n_proto_default
         trial.set_user_attr("n_prototypes_actual", n_proto_default)
+        # The arm the trial was searched under, checked by restore_params(); the
+        # study filename (..nodr) and the contract carry it too, this is the
+        # per-trial copy that survives --allow_unverified_study.
+        trial.set_user_attr("disable_dead_reinit_actual", bool(args.disable_dead_reinit))
+        # HPO provenance: the objective and the CLI->config wiring live in this
+        # file, which implementation_id() deliberately does not hash (a
+        # cosmetic edit here must not invalidate every study). Recorded, not
+        # enforced, so an audit can still tell which optimize.py ran a study.
+        trial.set_user_attr("optimize_sha256", script_sha256(__file__))
         # ⚠ batch_size 는 space dict 에 직접 써넣는 값이라(trial.suggest_* 가
         #   아님) study.best_params 에 남지 않는다 -- n_prototypes 와 같은
         #   상황이다. 기록해 두지 않으면 reproduce.py 가 값을 알 방법이 없어
@@ -417,24 +455,36 @@ if train:
         # it must be identifiable from the study alone -- same reason as the arm.
         trial.set_user_attr("early_stop_metric_actual", args.early_stop_metric)
         wrapper = build_wrapper(dataset, params, run_config, device, num_bin_edges)
+        for key, value in wrapper.dynamics_provenance.items():
+            trial.set_user_attr(key, value)
         wrapper._data_id = args.openml_id   # shown in the epoch progress bar
         wrapper.fit(X_train, y_train, X_val, y_val)
+        for key, value in training_diagnostics(wrapper).items():
+            trial.set_user_attr(key, value)
 
         # ── Evaluate: one logits pass, then preds and probs ────
         wrapper.model.eval()
         with torch.no_grad():
-            val_logits  = wrapper._forward_batched(X_val)
-            test_logits = wrapper._forward_batched(X_test)
+            val_logits  = wrapper._forward_batched(X_val, collect_diagnostics=True)
+            trial.set_user_attr("prediction_diagnostics_val", wrapper.prediction_diagnostics)
+            if not args.validation_only:
+                test_logits = wrapper._forward_batched(X_test)
         preds_val,  probs_val  = get_preds_and_probs(val_logits,  tasktype)
-        preds_test, probs_test = get_preds_and_probs(test_logits, tasktype)
+        if not args.validation_only:
+            preds_test, probs_test = get_preds_and_probs(test_logits, tasktype)
 
         # Regression metrics are computed after undoing the y standardisation.
         if tasktype == "regression":
             val_metrics  = calculate_metric(y_val  * y_std, preds_val  * y_std, probs_val,  tasktype, "val")
-            test_metrics = calculate_metric(y_test * y_std, preds_test * y_std, probs_test, tasktype, "test")
         else:
             val_metrics  = calculate_metric(y_val,  preds_val,  probs_val,  tasktype, "val")
-            test_metrics = calculate_metric(y_test, preds_test, probs_test, tasktype, "test")
+
+        test_metrics = {}
+        if not args.validation_only:
+            if tasktype == "regression":
+                test_metrics = calculate_metric(y_test * y_std, preds_test * y_std, probs_test, tasktype, "test")
+            else:
+                test_metrics = calculate_metric(y_test, preds_test, probs_test, tasktype, "test")
 
         for k, v in val_metrics.items():
             trial.set_user_attr(k, v)
@@ -445,7 +495,8 @@ if train:
         print(device, env_info, args.openml_id,
               data_info.get(str(args.openml_id))["name"], "tabera", savepath)
         print(val_metrics)
-        print(test_metrics)
+        if not args.validation_only:
+            print(test_metrics)
         now      = datetime.datetime.now()
         duration = now - trial.datetime_start
         print(f"### Optimization time for trial {trial.number}: {duration.total_seconds():.0f} secs")
@@ -520,6 +571,8 @@ if train:
         _sel = {"acc":     (val_metrics.get("acc_val"),     True),
                 "auroc":   (val_metrics.get("auroc_val"),   True),
                 "logloss": (val_metrics.get("logloss_val"), False)}
+        if args.validation_only:
+            _sel = {}  # No best-trial NPZ artifacts containing held-out test data.
         for _crit, (_v, _higher_better) in _sel.items():
             if _v is None or _v != _v:      # None / NaN
                 continue

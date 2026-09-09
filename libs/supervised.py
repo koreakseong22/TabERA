@@ -152,7 +152,7 @@ class TabERAWrapper:
         # retrieval robustness, validation and test scores can move. Compare
         # A/B on a dataset before making it the default. Not in the HPO search
         # space.
-        early_stop_metric: str = "accuracy",
+        early_stop_metric: str = "val_loss",
         tie_rule: str = "first",
         # ── Which checkpoint to return among epochs with equal selection score ──
         # "first"  : legacy. Strict `>` only, so the earliest epoch that reached
@@ -172,8 +172,13 @@ class TabERAWrapper:
         # 21 had AUROC .75. "latest" returns epoch 21 (×30) / epoch 9 (×300)
         # from the identical run.
         # ── Which validation metric selects best_state and drives patience ──
-        # "accuracy" is the legacy behaviour and the default, so every existing
-        # study reproduces unchanged.
+        # Default "val_loss" is the MultiTab protocol and matches
+        # FINAL_CONFIG: the batch-averaged validation loss is monitored with
+        # patience, and the model at the epoch training stopped is returned
+        # (no best-checkpoint restore). "accuracy" is the earlier TabERA rule
+        # (best-val-accuracy checkpoint restore), kept as an ablation arm; the
+        # studies recorded under it carry no ..esm tag and still reproduce
+        # when that value is passed explicitly.
         #
         # ⚠ The legacy code read `list(val_m.values())[0]`: the selection
         #   criterion was decided by a dict insertion order, and libs/eval.py
@@ -210,6 +215,13 @@ class TabERAWrapper:
         # name -> (key in compute_metric's dict, higher_is_better)
         _SEL = {"accuracy": ("acc_val",     True),
                 "logloss":  ("logloss_val", False),
+                # MultiTab protocol (Lee et al., libs/supervised.py EarlyStopping):
+                # monitor the validation *training loss* -- BCE-with-logits /
+                # CE / MSE averaged over validation batches -- with strict
+                # improvement and patience, and evaluate the model at the
+                # epoch training stopped. No best-checkpoint restore. The
+                # value is computed in fit(); it is not a compute_metric() key.
+                "val_loss": ("val_loss",    False),
                 "auroc":    ("auroc_val",   True),
                 "bacc":     ("bacc_val",    True)}
         if early_stop_metric not in _SEL:
@@ -233,6 +245,20 @@ class TabERAWrapper:
             self._sel_key, self._sel_higher_better = "rmse_val", False
         else:
             self._sel_key, self._sel_higher_better = _SEL[early_stop_metric]
+        # ⚠ val_loss applies to every task type, regression included: MultiTab
+        #   stops regression on validation MSE, not RMSE (same ordering, but
+        #   the protocol names the loss and so does this).
+        if early_stop_metric == "val_loss":
+            self._sel_key, self._sel_higher_better = "val_loss", False
+        # Terminal-checkpoint semantics: with val_loss the model returned by
+        # fit() is the one at the epoch training stopped, exactly as the
+        # MultiTab neural baselines are evaluated. Every other metric keeps
+        # TabERA's best-checkpoint restore.
+        self.terminal_checkpoint = (early_stop_metric == "val_loss")
+        self.val_loss_history: List[float] = []
+        self.beta_epoch_history = []
+        self.best_metric_epoch: Optional[int] = None   # epoch of the best selection value
+        self.last_epoch: Optional[int] = None          # epoch training stopped at
         self._sel_fallback_warned = False
         # Epoch at which best_state selection actually opened, so a run can be
         # audited afterwards without re-deriving it from the flags.
@@ -286,25 +312,20 @@ class TabERAWrapper:
         sample_groups was computed against the noisy memory.keys as they stood
         during training. refresh_memory_keys() replaces memory.keys entirely
         with the clean embeddings but leaves sample_groups alone, so the two
-        stores end up describing different moments -- the same class of
-        problem as the reinit-then-regroup issue documented inside
-        regroup_update() in libs/prototypes.py.
+        stores end up describing different moments. Re-deriving sample_groups
+        from the clean embeddings -- with the routing rule and nothing else --
+        returns sample_groups, centroid_emb and memory.keys to one consistent
+        state; the retrieval cache and the group labels, both derived from
+        sample_groups, are rebuilt below.
 
-        regroup_update() ignores X_raw (the parameter is kept for signature
-        compatibility) and, even when a dead-prototype reinit happens,
-        recomputes assignments against the final centroid_emb and overwrites
-        sample_groups. Calling it once more on the clean embeddings therefore
-        returns sample_groups, centroid_emb and memory.keys to a consistent
-        state.
-
-        ⚠ regroup_update() increments current_epoch and may reinitialise a
-          prototype depending on its dead_streak. That is the same safeguard
-          as during training and is fine in principle, but it does mean the
-          final centroid_emb can differ slightly from the saved best_state --
-          for the few prototypes that were reinitialised.
+        ⚠ Pure reassignment. An earlier version called regroup_update() here,
+          which increments current_epoch and may reinitialise a dead prototype
+          from the global RNG -- so the evaluated centroid_emb could differ
+          from the saved best_state, and differ between two runs of the same
+          checkpoint. reassign_groups() applies only the routing rule.
         """
         if not (hasattr(self.model, 'prototype_layer')
-                and hasattr(self.model.prototype_layer, 'regroup_update')):
+                and hasattr(self.model.prototype_layer, 'reassign_groups')):
             return None
 
         with torch.no_grad():
@@ -312,7 +333,13 @@ class TabERAWrapper:
             if n_mem < 1:
                 return None
             emb_regroup = self.model.memory.keys[:n_mem]   # the values just refreshed
-            regroup_stats = self.model.prototype_layer.regroup_update(emb_regroup)
+            # ⚠ reassign_groups, not regroup_update. The latter is the training
+            #   step (epoch counter, dead streaks, random reinit of dead
+            #   centroids) and would alter the restored best model right
+            #   before evaluation -- nondeterministically, from the global RNG.
+            #   The resync must only re-derive sample_groups from the clean
+            #   embeddings against the centroids as saved.
+            regroup_stats = self.model.prototype_layer.reassign_groups(emb_regroup)
 
             # Refresh the GPU group cache that retrieve() reads as well.
             # Otherwise the freshly updated sample_groups and the cache built
@@ -571,6 +598,7 @@ class TabERAWrapper:
         best_group_labels  = None
         best_target_labels = None
         self.regroup_history = []
+        self.beta_epoch_history = []
         self.final_regroup_stats = None
         # Routing-stability diagnostics across the whole run. Logged only, not
         # fed into any penalty: check the correlation first, decide later.
@@ -904,6 +932,28 @@ class TabERAWrapper:
                 _val_perm  = torch.randperm(len(X_val), device=self.device)
                 val_logits = self._forward_batched(X_val[_val_perm])
                 val_m  = compute_metric(val_logits, y_val[_val_perm], self.tasktype)
+                # MultiTab-style validation loss: the training loss function,
+                # averaged over validation batches in the dataset's fixed
+                # order (batch_size = the protocol's get_batch_size(n_train),
+                # no shuffling), i.e.  sum_b loss_fn(out_b, y_b) / n_batches
+                # as in multitab/libs/supervised.py. Per-sample logits do not
+                # depend on batch order, so the permuted forward above is
+                # simply un-permuted rather than run again.
+                if self.early_stop_metric == "val_loss":
+                    _lg_fixed = torch.empty_like(val_logits)
+                    _lg_fixed[_val_perm] = val_logits
+                    _bs = int(self.params["batch_size"])
+                    _losses = []
+                    for _s in range(0, len(y_val), _bs):
+                        _o, _y = _lg_fixed[_s:_s + _bs], y_val[_s:_s + _bs]
+                        if self.tasktype == "regression":
+                            _losses.append(F.mse_loss(_o.view(_y.shape), _y.float()))
+                        elif self.tasktype == "binclass":
+                            _losses.append(F.binary_cross_entropy_with_logits(_o.view(_y.shape), _y.float()))
+                        else:
+                            _losses.append(F.cross_entropy(_o, _y.long()))
+                    val_m["val_loss"] = float(torch.stack(_losses).mean())
+                    self.val_loss_history.append(val_m["val_loss"])
                 # #correct as an integer. Float accuracy k/n is deterministic for
                 # equal k, but the integer makes `==` unambiguous and is what
                 # tie_rule compares. Regression: None.
@@ -917,13 +967,18 @@ class TabERAWrapper:
                     n_correct = None
             # ⚠ Was `list(val_m.values())[0]`, which made a dict insertion
             #   order the model-selection criterion. The key is now named.
-            #   Fallback to the legacy first value is reachable when
+            #   For ablation metrics, fallback to the legacy first value is reachable when
             #   compute_metric ran its reduced path (accuracy only) or when a
             #   metric is NaN -- AUROC does that on a fold where a class is
             #   absent. Falling back silently would change the criterion
             #   mid-run, so it is announced once.
             _sel = val_m.get(self._sel_key)
-            if _sel is None or _sel != _sel:               # missing or NaN
+            if self.early_stop_metric == "val_loss":
+                # MultiTab a0c075e passes NaN through unchanged: the first
+                # observation seeds best_value; later NaNs consume patience.
+                # This loss is always populated above, even if it is NaN.
+                val_v = float(val_m["val_loss"])
+            elif _sel is None or _sel != _sel:             # missing or NaN
                 if not self._sel_fallback_warned:
                     tqdm.write(
                         f"  !  early_stop_metric={self.early_stop_metric} "
@@ -1002,6 +1057,11 @@ class TabERAWrapper:
                             float(_pred.float().mean()) if val_logits.shape[-1] == 1 else float("nan"))
 
             # Whether this epoch may contribute a checkpoint at all.
+            self.beta_epoch_history.append({
+                "epoch": int(epoch),
+                "beta": float(self.model.effective_beta().detach().mean()),
+            })
+
             # ⚠ It does NOT gate the patience counter unconditionally. Below:
             #     if (not self.defer_early_stopping) or _selection_open: es.step(...)
             #   so with defer_early_stopping=False (the default) ineligible
@@ -1033,7 +1093,13 @@ class TabERAWrapper:
             elif _same_best_correct and _selection_open:
                 self.n_best_ties += 1
             _tied_for_save = (self.tie_rule == "latest" and _same_best_correct)
-            if (_improved or _tied_for_save) and _selection_open:
+            if self.terminal_checkpoint and _improved and _selection_open:
+                # Bookkeeping only: which epoch had the best validation loss.
+                # No snapshot is taken -- the terminal model is what is
+                # evaluated, so there is nothing to restore.
+                best_val = val_v
+                self.best_metric_epoch = int(epoch)
+            if (_improved or _tied_for_save) and _selection_open and not self.terminal_checkpoint:
                 best_val   = val_v
                 if n_correct is not None:
                     best_correct = n_correct
@@ -1143,8 +1209,14 @@ class TabERAWrapper:
                     break
 
         pbar.close()
+        self.last_epoch = int(epoch)
+        if self.terminal_checkpoint:
+            # The evaluated model is the terminal one: best_epoch names it so
+            # meta records stay truthful; best_metric_epoch keeps the loss
+            # minimum for the record.
+            self.best_epoch = int(epoch)
 
-        if best_state is None:
+        if best_state is None and not self.terminal_checkpoint:
             # If regroup_warmup_epochs is too long (or patience too short),
             # the run can stop before warmup ever ends and best_state is never
             # filled. The model then keeps the weights from the final training
@@ -1158,8 +1230,9 @@ class TabERAWrapper:
                 f"shorter warmup or a larger patience."
             )
 
-        if best_state:
-            self.model.load_state_dict(best_state)
+        if best_state or self.terminal_checkpoint:
+            if best_state:
+                self.model.load_state_dict(best_state)
             # sample_groups and feature_store are not in the state_dict, so
             # they are restored to the same best epoch explicitly, keeping
             # them in step with centroid_emb and memory.keys.
@@ -1543,7 +1616,8 @@ class TabERAWrapper:
 
     # ── Batched inference ───────────────────────────────────
 
-    def _forward_batched(self, X: torch.Tensor, batch_size: Optional[int] = None) -> torch.Tensor:
+    def _forward_batched(self, X: torch.Tensor, batch_size: Optional[int] = None,
+                         collect_diagnostics: bool = False) -> torch.Tensor:
         # The old default of 1024 exceeded the training batch size (128-512 as
         # chosen by HPO), which made validation far slower than training once a
         # group had grown large (measured: val_forward going from 1s to 76s
@@ -1555,6 +1629,42 @@ class TabERAWrapper:
         if batch_size is None:
             batch_size = self.params.get("batch_size", 512)
         parts = []
+        region_parts = []
         for start in range(0, len(X), batch_size):
-            parts.append(self.model(X[start:start + batch_size])["logits"])
-        return torch.cat(parts, dim=0)
+            out = self.model(X[start:start + batch_size])
+            parts.append(out["logits"])
+            if collect_diagnostics and self.tasktype != "regression":
+                region_parts.append(self.model.dev_head(
+                    self.model.effective_gamma() * out["context_emb"]))
+        logits = torch.cat(parts, dim=0)
+        if collect_diagnostics:
+            self.prediction_diagnostics = (classification_margin_diagnostics(
+                logits, torch.cat(region_parts, dim=0)) if region_parts else {})
+        return logits
+
+
+def classification_margin_diagnostics(logits, region_logits):
+    """Compare both terms on the FINAL winner/runner-up pair (validation only).
+
+    A binary scalar logit z is represented as [0, z]. Margins are therefore
+    log-odds margins, with no artificial factor of two. No labels are used.
+    """
+    with torch.no_grad():
+        if logits.ndim == 1 or logits.shape[-1] == 1:
+            z, r = logits.reshape(-1), region_logits.reshape(-1)
+            logits = torch.stack((torch.zeros_like(z), z), dim=-1)
+            region_logits = torch.stack((torch.zeros_like(r), r), dim=-1)
+        if not torch.isfinite(logits).all() or not torch.isfinite(region_logits).all():
+            return {"available": False}
+        winner = logits.argmax(dim=-1, keepdim=True)
+        runner = logits.scatter(1, winner, float("-inf")).argmax(dim=-1, keepdim=True)
+        final_margin = (logits.gather(1, winner) - logits.gather(1, runner)).squeeze(1)
+        region_margin = (region_logits.gather(1, winner) - region_logits.gather(1, runner)).squeeze(1)
+        delta = final_margin - region_margin
+        return dict(available=True, pair="final_winner_vs_runner_up", n_samples=len(logits),
+                    region_margin_mean=float(region_margin.mean()),
+                    final_margin_mean=float(final_margin.mean()),
+                    correction_margin_mean=float(delta.mean()),
+                    correction_margin_positive_rate=float((delta > 0).float().mean()),
+                    region_to_final_class_change_rate=float(
+                        (region_logits.argmax(-1) != winner.squeeze(1)).float().mean()))
