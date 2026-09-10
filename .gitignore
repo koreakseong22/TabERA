@@ -4,10 +4,13 @@ data_cache/
 eda_output/
 figures/
 diagnostics/
+diag_probe/
 reproduce_logs/
 scripts/
 _archive/
 results/
+final_logs/
+pilot_dynamics2d/
 
 # Python
 __pycache__/
