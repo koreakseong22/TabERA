@@ -467,6 +467,14 @@ if train:
         with torch.no_grad():
             val_logits  = wrapper._forward_batched(X_val, collect_diagnostics=True)
             trial.set_user_attr("prediction_diagnostics_val", wrapper.prediction_diagnostics)
+            # Scale diagnostics for the trial-selection analysis: a trial whose
+            # accuracy is ordinary but whose logloss explodes should be readable
+            # from the study alone (head scale, effective ||W||, logit size).
+            trial.set_user_attr("head_gamma", float(wrapper.model.effective_gamma()))
+            trial.set_user_attr("head_weight_norm_effective", float(wrapper.model.effective_W().norm()))
+            trial.set_user_attr("head_bias_norm", float(wrapper.model.dev_head.bias.norm()))
+            trial.set_user_attr("val_logit_abs_mean", float(val_logits.abs().mean()))
+            trial.set_user_attr("val_logit_abs_max", float(val_logits.abs().max()))
             if not args.validation_only:
                 test_logits = wrapper._forward_batched(X_test)
         preds_val,  probs_val  = get_preds_and_probs(val_logits,  tasktype)
