@@ -1,0 +1,21 @@
+Sample #4: implementation review
+
+Scope: source inspection of the standard hard-region/shared-head path. The supplied checkpoint, seed, exact logits and ground-truth label are unavailable. Numerical reproduction has not been performed.
+
+Region: libs/tabera.py:1597 passes the encoded query to prototype_layer and uses the same hard_assignment for retrieval. libs/prototypes.py:1333 normalizes embeddings for cosine routing; the top_m == 1 branch at 1365 implements hard assignment. Region label proportions describe training members, not model probabilities.
+
+Prediction: libs/tabera.py:1632 computes d and h=c+d. The head at 1669 gives W(gamma*h)+b, hence z=(W_eff*c+b)+W_eff*d. libs/diagnostics.py:355 reads the effective head, derives prototype logits, and takes final minus prototype logits for the correction. Binary sigmoid probabilities are both measured on the final predicted class. analyze.py:225 prints the direction with a 5e-4 probability-difference tolerance. Rounded 89.0% and 89.1% do not determine exact component logits; no numeric logit decomposition is invented in the figure.
+
+Evidence: retrieval at libs/tabera.py:1604 uses the same assignment and query; neither retrieved keys nor labels enters the logits. libs/diagnostics.py:104 reconstructs retrieved cases and normalized embedding cosine similarity. analyze.py:272 selects the closest differing-label case; libs/explain_format.py:237 selects exact feature matches and largest feature gaps. Categorical matches prioritize rarer shared regional values. Displayed feature matches are descriptive, not reasons for the embedding similarity.
+
+Retrieval exception: libs/tabera.py:639 expands beyond the region when it cannot provide k candidates. For the supplied 42-member region and k=8, this size condition does not apply in standard inference. Do not describe every possible retrieval as unconditionally within-region.
+
+Position: libs/diagnostics.py:520 computes numeric statistics in quantile space, including strict below/equal proportions; numeric features are sorted by absolute regional z-score at 608. libs/explain_format.py:130 inverse-transforms the regional mean, so reference 30 is not the arithmetic mean duration. rank_position prints shares with whole-percent rounding. Categorical frequency and mode describe prevalence, not influence.
+
+Embedding position: libs/diagnostics.py:632 computes cosine distance to the assigned prototype; group_pct at 699 is the fraction of region training distances strictly smaller than the query distance. 'Farther than 93%' is a distance rank, not uncertainty, an outlier score or a causal explanation of correction. Comparable ranks require refreshed deterministic memory keys.
+
+Default geometry: libs/benchmark_config.py:9 selects unit_tangent and auto head scale. libs/tabera.py:1482 implements it. Outside epsilon-degenerate cases, correction norm equals learned beta; direction rather than radial distance magnitude enters the correction. A distant sample can therefore remain near its regional baseline probability. The supplied sample's exact configuration still requires checkpoint metadata.
+
+Results interpretation: 83% regional bad labels, 75% retrieved bad labels and 89.1% model probability are distinct quantities. This case illustrates that descriptive position can differ from regional references while the displayed probability changes little. It does not establish calibration, correctness, causal feature importance or typical dataset-wide behaviour.
+
+Validation: inspected routing, prediction, retrieval, diagnostics and formatting; rendered PNG/PDF/SVG and inspected the image. No model or training files changed. The existing libs/explain_figure.py renderer is separate and still uses the older evidence presentation; this artifact is the standalone Sample #4 rendering.

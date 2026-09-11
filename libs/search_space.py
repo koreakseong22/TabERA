@@ -83,7 +83,7 @@ as if they came from the same training algorithm.
 DEFAULT_K_NO_TUNE = 8
 
 # Search recipe version, separate from the unchanged benchmark protocol.
-RECIPE_TAG = "..recipe=betaema1"
+RECIPE_TAG = "..recipe=betaema1_plehpo"
 EMA_TIMESCALES = ("legacy_099", "hl_05", "hl_1", "hl_3", "hl_10")
 EMA_HALF_LIVES = {"hl_05": 0.5, "hl_1": 1.0, "hl_3": 3.0, "hl_10": 10.0}
 LEGACY_ANCHOR = dict(embed_dim=128, embedder_layers=2, dropout=0.1,
@@ -172,7 +172,7 @@ def study_pkl_tag(
         + (f"..tie={tie_rule}" if tie_rule != "first" else "")
 
 
-def suggest_initial_trial(pilot_space: str = "joint") -> dict:
+def suggest_initial_trial(pilot_space: str = "joint", num_embedding: str = "ple") -> dict:
     """Defaults enqueued as the first trial.
 
     ⚠ Include **only keys that get_search_space() actually searches**. Optuna
@@ -184,7 +184,11 @@ def suggest_initial_trial(pilot_space: str = "joint") -> dict:
     if pilot_space not in ("joint", "dynamics2d"):
         raise ValueError(f"Unknown pilot_space: {pilot_space}")
     initial = dict(beta_lr_mult=1.0, ema_timescale="legacy_099")
-    return dict(LEGACY_ANCHOR, **initial) if pilot_space == "joint" else initial
+    if pilot_space == "joint":
+        initial = dict(LEGACY_ANCHOR, **initial)
+        if num_embedding == "ple":
+            initial.update(num_bins=8, ple_d_embedding=12)
+    return initial
 
 
 # ─────────────────────────────────────────────────────────────
@@ -348,6 +352,10 @@ def get_search_space(
                             else int(batch_size)),
     }
 
+    if num_embedding == "ple":
+        space["num_bins"] = trial.suggest_int("num_bins", 2, 128)
+        space["ple_d_embedding"] = trial.suggest_int("ple_d_embedding", 8, 32, step=4)
+
     if num_embedding == "plr_lite":
         # PLR (lite) hyperparameters are searched per trial rather than fixed.
         # Gorishniy et al. 2022 (the periodic-embedding paper) treats sigma
@@ -393,7 +401,7 @@ def params_to_model_kwargs(params: dict, n_features: int, n_output: int) -> dict
     # PLR (lite) hyperparameters are present only when num_embedding was
     # "plr_lite"; pass them through when they exist, otherwise the TabERA
     # defaults (or the CLI --plr_* values) apply.
-    for key in ("plr_freq_scale", "plr_n_frequencies", "plr_out_dim"):
+    for key in ("ple_d_embedding", "plr_freq_scale", "plr_n_frequencies", "plr_out_dim"):
         if key in params:
             kwargs[key] = params[key]
     # ⚠ correction_geometry is not searched -- it is the Phase A arm, set once

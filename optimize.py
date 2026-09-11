@@ -75,7 +75,7 @@ parser.add_argument("--num_embedding", type=str, default="ple",
                         "default and remains available."
                     ))
 parser.add_argument("--num_bins", type=int, default=8,
-                    help="Bins per column when num_embedding=ple.")
+                    help="Fixed bins for dynamics2d (8). Joint PLE HPO searches 2..128.")
 parser.add_argument("--correction_geometry", type=str, default=FINAL_CONFIG["correction_geometry"],
                     choices=["additive", "chord", "tangent", "unit_tangent"],
                     help=(
@@ -128,6 +128,8 @@ parser.add_argument("--early_stop_metric", type=str, default=FINAL_CONFIG["early
 # flags remain there; whatever HPO found is stored in best_params and picked
 # up automatically when reproduce.py reloads the study.
 args = parser.parse_args()
+if args.num_embedding == "ple" and args.pilot_space == "joint" and args.num_bins != 8:
+    parser.error("Joint PLE HPO searches num_bins; omit --num_bins")
 if args.pilot_space == "dynamics2d":
     if not args.validation_only:
         parser.error("--pilot_space dynamics2d requires --validation_only")
@@ -209,7 +211,7 @@ if os.path.exists(fname):
 else:
     study = (optuna.create_study(direction="minimize") if tasktype == "regression"
              else optuna.create_study(direction="maximize"))
-    initial_trial = suggest_initial_trial(args.pilot_space)
+    initial_trial = suggest_initial_trial(args.pilot_space, args.num_embedding)
     study.enqueue_trial(initial_trial)
     train = check_if_fname_exists_in_error(fname)
 
@@ -313,14 +315,8 @@ if train:
         print(f"    ! mean group size ({_grp}) < k ({_k_ref}): retrieval will "
               f"fall back across groups.")
 
-    # ── PLE bin edges (only when num_embedding=ple) ────────────────
-    # Same logic as reproduce.py. Computed once outside objective(): the
-    # edges derive from the data, not from any trial hyperparameter.
-    num_bin_edges = None
-    if args.num_embedding == "ple" and len(dataset.X_num) > 0:
-        X_num_train = X_train[:, dataset.X_num]
-        q = torch.linspace(0.0, 1.0, args.num_bins + 1, device=X_num_train.device)
-        num_bin_edges = torch.quantile(X_num_train, q, dim=0).T.contiguous()
+    # PLE edges are fitted inside build_wrapper for each trial's bin count,
+    # using the train split only, just as in reproduction.
 
     # ── Reproducibility guard: was this study built with a different P? ──
     # ⚠ The auto-computed P does not appear in the study filename. If a code
@@ -454,7 +450,9 @@ if train:
         # The selection metric decides which checkpoint every trial returns, so
         # it must be identifiable from the study alone -- same reason as the arm.
         trial.set_user_attr("early_stop_metric_actual", args.early_stop_metric)
-        wrapper = build_wrapper(dataset, params, run_config, device, num_bin_edges)
+        wrapper = build_wrapper(dataset, params, run_config, device)
+        for key, value in wrapper.encoding_provenance.items():
+            trial.set_user_attr(key, value)
         for key, value in wrapper.dynamics_provenance.items():
             trial.set_user_attr(key, value)
         wrapper._data_id = args.openml_id   # shown in the epoch progress bar
@@ -656,7 +654,7 @@ if train:
     _done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     # Searched hyperparameters, in a fixed reading order rather than dict order.
     _HP = ("embed_dim", "embedder_layers", "dropout", "lr", "weight_decay",
-           "beta_lr_mult", "ema_timescale",
+           "beta_lr_mult", "ema_timescale", "num_bins", "ple_d_embedding",
            "plr_freq_scale", "plr_n_frequencies", "plr_out_dim")
     # Not searched, but part of the configuration the best trial actually ran:
     # n_prototypes / batch_size follow protocol rules, and beta_lr / ema_decay

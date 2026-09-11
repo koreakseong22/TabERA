@@ -43,7 +43,8 @@ class RecipeTests(unittest.TestCase):
 
     def test_anchor_and_distributions(self):
         anchor = dict(embed_dim=128, embedder_layers=2, dropout=.1, lr=3e-4,
-                      weight_decay=1e-5, beta_lr_mult=1., ema_timescale="legacy_099")
+                      weight_decay=1e-5, beta_lr_mult=1., ema_timescale="legacy_099",
+                      num_bins=8, ple_d_embedding=12)
         self.assertEqual(suggest_initial_trial(), anchor)
         study = optuna.create_study()
         study.enqueue_trial(anchor)
@@ -54,8 +55,58 @@ class RecipeTests(unittest.TestCase):
         self.assertTrue(trial.distributions["beta_lr_mult"].log)
         self.assertIsInstance(trial.distributions["beta_lr_mult"], optuna.distributions.FloatDistribution)
         self.assertEqual(trial.distributions["embed_dim"].choices, (64, 128, 256))
+        self.assertEqual(trial.distributions["num_bins"], optuna.distributions.IntDistribution(2, 128))
+        self.assertEqual(trial.distributions["ple_d_embedding"], optuna.distributions.IntDistribution(8, 32, step=4))
+        self.assertEqual(len(trial.params), 9)
         self.assertIn(RECIPE_TAG, str(final_study_path("r", 1, 31)))
         self.assertIn(RECIPE_TAG, str(result_path("r", 1, 31)))
+        self.assertIn("..recipe=betaema1_plehpo..", str(final_study_path("r", 1, 31)))
+        self.assertNotIn("..recipe=betaema1..", str(result_path("r", 1, 31)))
+
+    def test_ple_trial_roundtrip_and_train_only_edges(self):
+        import joblib
+        import tempfile
+        from pathlib import Path
+        ds = dataset()
+        train_x = ds._indv_dataset()[0][0]
+        # Held-out extremes must never affect the bin boundaries.
+        ds._indv_dataset()[1][0].fill_(1000)
+        ds._indv_dataset()[2][0].fill_(-1000)
+        for bins, dim in ((2, 8), (37, 20), (128, 32)):
+            trial = study_for(ds, count=1).best_trial
+            trial.params.update(num_bins=bins, ple_d_embedding=dim)
+            trial.user_attrs.update(num_bins_actual=bins, ple_d_embedding_actual=dim)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "trial.pkl"
+                joblib.dump(trial, path)
+                restored = restore_params(joblib.load(path), 40)
+            torch.manual_seed(19)
+            hpo = build_wrapper(ds, dict(trial.params, n_prototypes=6, batch_size=64), FINAL_CONFIG, "cpu")
+            torch.manual_seed(19)
+            repro = build_wrapper(ds, restored, FINAL_CONFIG, "cpu")
+            emb = repro.model.embedder
+            self.assertEqual(tuple(emb.ple_emb_weight.shape), (3, bins, dim))
+            self.assertEqual(emb.final_proj[1].in_features, 3 * dim)
+            expected = torch.quantile(train_x, torch.linspace(0, 1, bins + 1), dim=0).T
+            torch.testing.assert_close(emb.ple_edges, expected)
+            torch.testing.assert_close(emb.ple_edges, hpo.model.embedder.ple_edges)
+            self.assertEqual(repro.encoding_provenance["num_bins_actual"], bins)
+            self.assertEqual(repro.encoding_provenance["ple_d_embedding_actual"], dim)
+            loss = repro.model.embedder(train_x).square().mean()
+            loss.backward()
+            self.assertTrue(torch.isfinite(emb.ple_emb_weight.grad).all())
+            with self.assertRaisesRegex(ValueError, "Precomputed PLE edges"):
+                build_wrapper(ds, restored, FINAL_CONFIG, "cpu", torch.zeros(3, bins + 2))
+            trial.user_attrs["num_bins_actual"] = 8 if bins != 8 else 9
+            with self.assertRaisesRegex(ValueError, "num_bins_actual"):
+                restore_params(trial, 40)
+
+    def test_old_fixed_ple_trial_cannot_be_relabelled(self):
+        trial = study_for(dataset(), count=1).best_trial
+        trial.params.pop("ple_d_embedding")
+        trial.user_attrs["benchmark_contract"]["recipe"] = "..recipe=betaema1"
+        with self.assertRaisesRegex(ValueError, "ple_d_embedding"):
+            restore_params(trial, 40)
 
     def test_half_life_including_partial_batches(self):
         for n, batch in ((118, 64), (800, 64), (104050, 1024)):

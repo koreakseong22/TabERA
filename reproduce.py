@@ -199,6 +199,7 @@ def run(args):
                        # can read utilisation next to the metrics it moved.
                        prototype_diag=prototype_diag(wrapper),
                        dynamics_provenance=wrapper.dynamics_provenance,
+                       encoding_provenance=wrapper.encoding_provenance,
                        training_diagnostics=training_diagnostics(wrapper),
                        prediction_diagnostics_val=wrapper.prediction_diagnostics,
                        environment={p: importlib.metadata.version(p) for p in ("torch", "numpy", "scikit-learn", "optuna")})

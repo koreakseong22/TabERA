@@ -158,6 +158,13 @@ def restore_params(trial, n_train, config=FINAL_CONFIG, hpo_config=None):
     params.update({k: config[k] for k in ("correction_geometry", "head_input_scale", "beta_param")})
     expected_dynamics = resolve_dynamics(params, n_train)
     recorded_recipe = (trial.user_attrs.get("benchmark_contract") or {}).get("recipe")
+    if hpo_config["num_embedding"] == "ple":
+        for name, low, high, step in (("num_bins", 2, 128, 1), ("ple_d_embedding", 8, 32, 4)):
+            value = params.get(name)
+            if not isinstance(value, int) or not low <= value <= high or (value - low) % step:
+                raise ValueError(f"Trial {trial.number}: missing or invalid PLE parameter {name}")
+            if trial.user_attrs.get(name + "_actual") != value:
+                raise ValueError(f"Trial {trial.number}: {name}_actual differs from searched value")
     if recorded_recipe == RECIPE_TAG:
         for name in ("beta_lr_mult", "ema_timescale"):
             if name not in params:
@@ -176,8 +183,11 @@ def build_wrapper(dataset, params, config, device, num_bin_edges=None):
     task = dataset.tasktype
     output_dim = dataset.n_classes if task == "multiclass" else 1
     train_x, train_y = dataset._indv_dataset()[0]
+    num_bins = params.get("num_bins", config["num_bins"])
+    if num_bin_edges is not None and num_bin_edges.shape[1] != num_bins + 1:
+        raise ValueError("Precomputed PLE edges do not match the trial's num_bins")
     if num_bin_edges is None and config["num_embedding"] == "ple" and len(dataset.X_num):
-        q = torch.linspace(0, 1, config["num_bins"] + 1, device=train_x.device)
+        q = torch.linspace(0, 1, num_bins + 1, device=train_x.device)
         num_bin_edges = torch.quantile(train_x[:, dataset.X_num], q, dim=0).T.contiguous()
     kwargs = params_to_model_kwargs(params, dataset.n_features, output_dim)
     dynamics = resolve_dynamics(params, len(train_y))
@@ -195,6 +205,12 @@ def build_wrapper(dataset, params, config, device, num_bin_edges=None):
                             early_stop_metric=config["early_stop_metric"], tie_rule=config["tie_rule"])
     wrapper.dynamics_provenance = dict(dynamics, ema_decay_actual=model.prototype_layer.ema_decay,
                                        beta_lr_actual=params["lr"] * wrapper.beta_lr_mult)
+    wrapper.encoding_provenance = {}
+    if config["num_embedding"] == "ple":
+        wrapper.encoding_provenance = dict(
+            num_bins_actual=model.embedder.ple_n_bins if len(dataset.X_num) else num_bins,
+            ple_d_embedding_actual=model.embedder.ple_d_embedding if len(dataset.X_num) else params.get("ple_d_embedding", 12),
+            n_numeric_features=len(dataset.X_num))
     return wrapper
 
 

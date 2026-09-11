@@ -1,7 +1,7 @@
 """
 run_final_parallel.py -- final 25-dataset x 5-seed benchmark, dispatched dynamically over GPUs.
 
-Every (dataset, seed) pair is one job:  optimize.py (100 trials)  ->  reproduce.py.
+Every (dataset, seed) pair is one job: optimize.py (up to 100 trials) -> reproduce.py.
 Jobs sit in one shared queue; each worker is pinned to a GPU and pulls the next
 job as soon as it finishes the previous one, so GPUs never wait for each other.
 Jobs are ordered largest-dataset-first so the long ones do not end up alone at
@@ -18,8 +18,8 @@ at all.
     python run_final_parallel.py --gpus 0 1 --dry_run
     python run_final_benchmark.py --seeds 1 2 3 4 5 --savepath . --aggregate   # afterwards
 
-Per-job logs: <savepath>/final_logs/ds<id>_seed<k>.log ; a running ledger in
-<savepath>/final_logs/progress.tsv (job, gpu, status, seconds, finished-at).
+Per-job logs: <savepath>/final_logs/<recipe>/ds<id>_seed<k>.log; a running ledger in
+<savepath>/final_logs/<recipe>/progress.tsv (job, gpu, status, seconds, finished-at).
 """
 from __future__ import annotations
 import argparse, csv, json, os, queue, subprocess, sys, threading, time
@@ -63,7 +63,8 @@ def main():
     from libs.benchmark import result_path, arm_config
     config = arm_config()
     save = Path(args.savepath).resolve()
-    log_dir = save / "final_logs"
+    from libs.search_space import RECIPE_TAG
+    log_dir = save / "final_logs" / RECIPE_TAG.removeprefix("..recipe=")
     log_dir.mkdir(parents=True, exist_ok=True)
     ledger = log_dir / "progress.tsv"
 

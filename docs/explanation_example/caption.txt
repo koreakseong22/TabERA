@@ -1,0 +1,8 @@
+﻿Figure X. User-facing TabERA explanation for Sample #4. (A) Region 3 is summarized by its 42 past cases and most frequent purpose. Each dot represents one case; colour indicates the observed label. (B) The eight retrieved cases are summarized by outcome, with detailed cards for the two closest cases and the closest contrasting case. (C) The predicted outcome is displayed with selected comparisons against the region: duration, credit amount and purpose frequency. The bottom strip locates the case by its centre-distance rank relative to region members.
+
+Visual encoding: dot layouts display counts, not embedding coordinates. Numeric-feature bars show the reported proportion of region cases with higher values. Purpose bars show category frequency. The bottom strip shows a distance rank, not an absolute distance or a density estimate. No raw distribution shape or additional case observations were synthesized. Case-card arrows run from the query value to the past-case value. Labels and numerical values retain the supplied output's rounding.
+
+Source: user-supplied Sample #4 output. No checkpoint, seed, unrounded logits or ground-truth label was supplied, and numerical values have not been independently reproduced. This is a static UI-style visualization. Region references are inverse-transformed quantile-space means, not raw arithmetic means. Evidence and position statistics do not enter the prediction; implementation details remain in code_review.txt rather than in the user-facing figure.
+
+Outputs: PNG (5100 x 3720, 300 dpi), PDF (vector), SVG (editable text).
+Regenerate: venv/Scripts/python.exe render_explanation_example.py

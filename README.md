@@ -321,11 +321,14 @@ partition, per-prototype profiles, and the pairwise prototype geometry.
 
 ## Controlled dynamics pilot
 
-The current `betaema1` controlled pilot fixes width 128, layers 2, dropout
+The controlled dynamics pilot fixes PLE at 8 bins / width 12, encoder width 128, layers 2, dropout
 0.1, lr 3e-4 and weight decay 1e-5. Only `beta_lr_mult` (continuous log
 1–30) and `ema_timescale` (`legacy_099`, `hl_05`, `hl_1`, `hl_3`, `hl_10`)
-are searched. These are the same dynamics ranges as the final seven-dimensional
-recipe; the pilot does not change that recipe.
+are searched. These are the same dynamics ranges as the final nine-dimensional
+`betaema1_plehpo` recipe. The joint recipe also searches `num_bins` (2–128)
+and `ple_d_embedding` (8–32, step 4), with initial values 8 and 12.
+See [the reproduction contract](docs/MULTITAB_REPRODUCTION.md#ple-hpo-recipe)
+for the full space and separation from the previous fixed-PLE `betaema1` results.
 
 ```bash
 python optimize.py --openml_id 31 --seed 1 --n_trials 25 --validation_only --pilot_space dynamics2d --savepath pilot_dynamics2d
@@ -336,7 +339,7 @@ The five constants are direct model parameters, recorded as study/trial
 multiplier 1 and legacy decay 0.99. Names include
 `..validation_only..pilot=dynamics2d`, separate from the joint pilot and
 final HPO. The mode requires validation-only evaluation and the fixed final
-architecture. Omitting `--pilot_space dynamics2d` searches all seven HPs.
+architecture. Omitting `--pilot_space dynamics2d` searches all nine HPs with PLE.
 
 A proposed small panel is 31, 54, 1067, 1493 and 151 (electricity), with
 seed 1 and 20–30 trials each. Compare validation improvement over trial 0,

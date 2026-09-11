@@ -31,12 +31,13 @@ def dataset(task="binclass"):
 def study_for(ds, count=100, config=FINAL_CONFIG):
     study = optuna.create_study(direction="minimize" if ds.tasktype == "regression" else "maximize")
     params = dict(embed_dim=8, embedder_layers=1, dropout=0., lr=.001, weight_decay=1e-6,
-                  beta_lr_mult=1.0, ema_timescale="legacy_099")
+                  beta_lr_mult=1.0, ema_timescale="legacy_099", num_bins=8, ple_d_embedding=12)
     attrs = {k + "_actual": config[k] for k in
              ("correction_geometry", "head_input_scale", "beta_param", "tie_rule", "early_stop_metric")}
     attrs.update(n_prototypes_actual=6, batch_size_actual=64, benchmark_contract=contract(config, ds),
                  disable_dead_reinit_actual=bool(config["disable_dead_reinit"]), optimize_sha256="test")
     attrs.update(resolve_dynamics(dict(params, batch_size=64), 40))
+    attrs.update(num_bins_actual=8, ple_d_embedding_actual=12)
     distributions = {k: optuna.distributions.CategoricalDistribution([v]) for k, v in params.items()}
     for i in range(count):
         study.add_trial(optuna.trial.create_trial(params=params, distributions=distributions,
@@ -48,7 +49,9 @@ class BenchmarkTests(unittest.TestCase):
     def test_hpo_entry_point_uses_shared_factory(self):
         import runpy
         import sys
+        from libs.search_space import suggest_initial_trial
         ds = dataset()
+        initial = dict(suggest_initial_trial(), num_bins=37, ple_d_embedding=20)
         def short_wrapper(*args, **kwargs):
             wrapper = build_wrapper(*args, **kwargs)
             wrapper.epochs = 2
@@ -58,13 +61,21 @@ class BenchmarkTests(unittest.TestCase):
             argv = ["optimize.py", "--openml_id", "31", "--seed", "2", "--n_trials", "1",
                     "--savepath", tmp, "--gpu_id", "-1"]
             with patch.object(sys, "argv", argv), patch("libs.data.TabularDataset", return_value=ds), \
-                    patch("libs.benchmark.build_wrapper", short_wrapper):
+                    patch("libs.benchmark.build_wrapper", short_wrapper), \
+                    patch("libs.search_space.suggest_initial_trial", return_value=initial):
                 runpy.run_path("optimize.py", run_name="__main__")
             study = joblib.load(final_study_path(tmp, 2, 31))
             self.assertEqual(len(study.trials), 1)
             self.assertEqual(study.best_trial.user_attrs["benchmark_contract"], contract(FINAL_CONFIG, ds))
             self.assertEqual(study.best_trial.params["beta_lr_mult"], 1.0)
             self.assertEqual(study.best_trial.params["ema_timescale"], "legacy_099")
+            self.assertEqual(study.best_trial.params["num_bins"], 37)
+            self.assertEqual(study.best_trial.params["ple_d_embedding"], 20)
+            self.assertEqual(study.best_trial.user_attrs["num_bins_actual"], 37)
+            self.assertEqual(study.best_trial.user_attrs["ple_d_embedding_actual"], 20)
+            restored = restore_params(study.best_trial, 40)
+            model = build_wrapper(ds, restored, FINAL_CONFIG, "cpu").model
+            self.assertEqual(tuple(model.embedder.ple_emb_weight.shape), (3, 37, 20))
             self.assertEqual(study.best_trial.user_attrs["ema_decay_actual"], 0.99)
             self.assertEqual(len(study.best_trial.user_attrs["beta_epoch_history"]), 2)
             self.assertIn("prediction_diagnostics_val", study.best_trial.user_attrs)
