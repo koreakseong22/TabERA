@@ -16,7 +16,7 @@ parser.add_argument("--n_trials",  type=int, default=100,    help="Number of opt
 parser.add_argument("--validation_only", action="store_true",
                     help="pilot mode: skip all test inference, metrics and prediction artifacts; use a separate study")
 parser.add_argument("--pilot_space", choices=["joint", "dynamics2d"], default="joint",
-                    help="dynamics2d fixes the five legacy anchor HPs and searches beta/EMA only; requires --validation_only")
+                    help="dynamics2d fixes the five anchor HPs and searches beta/EMA only; requires --validation_only")
 # ⚠ Any flag that changes the architecture must also appear in
 #   study_pkl_tag(), so that the study file is separated. Forgetting that
 #   makes reproduce.py load the baseline study and train the new structure

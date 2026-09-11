@@ -83,8 +83,8 @@ as if they came from the same training algorithm.
 DEFAULT_K_NO_TUNE = 8
 
 # Search recipe version, separate from the unchanged benchmark protocol.
-RECIPE_TAG = "..recipe=betaema1_plehpo"
-EMA_TIMESCALES = ("legacy_099", "hl_05", "hl_1", "hl_3", "hl_10")
+RECIPE_TAG = "..recipe=betaema1_plehpo_epochhl"
+EMA_TIMESCALES = ("hl_05", "hl_1", "hl_3", "hl_10")
 EMA_HALF_LIVES = {"hl_05": 0.5, "hl_1": 1.0, "hl_3": 3.0, "hl_10": 10.0}
 LEGACY_ANCHOR = dict(embed_dim=128, embedder_layers=2, dropout=0.1,
                      lr=3e-4, weight_decay=1e-5)
@@ -96,11 +96,10 @@ def resolve_dynamics(params: dict, n_train: int) -> dict:
     if n_train <= 0 or batch_size <= 0:
         raise ValueError("n_train and batch_size must be positive")
     steps = math.ceil(n_train / batch_size)  # fit() retains the final short batch
-    timescale = params.get("ema_timescale", "legacy_099")
+    timescale = params.get("ema_timescale", "hl_1")
     if timescale not in EMA_TIMESCALES:
         raise ValueError(f"Unknown ema_timescale: {timescale}")
-    decay = (0.99 if timescale == "legacy_099"
-             else 2.0 ** (-1.0 / (EMA_HALF_LIVES[timescale] * steps)))
+    decay = 2.0 ** (-1.0 / (EMA_HALF_LIVES[timescale] * steps))
     multiplier = float(params.get("beta_lr_mult", 1.0))
     lr = float(params["lr"])
     if not math.isfinite(multiplier) or multiplier <= 0 or not math.isfinite(lr) or lr <= 0:
@@ -183,7 +182,7 @@ def suggest_initial_trial(pilot_space: str = "joint", num_embedding: str = "ple"
     """
     if pilot_space not in ("joint", "dynamics2d"):
         raise ValueError(f"Unknown pilot_space: {pilot_space}")
-    initial = dict(beta_lr_mult=1.0, ema_timescale="legacy_099")
+    initial = dict(beta_lr_mult=1.0, ema_timescale="hl_1")
     if pilot_space == "joint":
         initial = dict(LEGACY_ANCHOR, **initial)
         if num_embedding == "ple":

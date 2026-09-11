@@ -27,7 +27,7 @@ class RecipeTests(unittest.TestCase):
             self.assertEqual(params["batch_size"], 64)
             seen.append(trial.params)
             study.tell(trial, .5)
-        self.assertEqual(seen[0], dict(beta_lr_mult=1., ema_timescale="legacy_099"))
+        self.assertEqual(seen[0], dict(beta_lr_mult=1., ema_timescale="hl_1"))
         self.assertGreater(len({p["beta_lr_mult"] for p in seen}), 1)
 
     def test_dynamics2d_requires_validation_only(self):
@@ -43,7 +43,7 @@ class RecipeTests(unittest.TestCase):
 
     def test_anchor_and_distributions(self):
         anchor = dict(embed_dim=128, embedder_layers=2, dropout=.1, lr=3e-4,
-                      weight_decay=1e-5, beta_lr_mult=1., ema_timescale="legacy_099",
+                      weight_decay=1e-5, beta_lr_mult=1., ema_timescale="hl_1",
                       num_bins=8, ple_d_embedding=12)
         self.assertEqual(suggest_initial_trial(), anchor)
         study = optuna.create_study()
@@ -54,13 +54,16 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(params["batch_size"], 64)
         self.assertTrue(trial.distributions["beta_lr_mult"].log)
         self.assertIsInstance(trial.distributions["beta_lr_mult"], optuna.distributions.FloatDistribution)
+        self.assertEqual(trial.distributions["ema_timescale"].choices,
+                         ("hl_05", "hl_1", "hl_3", "hl_10"))
         self.assertEqual(trial.distributions["embed_dim"].choices, (64, 128, 256))
         self.assertEqual(trial.distributions["num_bins"], optuna.distributions.IntDistribution(2, 128))
         self.assertEqual(trial.distributions["ple_d_embedding"], optuna.distributions.IntDistribution(8, 32, step=4))
         self.assertEqual(len(trial.params), 9)
         self.assertIn(RECIPE_TAG, str(final_study_path("r", 1, 31)))
         self.assertIn(RECIPE_TAG, str(result_path("r", 1, 31)))
-        self.assertIn("..recipe=betaema1_plehpo..", str(final_study_path("r", 1, 31)))
+        self.assertIn("..recipe=betaema1_plehpo_epochhl..", str(final_study_path("r", 1, 31)))
+        self.assertNotIn("..recipe=betaema1_plehpo..", str(final_study_path("r", 1, 31)))
         self.assertNotIn("..recipe=betaema1..", str(result_path("r", 1, 31)))
 
     def test_ple_trial_roundtrip_and_train_only_edges(self):
@@ -118,9 +121,12 @@ class RecipeTests(unittest.TestCase):
                 self.assertAlmostEqual(d["ema_decay_actual"] ** (steps * half_life), .5)
                 self.assertAlmostEqual(d["ema_half_life_epochs_actual"], half_life)
                 self.assertAlmostEqual(d["beta_lr_actual"], .0084)
-        self.assertEqual(resolve_dynamics(dict(batch_size=64, lr=.001), 118)["ema_decay_actual"], .99)
-        with self.assertRaises(ValueError):
-            resolve_dynamics(dict(batch_size=64, lr=.001, ema_timescale="typo"), 118)
+        default_dynamics = resolve_dynamics(dict(batch_size=64, lr=.001), 118)
+        self.assertEqual(default_dynamics["ema_timescale"], "hl_1")
+        self.assertAlmostEqual(default_dynamics["ema_half_life_epochs_actual"], 1.0)
+        for invalid in ("legacy_099", "typo"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                resolve_dynamics(dict(batch_size=64, lr=.001, ema_timescale=invalid), 118)
 
     def test_applied_groups_and_restore_guard(self):
         torch.set_num_threads(1)
@@ -154,14 +160,14 @@ class RecipeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ema_decay_actual"):
             restore_params(trial, 40)
 
-    def test_legacy_anchor_preserves_training(self):
+    def test_default_dynamics_matches_hl1(self):
         torch.set_num_threads(1)
         ds = dataset()
         p = dict(embed_dim=8, embedder_layers=1, dropout=.1, lr=.001,
                  weight_decay=1e-5, n_prototypes=6, batch_size=64)
         p.update({k: FINAL_CONFIG[k] for k in ("correction_geometry", "head_input_scale", "beta_param")})
         states = []
-        for extra in ({}, dict(beta_lr_mult=1., ema_timescale="legacy_099")):
+        for extra in ({}, dict(beta_lr_mult=1., ema_timescale="hl_1")):
             torch.manual_seed(19)
             w = build_wrapper(ds, dict(p, **extra), FINAL_CONFIG, "cpu")
             w.epochs = 2

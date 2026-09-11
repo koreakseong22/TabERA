@@ -205,7 +205,7 @@ term does.
 |---|---|
 | Encoding | numeric → piecewise-linear embeddings (bin edges from the training split); categorical → one-hot; MLP → `q` |
 | Assignment | `argmax cos(q, C)`; forward hard, backward straight-through |
-| Prototypes | `P` observed embeddings sampled before epoch 1, then EMA (`decay 0.99`). No gradient. Unassigned ones reinitialised from an observed embedding |
+| Prototypes | `P` observed embeddings sampled before epoch 1, then EMA with a tuned epoch-based half-life. No gradient. Unassigned ones reinitialised from an observed embedding |
 | Prediction | `h = c + β·normalize(q − c)`, `W` shared between the terms |
 | Retrieval | k-NN within `G(a)`, self excluded |
 
@@ -293,6 +293,10 @@ legacy arm.
 | `dropout` | 0.0–0.5, step 0.05 |
 | `lr` | 1e-4 – 1e-2, log |
 | `weight_decay` | 1e-6 – 1e-2, log |
+| `beta_lr_mult` | 1–30, log |
+| `ema_timescale` | epoch half-life {0.5, 1, 3, 10} |
+| `num_bins` | integer 2–128 |
+| `ple_d_embedding` | integer 8–32, step 4 |
 | *(plr_lite only)* | `plr_freq_scale`, `plr_n_frequencies`, `plr_out_dim` |
 
 **Fixed by rule**, not tuned.
@@ -301,9 +305,8 @@ legacy arm.
 |---|---|---|
 | `P` | `floor(√N_train)` | capacity tied to dataset size |
 | `k` | 8 | explanation budget — outside the prediction path, so it cannot move the objective |
-| `batch_size` | 256 | fixed protocol |
+| `batch_size` | MultiTab size rule | derived from training-set size |
 | `routing_scale` | `√2·log(P − 1)` | derived from `P` |
-| `ema_decay` | 0.99 | |
 
 Ablation flags are listed by `--help`. Variants no longer in this code — the
 alternative prediction heads, the neighbourhood regulariser, the aggregator —
@@ -323,9 +326,9 @@ partition, per-prototype profiles, and the pairwise prototype geometry.
 
 The controlled dynamics pilot fixes PLE at 8 bins / width 12, encoder width 128, layers 2, dropout
 0.1, lr 3e-4 and weight decay 1e-5. Only `beta_lr_mult` (continuous log
-1–30) and `ema_timescale` (`legacy_099`, `hl_05`, `hl_1`, `hl_3`, `hl_10`)
+1–30) and `ema_timescale` (`hl_05`, `hl_1`, `hl_3`, `hl_10`)
 are searched. These are the same dynamics ranges as the final nine-dimensional
-`betaema1_plehpo` recipe. The joint recipe also searches `num_bins` (2–128)
+`betaema1_plehpo_epochhl` recipe. The joint recipe also searches `num_bins` (2–128)
 and `ple_d_embedding` (8–32, step 4), with initial values 8 and 12.
 See [the reproduction contract](docs/MULTITAB_REPRODUCTION.md#ple-hpo-recipe)
 for the full space and separation from the previous fixed-PLE `betaema1` results.
@@ -336,7 +339,7 @@ python optimize.py --openml_id 31 --seed 1 --n_trials 25 --validation_only --pil
 
 The five constants are direct model parameters, recorded as study/trial
 `fixed_hyperparameters`, not one-choice Optuna distributions. Trial 0 uses
-multiplier 1 and legacy decay 0.99. Names include
+multiplier 1 and a nominal EMA half-life of 1 epoch. Names include
 `..validation_only..pilot=dynamics2d`, separate from the joint pilot and
 final HPO. The mode requires validation-only evaluation and the fixed final
 architecture. Omitting `--pilot_space dynamics2d` searches all nine HPs with PLE.

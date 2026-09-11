@@ -1,4 +1,5 @@
 import ast
+import math
 import subprocess
 import tempfile
 import unittest
@@ -31,7 +32,7 @@ def dataset(task="binclass"):
 def study_for(ds, count=100, config=FINAL_CONFIG):
     study = optuna.create_study(direction="minimize" if ds.tasktype == "regression" else "maximize")
     params = dict(embed_dim=8, embedder_layers=1, dropout=0., lr=.001, weight_decay=1e-6,
-                  beta_lr_mult=1.0, ema_timescale="legacy_099", num_bins=8, ple_d_embedding=12)
+                  beta_lr_mult=1.0, ema_timescale="hl_1", num_bins=8, ple_d_embedding=12)
     attrs = {k + "_actual": config[k] for k in
              ("correction_geometry", "head_input_scale", "beta_param", "tie_rule", "early_stop_metric")}
     attrs.update(n_prototypes_actual=6, batch_size_actual=64, benchmark_contract=contract(config, ds),
@@ -68,7 +69,7 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(len(study.trials), 1)
             self.assertEqual(study.best_trial.user_attrs["benchmark_contract"], contract(FINAL_CONFIG, ds))
             self.assertEqual(study.best_trial.params["beta_lr_mult"], 1.0)
-            self.assertEqual(study.best_trial.params["ema_timescale"], "legacy_099")
+            self.assertEqual(study.best_trial.params["ema_timescale"], "hl_1")
             self.assertEqual(study.best_trial.params["num_bins"], 37)
             self.assertEqual(study.best_trial.params["ple_d_embedding"], 20)
             self.assertEqual(study.best_trial.user_attrs["num_bins_actual"], 37)
@@ -76,7 +77,8 @@ class BenchmarkTests(unittest.TestCase):
             restored = restore_params(study.best_trial, 40)
             model = build_wrapper(ds, restored, FINAL_CONFIG, "cpu").model
             self.assertEqual(tuple(model.embedder.ple_emb_weight.shape), (3, 37, 20))
-            self.assertEqual(study.best_trial.user_attrs["ema_decay_actual"], 0.99)
+            expected_decay = 2 ** (-1 / math.ceil(40 / 64))
+            self.assertAlmostEqual(study.best_trial.user_attrs["ema_decay_actual"], expected_decay)
             self.assertEqual(len(study.best_trial.user_attrs["beta_epoch_history"]), 2)
             self.assertIn("prediction_diagnostics_val", study.best_trial.user_attrs)
             self.assertIn("acc_test", study.best_trial.user_attrs)
@@ -133,7 +135,7 @@ class BenchmarkTests(unittest.TestCase):
                     from libs.search_space import LEGACY_ANCHOR
                     self.assertIn("..validation_only..pilot=dynamics2d", paths[0].name)
                     self.assertEqual(set(trial.params), {"beta_lr_mult", "ema_timescale"})
-                    self.assertEqual(trial.params, {"beta_lr_mult": 1., "ema_timescale": "legacy_099"})
+                    self.assertEqual(trial.params, {"beta_lr_mult": 1., "ema_timescale": "hl_1"})
                     self.assertEqual(trial.user_attrs["fixed_hyperparameters"], LEGACY_ANCHOR)
                     self.assertEqual({k: applied[0][k] for k in LEGACY_ANCHOR}, LEGACY_ANCHOR)
                 self.assertFalse(any(k.endswith("_test") for k in trial.user_attrs))
@@ -547,7 +549,8 @@ class BenchmarkTests(unittest.TestCase):
                     saved = np.load(path, allow_pickle=True).item()
                     self.assertEqual(saved["Prediction"].shape, (10,))
                     self.assertTrue(saved["time"] > 0)
-                    self.assertEqual(saved["dynamics_provenance"]["ema_decay_actual"], 0.99)
+                    self.assertAlmostEqual(
+                        saved["dynamics_provenance"]["ema_half_life_epochs_actual"], 1.0)
                     self.assertTrue(saved["training_diagnostics"]["beta_epoch_history"])
                     if task != "regression":
                         pred, probs = get_preds_and_probs(torch.tensor(saved["Probability"]), task)
