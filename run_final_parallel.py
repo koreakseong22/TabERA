@@ -100,6 +100,9 @@ def main():
               f"remaining {q.qsize()}", flush=True)
 
     def run_step(name, cmd, log, ds, seed, gpu):
+        step_start = time.time()
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] gpu{gpu} ds={ds} seed={seed} "
+              f"START {name}", flush=True)
         with log.open("a", encoding="utf-8") as out:
             out.write(f"\n===== {name} {datetime.now():%Y-%m-%d %H:%M:%S} =====\n{subprocess.list2cmdline(cmd)}\n")
             out.flush()
@@ -109,6 +112,10 @@ def main():
             code = proc.wait()
             with lock:
                 running.pop((ds, seed), None)
+        step_seconds = time.time() - step_start
+        outcome = "DONE" if code == 0 else f"FAILED(rc={code})"
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] gpu{gpu} ds={ds} seed={seed} "
+              f"{outcome} {name} elapsed={step_seconds:.0f}s", flush=True)
         return code
 
     def worker(gpu):
