@@ -49,6 +49,9 @@ def main():
     p.add_argument("--only_ds", type=int, nargs="+")
     p.add_argument("--savepath", default=".", help="same root for optimize.py and reproduce.py (existing seed-1 studies live in '.')")
     p.add_argument("--mode", choices=["best", "all"], default="best")
+    p.add_argument("--correction_geometry", choices=["unit_tangent", "tangent"],
+                   default="unit_tangent")
+    p.add_argument("--head_input_scale", choices=["auto", "unit"], default="auto")
     p.add_argument("--n_trials", type=int, default=100, help="HPO budget; anything but 100 is a smoke test, not a benchmark")
     p.add_argument("--skip_hpo", action="store_true", help="reproduce only (studies must already be complete)")
     p.add_argument("--allow_unverified_study", action="store_true")
@@ -61,10 +64,20 @@ def main():
     if unknown:
         p.error(f"Unknown datasets: {sorted(unknown)}")
     from libs.benchmark import result_path, arm_config
-    config = arm_config()
+    from reproduce import structure_result_path, with_structure
+    try:
+        config = with_structure(arm_config(), args.correction_geometry,
+                                args.head_input_scale)
+    except ValueError as exc:
+        p.error(str(exc))
     save = Path(args.savepath).resolve()
     from libs.search_space import RECIPE_TAG
-    log_dir = save / "final_logs" / RECIPE_TAG.removeprefix("..recipe=")
+    structure_log = ""
+    if config["correction_geometry"] != "unit_tangent":
+        structure_log += f"__geom={config['correction_geometry']}"
+    if config["head_input_scale"] != "auto":
+        structure_log += f"__hs={config['head_input_scale']}"
+    log_dir = save / "final_logs" / (RECIPE_TAG.removeprefix("..recipe=") + structure_log)
     log_dir.mkdir(parents=True, exist_ok=True)
     ledger = log_dir / "progress.tsv"
 
@@ -73,7 +86,9 @@ def main():
     jobs, done = [], []
     for ds in order:
         for seed in args.seeds:
-            if result_path(save, seed, ds, config=config).exists():
+            result = structure_result_path(
+                result_path(save, seed, ds, config=config), config)
+            if result.exists():
                 done.append((ds, seed))
             else:
                 jobs.append((ds, seed))
@@ -126,7 +141,8 @@ def main():
                 return
             log = log_dir / f"ds{ds}_seed{seed}.log"
             base = ["--openml_id", str(ds), "--seed", str(seed), "--gpu_id", str(gpu), "--savepath", str(save),
-                    "--correction_geometry", "unit_tangent", "--head_input_scale", "auto"]
+                    "--correction_geometry", args.correction_geometry,
+                    "--head_input_scale", args.head_input_scale]
             t0 = time.time()
             status = "ok"
             if not args.skip_hpo:

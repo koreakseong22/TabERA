@@ -21,6 +21,9 @@ def main():
     p.add_argument("--savepath", default=".")
     p.add_argument("--run_hpo", action="store_true")
     p.add_argument("--mode", choices=["best", "all"], default="best")
+    p.add_argument("--correction_geometry", choices=["unit_tangent", "tangent"],
+                   default="unit_tangent")
+    p.add_argument("--head_input_scale", choices=["auto", "unit"], default="auto")
     p.add_argument("--dry_run", action="store_true")
     p.add_argument("--aggregate", action="store_true")
     p.add_argument("--allow_unverified_study", action="store_true")
@@ -34,7 +37,13 @@ def main():
                          "main needs no --run_hpo and reads/writes <arm>..hpo=main files"))
     args = p.parse_args()
     from libs.benchmark import arm_config, is_main_arm
-    config = arm_config(args.disable_dead_reinit, args.early_stop_metric)
+    from reproduce import structure_result_path, with_structure
+    try:
+        config = with_structure(
+            arm_config(args.disable_dead_reinit, args.early_stop_metric),
+            args.correction_geometry, args.head_input_scale)
+    except ValueError as exc:
+        p.error(str(exc))
     if args.hpo_source == "main":
         if is_main_arm(config):
             p.error("--hpo_source main only applies with an ablation arm (--disable_dead_reinit / --early_stop_metric)")
@@ -53,7 +62,9 @@ def main():
         rows = []
         for seed in args.seeds:
             for ds in ids:
-                path = result_path(args.savepath, seed, ds, config=config, hpo_source=args.hpo_source)
+                path = structure_result_path(
+                    result_path(args.savepath, seed, ds, config=config,
+                                hpo_source=args.hpo_source), config)
                 if not path.exists():
                     print(f"[missing] {path}")
                     continue
@@ -71,7 +82,12 @@ def main():
                                  unverified_hpo=saved["identity"]["unverified_hpo"],
                                  **saved["Performance"], **diag))
         hpo = "" if args.hpo_source == "own" else f"..hpo={args.hpo_source}"
-        out = Path(args.savepath) / f"results/tabera_final_per_fold{RECIPE_TAG}{arm_tag(config)}{hpo}.csv"
+        structure = ""
+        if config["correction_geometry"] != "unit_tangent":
+            structure += f"..geom={config['correction_geometry']}"
+        if config["head_input_scale"] != "auto":
+            structure += f"..hs={config['head_input_scale']}"
+        out = Path(args.savepath) / f"results/tabera_final_per_fold{RECIPE_TAG}{arm_tag(config)}{structure}{hpo}.csv"
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
@@ -86,7 +102,8 @@ def main():
         for seed in args.seeds:
             base = ["--openml_id", str(ds), "--seed", str(seed), "--gpu_id", str(args.gpu_id),
                     "--savepath", str(Path(args.savepath).resolve()),
-                    "--correction_geometry", "unit_tangent", "--head_input_scale", "auto"]
+                    "--correction_geometry", args.correction_geometry,
+                    "--head_input_scale", args.head_input_scale]
             commands = []
             if args.run_hpo:
                 commands.append([sys.executable, str(root / "optimize.py"), *base, *arm, "--n_trials", "100"])

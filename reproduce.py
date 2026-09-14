@@ -14,8 +14,12 @@ def parser():
     p.add_argument("--json", default=str(Path(__file__).with_name("dataset_id.json")))
     p.add_argument("--mode", choices=["best", "init", "deep", "hyper", "all"], default="best")
     p.add_argument("--member", type=int, choices=range(5), default=0)
-    p.add_argument("--correction_geometry", choices=[FINAL_CONFIG["correction_geometry"]], default=FINAL_CONFIG["correction_geometry"])
-    p.add_argument("--head_input_scale", choices=[FINAL_CONFIG["head_input_scale"]], default=FINAL_CONFIG["head_input_scale"])
+    p.add_argument("--correction_geometry", choices=["unit_tangent", "tangent"],
+                   default=FINAL_CONFIG["correction_geometry"],
+                   help="final Unit Tangent model or the independently tuned Tangent ablation")
+    p.add_argument("--head_input_scale", choices=["auto", "unit"],
+                   default=FINAL_CONFIG["head_input_scale"],
+                   help="Unit Tangent uses auto; the Tangent ablation uses unit")
     p.add_argument("--disable_dead_reinit", action="store_true",
                    help=("ablation arm: dead-prototype recovery off (dead_reinit_patience=1e9, so the reinit "
                          "block in regroup_update never fires). Reads the ..nodr study written by "
@@ -35,10 +39,56 @@ def parser():
                          "changes -- the fixed-HP ablation. Results are written as model=tabera<arm>..hpo=main.. "
                          "and record both contracts"))
     p.add_argument("--allow_unverified_study", action="store_true",
-                   help="accept old trials lacking code/data provenance after your own audit; result marked unverified")
+                   help=("accept trials lacking provenance, or a study whose only contract "
+                         "difference is the library implementation hash, after your own audit; "
+                         "result marked unverified. Data/config/environment mismatches still fail"))
     p.add_argument("--overwrite", action="store_true", help="explicitly replace an existing result")
     p.add_argument("--audit_only", action="store_true", help="validate study and data without training")
     return p
+
+
+def with_structure(config, correction_geometry, head_input_scale):
+    """Return a copied config with one supported geometry/scale pairing."""
+    pair = (correction_geometry, head_input_scale)
+    supported = {("unit_tangent", "auto"), ("tangent", "unit")}
+    if pair not in supported:
+        raise ValueError(
+            f"Unsupported geometry/scale pair {pair!r}. Use "
+            "unit_tangent + auto or tangent + unit.")
+    return dict(config, correction_geometry=correction_geometry,
+                head_input_scale=head_input_scale)
+
+
+def requested_config(args, arm_config):
+    """Build one complete run config without changing the frozen main default."""
+    return with_structure(
+        arm_config(args.disable_dead_reinit, args.early_stop_metric),
+        args.correction_geometry, args.head_input_scale)
+
+
+def structure_result_path(path, config):
+    """Give non-final geometry results a collision-proof filename.
+
+    This intentionally lives in reproduce.py. Moving it into libs/benchmark.py
+    would change implementation_id() and invalidate an already completed HPO
+    study even though model training code did not change.
+    """
+    path = Path(path)
+    tags = ""
+    if config["correction_geometry"] != FINAL_CONFIG["correction_geometry"]:
+        tags += f"..geom={config['correction_geometry']}"
+    if config["head_input_scale"] != FINAL_CONFIG["head_input_scale"]:
+        tags += f"..hs={config['head_input_scale']}"
+    if not tags:
+        return path
+    if not path.name.startswith("model=tabera"):
+        raise ValueError(f"Unexpected result filename: {path.name}")
+    return path.with_name(path.name.replace("model=tabera", "model=tabera" + tags, 1))
+
+
+def implementation_only_contract_diff(diff):
+    """True only when every reported provenance mismatch is implementation code."""
+    return bool(diff) and all(item.startswith("implementation:") for item in diff)
 
 
 def prototype_diag(wrapper):
@@ -83,7 +133,7 @@ def run(args):
     task = info["tasktype"]
     # One config object drives the study lookup, the contract, the model and
     # the result path, so an arm can never be half-applied.
-    config = arm_config(args.disable_dead_reinit, args.early_stop_metric)
+    config = requested_config(args, arm_config)
     if args.hpo_source == "main" and is_main_arm(config):
         raise ValueError("--hpo_source main only applies to an ablation arm "
                          "(--disable_dead_reinit and/or a non-default --early_stop_metric)")
@@ -114,7 +164,8 @@ def run(args):
         elif recorded != expected_hpo:
             diff = contract_diff(recorded, expected_hpo)
             hint = ""
-            if [d for d in diff if d.startswith("implementation:")] == diff:
+            implementation_only = implementation_only_contract_diff(diff)
+            if implementation_only:
                 # Only the code hash moved. That still means this study was
                 # searched under different library code, but it tells the
                 # reader the data and the configuration are intact -- and that
@@ -123,10 +174,15 @@ def run(args):
                         "implementation_id() covers libs/{benchmark,benchmark_config,data,eval,"
                         "search_space,supervised,tabera,prototypes}.py, so any edit to those "
                         "invalidates studies recorded before it.")
+                if args.allow_unverified_study:
+                    unverified = True
+                    continue
             raise ValueError(
                 f"Trial {trial.number}: this study was recorded under a different contract; "
                 f"rerun HPO or use a study that matches.\n  " + "\n  ".join(diff) + hint)
     print(f"[HPO audit] {len(completed)} completed; unverified_hpo={unverified}; {source}")
+    print(f"[structure] geometry={config['correction_geometry']}; "
+          f"head_input_scale={config['head_input_scale']}; hpo_source={args.hpo_source}")
     if args.audit_only:
         return
     modes = ([("init", 0), ("best", 0)] + [("deep", i) for i in range(1, 5)] +
@@ -147,7 +203,9 @@ def run(args):
                         train_seed=train_seed, unverified_hpo=unverified,
                         reproduction_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                         study_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
-        path = result_path(args.savepath, args.seed, args.openml_id, mode, member, config, args.hpo_source)
+        path = structure_result_path(
+            result_path(args.savepath, args.seed, args.openml_id, mode, member,
+                        config, args.hpo_source), config)
         if path.exists() and not args.overwrite:
             saved = np.load(path, allow_pickle=True).item()
             if not isinstance(saved, dict) or saved.get("identity") != identity:
