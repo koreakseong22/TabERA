@@ -13,7 +13,10 @@ round-trip audit.
 Implemented: read-only retrieval branch instrumentation, metadata-off/on output
 identity checks and per-query branch trace export.
 
-Pending: real retrieval-instrumentation pilots, explanation metrics,
+The three retrieval-instrumentation pilots passed: OpenML 31/folds 1 and 2
+and OpenML 10/fold 1. Implemented next: per-run region structure, prediction
+decomposition, global-kNN control, label-gain metrics and auditable query,
+region and neighbor exports. Pending: metric pilots, 105-run execution,
 aggregation and paper tables.
 
 The manifest inventories benchmark results; `checkpoint_available=false` means
@@ -53,6 +56,9 @@ python refresh_explanation_checkpoint.py --dataset-id 31 --fold 1
 
 # Only after the refreshed checkpoint passes its complete audit.
 python audit_retrieval_instrumentation.py --dataset-id 31 --fold 1
+
+# Only after the retrieval instrumentation gate passes.
+python analyze_explanation_structure.py --dataset-id 31 --fold 1
 ```
 
 Manifest generation refuses an existing destination. Checkpoint saving refuses
@@ -129,6 +135,10 @@ replacing the original checkpoint or reproduction audits.
 
 - Majority tie: smallest class index. Empty region: global-majority prediction;
   report empty-region query rate.
+- Normalized region entropy is the training-sample-weighted mean of each
+  nonempty region's entropy divided by log(number of classes). Also save the
+  unweighted nonempty-region mean. Region size median/IQR excludes empty
+  regions; save the fraction of empty training regions separately.
 - Hard prediction: `libs.eval.get_preds_and_probs` (binary sigmoid > 0.5).
 - Tangent/unit: independently calculate z_region = head(c), z_corr = W*d from
   actual forward correction. Assert max decomposition error < 1e-5.
@@ -146,6 +156,12 @@ replacing the original checkpoint or reproduction audits.
   distribution. Mean(query-label agreement - region proportion of true label).
   Random sampling is unnecessary. Save eligible coverage; zero eligible means
   undefined gain (JSON null / tabular NaN), never zero.
+- Label agreement versus global kNN is saved as a secondary diagnostic. It
+  isolates the effect of the region constraint, whereas the primary
+  random-within-region expectation measures query specificity inside a region.
+  It uses the primary label-gain eligibility plus a valid unique global-kNN set,
+  so adjacent/global fallback queries are excluded. These two quantities answer
+  different questions and are not substituted for one another.
 
 Retrieval instrumentation wraps and calls the frozen benchmark's bound
 `MemoryBank.retrieve` method; it does not replace its search implementation or
