@@ -26,12 +26,25 @@ def run(args):
             and retrieval_audit.get("refreshed_checkpoint_sha256") == checkpoint_sha):
         raise ValueError("Retrieval instrumentation did not pass the locked gate")
     stored_trace = json.loads(retrieval_trace_path.read_text(encoding="utf-8"))
-    targets = [run_dir / name for name in (
+    metric_outputs = [run_dir / name for name in (
         "query_metrics.parquet", "region_stats.parquet", "neighbors_tabera.parquet",
-        "neighbors_global.parquet", "summary.json", "audit_metrics.json")]
-    existing = [str(path) for path in targets if path.exists()]
-    if existing:
-        raise FileExistsError(f"Metric artifacts already exist: {existing}")
+        "neighbors_global.parquet", "summary.json")]
+    audit_path = run_dir / "audit_metrics.json"
+    existing_audit = None
+    if audit_path.exists():
+        try:
+            existing_audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if existing_audit and existing_audit.get("status") == "explanation_metrics_passed":
+        raise FileExistsError("Successful metric artifacts already exist")
+    # Derived files without a successful audit are untrusted remnants of a
+    # failed or interrupted attempt. Removing them makes the metric stage
+    # resumable while preserving every successfully audited result.
+    for path in metric_outputs:
+        path.unlink(missing_ok=True)
+    audit_path.unlink(missing_ok=True)
+    targets = [*metric_outputs, audit_path]
     device = "cuda:0" if args.gpu_id >= 0 and torch.cuda.is_available() else "cpu"
     wrapper, dataset, payload = restore_checkpoint(checkpoint, device)
     state_before = {name: value.detach().cpu().clone()
@@ -93,4 +106,24 @@ def parser():
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(parser().parse_args()))
+    args = parser().parse_args()
+    try:
+        raise SystemExit(run(args))
+    except Exception as exc:
+        run_dir = (Path(args.analysis_root).resolve() /
+                   f"openml_{args.dataset_id}" / f"fold_{args.fold}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = run_dir / "audit_metrics.json"
+        existing = None
+        if audit_path.exists():
+            try:
+                existing = json.loads(audit_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        # Never replace a prior successful audit with a failed re-run record.
+        if not (existing and existing.get("status") == "explanation_metrics_passed"):
+            write_json(audit_path, dict(
+                status="failed_explanation_metrics", dataset_id=args.dataset_id,
+                fold=args.fold, error_type=type(exc).__name__, error=str(exc),
+                eligible_for_aggregation=False))
+        raise

@@ -144,6 +144,12 @@ class ExplanationMetricTests(unittest.TestCase):
             args = parser().parse_args([
                 "--analysis-root", tmp, "--dataset-id", "31", "--fold", "1",
                 "--gpu-id", "-1"])
+            # A prior failed/interrupted attempt is cleaned and can resume.
+            (run_dir / "audit_metrics.json").write_text(json.dumps(dict(
+                status="failed_explanation_metrics",
+                eligible_for_aggregation=False)), encoding="utf-8")
+            (run_dir / "summary.json").write_text("partial", encoding="utf-8")
+            (run_dir / "query_metrics.parquet").write_bytes(b"partial")
             self.assertEqual(run(args), 0)
             expected = {
                 "query_metrics.parquet", "region_stats.parquet",

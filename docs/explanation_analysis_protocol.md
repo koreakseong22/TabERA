@@ -59,6 +59,12 @@ python audit_retrieval_instrumentation.py --dataset-id 31 --fold 1
 
 # Only after the retrieval instrumentation gate passes.
 python analyze_explanation_structure.py --dataset-id 31 --fold 1
+
+# After all three metric pilots pass, resume the full manifest pipeline.
+python run_explanation_analysis_batch.py --gpu-id 0
+
+# This returns an incomplete status unless all 105 metric audits pass.
+python aggregate_explanation_analysis.py
 ```
 
 Manifest generation refuses an existing destination. Checkpoint saving refuses
@@ -187,5 +193,6 @@ Main Table 2: global-majority, region-majority, regional-baseline and final
 accuracy; corrected and degraded rate.
 
 Main Table 3: same-region share, fallback invocation rate, global-kNN Jaccard,
-label agreement gain. Always report eligible-query coverage in the caption or
-body. Dataset/fold variation and other diagnostics belong in the appendix.
+global-kNN overlap coverage, label agreement gain and label-gain eligible
+coverage. The secondary global-kNN label delta and its coverage remain appendix
+diagnostics. Dataset/fold variation and other diagnostics belong in the appendix.
