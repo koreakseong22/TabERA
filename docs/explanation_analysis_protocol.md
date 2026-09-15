@@ -10,8 +10,11 @@ Implemented: final-encoder memory reconstruction and its separate checkpoint,
 parameter/centroid/sample-ID checks, prediction invariance and refreshed-state
 round-trip audit.
 
-Pending: real memory-refresh pilots, retrieval branch instrumentation,
-explanation metrics, aggregation and paper tables.
+Implemented: read-only retrieval branch instrumentation, metadata-off/on output
+identity checks and per-query branch trace export.
+
+Pending: real retrieval-instrumentation pilots, explanation metrics,
+aggregation and paper tables.
 
 The manifest inventories benchmark results; `checkpoint_available=false` means
 no verified checkpoint was supplied with that inventory. Per-run preflight and
@@ -47,6 +50,9 @@ python reproduce_with_checkpoint.py --dataset-id 31 --fold 1 --restore-only
 
 # Only after train and restore audits pass every reproduction gate.
 python refresh_explanation_checkpoint.py --dataset-id 31 --fold 1
+
+# Only after the refreshed checkpoint passes its complete audit.
+python audit_retrieval_instrumentation.py --dataset-id 31 --fold 1
 ```
 
 Manifest generation refuses an existing destination. Checkpoint saving refuses
@@ -140,6 +146,14 @@ replacing the original checkpoint or reproduction audits.
   distribution. Mean(query-label agreement - region proportion of true label).
   Random sampling is unnecessary. Save eligible coverage; zero eligible means
   undefined gain (JSON null / tabular NaN), never zero.
+
+Retrieval instrumentation wraps and calls the frozen benchmark's bound
+`MemoryBank.retrieve` method; it does not replace its search implementation or
+modify `libs/tabera.py`. It records the exact control conditions selecting the
+branch and verifies metadata OFF/ON equality for logits, neighbor slots, valid
+mask, region assignment and query embedding. It also verifies the complete
+model state is unchanged. Outputs are `audit_retrieval.json` and the per-query
+`retrieval_trace.json`.
 
 ## Later outputs and aggregation
 
