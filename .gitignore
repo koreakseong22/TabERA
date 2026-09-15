@@ -9,6 +9,7 @@ reproduce_logs/
 scripts/
 _archive/
 results/
+analysis_results/
 final_logs/
 pilot_dynamics2d/
 
@@ -29,4 +30,5 @@ venv/
 # Optuna DB
 *.db
 *.md
+!docs/explanation_analysis_protocol.md
 *.tar.gz
