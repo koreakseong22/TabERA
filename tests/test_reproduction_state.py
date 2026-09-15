@@ -14,7 +14,8 @@ from build_explanation_manifest import build_manifest
 from libs.benchmark import build_wrapper, contract
 from libs.benchmark_config import FINAL_CONFIG
 from libs.eval import get_preds_and_probs
-from libs.reproduction_state import (compare_predictions, restore_checkpoint, save_checkpoint, snapshot)
+from libs.reproduction_state import (compare_predictions, refresh_training_memory,
+                                     restore_checkpoint, save_checkpoint, snapshot)
 from tests.test_benchmark import dataset
 
 
@@ -61,6 +62,30 @@ class ReproductionStateTests(unittest.TestCase):
                 torch.testing.assert_close(restored.model.memory.sample_ids, w.model.memory.sample_ids)
                 torch.testing.assert_close(restored.model.feature_store._store, w.model.feature_store._store)
                 self.assertEqual(contract(state["model_config"], rds), state["identity"]["contract"])
+                refresh = refresh_training_memory(restored, rds)
+                self.assertTrue(refresh["parameter_match"])
+                self.assertTrue(refresh["centroid_match"])
+                self.assertTrue(refresh["training_sample_id_unique"])
+                self.assertTrue(refresh["training_sample_id_complete"])
+                self.assertTrue(refresh["region_membership_complete"])
+                with torch.no_grad():
+                    refreshed_out = restored.model(xe)
+                torch.testing.assert_close(refreshed_out["logits"], before["logits"], rtol=0, atol=0)
+                torch.testing.assert_close(
+                    restored.model.memory.sample_ids, torch.arange(len(ds._indv_dataset()[0][1])))
+                refreshed_state = snapshot(
+                    restored, rds, state["identity"], refreshed_out["logits"],
+                    get_preds_and_probs(refreshed_out["logits"], task)[0],
+                    state_kind="final_encoder_refreshed_for_explanation",
+                    parent_checkpoint_sha256="test-parent", refresh_audit=refresh)
+                refreshed_path = Path(tmp) / "checkpoint_refreshed.pt"
+                save_checkpoint(refreshed_path, refreshed_state)
+                restored_again, _, payload = restore_checkpoint(refreshed_path)
+                self.assertEqual(payload["state_kind"], "final_encoder_refreshed_for_explanation")
+                with torch.no_grad():
+                    roundtrip_out = restored_again.model(xe)
+                for key in ("logits", "centroid_id", "topk_idx", "neighbor_mask"):
+                    torch.testing.assert_close(roundtrip_out[key], refreshed_out[key], rtol=0, atol=0)
                 with self.assertRaises(FileExistsError):
                     save_checkpoint(path, state)
                 bad = copy.deepcopy(state)
@@ -76,6 +101,40 @@ class ReproductionStateTests(unittest.TestCase):
         self.assertFalse(audit["passed"])
         with self.assertRaises(ValueError):
             compare_predictions([np.nan], [0], [0.], [0], [0])
+
+    def test_memory_refresh_runner_preserves_original_and_saves_separate_state(self):
+        from build_explanation_manifest import sha256
+        from refresh_explanation_checkpoint import parser, run
+
+        _, _, state = self.make_state("binclass")
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "openml_31/fold_1"
+            run_dir.mkdir(parents=True)
+            original = run_dir / "checkpoint.pt"
+            save_checkpoint(original, state)
+            original_sha = sha256(original)
+            common = dict(status="reproduction_passed", checkpoint_sha256=original_sha,
+                          checkpoint_roundtrip={"passed": True},
+                          benchmark_reproduction={"passed": True},
+                          benchmark_accuracy_consistent=True,
+                          eligible_for_memory_refresh=True, eligible_for_explanation=False)
+            for mode, name in (("train", "audit_train.json"),
+                               ("restore_only", "audit_restore.json")):
+                (run_dir / name).write_text(
+                    json.dumps(dict(common, execution_mode=mode)), encoding="utf-8")
+            args = parser().parse_args(["--analysis-root", tmp, "--dataset-id", "31",
+                                       "--fold", "1", "--gpu-id", "-1"])
+            self.assertEqual(run(args), 0)
+            self.assertEqual(sha256(original), original_sha)
+            self.assertTrue((run_dir / "checkpoint_refreshed.pt").is_file())
+            audit = json.loads((run_dir / "audit_memory_refresh.json").read_text())
+            self.assertEqual(audit["status"], "memory_refresh_passed")
+            self.assertTrue(audit["eligible_for_explanation"])
+            self.assertTrue(audit["original_state_preserved"])
+            self.assertTrue(audit["refreshed_state_saved_separately"])
+            self.assertEqual(audit["prediction_invariance"]["max_abs_logit_error"], 0.0)
+            with self.assertRaises(FileExistsError):
+                run(args)
 
     def test_manifest_and_runner_restore_with_reference_checks(self):
         from reproduce_with_checkpoint import parser, run

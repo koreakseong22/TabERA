@@ -6,8 +6,12 @@ Implemented: immutable benchmark manifest/references, provenance preflight,
 manifest-driven reproduction without HPO, original-state checkpoint saving and
 strict restoration, separate checkpoint-roundtrip and benchmark-logit audits.
 
-Pending: real benchmark pilots, final-encoder memory reconstruction, retrieval
-branch instrumentation, explanation metrics, aggregation and paper tables.
+Implemented: final-encoder memory reconstruction and its separate checkpoint,
+parameter/centroid/sample-ID checks, prediction invariance and refreshed-state
+round-trip audit.
+
+Pending: real memory-refresh pilots, retrieval branch instrumentation,
+explanation metrics, aggregation and paper tables.
 
 The manifest inventories benchmark results; `checkpoint_available=false` means
 no verified checkpoint was supplied with that inventory. Per-run preflight and
@@ -40,6 +44,9 @@ python reproduce_with_checkpoint.py --dataset-id 31 --fold 1 --train
 
 # No training, no network dataset loading: audit the saved transformed splits.
 python reproduce_with_checkpoint.py --dataset-id 31 --fold 1 --restore-only
+
+# Only after train and restore audits pass every reproduction gate.
+python refresh_explanation_checkpoint.py --dataset-id 31 --fold 1
 ```
 
 Manifest generation refuses an existing destination. Checkpoint saving refuses
@@ -87,15 +94,19 @@ Restore with strict state_dict loading and original caches, without calling
 regroup, refresh, centroid reinitialization or training. Additional unsupported
 constructor/runtime changes must cause an implementation/config audit failure.
 
-## Final-model memory protocol (next implementation)
+## Final-model memory protocol
 
 Preserve the original checkpoint first. Freeze model parameters and centroids;
 encode every training sample once in eval mode; route using the actual forward
 routing function; rebuild memory and search caches. Check training sample IDs
 are unique and complete, and labels/features align with them.
 
+Memory slots are canonicalized into training-row order after the final encoder
+pass: slot/sample ID `i` contains training row `i`, its label, raw transformed
+features and embedding. This makes every later neighbor export auditable.
+
 Do not use a separate argmax implementation for region assignment: the actual
-routing uses topk, whose tie selection can differ. Do not use regroup_update,
+routing module uses topk, whose tie selection can differ. Do not use regroup_update,
 which can update training counters or reinitialize centroids.
 
 Assert model parameters and centroids are unchanged and test logits/predictions
@@ -103,6 +114,10 @@ are invariant before/after refresh. Save the refreshed state separately. Use
 this single final-model partition for both region and retrieval statistics,
 including the qualitative example. Describe refresh as post-training inference
 preparation in the paper; never imply the original training cache was identical.
+The command requires both `audit_train.json` and `audit_restore.json` to pass
+all locked reproduction gates and match the original checkpoint checksum. It
+writes `checkpoint_refreshed.pt` and `audit_memory_refresh.json` without
+replacing the original checkpoint or reproduction audits.
 
 ## Locked metric definitions
 
