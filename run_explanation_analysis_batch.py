@@ -29,29 +29,34 @@ def command(script, dataset_id, fold, gpu_id, extra=()):
             "--fold", str(fold), "--gpu-id", str(gpu_id), *extra]
 
 
-def stages_for(row, root, manifest_path, effective_gpu):
+def stages_for(row, root, manifest_path, physical_gpu):
     ds, fold = row["dataset_id"], row["fold"]
     run_dir = root / f"openml_{ds}" / f"fold_{fold}"
+    # reproduce_with_checkpoint.py sets CUDA_VISIBLE_DEVICES itself, so it
+    # must receive the physical ID. Later stage scripts inherit the worker's
+    # visibility mask and therefore address that one visible device as cuda:0.
+    reproduce_gpu = physical_gpu
+    stage_gpu = -1 if physical_gpu < 0 else 0
     return [
         ("train", run_dir / "audit_train.json", "reproduction_passed",
          "eligible_for_memory_refresh", command(
-             "reproduce_with_checkpoint.py", ds, fold, effective_gpu,
+             "reproduce_with_checkpoint.py", ds, fold, reproduce_gpu,
              ("--manifest", str(manifest_path), "--output", str(run_dir), "--train"))),
         ("restore", run_dir / "audit_restore.json", "reproduction_passed",
          "eligible_for_memory_refresh", command(
-             "reproduce_with_checkpoint.py", ds, fold, effective_gpu,
+             "reproduce_with_checkpoint.py", ds, fold, reproduce_gpu,
              ("--manifest", str(manifest_path), "--output", str(run_dir), "--restore-only"))),
         ("refresh", run_dir / "audit_memory_refresh.json", "memory_refresh_passed",
          "eligible_for_explanation", command(
-             "refresh_explanation_checkpoint.py", ds, fold, effective_gpu,
+             "refresh_explanation_checkpoint.py", ds, fold, stage_gpu,
              ("--analysis-root", str(root)))),
         ("retrieval", run_dir / "audit_retrieval.json",
          "retrieval_instrumentation_passed", "eligible_for_explanation_metrics",
-         command("audit_retrieval_instrumentation.py", ds, fold, effective_gpu,
+         command("audit_retrieval_instrumentation.py", ds, fold, stage_gpu,
                  ("--analysis-root", str(root)))),
         ("metrics", run_dir / "audit_metrics.json", "explanation_metrics_passed",
          "eligible_for_aggregation", command(
-             "analyze_explanation_structure.py", ds, fold, effective_gpu,
+             "analyze_explanation_structure.py", ds, fold, stage_gpu,
              ("--analysis-root", str(root)))),
     ]
 
@@ -90,10 +95,9 @@ def run(args):
         results = []
         for position, row in enumerate(rows):
             gpu = physical_gpus[position % len(physical_gpus)]
-            effective_gpu = -1 if gpu < 0 else 0
             outcome = "success"
-            for _, audit, status, eligible, cmd in stages_for(row, root, manifest_path,
-                                                               effective_gpu):
+            for _, audit, status, eligible, cmd in stages_for(
+                    row, root, manifest_path, gpu):
                 if passed(audit, status, eligible):
                     continue
                 print(f"[gpu {gpu}] {subprocess.list2cmdline(cmd)}")
@@ -110,7 +114,6 @@ def run(args):
         log_dir.mkdir(parents=True, exist_ok=True)
 
         def worker(gpu):
-            effective_gpu = -1 if gpu < 0 else 0
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = "" if gpu < 0 else str(gpu)
             while True:
@@ -122,7 +125,7 @@ def run(args):
                 outcome = "success"
                 log_path = log_dir / f"openml_{ds}_fold_{fold}.log"
                 for name, audit, status, eligible, cmd in stages_for(
-                        row, root, manifest_path, effective_gpu):
+                        row, root, manifest_path, gpu):
                     if passed(audit, status, eligible):
                         continue
                     with log_path.open("a", encoding="utf-8") as log:

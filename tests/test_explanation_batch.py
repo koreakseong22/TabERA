@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from run_explanation_analysis_batch import parser, run
+from run_explanation_analysis_batch import parser, run, stages_for
 
 
 class ExplanationBatchTests(unittest.TestCase):
@@ -40,6 +40,14 @@ class ExplanationBatchTests(unittest.TestCase):
                 "--gpus", "0", "0", "--dry-run"])
             with self.assertRaisesRegex(ValueError, "unique"):
                 run(args)
+
+    def test_physical_gpu_reaches_reproduction_and_later_stages_use_visible_zero(self):
+        row = dict(dataset_id=31, fold=2)
+        stages = stages_for(row, Path("analysis"), Path("manifest.json"), 1)
+        train_command = stages[0][-1]
+        refresh_command = stages[2][-1]
+        self.assertEqual(train_command[train_command.index("--gpu-id") + 1], "1")
+        self.assertEqual(refresh_command[refresh_command.index("--gpu-id") + 1], "0")
 
 
 if __name__ == "__main__":
