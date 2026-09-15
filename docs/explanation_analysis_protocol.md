@@ -61,7 +61,7 @@ python audit_retrieval_instrumentation.py --dataset-id 31 --fold 1
 python analyze_explanation_structure.py --dataset-id 31 --fold 1
 
 # After all three metric pilots pass, resume the full manifest pipeline.
-python run_explanation_analysis_batch.py --gpu-id 0
+python run_explanation_analysis_batch.py --gpus 0 1
 
 # This returns an incomplete status unless all 105 metric audits pass.
 python aggregate_explanation_analysis.py
