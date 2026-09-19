@@ -49,6 +49,11 @@ def parser():
     p.add_argument("--repeats", type=int, default=200)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--full_pass_repeats", type=int, default=20)
+    p.add_argument("--full_pass_chunk", type=int, default=10_000,
+                   help="rows per forward when scoring the whole test split. 10000 is the chunk "
+                        "MultiTab's TabR uses in predict(), so every benchmark test split is one call.")
+    p.add_argument("--skip_batches", action="store_true",
+                   help="only the whole-split measurements (no per-batch timing)")
     p.add_argument("--split", choices=["test", "val"], default="test")
     p.add_argument("--tile", action="store_true",
                    help="repeat rows so every dataset is timed at the requested batch size even when "
@@ -123,12 +128,53 @@ def run(args):
         assert torch.equal(z0, fns["prediction_explain"](probe)["logits"])
 
     resident = resident_memory_mb(device)
-    timing = run_protocol(fns, X, args.batch_sizes, args.repeats, args.warmup,
-                          full_pass_batch=max(args.batch_sizes), full_pass_repeats=args.full_pass_repeats,
-                          seed=args.seed, tile=args.tile)
-    api = time_full_pass(lambda xb: wrapper.predict_proba(xb, logit=True), X,
-                         batch_size=len(X), repeats=args.full_pass_repeats)
-    timing["api_predict_proba"] = {"full_pass": api}
+    if args.skip_batches:
+        timing = {name: {"full_pass": time_full_pass(fn, X, args.full_pass_chunk,
+                                                     repeats=args.full_pass_repeats)}
+                  for name, fn in fns.items()}
+    else:
+        timing = run_protocol(fns, X, args.batch_sizes, args.repeats, args.warmup,
+                              full_pass_batch=args.full_pass_chunk,
+                              full_pass_repeats=args.full_pass_repeats,
+                              seed=args.seed, tile=args.tile)
+
+    # The public API, two ways. "legacy" is what reproduce.py runs: chunks of
+    # the tuned training batch. "chunked" sets the explicit inference chunk to
+    # --full_pass_chunk, MultiTab's unit for TabR. Both go through
+    # predict_proba -> _forward_batched -> forward(retrieve=False). Their
+    # agreement is recorded so the paper can state the predictions are the
+    # benchmark's.
+    with torch.no_grad():
+        wrapper.inference_batch_size = None
+        z_legacy = wrapper.predict_proba(X, logit=True)
+        wrapper.inference_batch_size = args.full_pass_chunk
+        z_chunk = wrapper.predict_proba(X, logit=True)
+    from libs.eval import get_preds_and_probs
+    if task == "regression":
+        agree = float((z_legacy - z_chunk).abs().max())
+        pred_agreement = None
+    else:
+        agree = float((z_legacy - z_chunk).abs().max())
+        pa, _ = get_preds_and_probs(z_legacy, task)
+        pb, _ = get_preds_and_probs(z_chunk, task)
+        pred_agreement = float((pa == pb).float().mean())
+    wrapper.inference_batch_size = None
+    api_legacy = time_full_pass(lambda xb: wrapper.predict_proba(xb, logit=True), X,
+                                batch_size=len(X), repeats=args.full_pass_repeats)
+    wrapper.inference_batch_size = args.full_pass_chunk
+    api_chunk = time_full_pass(lambda xb: wrapper.predict_proba(xb, logit=True), X,
+                               batch_size=len(X), repeats=args.full_pass_repeats)
+    wrapper.inference_batch_size = None
+    timing["api_predict_proba"] = {
+        "full_pass": api_legacy,
+        "inference_chunk": int(params.get("batch_size", 512)),
+        "note": "reproduce.py path: chunks of the tuned training batch"}
+    timing["api_predict_proba_chunked"] = {
+        "full_pass": api_chunk,
+        "inference_chunk": args.full_pass_chunk,
+        "max_abs_logit_diff_vs_legacy": agree,
+        "prediction_agreement_vs_legacy": pred_agreement,
+        "note": "same API with inference_batch_size = full_pass_chunk (MultiTab's TabR unit)"}
 
     payload = {
         "model": "tabera",
@@ -142,6 +188,7 @@ def run(args):
         "fit_s_not_protocol": fit_s,
         "protocol": {"batch_sizes": args.batch_sizes, "repeats": args.repeats, "warmup": args.warmup,
                      "full_pass_repeats": args.full_pass_repeats, "tile": args.tile,
+                     "full_pass_chunk": args.full_pass_chunk, "skip_batches": args.skip_batches,
                      "excluded": ["data loading", "input host->device copy", "model construction",
                                   "training", "memory-bank construction"]},
         "resident_mb_after_setup": resident,

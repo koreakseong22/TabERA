@@ -1630,7 +1630,16 @@ class TabERAWrapper:
         # tensors larger than during training. Validation now uses the same
         # batch size as training.
         if batch_size is None:
-            batch_size = self.params.get("batch_size", 512)
+            # Inference chunk. The default keeps the benchmark's behaviour
+            # (chunks of the tuned training batch, see the note above), so
+            # reproduce.py and the archived predictions are untouched. Setting
+            # ``inference_batch_size`` on the wrapper switches predict /
+            # predict_proba to larger chunks; with retrieve=False nothing in the
+            # forward depends on the batch composition, so this changes the
+            # per-row work not at all and the logits only at float-rounding
+            # level. bench_inference.py sets 10_000 -- MultiTab's own chunk
+            # for TabR -- and records the agreement with the default chunking.
+            batch_size = getattr(self, "inference_batch_size", None) or                 self.params.get("batch_size", 512)
         parts = []
         region_parts = []
         for start in range(0, len(X), batch_size):

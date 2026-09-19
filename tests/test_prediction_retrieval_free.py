@@ -17,6 +17,7 @@ import torch
 
 from libs.benchmark import build_wrapper
 from libs.benchmark_config import FINAL_CONFIG
+from libs.eval import get_preds_and_probs
 from tests.test_benchmark import dataset
 
 
@@ -82,6 +83,26 @@ class PredictionRetrievalFreeTests(unittest.TestCase):
                 self.assertTrue(torch.equal(batched, reference))
                 self.assertTrue(torch.equal(val_logits, reference_val))
                 self.assertEqual(len(preds), len(xe))
+
+    def test_inference_chunk_size_does_not_change_predictions(self):
+        """predict_proba with one large chunk agrees with the benchmark's
+        tuned-batch chunking: same argmax everywhere, logits within rounding."""
+        for task in ("binclass", "multiclass", "regression"):
+            with self.subTest(task=task):
+                w, xv, xe = _trained_wrapper(task)
+                self.assertIsNone(getattr(w, "inference_batch_size", None))
+                with torch.no_grad():
+                    legacy = w.predict_proba(xe, logit=True)
+                    w.inference_batch_size = 10_000
+                    big = w.predict_proba(xe, logit=True)
+                    w.inference_batch_size = None
+                    back = w.predict_proba(xe, logit=True)
+                self.assertTrue(torch.equal(legacy, back))
+                torch.testing.assert_close(big, legacy, rtol=1e-5, atol=1e-6)
+                if task != "regression":
+                    a, _ = get_preds_and_probs(legacy, task)
+                    b, _ = get_preds_and_probs(big, task)
+                    self.assertTrue(torch.equal(a, b))
 
     def test_explanation_and_default_calls_still_retrieve(self):
         w, xv, xe = _trained_wrapper("binclass")

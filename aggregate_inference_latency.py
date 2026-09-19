@@ -90,6 +90,16 @@ def build_rows(recs, b_small, b_large):
             r["tabera_ev_ms_b1"] = stat(a, "prediction_retrieval", f"batch={b_small}",
                                         "ms_per_sample_median")
             r["tabera_ev_ms_full"] = stat(a, "prediction_retrieval", "full_pass", "ms_median")
+            r["tabera_ev_ms_large"] = stat(a, "prediction_retrieval", f"batch={b_large}", "ms_median")
+            # Public API on the whole test split: the benchmark path (tuned
+            # training-batch chunks) and the same API with the explicit
+            # inference chunk that mirrors MultiTab's TabR unit.
+            r["tabera_api_ms_full"] = stat(a, "api_predict_proba", "full_pass", "ms_median")
+            r["tabera_api_chunked_ms_full"] = stat(a, "api_predict_proba_chunked", "full_pass", "ms_median")
+            ac = a["timing"].get("api_predict_proba_chunked") or {}
+            r["api_chunk"] = ac.get("inference_chunk")
+            r["api_max_abs_logit_diff"] = ac.get("max_abs_logit_diff_vs_legacy")
+            r["api_prediction_agreement"] = ac.get("prediction_agreement_vs_legacy")
             r["tabera_ex_ms_full"] = stat(a, "prediction_explain", "full_pass", "ms_median")
             r["n_prototypes"] = a.get("n_prototypes")
             r["tabera_arm"] = f"{a.get('correction_geometry')}/{a.get('head_input_scale')}"
@@ -98,7 +108,9 @@ def build_rows(recs, b_small, b_large):
                 r["tiled_large"] = bool(stat(a, "prediction_only", f"batch={b_large}", "tiled"))
         for name, num, den in (("speedup_b1", "tabr_ms_b1", "tabera_ms_b1"),
                                ("speedup_full", "tabr_ms_full", "tabera_ms_full"),
-                               ("speedup_large", "tabr_ms_large", "tabera_ms_large")):
+                               ("speedup_large", "tabr_ms_large", "tabera_ms_large"),
+                               ("speedup_api", "tabr_ms_full", "tabera_api_chunked_ms_full"),
+                               ("speedup_api_legacy", "tabr_ms_full", "tabera_api_ms_full")):
             if r.get(num) and r.get(den):
                 r[name] = r[num] / r[den]
         for name, ev, base in (("evidence_overhead_ms_b1", "tabera_ev_ms_b1", "tabera_ms_b1"),
@@ -113,20 +125,35 @@ def geomean(v):
     return math.exp(statistics.fmean(math.log(x) for x in v))
 
 
-def summary(rows):
+def fixed_batch_rows(rows, b_large):
+    """True when every dataset really was timed at b_large rows.
+
+    Not the same as the per-call ``tiled`` flag: a split already larger than
+    b_large is timed at b_large without repeating anything, so ``tiled`` is
+    False there even though the batch is the requested size. The batch-size
+    columns are comparable across datasets exactly when the row count is
+    constant, which is what this checks.
+    """
+    seen = [r.get("batch_rows_large") for r in rows if r.get("batch_rows_large") is not None]
+    return bool(seen) and all(x == b_large for x in seen)
+
+
+def summary(rows, b_large=512):
     out = {}
-    for key, label in (("speedup_b1", "Speedup, batch 1 (online latency)"),
-                       ("speedup_full", "Speedup, full test split")):
+    for key, label in (("speedup_api", "Speedup, MultiTab test split (each model's predict path)"),
+                       ("speedup_api_legacy", "  same, TabERA chunked at its training batch (reproduce.py default)"),
+                       ("speedup_full", "  same, TabERA as one forward per chunk (model call, not the wrapper)"),
+                       ("speedup_b1", "Speedup, batch 1 (online latency)")):
         v = [r[key] for r in rows if r.get(key)]
         if v:
             out[label] = {"n": len(v), "median": statistics.median(v), "geomean": geomean(v),
-                          "min": min(v), "max": max(v), "unit": "x"}
-    tiled = [r.get("tiled_large") for r in rows if "tiled_large" in r]
-    if tiled and all(tiled) and any(r.get("speedup_large") for r in rows):
+                          "min": min(v), "max": max(v), "wins": sum(x > 1 for x in v), "unit": "x"}
+    if fixed_batch_rows(rows, b_large):
         v = [r["speedup_large"] for r in rows if r.get("speedup_large")]
-        out["Speedup, fixed batch (tiled)"] = {
-            "n": len(v), "median": statistics.median(v), "geomean": geomean(v),
-            "min": min(v), "max": max(v), "unit": "x"}
+        if v:
+            out[f"Speedup, batch {b_large} (same rows on every dataset)"] = {
+                "n": len(v), "median": statistics.median(v), "geomean": geomean(v),
+                "min": min(v), "max": max(v), "wins": sum(x > 1 for x in v), "unit": "x"}
     for key, label in (("evidence_overhead_ms_b1", "Evidence retrieval overhead, batch 1"),
                        ("evidence_overhead_ms_full", "Evidence retrieval overhead, full split")):
         v = [r[key] for r in rows if r.get(key) is not None]
@@ -158,6 +185,8 @@ def write_table(rows, summ, envs, out_dir, b_small, b_large):
             "tabr_ms_large", "tabera_ms_large", "speedup_large", "batch_rows_large", "tiled_large",
             "tabera_ev_ms_b1", "evidence_overhead_ms_b1",
             "tabera_ev_ms_full", "evidence_overhead_ms_full", "tabera_ex_ms_full",
+            "tabera_ev_ms_large", "tabera_api_ms_full", "tabera_api_chunked_ms_full", "api_chunk",
+            "speedup_api", "speedup_api_legacy", "api_max_abs_logit_diff", "api_prediction_agreement",
             "tabr_backend", "tabera_arm"]
     with open(out_dir / "inference_latency.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -176,60 +205,84 @@ def write_table(rows, summ, envs, out_dir, b_small, b_large):
     elif len(all_torch) > 1:
         L += ["", "**The two models ran under different torch builds. State both versions with "
                   "the numbers, or re-time one model under the other's runtime.**"]
+    chunks = {r.get("api_chunk") for r in rows if r.get("api_chunk")}
     L += ["",
-          f"`batch {b_small}` is online latency in ms per sample. `full split` is the time to "
-          "score the whole test split in chunks, in ms. Speedup is TabR divided by TabERA "
-          "prediction-only; above 1 means TabERA is faster. Evidence overhead is TabERA with "
-          "retrieval minus prediction-only.", ""]
-    tiled = [r.get("tiled_large") for r in rows if "tiled_large" in r]
-    if tiled and not all(tiled):
+          "`test split` is the time to score the dataset's whole MultiTab test split through each "
+          "model's own predict path, in ms: TabR's predict loop with its candidate index already "
+          f"built, and TabERA's predict_proba with an inference chunk of {', '.join(map(str, sorted(chunks))) or '?'} "
+          "rows (MultiTab's TabR unit). The column after it is the same TabERA API chunked at the "
+          "tuned training batch, as reproduce.py runs it; `pred. agreement` is the fraction of "
+          "test predictions identical between the two chunkings. Speedup is TabR divided by "
+          f"TabERA; above 1 means TabERA is faster. `batch {b_small}` is online latency in ms per "
+          "sample. Evidence overhead is TabERA with retrieval minus prediction-only.", ""]
+    if fixed_batch_rows(rows, b_large):
+        repeated = [r["dataset_id"] for r in rows if r.get("tiled_large")]
+        note = (f"Every dataset was timed at exactly {b_large} rows, so the `batch {b_large}` "
+                "numbers are comparable across datasets.")
+        if repeated:
+            note += (f" {len(repeated)} of {len(rows)} have a test split smaller than {b_large}; "
+                     "their batches repeat rows to reach it, which changes no work per call.")
+        L += [note, ""]
+    else:
         short = [r["dataset_id"] for r in rows if r.get("batch_rows_large") not in (None, b_large)]
         L += [f"The `batch {b_large}` columns are kept out of the summary: {len(short)} of "
-              f"{len(rows)} datasets have a test split smaller than {b_large}, so they were timed "
-              "at their own size. Per-dataset ratios stay valid; samples/s across datasets does "
-              "not. Re-run the runners with `--tile` for a fixed-batch comparison.", ""]
+              f"{len(rows)} datasets were timed at fewer than {b_large} rows because their test "
+              "split is smaller. Per-dataset ratios stay valid; samples/s across datasets does "
+              "not. Re-run both runners with `--tile` for a fixed-batch comparison.", ""]
 
-    hdr = ["dataset", "N train", "n test", "P", f"TabR ms (b{b_small})",
-           f"TabERA ms (b{b_small})", "speedup", "TabR ms (full)", "TabERA ms (full)",
-           "speedup", "evidence +ms (full)"]
+    hdr = ["dataset", "N train", "n test", "P",
+           "TabR ms (test split)", "TabERA ms (test split, API)", "speedup",
+           "TabERA ms (API, training-batch chunks)", "pred. agreement",
+           f"TabR ms (b{b_small})", f"TabERA ms (b{b_small})", "speedup",
+           "evidence +ms (b1)"]
     L.append("| " + " | ".join(hdr) + " |")
     L.append("|" + "---|" * len(hdr))
     for r in sorted(rows, key=lambda r: r["n_train"]):
         L.append("| " + " | ".join([
             f"{r['dataset_id']} {r.get('dataset') or ''}".strip(),
             str(r["n_train"]), str(r["n_eval"]), fmt(r.get("n_prototypes")),
+            fmt(r.get("tabr_ms_full")), fmt(r.get("tabera_api_chunked_ms_full")), fmt(r.get("speedup_api"), 2),
+            fmt(r.get("tabera_api_ms_full")), fmt(r.get("api_prediction_agreement"), 3),
             fmt(r.get("tabr_ms_b1")), fmt(r.get("tabera_ms_b1")), fmt(r.get("speedup_b1"), 2),
-            fmt(r.get("tabr_ms_full")), fmt(r.get("tabera_ms_full")), fmt(r.get("speedup_full"), 2),
-            fmt(r.get("evidence_overhead_ms_full")),
+            fmt(r.get("evidence_overhead_ms_b1")),
         ]) + " |")
     L += ["", "## Summary over datasets", ""]
     for label, s in summ.items():
         if s["unit"] == "x":
             L.append(f"- {label}: median {s['median']:.2f}x, geometric mean {s['geomean']:.2f}x, "
-                     f"range {s['min']:.2f}x to {s['max']:.2f}x (n={s['n']})")
+                     f"range {s['min']:.2f}x to {s['max']:.2f}x, TabERA faster on {s['wins']}/{s['n']}")
         else:
             L.append(f"- {label}: median {s['median']:.3f} ms, "
                      f"range {s['min']:.3f} to {s['max']:.3f} ms (n={s['n']})")
     backends = {r.get("tabr_backend") for r in rows if r.get("tabr_backend")}
     if backends:
-        L += ["", f"TabR candidate search: {', '.join(sorted(backends))}. "
-                  "With a CPU index the query embeddings leave the GPU and the results come back "
-                  "each call; that round trip is part of TabR's measured latency."]
+        L += ["", f"TabR candidate search: {', '.join(sorted(backends))}. Whichever index backend "
+                  "is used, this implementation copies the query embeddings to host memory for the "
+                  "faiss call and copies the neighbour indices back on every call, so that round "
+                  "trip is part of TabR's measured latency."]
     (out_dir / "inference_latency.md").write_text("\n".join(L) + "\n", encoding="utf-8")
     return L
 
 
-def plot(rows, out_dir, b_small):
+def plot(rows, out_dir, b_small, b_large):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
+    # Both panels vary only N: batch 1 and a batch fixed at b_large rows on
+    # every dataset. The whole-test-split timing is in the table instead,
+    # because there the query count grows with the dataset as well, so it
+    # cannot separate the candidate pool from the workload size.
+    fixed = fixed_batch_rows(rows, b_large)
+    second = (("tabr_ms_large", "tabera_ms_large", "tabera_ev_ms_large",
+               f"Batched latency (batch {b_large})", "ms per batch") if fixed else
+              ("tabr_ms_full", "tabera_ms_full", "tabera_ev_ms_full",
+               "Scoring the full test split", "ms per pass"))
     panels = [
         ("tabr_ms_b1", "tabera_ms_b1", "tabera_ev_ms_b1",
          f"Online latency (batch {b_small})", "ms per sample"),
-        ("tabr_ms_full", "tabera_ms_full", "tabera_ev_ms_full",
-         "Scoring the full test split", "ms per pass"),
+        second,
     ]
     # Each point is one dataset, so the points are NOT connected: a line would
     # read as a trajectory through a single system. The dashed line is an
@@ -321,11 +374,11 @@ def main():
     out_dir = Path(args.out or args.dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = build_rows(recs, args.batch_small, args.batch_large)
-    summ = summary(rows)
+    summ = summary(rows, args.batch_large)
     lines = write_table(rows, summ, environments(recs), out_dir,
                         args.batch_small, args.batch_large)
     print("\n".join(lines))
-    fig = plot(rows, out_dir, args.batch_small)
+    fig = plot(rows, out_dir, args.batch_small, args.batch_large)
     print(f"\nwrote {out_dir / 'inference_latency.csv'}, {out_dir / 'inference_latency.md'}"
           + (f", {fig}" if fig else ""))
 
