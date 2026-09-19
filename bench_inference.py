@@ -22,6 +22,7 @@ it is not part of this protocol.
 """
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -49,6 +50,9 @@ def parser():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--full_pass_repeats", type=int, default=20)
     p.add_argument("--split", choices=["test", "val"], default="test")
+    p.add_argument("--tile", action="store_true",
+                   help="repeat rows so every dataset is timed at the requested batch size even when "
+                        "its split is smaller; needed for a samples/s comparison across datasets")
     p.add_argument("--threads", type=int, default=None, help="torch CPU threads (pin for CPU runs)")
     p.add_argument("--overwrite", action="store_true")
     return p
@@ -121,7 +125,7 @@ def run(args):
     resident = resident_memory_mb(device)
     timing = run_protocol(fns, X, args.batch_sizes, args.repeats, args.warmup,
                           full_pass_batch=max(args.batch_sizes), full_pass_repeats=args.full_pass_repeats,
-                          seed=args.seed)
+                          seed=args.seed, tile=args.tile)
     api = time_full_pass(lambda xb: wrapper.predict_proba(xb, logit=True), X,
                          batch_size=len(X), repeats=args.full_pass_repeats)
     timing["api_predict_proba"] = {"full_pass": api}
@@ -137,11 +141,11 @@ def run(args):
         "study": str(source), "trial": trial.number, "params": params,
         "fit_s_not_protocol": fit_s,
         "protocol": {"batch_sizes": args.batch_sizes, "repeats": args.repeats, "warmup": args.warmup,
-                     "full_pass_repeats": args.full_pass_repeats,
+                     "full_pass_repeats": args.full_pass_repeats, "tile": args.tile,
                      "excluded": ["data loading", "input host->device copy", "model construction",
                                   "training", "memory-bank construction"]},
         "resident_mb_after_setup": resident,
-        "environment": environment(device),
+        "environment": dict(environment(device), physical_gpu_id=args.gpu_id),
         "timing": timing,
     }
     atomic_save(out_path, payload) if out_path.suffix == ".npy" else out_path.write_text(
@@ -155,5 +159,16 @@ def run(args):
                       f"{st['samples_per_s']:10.0f} samples/s")
 
 
+def main():
+    args = parser().parse_args()
+    # Same convention as reproduce.py: the physical GPU is selected by
+    # remapping, before run() imports torch, so the process sees exactly one
+    # device and `cuda:0` inside is that GPU. Without this, --gpu_id 1 would
+    # silently land on GPU 0 and two parallel workers would share one device,
+    # which for a timing experiment means both sets of numbers are contended.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id) if args.gpu_id >= 0 else ""
+    run(args)
+
+
 if __name__ == "__main__":
-    run(parser().parse_args())
+    main()

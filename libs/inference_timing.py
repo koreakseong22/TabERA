@@ -33,13 +33,23 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def make_batches(X: torch.Tensor, batch_size: int, count: int,
-                 seed: int = 0) -> List[torch.Tensor]:
+def make_batches(X: torch.Tensor, batch_size: int, count: int, seed: int = 0,
+                 tile: bool = False) -> List[torch.Tensor]:
     """``count`` batches of ``batch_size`` rows drawn from X in a fixed random
-    row order (wrapping around when the split is short), materialised up
-    front so that indexing is never inside the timed region."""
+    row order, materialised up front so that indexing is never inside the
+    timed region.
+
+    ``tile`` decides what happens when the split has fewer rows than
+    ``batch_size``. False (the default) shrinks the batch to the split, so a
+    small dataset is timed on a smaller batch -- the per-dataset ratio between
+    two models stays valid, but samples/s is NOT comparable across datasets.
+    True repeats rows to reach ``batch_size`` exactly, which makes a
+    fixed-batch throughput comparison across datasets meaningful; the work per
+    call is identical whether or not rows repeat. Callers record which was
+    used, so a result is self-describing.
+    """
     n = X.shape[0]
-    rows = min(batch_size, n)
+    rows = batch_size if tile else min(batch_size, n)
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(n, generator=g)
     batches = []
@@ -50,13 +60,17 @@ def make_batches(X: torch.Tensor, batch_size: int, count: int,
     return batches
 
 
-def _stats(ms: Sequence[float], rows: int) -> Dict[str, float]:
+def _stats(ms: Sequence[float], rows: int, tiled: bool = False) -> Dict[str, float]:
     s = sorted(ms)
     q = lambda p: s[min(len(s) - 1, max(0, int(round(p * (len(s) - 1)))))]
     med = statistics.median(s)
     return {
         "n_calls": len(s),
         "batch_rows": rows,
+        # True when rows were repeated to reach the requested batch size
+        # because the split was smaller. Only then is samples/s comparable
+        # across datasets.
+        "tiled": bool(tiled),
         "ms_median": med,
         "ms_mean": statistics.fmean(s),
         "ms_p10": q(0.10),
@@ -70,10 +84,11 @@ def _stats(ms: Sequence[float], rows: int) -> Dict[str, float]:
 
 @torch.no_grad()
 def time_batches(fn: Callable[[torch.Tensor], object], X: torch.Tensor, batch_size: int,
-                 repeats: int = 100, warmup: int = 10, seed: int = 0) -> Dict[str, float]:
+                 repeats: int = 100, warmup: int = 10, seed: int = 0,
+                 tile: bool = False) -> Dict[str, float]:
     """Per-call latency of ``fn`` on batches of ``batch_size`` rows."""
     device = X.device
-    batches = make_batches(X, batch_size, repeats + warmup, seed=seed)
+    batches = make_batches(X, batch_size, repeats + warmup, seed=seed, tile=tile)
     for xb in batches[:warmup]:
         fn(xb)
     _sync(device)
@@ -84,7 +99,7 @@ def time_batches(fn: Callable[[torch.Tensor], object], X: torch.Tensor, batch_si
         fn(xb)
         _sync(device)
         ms.append((time.perf_counter() - t0) * 1000.0)
-    return _stats(ms, batches[0].shape[0])
+    return _stats(ms, batches[0].shape[0], tiled=tile and batch_size > X.shape[0])
 
 
 @torch.no_grad()
@@ -160,7 +175,7 @@ def environment(device: torch.device) -> Dict[str, object]:
 def run_protocol(fns: Dict[str, Callable[[torch.Tensor], object]], X: torch.Tensor,
                  batch_sizes: Sequence[int], repeats: int, warmup: int,
                  full_pass_batch: Optional[int] = None, full_pass_repeats: int = 20,
-                 seed: int = 0) -> Dict[str, object]:
+                 seed: int = 0, tile: bool = False) -> Dict[str, object]:
     """Time every mode in ``fns`` under the same batches. Returns
     {mode: {"batch=<b>": stats, "full_pass": stats, "peak_call_mb": ...}}."""
     device = X.device
@@ -168,7 +183,8 @@ def run_protocol(fns: Dict[str, Callable[[torch.Tensor], object]], X: torch.Tens
     for name, fn in fns.items():
         rec: Dict[str, object] = {}
         for b in batch_sizes:
-            rec[f"batch={b}"] = time_batches(fn, X, b, repeats=repeats, warmup=warmup, seed=seed)
+            rec[f"batch={b}"] = time_batches(fn, X, b, repeats=repeats, warmup=warmup,
+                                             seed=seed, tile=tile)
         if full_pass_batch:
             rec["full_pass"] = time_full_pass(fn, X, full_pass_batch, repeats=full_pass_repeats)
         probe = make_batches(X, max(batch_sizes), 1, seed=seed)[0]
