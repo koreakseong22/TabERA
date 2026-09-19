@@ -58,7 +58,7 @@ def main():
     pred, prob, logits = combine(members, task)
     y = ds._indv_dataset()[2][1]
     scale = ds.y_std if task == "regression" else 1.
-    metrics = calculate_metric(y * scale, pred * scale, prob, task, "test")
+    metrics = calculate_metric(y * scale, pred * scale, logits, task, "test")
     deep = 5 if args.type == "all" else args.members if args.type == "deep" else 0
     hyper = 5 if args.type == "all" else args.members if args.type == "hyper" else 0
     out = (Path(args.savepath) / f"ensemble_logs/seed={args.seed}/data={args.openml_id}/"

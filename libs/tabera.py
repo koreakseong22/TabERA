@@ -1574,6 +1574,20 @@ class TabERA(nn.Module):
         #   slot correspondence and for self-exclusion. Batches are shuffled,
         #   so storage order is not train row order.
         return_explanations: bool = False,
+        retrieve: Optional[bool] = None,
+        # Whether to run the evidence k-NN over the MemoryBank.
+        #   None  -> legacy: retrieve whenever the memory holds >= k entries
+        #            (training, diagnostics and explanation callers rely on
+        #            out["topk_idx"] / out["neighbor_mask"] being tensors).
+        #   False -> prediction-only: skip retrieval entirely. topk_idx and
+        #            neighbor_mask are None, and the eval-time decomposition
+        #            diagnostics (out["dev_diag"], host-syncing float() calls)
+        #            are skipped as well. The logits are unaffected by
+        #            construction -- retrieval never enters z -- and
+        #            tests/test_prediction_retrieval_free.py pins that with
+        #            torch.equal. TabERAWrapper._forward_batched passes this,
+        #            so predict / predict_proba never touch the memory bank.
+        #   True  -> retrieve (same warm-up guard as None).
     ) -> Dict[str, torch.Tensor]:
 
         # 1. Embed
@@ -1600,7 +1614,10 @@ class TabERA(nn.Module):
 
         # 3. Retrieve, within the assigned group only. Outside the prediction path.
         _neighbor_mask = None
-        if self.memory.filled.item() >= self.k:
+        if retrieve is False:
+            # Prediction-only path: no memory-bank access at all.
+            topk_idx = None
+        elif self.memory.filled.item() >= self.k:
             nk, neighbour_labels, topk_idx = self.memory.retrieve(
                 query_emb, self.k,
                 hard_assignment=hard_assignment,
@@ -1694,8 +1711,12 @@ class TabERA(nn.Module):
         # GPU sync를 강제하고, (b) context_dropout>0 ablation 시 손상된 c 기준
         # 값이라 어차피 해석 불가하므로 계산하지 않는다. 소비는
         # scripts/step0_diagnose.py의 eval pass가 담당한다.
+        # ⚠ Each float() below is a host sync. In the prediction-only mode
+        #   (retrieve=False) they are skipped too: the dict is diagnostic
+        #   material read by direct model(...) callers, never by the
+        #   prediction API, and six syncs per batch dominate batch-1 latency.
         _diag: Dict[str, float] = {}
-        if self.training:
+        if self.training or retrieve is False:
             pass
         else:
          with torch.no_grad():

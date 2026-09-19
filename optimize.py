@@ -112,7 +112,7 @@ parser.add_argument("--early_stop_metric", type=str, default=FINAL_CONFIG["early
                         "Validation metric that selects best_state and drives the "
                         "patience counter INSIDE a trial. The HPO objective itself "
                         "stays val accuracy either way, so comparability with the "
-                        "MultiTab baselines is unaffected. Default val_loss is the MultiTab protocol (batch-averaged validation loss, patience 20, terminal checkpoint, no restore). 'accuracy' is the earlier TabERA rule, now an ablation arm: the "
+                        "HPO objective is unchanged. Default val_loss uses the MultiTab protocol (batch-averaged validation loss, patience 20, terminal checkpoint, no restore). The optional accuracy variant restores the best validation-accuracy checkpoint and retains the "
                         "legacy behaviour. On an imbalanced dataset accuracy can sit "
                         "flat at the majority rate from epoch 1 (ds=1067: acc_val "
                         "identical for epochs 1-10 while AUROC went 0.354 -> 0.708), "
@@ -128,6 +128,9 @@ parser.add_argument("--early_stop_metric", type=str, default=FINAL_CONFIG["early
 # flags remain there; whatever HPO found is stored in best_params and picked
 # up automatically when reproduce.py reloads the study.
 args = parser.parse_args()
+if args.head_input_scale == "auto" and args.correction_geometry != "unit_tangent":
+    parser.error("head_input_scale=auto is defined only for correction_geometry=unit_tangent. "
+                 "For tangent use --head_input_scale unit.")
 if args.num_embedding == "ple" and args.pilot_space == "joint" and args.num_bins != 8:
     parser.error("Joint PLE HPO searches num_bins; omit --num_bins")
 if args.pilot_space == "dynamics2d":
@@ -483,14 +486,14 @@ if train:
         if tasktype == "regression":
             val_metrics  = calculate_metric(y_val  * y_std, preds_val  * y_std, probs_val,  tasktype, "val")
         else:
-            val_metrics  = calculate_metric(y_val,  preds_val,  probs_val,  tasktype, "val")
+            val_metrics  = calculate_metric(y_val,  preds_val,  val_logits,  tasktype, "val")
 
         test_metrics = {}
         if not args.validation_only:
             if tasktype == "regression":
                 test_metrics = calculate_metric(y_test * y_std, preds_test * y_std, probs_test, tasktype, "test")
             else:
-                test_metrics = calculate_metric(y_test, preds_test, probs_test, tasktype, "test")
+                test_metrics = calculate_metric(y_test, preds_test, test_logits, tasktype, "test")
 
         for k, v in val_metrics.items():
             trial.set_user_attr(k, v)

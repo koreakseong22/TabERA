@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse, csv, json, os, queue, subprocess, sys, threading, time
 from datetime import datetime
 from pathlib import Path
+from libs.benchmark_config import FINAL_CONFIG
 
 ROOT = Path(__file__).resolve().parent
 
@@ -50,8 +51,9 @@ def main():
     p.add_argument("--savepath", default=".", help="same root for optimize.py and reproduce.py (existing seed-1 studies live in '.')")
     p.add_argument("--mode", choices=["best", "all"], default="best")
     p.add_argument("--correction_geometry", choices=["unit_tangent", "tangent"],
-                   default="unit_tangent")
-    p.add_argument("--head_input_scale", choices=["auto", "unit"], default="auto")
+                   default=FINAL_CONFIG["correction_geometry"])
+    p.add_argument("--head_input_scale", choices=["auto", "unit"],
+                   default=FINAL_CONFIG["head_input_scale"])
     p.add_argument("--n_trials", type=int, default=100, help="HPO budget; anything but 100 is a smoke test, not a benchmark")
     p.add_argument("--skip_hpo", action="store_true", help="reproduce only (studies must already be complete)")
     p.add_argument("--allow_unverified_study", action="store_true")

@@ -12,6 +12,7 @@ results/
 analysis_results/
 final_logs/
 pilot_dynamics2d/
+figs/
 
 # Python
 __pycache__/

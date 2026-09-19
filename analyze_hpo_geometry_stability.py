@@ -133,7 +133,7 @@ def run_one(args, dataset, task: str, data: int, member: int, geometry: str):
         for name, (x, y) in zip(("val", "test"), ((xv, yv), (xe, ye))):
             logits = wrapper._forward_batched(x)
             pred, prob = get_preds_and_probs(logits, task)
-            performance[name] = clean(calculate_metric(y, pred, prob, task, name))
+            performance[name] = clean(calculate_metric(y, pred, logits, task, name))
     record = dict(identity=identity, training_seconds=elapsed,
                   performance=performance,
                   training=training_diagnostics(wrapper))

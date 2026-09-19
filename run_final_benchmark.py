@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from libs.benchmark_config import FINAL_CONFIG
 
 
 def main():
@@ -22,8 +23,9 @@ def main():
     p.add_argument("--run_hpo", action="store_true")
     p.add_argument("--mode", choices=["best", "all"], default="best")
     p.add_argument("--correction_geometry", choices=["unit_tangent", "tangent"],
-                   default="unit_tangent")
-    p.add_argument("--head_input_scale", choices=["auto", "unit"], default="auto")
+                   default=FINAL_CONFIG["correction_geometry"])
+    p.add_argument("--head_input_scale", choices=["auto", "unit"],
+                   default=FINAL_CONFIG["head_input_scale"])
     p.add_argument("--dry_run", action="store_true")
     p.add_argument("--aggregate", action="store_true")
     p.add_argument("--allow_unverified_study", action="store_true")

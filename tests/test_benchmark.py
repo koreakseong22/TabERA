@@ -184,7 +184,7 @@ class BenchmarkTests(unittest.TestCase):
                 select_trial(study_for(dataset(task), 2), task)
         ds = dataset()
         trial = study_for(ds).best_trial
-        trial.user_attrs["head_input_scale_actual"] = "unit"
+        trial.user_attrs["head_input_scale_actual"] = "auto"
         with self.assertRaises(ValueError):
             restore_params(trial, 40)
 
@@ -201,7 +201,7 @@ class BenchmarkTests(unittest.TestCase):
             y = torch.tensor([0, 1, 0, 1]) if task != "multiclass" else torch.tensor([0, 1, 2, 1])
             logits = torch.tensor([[-1.], [2.], [.5], [1.]]) if actual_task != "multiclass" else torch.tensor([[1., 2., 3.], [2., 4., 1.], [0., 1., 3.], [1., 0., 2.]])
             pred, prob = get_preds_and_probs(logits, actual_task)
-            ours = calculate_metric(y, pred, prob, actual_task, "test")
+            ours = calculate_metric(y, pred, logits, actual_task, "test")
             official_y = np.eye(3)[y.numpy()] if actual_task == "multiclass" else y.numpy()
             official = namespace["calculate_metric"](official_y, pred.numpy(), logits.numpy(), actual_task, "test")
             self.assertEqual(set(ours), set(official))
@@ -432,7 +432,7 @@ class BenchmarkTests(unittest.TestCase):
                 reproduce.run(args)
 
     def test_val_loss_early_stopping_has_multitab_semantics(self):
-        # FINAL_CONFIG now stops on the batch-averaged validation loss and
+        # The explicit val_loss arm stops on batch-averaged validation loss and
         # evaluates the terminal model, as MultiTab's neural baselines do:
         #   (1) the selection key is val_loss and the monitor is the training
         #       loss function averaged over fixed-order validation batches,
@@ -442,12 +442,12 @@ class BenchmarkTests(unittest.TestCase):
         #       recomputed validation loss equals the last history entry, not
         #       the minimum.
         torch.set_num_threads(1)
-        self.assertEqual(FINAL_CONFIG["early_stop_metric"], "val_loss")
+        config = dict(FINAL_CONFIG, early_stop_metric="val_loss")
         ds = dataset("binclass")
         params = dict(embed_dim=8, embedder_layers=1, dropout=0., lr=.05, weight_decay=1e-6,
                       n_prototypes=6, batch_size=64)
         torch.manual_seed(0)
-        w = build_wrapper(ds, params, FINAL_CONFIG, "cpu")
+        w = build_wrapper(ds, params, config, "cpu")
         w.epochs, w.patience = 60, 3
         self.assertTrue(w.terminal_checkpoint)
         self.assertEqual(w._sel_key, "val_loss")
@@ -477,7 +477,7 @@ class BenchmarkTests(unittest.TestCase):
         params = dict(embed_dim=8, embedder_layers=1, dropout=0., lr=.001,
                       weight_decay=1e-6, n_prototypes=6, batch_size=64)
         torch.manual_seed(0)
-        w = build_wrapper(ds, params, FINAL_CONFIG, "cpu")
+        w = build_wrapper(ds, params, dict(FINAL_CONFIG, early_stop_metric="val_loss"), "cpu")
         w.epochs, w.patience = 10, 3
         (xt, yt), (xv, yv), _ = ds._indv_dataset()
         # Keep training finite while validation loss is NaN and accuracy
@@ -554,7 +554,7 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertTrue(saved["training_diagnostics"]["beta_epoch_history"])
                     if task != "regression":
                         pred, probs = get_preds_and_probs(torch.tensor(saved["Probability"]), task)
-                        perf = calculate_metric(ds._indv_dataset()[2][1], pred, probs, task, "test")
+                        perf = calculate_metric(ds._indv_dataset()[2][1], pred, probs, task, "test", prob=True)
                         for key, value in perf.items():
                             self.assertAlmostEqual(value, saved["Performance"][key])
                     with patch("libs.benchmark.build_wrapper", side_effect=AssertionError("must skip")):

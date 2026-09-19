@@ -22,7 +22,7 @@ x ─→ Encoder ─→ q ─→ argmax cos(q, C) ─→ prototype a
 | | |
 |---|---|
 | Prediction | `z = W·(γh) + b`, `h = c + d` |
-| Correction | `d = β · p⊥ / max(‖p⊥‖, ε)`, where `p = normalize(q − c)` and `p⊥ = p − (p·c)c` — the unit tangent direction at `c` toward `q` (`correction_geometry="unit_tangent"`). `‖d‖ = β` for every non-degenerate sample (`‖p⊥‖ ≥ ε`, `ε = 1e-6`); the distance from `c` does not enter `d`, only the direction does. `β = σ(β_raw)` is one learned scalar; `γ` is the head input scale (`head_input_scale="auto"`) |
+| Correction | `d = β · p⊥`, where `p = normalize(q − c)` and `p⊥ = p − (p·c)c` (`correction_geometry="tangent"`). No second normalization: `‖d‖ = β‖p⊥‖`. `β = σ(β_raw)` is one learned scalar; `head_input_scale="unit"` sets `γ = 1`. |
 | Decomposition | `z = (W_eff·c + b) + W_eff·d`, `W_eff = γW` — exact in logit space, since `W` is shared |
 | Retrieval | k-NN inside `G(a)`, self excluded. Not an input to `z` |
 | Objective | cross-entropy only; prototypes carry no loss |
@@ -35,16 +35,19 @@ not the final configuration (`libs/benchmark_config.py`).
 ## What an explanation shows
 
 Printed by `analyze.py --explain` (`--from_saved_state <…_model_state.pt>` skips
-training; `--explain_verbose` adds the researcher diagnostics). The region and
-the prediction split are read off the computation that produced the
-prediction; evidence and position run beside it and are not inputs to it.
+training; `--explain_verbose` adds the researcher view). The default view
+answers three user questions, one block each. Everything a user does not need
+to answer them — sample and region ids, the full feature list, the logit
+decomposition, cosine similarities, routing mass — is kept for
+`--explain_verbose`, so the default screen stays short enough to read. The
+default view says *group*; the code and the verbose view say *region* for the
+same thing.
 
-`--explain_figure <prefix>` writes the explanation as a paper figure —
-`<prefix>_sample<i>.png` at 300 dpi and a vector `.pdf` — drawn from the same
-observer outputs and the same formatter as the text. Prediction, ① and ③ match
-the text exactly; the figure's ② panel still shows the older contrast-only
-comparison rather than the per-case cards, so do not cite it as identical
-until it is updated.
+| | Question | Source |
+|---|---|---|
+| ① Group | Which group was this case assigned to, and what is that group like? | assignment `a`; group profile against the training set |
+| ② Position | Where does this case depart from the members of that group? | within-group feature statistics |
+| ③ Evidence | Which training cases were retrieved from that group? | `NN(q, G(a))` |
 
 Analysing a saved checkpoint is deterministic: the post-refresh resync only
 re-derives `sample_groups` from the clean embeddings against the centroids as
@@ -52,150 +55,225 @@ saved (`CentroidLayer.reassign_groups`). It used to call the training-epoch
 `regroup_update`, whose random dead-prototype reinit altered the restored
 model before evaluation and made two analyses of one checkpoint disagree.
 
-| | Question | Source |
-|---|---|---|
-| Prediction | How did the region baseline become the final prediction? | `W_eff·c + b` vs `z` |
-| ① Region | Where does this sample belong? | assignment `a` |
-| ② Evidence | Which real cases are nearest within that region? | `NN(q, G(a))` |
-| ③ Position | Where does this sample sit relative to the members of its region? | region feature statistics, cosine distance to `c` |
-
 Example: `credit-g`, predicting loan default. This is the verbatim output of
-`analyze.py --openml_id 31 --seed 1 --explain --from_saved_state …` for the
-first test sample.
-
-### Prediction
+`analyze.py --openml_id 31 --seed 1 --explain --from_saved_state …` for test
+sample 16.
 
 ```
-Prediction
-   → good — 58.1%
-   Region baseline:  good 63.9%
-   Final prediction: good 58.1%
-   Correction:       weakens "good" relative to "bad"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TabERA Explanation  # 16
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Prediction
+     good — 94.8%
+
+  Input summary
+     checking_status = 0<=X<200, duration = 6, purpose = retraining, age = 39
+     +16 more
+
+  ① Your assigned group
+     260 training cases; good 250 (96%), bad 10 (4%)
+
+     Group profile
+                       typical in group    this case
+     checking_status   no checking (66%)   ≠ 0<=X<200
+     age               38 (median)         39
+     savings_status    <100 (42%)          ≠ no known savings
+
+  ② How does this case compare within the group?
+                     this case    typical in group   position
+     purpose         retraining   radio/tv (37%)     seen in 2 of 260
+     duration        6            13 (median)        lower than 87%
+     credit_amount   932          1,984 (median)     lower than 87%
+
+  ③ Retrieved past cases from this group
+
+              checking_status   duration   purpose    age   outcome
+     Case 1   no checking       12         radio/tv   35    good
+     Case 2   no checking       21         radio/tv   41    good
+     Case 3   no checking       24         radio/tv   53    good
+
+     3 of 8 shown; 8 good, 0 bad
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-`Region baseline` is `σ(W_eff·c + b)` and `Final prediction` is `σ(z)`, both
-read on the finally predicted class. `W_eff·c + b` is identical for every
-sample in the region; the correction `W_eff·d` is what separates them. Where
-`P < C` it does the classifying instead — on a 100-class dataset with 35
-prototypes, setting `β = 0` drops accuracy from 0.725 to 0.256.
+The same few features recur from top to bottom on purpose. `Input summary`
+and the columns of ③ are one shared set of at most four features — the first
+two rows of ① and of ②, then the remaining shown rows of each — so no block
+introduces a feature the others do not show, and a retrieved case can be
+compared with the query and with the group on the same columns. It is called
+a summary, not "key input", because nothing here is attribution: the rows are
+a display selection. The rules below are display rules
+(`libs/explain_format.py`), not model thresholds and not claims of the paper;
+`print_explanation` only prints what `select_explanation_features` picked.
 
-⚠ The two probabilities are shown side by side, never subtracted. The
-decomposition is exact in logit space, but each probability is a separate
-sigmoid/softmax, so their difference is not a contribution in probability
-space. The `Correction:` line is the *direction* only — the sign of the
-correction logit — and it is printed for binary tasks only, since with more
-classes a single term shifts all of them at once and naming one "main
-alternative" would be a choice with no basis. `--explain_verbose` prints the
-three logits themselves:
+### ① Group
 
-```
-Logit decomposition (exact in logit space; binary logit, + favours "good"):
-  region baseline +0.5723 · correction -0.2458 · final +0.3265
-```
+`260 training cases; good 250 (96%)` reads as "this group holds 260 training
+samples, 96% of which were good", not "this group means good": a prototype is
+a regional anchor, not a class representative, since assignment and the EMA
+update never read labels. The prediction uses the hard assignment, not a
+mixture.
 
-### ① Region
+The *group profile* is ranked **without looking at the case**, so the rows
+cannot be the ones that happen to agree with it — and two `≠` marks are a
+finding, not a fault. Rank and display are separate. The rank is a
+distribution-shift score on one 0–1 scale for both feature kinds, so they can
+be ordered together: the KS distance `sup_x |F_group(x) − F_all(x)|` for a
+numeric feature and the total-variation distance `½ Σ_v |p_group(v) − p_all(v)|`
+for a categorical one, both against the whole training store and both
+computed where the model saw the values (the KS distance is invariant to the
+quantile transform). The displayed value is the group median or the group
+mode with its share.
 
-```
-① Predictive region
-   Region 5 — 93 training cases
-   Outcomes: good 70/93 (75%) · bad 23/93 (25%)
-```
+Only after the top three are fixed is the case compared to them, and only
+where a comparison is exact: `✓ same` when it holds the group's modal value,
+`≠ value` otherwise. A numeric row shows the case's value with no mark,
+because nothing equals a median — a tick there would stand for an unstated
+band ("48 against a median of 42 — within what?") that the reader cannot
+check. The band that does exist, the group's middle 50%, is a column of its
+own under `--explain_verbose` rather than a tick.
 
-A prototype is a regional anchor, not a learned class representative:
-assignment and the EMA update are both class-agnostic. Read it as "this group
-holds 93 training samples, 75% of which were good", not "this group means
-good". The prediction uses the hard assignment, not a mixture; the routing
-spread (`--explain_verbose`) is a diagnostic of assignment ambiguity.
+⚠ These are typical values *observed* in the group's training members, not
+the features that routed the case there. Routing is a cosine in the
+representation, and nothing in raw feature space attributes it — which is
+why the profile is not filtered to what the case shares with the group: that
+would invent a cause.
 
-### ② Evidence
+With fewer than 10 training cases (the `n<10` cut of Figure 2) a median or a
+mode is luck, so the profile and block ② are replaced by one line each
+(`Group profile unavailable — only 8 training cases in this group.`); the
+outcome counts and ③ remain.
 
-```
-② Similar past cases — evidence only
-   Retrieved: good 7/8 (88%) · bad 1/8 (12%)
-   Closest cases:
-     #269    good  ·  similarity 1.000
-       matches: job = unskilled resident · purpose = furniture/equipment
-       differs: checking_status: <0 ↔ 0<=X<200
+### ② Position
 
-     #507    good  ·  similarity 0.999
-       matches: personal_status = male single · credit_history = existing paid
-       differs: checking_status: <0 ↔ 0<=X<200
+Where this case departs from the members of its own group, as a table of
+`this case, typical in group, position`. A numeric row qualifies when the
+case lies below the 15th or above the 85th within-group percentile
+(`2·|q − ½| ≥ 0.7` on the midrank percentile `q`); a categorical row when its
+value is held by fewer than 10% of the group (an absent value counts). Rows
+are ranked by that atypicality, at most three are shown, and a feature may
+appear in both ① and ②: the two answer different questions — what the group
+is like, and where this case sits in it — and meeting both criteria is itself
+information (`duration` above). When nothing qualifies the block says
+`This case is typical of its group.` instead of filling three rows: the more
+typical the case, the shorter its explanation.
 
-   Closest contrasting case:
-     #577    bad  ·  similarity 0.999 · contrast
-       matches: own_telephone = yes · personal_status = male single
-       differs: checking_status: <0 ↔ >=200 · credit_history: existing paid ↔ no credits/all paid
+The reference column shows the scale that the position alone does not:
+`lower than 87%` reads differently against a median of 1,000 than of 1,984.
+Numeric references are the group **median** (a mean is dragged by the long
+tail of a column like `credit_amount`), mapped back to original units, and
+categorical references are the group mode with its share, since a mode at
+37% and one at 90% are different claims.
 
-   Similarity is measured in the embedding; shown feature values are descriptive.
-```
-
-The partition selects the pool, the query orders it. Retrieved labels are
-descriptive, not predictive — TabERA does not vote over neighbours, and
-nothing in ② enters `z`. The local distribution is always shown against the
-group distribution, since `7/8` means nothing without knowing the group is
-already `75%`. Without a contrasting case the first line says so
-(`· no contrast among 8`).
-
-The display policy is visible in the headings: the two closest cases, plus
-the closest case with a different label as an extra slot when it falls outside
-that budget — so counter-evidence is never hidden by presentation, and the
-evidence block stays a minority of the explanation. Each case carries a small
-card so it reads as an example rather than an id. The rows are ranked, never
-thresholded, and none is padded to its budget: `differs` is reserved first
-(largest Gower gap; two for the contrast case), `matches` are exact equalities
-with exact categorical matches ordered by how rare the shared value is in the
-region (a match on a value 2% of the region holds says more than a match on
-the mode), and `closest values` appears only when there is no exact match at
-all — rank language on purpose, since without a threshold nothing certifies
-that the smallest gap is "similar". The gap is measured where the model saw the
-values, the quantile space held in `FeatureStore`; only the displayed numbers
-are mapped back to original units. The card describes values the two cases
-hold; it does not explain why their embedding cosine is high.
-
-### ③ Position
-
-```
-③ Position relative to the region
-   Values that stand out:
-     • installment_commitment = 1
-       region reference: 4
-       lower than 85% of region cases · equal to 15%
-     • duration = 6
-       region reference: 12
-       lower than 91% of region cases · equal to 9%
-     • checking_status = <0
-       17% in region · most common: no checking 32%
-   Distance from region centre:
-     Farther than 66% of region training cases
-```
-
-Locates the sample among the training members of its own region, in two
-spaces.
-
-*Values that stand out* is raw feature space. Numeric features are ranked by
-within-region |z| and stated as exact shares of region training cases
-(`higher/lower than X% · equal to Y%`) rather than a midrank percentile, so the
-sentence stays true when a discrete feature ties. `region reference` is the
-region mean taken in quantile space and mapped back to original units — it is
-a representative value, not the arithmetic mean of the original column.
-Categorical features show the value's frequency in the region and the region
-mode; values equal to the mode are not shown in this section.
-
-*Distance from region centre* is representation space: the cosine distance
-`1 − cos(q̂, ĉ)` and its rank among the region's training cases — the space the
-assignment was made in. It is not a confidence and not a typicality score;
-whether the sample is "atypical" is left to the reader, since a region need not
-be spherical. The distance does not enter the prediction either: `d` is a unit
-tangent direction scaled by the single scalar `β`, so only the *direction* from
-`c` toward `q` reaches `z`, never how far `q` is from `c`. It appears only when
-`--refresh_on_best` is on (the default): otherwise memory holds training-time
-embeddings taken under a dropout mask while the query is deterministic, and the
-rank would be against a different representation.
+A share of at most three cases is printed as a count (`seen in 2 of 260`),
+not a percentage. In a group of 260 both one case and two round to "1%", and
+in a group of 83 the percentage moves in 1.2-point steps: the figure reads
+more precise than the data is, and the count is what a reader of a small
+share wants anyway. A value no member holds says `not seen in group`.
+`--explain_verbose` adds the middle 50% of the group and the cosine distance
+to the group centre.
 
 ⚠ This is descriptive statistics, not attribution. "The prediction came out
 this way because of this feature" is not a sentence these values support, and
-nothing in ③ explains the shift shown under Prediction — only the correction
-term does.
+nothing in ② explains how the group baseline became the final prediction —
+only the correction term does. The default view shows that decomposition in
+exactly one situation: when the correction changed the predicted class.
+Without it ① (`bad 37 (60%)`) and the prediction (`good`) would read as a
+contradiction, so one line states the two decisions — a fact, not an
+attribution to the rows above, since the correction is latent:
+
+```
+     Group-based prediction: bad → Final prediction: good
+     The case-specific adjustment changed the predicted class.
+```
+
+`--explain_verbose` always prints the full path:
+
+```
+Prediction path
+   ...
+   Region 25
+     ↓ region prediction
+   good — 94.7%
+     ↓ sample-specific correction
+   good — 94.8%
+   Group-based prediction: good → Final prediction: good (unchanged)
+
+   Logit decomposition (binary logit; + favours "good"):
+     region       +2.8900
+     correction   +0.0055
+     final        +2.8955
+```
+
+`z = (W_eff·c + b) + W_eff·d` is exact in logit space; the two probabilities
+are each a separate sigmoid/softmax and are placed side by side, never
+subtracted. `W_eff·c + b` is identical for every sample in the group; the
+correction `W_eff·d` is what separates them. Where `P < C` it does the
+classifying instead — on a 100-class dataset with 35 prototypes, setting
+`β = 0` drops accuracy from 0.725 to 0.256.
+
+### ③ Evidence
+
+The partition selects the pool, the query orders it: the retrieved cases are
+the `k` nearest training cases inside the assigned group, ranked by cosine
+similarity in the learned representation, shown on the shared columns with
+their observed outcome. The block says *retrieved*, not *similar*: proximity
+in the representation need not look like raw-feature similarity (above, the
+query's `retraining` against three `radio/tv` cases), and the title must not
+promise what the columns cannot show. Three of the `k` are shown by default
+and the counts are given without shares (`8 good, 0 bad`) so the line does
+not read as a vote; `--explain_verbose` lists all of them with training ids,
+similarities and each case's full input. Retrieved labels are descriptive,
+not predictive — TabERA does not vote over neighbours, and nothing in ③
+enters `z`. `retrieve()` expands beyond the assigned group only when the group
+cannot supply `k` candidates, and the block then says so in its title and a
+note rather than calling the result within-group.
+
+### `--explain_verbose`
+
+Adds, in place: the sample and region ids, the full input in column order,
+the prediction path and logit decomposition above, the ranking rules under ①
+and ②, the middle-50% ranges and centre distance, all retrieved cases with
+ids, similarities and full inputs, and the researcher diagnostics (correction
+configuration, routing mass and runners-up, label entropies, and the
+cross-group distinctive features from `label_all_groups`, which rank by a
+different rule from ① and are named as such).
+
+### Putting the explanation in a paper
+
+`--explain_png <prefix>` typesets the view above as
+`<prefix>_sample<i>.png` (300 dpi) and a vector `<prefix>_sample<i>.pdf`, on a
+white page — for when the figure should be the explanation a user actually
+sees, rather than a chart drawn from the same numbers.
+
+It is the *same lines*, not a second layout. `print_explanation` emits its
+output through one emitter; with a sink it collects those lines instead of
+printing them, each tagged with the role it plays, and `libs/explain_png.py`
+draws them in order. Nothing there recomputes, re-wraps or re-words anything,
+and a round-trip test asserts that the collected rows rebuild the printed text
+character for character. `--explain_verbose` therefore changes the image the
+same way it changes the terminal (and makes it very tall: the full researcher
+view of credit-g runs about 9 × 52 inches, against 6 × 7 for the default).
+
+Typography follows the roles: titles and section headings, the prediction, and
+a decision that changed are DejaVu Sans Bold; prose is DejaVu Sans; secondary
+notes are DejaVu Sans in dark gray; feature names, values and every aligned
+table are DejaVu Sans Mono. A value *inside* a monospace table is set in
+DejaVu Sans **Mono** Bold rather than the proportional bold, since a
+proportional face would move every column boundary after it — the monospace
+bold has the identical advance and the renderer verifies that before using
+it. The font files are pinned rather than resolved by family name, so a
+system font cannot silently substitute itself between machines. The ━ runs
+are drawn as rules spanning the content width instead of at their literal
+60-character length, which is the one place the image departs from the
+terminal's geometry.
+
+`--explain_figure <prefix>` is a different thing: a composed publication
+figure (bars, dumbbells, panels) from the same observer outputs and the same
+formatter. Its panels predate the display rules above (it still shows the
+contrast-case layout and z-ranked position rows), so do not cite it as
+identical to the text until it is updated.
 
 ---
 
@@ -239,7 +317,13 @@ The assignment is the branching point.
 lets samples separate inside a region while the region still sets the baseline.
 
 The evidence branch does not feed the prediction — changing `k` leaves the
-logits bit-identical. Whether retrieval *could* improve prediction was measured
+logits bit-identical. It is also not *run* on the prediction path:
+`TabERAWrapper.predict` / `predict_proba` / `_forward_batched` call
+`forward(..., retrieve=False)`, which never touches the memory bank, so
+prediction-only inference routes over the `P = ⌊√N⌋` prototypes only.
+Explanation and diagnostics callers use the default (`retrieve=None`) and
+still get `topk_idx` / `neighbor_mask`. `tests/test_prediction_retrieval_free.py`
+pins both facts. Whether retrieval *could* improve prediction was measured
 across several fusion designs; see `TABERA_V3_ARCHITECTURE.md` §14.
 
 ---
@@ -278,8 +362,11 @@ python analyze.py   --openml_id 31 --seed 1 --deterministic --explain
 ```
 
 `optimize.py` writes the study file `reproduce.py` reads back, so it runs
-first. Both scripts default to the final architecture (`unit_tangent`,
-`head_input_scale=auto`) through one shared `FINAL_CONFIG`; no flags needed.
+first. Both scripts default to the final architecture (`tangent`,
+`head_input_scale=unit`) through one shared `FINAL_CONFIG`; no flags needed.
+The default `early_stop_metric=val_loss` uses batch-averaged validation loss,
+patience 20, and the terminal model without best-checkpoint restore, matching
+the completed 105-run benchmark protocol.
 Pass `--correction_geometry additive --head_input_scale unit` only to run the
 legacy arm.
 `--calibration_analysis` and `--linear_probe` add diagnostics.

@@ -13,10 +13,11 @@ figure in the paper stops matching the text the code prints.
 
 ⚠ Formatting only. Nothing here reads the model, and ``ExplanationFormatter``
   never decides what is shown: selection, ordering and display budgets stay
-  with the caller. The one deliberate exception is ``build_neighbor_card`` --
-  a *selection* helper kept in this module, outside the formatter class, so
-  the text view and the figure pick the same feature values for a retrieved
-  case.
+  with the caller. The deliberate exceptions are the *selection* helpers kept
+  in this module, outside the formatter class, so the text view and the
+  figure pick the same rows: ``select_explanation_features`` (which features
+  blocks ①/②/③ show) and ``build_neighbor_card`` (which values sit beside a
+  retrieved case).
 """
 
 from __future__ import annotations
@@ -76,22 +77,27 @@ class ExplanationFormatter:
             return "Region " + raw.split("Prototype_", 1)[1]
         return raw
 
-    def dist_str(self, counts, total, max_items: int = 3) -> str:
+    def dist_str(self, counts, total, max_items: int = 3,
+                 show_total: bool = True, sep: str = " · ") -> str:
         """Compact but exhaustive-in-mass class distribution.
 
         For many-class regions only the largest classes are named and the
         remaining probability mass is explicitly collapsed into ``others``.
+        ``show_total=False`` drops the ``/total`` when the total was already
+        stated on the same line (``260 training cases; good 250 (96%)``), and
+        ``sep`` lets a caller match the separator of that line.
         """
         counts = {int(k): int(v) for k, v in (counts or {}).items()}
         if not total or not counts:
             return "(no label summary)"
         ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         shown = ranked[:max_items]
-        parts = [f"{self.label_name(k)} {c}/{total} ({c/total:.0%})" for k, c in shown]
+        tot = f"/{total}" if show_total else ""
+        parts = [f"{self.label_name(k)} {c}{tot} ({c/total:.0%})" for k, c in shown]
         rest = sum(c for _, c in ranked[max_items:])
         if rest:
-            parts.append(f"others {rest}/{total} ({rest/total:.0%})")
-        return " · ".join(parts)
+            parts.append(f"others {rest}{tot} ({rest/total:.0%})")
+        return sep.join(parts)
 
     def dist_items(self, counts, total, max_items: int = 3) -> List[dict]:
         """``dist_str`` as structured rows, for views that draw rather than print.
@@ -162,14 +168,7 @@ class ExplanationFormatter:
     # ── within-region rank ────────────────────────────────────────
     @staticmethod
     def rank_position(d: Dict) -> Optional[str]:
-        """Numeric feature rank inside the region, stated without a midrank.
-
-        ``group_pct`` is a midrank (below + equal/2) and discrete features tie
-        often, so "top 7%" derived from it can read as a strict ordering that
-        does not hold. ``group_pct_below`` / ``group_pct_equal`` are exact
-        shares of region training cases, so the sentence built from them is
-        literally true: higher than X%, equal to Y%.
-        """
+        """Plain-language numeric rank among the group's training cases."""
         below = d.get("group_pct_below")
         equal = d.get("group_pct_equal")
         if below is None or equal is None:
@@ -177,12 +176,83 @@ class ExplanationFormatter:
         below, equal = float(below), float(equal)
         above = max(0.0, 1.0 - below - equal)
         if below >= above:
-            s = f"higher than {below:.0%} of region cases"
+            s = f"higher than {below:.0%} of cases in this group"
         else:
-            s = f"lower than {above:.0%} of region cases"
-        if equal > 0.0005:
-            s += f" · equal to {equal:.0%}"
+            s = f"lower than {above:.0%} of cases in this group"
         return s
+
+    @staticmethod
+    def rank_position_short(d: Dict) -> Optional[str]:
+        """``rank_position`` for a table cell: ``lower than 87%``."""
+        s = ExplanationFormatter.rank_position(d)
+        return s.replace(" of cases in this group", "") if s else None
+
+    @staticmethod
+    def cat_share(count, total, freq) -> str:
+        """A categorical share, as a count while a percentage would overstate it.
+
+        In a group of 83 a single case is "1%", and the next value up is "2%":
+        the percentage moves in 1.2-point steps and reads more precise than the
+        data is. Up to ``CAT_SHARE_AS_COUNT`` cases the count is printed
+        instead, which is also what a reader of a small group wants to know.
+        """
+        if count is not None and total and int(count) <= CAT_SHARE_AS_COUNT:
+            return f"{int(count)} of {int(total)}"
+        return f"{float(freq):.0%}"
+
+    def cat_position_short(self, d: Dict) -> str:
+        """Group share of this case's categorical value, for a table cell."""
+        if d.get("absent_from_group"):
+            return "not seen in group"
+        return "seen in " + self.cat_share(d.get("group_count"), d.get("group_n"),
+                                           d.get("group_freq", 0.0))
+
+    # ── region profile rows (block ①) ─────────────────────────────
+    def typical_value(self, row: Dict) -> str:
+        """The group's typical value for one profile row of
+        ``group_stats["region"]`` -- mode with its share, or the median."""
+        name = row["feature_name"]
+        if row["kind"] == "categorical":
+            share = self.cat_share(row.get("region_mode_count"), row.get("region_n"),
+                                   row.get("region_mode_freq", 0.0))
+            return f"{self.fmt_cat_value(name, row['region_mode'])} ({share})"
+        return f"{self.fmt_num_value(name, row['region_median'])} (median)"
+
+    def typical_range(self, d: Dict) -> Optional[str]:
+        """Middle 50% of the region for a numeric sample row, original units."""
+        lo, hi = d.get("group_q25"), d.get("group_q75")
+        if lo is None or hi is None:
+            return None
+        name = d["feature_name"]
+        return f"{self.fmt_num_value(name, lo)}–{self.fmt_num_value(name, hi)}"
+
+    def region_row_comparison(self, row: Dict, sample: Optional[Dict]):
+        """How this case relates to one typical characteristic of its region.
+
+        Returns ``(case_value, agrees)``. The profile row was chosen without
+        the sample (diagnostics._region_profile), so this is the only place
+        the two meet -- after selection, never during it.
+
+        ``agrees`` is a *categorical* judgement only: the case either holds
+        the group's modal value or it does not, and a reader can check that
+        from the two cells.
+
+        ⚠ For a numeric row ``agrees`` is None, and the caller prints the
+          value with no mark. A median is not something a value can equal, so
+          any ✓ there would stand for an unstated band ("48 against a median
+          of 42 -- within what?"), and a reader could not tell which band was
+          meant. The band that does exist, the group's middle 50%, is shown
+          under --explain_verbose as its own column rather than compressed
+          into a tick. ``agrees`` is None as well when the sample row is
+          missing (a feature constant within the group has no statistics).
+        """
+        name = row["feature_name"]
+        if sample is None:
+            return None, None
+        if row["kind"] == "categorical":
+            same = int(round(float(sample["value"]))) == int(row["region_mode"])
+            return self.fmt_cat_value(name, sample["value"]), same
+        return self.fmt_num_value(name, sample["value"]), None
 
     @staticmethod
     def centre_distance_position(rp: Dict) -> Optional[str]:
@@ -198,12 +268,12 @@ class ExplanationFormatter:
         farther = float(rp["group_pct"])   # share of the region closer to the centre
         closer = 1.0 - farther
         if farther >= 0.995:
-            return "Farther than every region training case"
+            return "Farther than every training case in this group"
         if closer >= 0.995:
-            return "Closer than every region training case"
+            return "Closer than every training case in this group"
         if farther >= 0.5:
-            return f"Farther than {farther:.0%} of region training cases"
-        return f"Closer than {closer:.0%} of region training cases"
+            return f"Farther than {farther:.0%} of training cases in this group"
+        return f"Closer than {closer:.0%} of training cases in this group"
 
     # ── query-vs-neighbour gaps ───────────────────────────────────
     def gap_summary(self, nb: Dict, n: int = 2) -> List[str]:
@@ -313,3 +383,120 @@ def build_neighbor_card(nb: Dict, fmt: ExplanationFormatter, *,
             closest.append(f"{name}: {q} ↔ {n}")
             used.add(name)
     return {"matches": matches, "closest": closest, "differs": differs}
+
+
+# ─────────────────────────────────────────────────────────────
+# Display rules for the default explanation view
+# ─────────────────────────────────────────────────────────────
+# ⚠ These are UI display rules, not paper claims and not detectors: they
+#   decide what a reader sees first, never whether a value is "abnormal".
+#   Stated once so the text view and any figure select the same rows.
+NUM_ATYPICAL = 0.70        # numeric: 2·|q − ½| with q the within-group midrank percentile;
+                           # 0.70 is "below the 15th or above the 85th percentile"
+CAT_RARE_FREQ = 0.10       # categorical: the case's value held by <10% of the group
+CAT_SHARE_AS_COUNT = 3     # at most this many cases, print "2 of 83" rather than "2%"
+MIN_GROUP_SIZE = 10        # below this a median or mode is luck, so no profile and no
+                           # positions are shown (same n<10 cut as the paper's Figure 2)
+N_REGION_ROWS = 3          # block ①: group profile
+N_POSITION_ROWS = 3        # block ②: where this case departs from the group
+N_DISPLAY_FEATURES = 4     # shared feature set for Input summary and block ③
+
+
+def atypicality(d: Dict) -> float:
+    """How far from the middle of its group a value sits, on a 0-1 scale.
+
+    numeric      2·|q − ½| with q the within-group midrank percentile
+                 (``group_pct``); 0 at the median, 1 beyond every member
+    categorical  1 − p_group(value); 1 when no member holds the value
+    """
+    if d.get("kind") == "categorical":
+        return 1.0 - float(d.get("group_freq", 0.0))
+    return 2.0 * abs(float(d.get("group_pct", 0.5)) - 0.5)
+
+
+def select_explanation_features(gc: Optional[Dict], *,
+                                n_region: int = N_REGION_ROWS,
+                                n_position: int = N_POSITION_ROWS,
+                                n_display: int = N_DISPLAY_FEATURES,
+                                num_atypical: float = NUM_ATYPICAL,
+                                cat_rare_freq: float = CAT_RARE_FREQ,
+                                min_group_size: int = MIN_GROUP_SIZE) -> Dict:
+    """Decide which features the three blocks of the explanation show.
+
+    Selection, not formatting -- kept beside ``build_neighbor_card`` so every
+    view applies one rule. ``gc`` is one entry of
+    ``diagnostics.group_relative_feature_stats``.
+
+    ① region    the first ``n_region`` rows of ``gc["region"]``, i.e. the
+                features whose distribution in the group differs most from
+                the whole training set (KS / TV distance, one 0-1 scale for
+                both kinds), ranked without looking at this case. Comparing
+                the case to them happens afterwards
+                (``region_row_comparison``), so the rows cannot be the ones
+                that happen to agree with it.
+    ② position  where this case departs from its group: numeric values below
+                the 15th or above the 85th within-group percentile
+                (``atypicality >= num_atypical``), categorical values held by
+                fewer than ``cat_rare_freq`` of the group (an absent value
+                counts). Ranked by ``atypicality``. A feature may appear in
+                both ① and ②: the two answer different questions (what the
+                group is like; where this case sits in it), and meeting both
+                criteria is itself information. When nothing qualifies the
+                list is empty and the view says the case is typical -- it is
+                never padded.
+    gate        with fewer than ``min_group_size`` training cases a median,
+                a mode or a percentile is luck, so ① and ② are both empty
+                and ``too_small`` is set; the view says so instead of
+                presenting the numbers as typical.
+    display     the feature set reused by Input summary and block ③, at most
+                ``n_display``: the first two of ① and of ②, then the remaining
+                shown rows of each in turn. Every column of ③ therefore
+                appears in ① or ②, and no block introduces a feature of its
+                own.
+
+    Returns {"region": [...], "position": [...], "display": [names],
+             "by_name": {feature_name: sample row}, "too_small": bool}.
+    """
+    gc = gc or {}
+    nums = list(gc.get("numeric") or [])
+    cats = list(gc.get("categorical") or [])
+    by_name = {d["feature_name"]: d for d in nums + cats}
+    n_g = gc.get("group_size")
+    too_small = n_g is not None and int(n_g) < int(min_group_size)
+    if too_small:
+        return {"region": [], "position": [], "display": [],
+                "by_name": by_name, "too_small": True}
+
+    region = list(gc.get("region") or [])[:max(0, int(n_region))]
+
+    cands = []
+    for d in nums:
+        if atypicality(d) >= num_atypical:
+            cands.append(d)
+    for d in cats:
+        if float(d.get("group_freq", 0.0)) < cat_rare_freq:
+            cands.append(d)
+    # Rounded so that 2·|0.85 − ½| and 2·|(0.80 + 0.10/2) − ½| tie by feature
+    # index instead of by floating-point noise.
+    cands.sort(key=lambda d: (-round(atypicality(d), 9), d["feature_idx"]))
+    position = cands[:max(0, int(n_position))]
+
+    display: List[str] = []
+
+    def _add(name):
+        if name not in display and len(display) < n_display:
+            display.append(name)
+
+    for r in region[:2]:
+        _add(r["feature_name"])
+    for d in position[:2]:
+        _add(d["feature_name"])
+    rest_r = [r["feature_name"] for r in region[2:]]
+    rest_p = [d["feature_name"] for d in position[2:]]
+    while (rest_r or rest_p) and len(display) < n_display:
+        if rest_r:
+            _add(rest_r.pop(0))
+        if rest_p and len(display) < n_display:
+            _add(rest_p.pop(0))
+    return {"region": region, "position": position, "display": display,
+            "by_name": by_name, "too_small": False}

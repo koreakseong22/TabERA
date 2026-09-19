@@ -1608,10 +1608,12 @@ class TabERAWrapper:
     # ── predict_proba ────────────────────────────────────────
 
     @torch.no_grad()
-    def predict_proba(self, X: torch.Tensor) -> Optional[torch.Tensor]:
+    def predict_proba(self, X: torch.Tensor, logit: bool = False) -> Optional[torch.Tensor]:
         """MultiTab: probs = model.predict_proba(X)"""
         self.model.eval()
         logits = self._forward_batched(X)
+        if logit:
+            return logits
         _, probs = get_preds_and_probs(logits, self.tasktype)
         return probs
 
@@ -1632,7 +1634,12 @@ class TabERAWrapper:
         parts = []
         region_parts = []
         for start in range(0, len(X), batch_size):
-            out = self.model(X[start:start + batch_size])
+            # retrieve=False: this is the prediction path (predict,
+            # predict_proba, validation / test logits). Evidence retrieval is
+            # never an input to the logits, so it is not run here; callers that
+            # need neighbours (explanations, diagnostics) call the model
+            # directly with the default.
+            out = self.model(X[start:start + batch_size], retrieve=False)
             parts.append(out["logits"])
             if collect_diagnostics and self.tasktype != "regression":
                 region_parts.append(self.model.dev_head(

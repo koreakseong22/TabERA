@@ -351,6 +351,11 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
     #   dev_head(c) 를 직접 쓰면 γ≠1 에서 항등식이 조용히 깨진다. 모델 API 만
     #   읽는다 (γ==1 이면 두 식은 legacy 와 동일).
     _gamma   = model.effective_gamma() if hasattr(model, "effective_gamma") else 1.0
+    _beta_value = float(model.effective_beta().detach()) \
+        if hasattr(model, "effective_beta") else None
+    _gamma_value = float(_gamma.detach()) if isinstance(_gamma, torch.Tensor) else float(_gamma)
+    _geometry = str(getattr(model, "correction_geometry", "additive"))
+    _head_input_scale = str(getattr(model, "head_input_scale", "unit"))
     W        = (model.effective_W().detach() if hasattr(model, "effective_W")
                 else dev_head.weight.detach())  # (O, D) = γ·W
     lg_proto = dev_head(c if _gamma == 1.0 else _gamma * c)   # (B, O) = W_eff·c + b
@@ -379,7 +384,7 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
     #   stage is what makes the shift readable.
     tasktype = getattr(model, "tasktype", None)
     if tasktype == "regression":
-        prob_proto = prob_final = None
+        prob_proto = prob_proto_pred = prob_final = None
         proto_pred = None
     elif lg.shape[-1] == 1:
         _pf = torch.sigmoid(lg.squeeze(-1))
@@ -388,11 +393,15 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
         prob_final = torch.where(_cls, _pf, 1 - _pf)
         prob_proto = torch.where(_cls, _pp, 1 - _pp)   # measured on the final predicted class
         proto_pred = (_pp > 0.5).long()
+        prob_proto_pred = torch.maximum(_pp, 1 - _pp)
     else:
         _ar0 = torch.arange(lg.shape[0], device=lg.device)
-        prob_final = torch.softmax(lg, -1)[_ar0, pred_m]
-        prob_proto = torch.softmax(lg_proto, -1)[_ar0, pred_m]
+        _prob_final_all = torch.softmax(lg, -1)
+        _prob_proto_all = torch.softmax(lg_proto, -1)
+        prob_final = _prob_final_all[_ar0, pred_m]
+        prob_proto = _prob_proto_all[_ar0, pred_m]
         proto_pred = proto_m
+        prob_proto_pred = _prob_proto_all[_ar0, proto_m]
 
     contrib = W[pred_m] * d                      # (B, D); sums to lg_dev[:, m]
     d_np       = d.norm(dim=-1).cpu().numpy()
@@ -401,6 +410,7 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
     m_np       = pred_m.cpu().numpy()
     chg_np     = changed.cpu().numpy()
     pp_np      = prob_proto.cpu().numpy() if prob_proto is not None else None
+    ppp_np     = prob_proto_pred.cpu().numpy() if prob_proto_pred is not None else None
     pf_np      = prob_final.cpu().numpy() if prob_final is not None else None
     ppred_np   = proto_pred.cpu().numpy() if proto_pred is not None else None
     contrib_np = contrib.cpu().numpy()
@@ -416,6 +426,10 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
             # is beta*sin(theta) and under unit_tangent beta*min(s/eps, 1), so
             # do not read it as "the learned beta".
             "dev_norm":       float(d_np[b]),
+            "correction_geometry": _geometry,
+            "head_input_scale": _head_input_scale,
+            "beta":           _beta_value,
+            "gamma":          _gamma_value,
             "logit_proto":    lp,                  # W_eff·c + b
             "logit_dev":      ld,                  # W_eff·d
             # Share of the predicted channel taken by the correction. Logits
@@ -427,6 +441,9 @@ def prototype_deviation(model, out: Dict) -> Optional[List[dict]]:
             # Probability of the finally predicted class at the prototype
             # stage, then after the correction. None for regression.
             "prob_proto":     (float(pp_np[b]) if pp_np is not None else None),
+            # Confidence of the class predicted by the region-only stage.
+            # This differs from prob_proto when the correction changes class.
+            "prob_proto_pred": (float(ppp_np[b]) if ppp_np is not None else None),
             "prob_final":     (float(pf_np[b]) if pf_np is not None else None),
             # Which class the prototype term alone would have predicted.
             "proto_pred":     (int(ppred_np[b]) if ppred_np is not None else None),
@@ -446,6 +463,8 @@ def group_relative_feature_stats(
     out: Dict,
     X: torch.Tensor,
     feature_store=None,
+    categorical_overrides=None,
+    quantile_transformer=None,
 ) -> Optional[List[dict]]:
     """
     Compare a sample against the typical member of its own group, directly in
@@ -473,13 +492,22 @@ def group_relative_feature_stats(
     ⚠ No truncation: all features are returned, sorted by |z| / rarity.
 
     Returns one dict per sample:
-    {"numeric": [...], "categorical": [...], "group_size": n}
-      numeric     : z = (x - group mean) / group std
+    {"numeric": [...], "categorical": [...], "region": [...], "group_size": n}
+      numeric     : z = (x - group mean) / group std, within-group rank,
+                    and the group median / middle 50% for user-facing comparison
       categorical : rarity = 1 - (frequency of this value within the group),
                     plus differs_from_mode, which sorts first: this view is
                     about where the sample departs from its group,
                     with group_mode / group_mode_freq attached so the consumer
                     can decide whether it matches the mode
+      region      : the group's own profile against the whole store, one row
+                    per feature sorted by distribution-shift score (KS for
+                    numeric, TV for categorical) -- what is typical of the
+                    group, computed without looking at the sample (see
+                    _region_profile). The display picks its group profile
+                    from this list first and only then compares the sample
+                    to it, so the shown rows cannot be the ones that happen
+                    to agree with the sample.
     """
     fs = feature_store if feature_store is not None else getattr(model, "feature_store", None)
     sg = getattr(model.prototype_layer, "sample_groups", None)
@@ -497,6 +525,28 @@ def group_relative_feature_stats(
     n_feat = Xnp.shape[1]
     cat, num = _cat_num_idx(model, n_feat)
     cols     = _cols(model, n_feat)
+    # Domain categories can be encoded through the model's numeric pipeline.
+    # Decode copies before counting codes; rounding quantiles would merge levels.
+    overrides = categorical_overrides or {}
+    override_idx = [i for i in num if cols[i] in overrides]
+    if override_idx:
+        if quantile_transformer is None:
+            raise ValueError("Categorical explanation overrides require the fitted numeric transformer")
+        store = store.copy()
+        Xnp = Xnp.copy()
+        decoded_store = quantile_transformer.inverse_transform(store[:, num])
+        decoded_query = quantile_transformer.inverse_transform(Xnp[:, num])
+        for fi in override_idx:
+            ni = list(num).index(fi)
+            allowed = overrides[cols[fi]]
+            for target, decoded in ((store, decoded_store), (Xnp, decoded_query)):
+                values = decoded[:, ni]
+                codes = np.rint(values)
+                if not np.all(np.isclose(values, codes, atol=1e-4, rtol=0)) or not np.all(np.isin(codes, allowed)):
+                    raise ValueError(f"Invalid reconstructed category codes for {cols[fi]}")
+                target[:, fi] = codes
+        cat = list(cat) + override_idx
+        num = [i for i in num if i not in override_idx]
     ha_np    = ha.detach().cpu().numpy()
 
     # ⚠ Global mean and std over the whole store, for the standardised
@@ -506,8 +556,91 @@ def group_relative_feature_stats(
     #   from the dataset mean, in units of the dataset's own spread".
     g_mean = store.mean(axis=0) if n_fill else np.zeros(store.shape[1])
     g_std  = store.std(axis=0)  if n_fill else np.ones(store.shape[1])
+    g_med = np.median(store, axis=0) if n_fill else np.zeros(store.shape[1])
+
+    def _ks_distance(a: np.ndarray, b: np.ndarray) -> float:
+        """sup_x |F_a(x) - F_b(x)| between two empirical CDFs."""
+        xs = np.unique(np.concatenate([a, b]))
+        sa, sb = np.sort(a), np.sort(b)
+        f_a = np.searchsorted(sa, xs, side="right") / len(sa)
+        f_b = np.searchsorted(sb, xs, side="right") / len(sb)
+        return float(np.abs(f_a - f_b).max())
+
+    def _tv_distance(a: np.ndarray, b: np.ndarray) -> float:
+        """½ Σ_v |p_a(v) - p_b(v)| between two categorical distributions."""
+        vals = np.unique(np.concatenate([a, b]))
+        p_a = np.array([(a == v).mean() for v in vals])
+        p_b = np.array([(b == v).mean() for v in vals])
+        return float(0.5 * np.abs(p_a - p_b).sum())
+
+    def _region_profile(rows: np.ndarray) -> List[dict]:
+        """What is typical of this group against the whole training store.
+
+        ⚠ Query-independent on purpose: the sample being explained does not
+          enter here, so the rows say what the group is like, not what it
+          shares with this sample. The display compares the two afterwards.
+          Nothing is filtered: every feature is returned with its score and
+          the display layer applies its budget and its group-size gate.
+
+        Ranking and display are separate. The rank is a distribution-shift
+        score on one 0-1 scale for both kinds, so numeric and categorical
+        features can be ordered together:
+          numeric      KS distance  sup_x |F_group(x) - F_all(x)|
+          categorical  TV distance  ½ Σ_v |p_group(v) - p_all(v)|
+        The displayed value is the group median (numeric) or the group mode
+        with its share (categorical). Both are computed where the model saw
+        the values (quantile space for numerics); the KS distance is
+        invariant to that monotone transform, and the median is mapped back
+        to original units by the display layer.
+
+        ⚠ Not "the features that caused the assignment". Routing is a cosine
+          in the representation; these are typical values observed in the
+          group's training members.
+        """
+        prof: List[dict] = []
+        n_r = int(rows.shape[0])
+        if n_r == 0:
+            return prof
+        for fi in num:
+            if fi >= n_feat or fi >= rows.shape[1]:
+                continue
+            col = rows[:, fi].astype(np.float64)
+            q25, med, q75 = (float(v) for v in np.percentile(col, [25, 50, 75]))
+            prof.append({
+                "feature_idx":   fi,
+                "feature_name":  cols[fi] if fi < len(cols) else f"f{fi}",
+                "kind":          "numeric",
+                "region_median": med,
+                "region_q25":    q25,
+                "region_q75":    q75,
+                "global_median": float(g_med[fi]),
+                "score":         _ks_distance(col, store[:, fi].astype(np.float64)),
+            })
+        for fi in cat:
+            if fi >= n_feat or fi >= rows.shape[1]:
+                continue
+            col = np.rint(rows[:, fi]).astype(np.int64)
+            g_col = np.rint(store[:, fi]).astype(np.int64)
+            vals, cnts = np.unique(col, return_counts=True)
+            mode = int(vals[int(cnts.argmax())])
+            prof.append({
+                "feature_idx":      fi,
+                "feature_name":     cols[fi] if fi < len(cols) else f"f{fi}",
+                "kind":             "categorical",
+                "region_mode":      mode,
+                "region_mode_freq": float(cnts.max()) / n_r,
+                # Count and n travel with the share so the display can write
+                # "2 of 83" where a percentage would overstate its precision.
+                "region_mode_count": int(cnts.max()),
+                "region_n":         n_r,
+                "global_mode_freq": float((g_col == mode).mean()),
+                "score":            _tv_distance(col, g_col),
+            })
+        prof.sort(key=lambda d: (-d["score"], d["feature_idx"]))
+        return prof
 
     cache: Dict[int, np.ndarray] = {}
+    profile_cache: Dict[int, List[dict]] = {}
     result = []
     for b in range(Xnp.shape[0]):
         p = int(ha_np[b])
@@ -515,6 +648,7 @@ def group_relative_feature_stats(
             ids = sg[p] if (p < len(sg) and sg[p] is not None) else []
             ids = [i for i in ids if 0 <= i < n_fill]
             cache[p] = store[ids] if ids else store[:0]
+            profile_cache[p] = _region_profile(cache[p])
         rows = cache[p]
         n_g  = int(rows.shape[0])
 
@@ -525,6 +659,7 @@ def group_relative_feature_stats(
                     continue
                 col = rows[:, fi].astype(np.float64)
                 mu, sd = float(col.mean()), float(col.std())
+                median = float(np.median(col))
                 val = float(Xnp[b, fi])
                 if sd < 1e-6:      # numerical guard, not a judgement
                     continue
@@ -542,12 +677,22 @@ def group_relative_feature_stats(
                 #   the position.
                 below = float((col < val).mean())
                 equal = float((col == val).mean())
+                q25, q75 = (float(v) for v in np.percentile(col, [25, 75]))
                 num_out.append({
                     "feature_idx":  fi,
                     "feature_name": cols[fi] if fi < len(cols) else f"f{fi}",
                     "kind":         "numeric",
                     "value":        val,
                     "group_mean":   mu,
+                    # Median in the model-input scale. Because the numeric
+                    # preprocessing transform is monotone, the display layer
+                    # can inverse-transform this into an intuitive region
+                    # reference in the feature's original units.
+                    "group_median": median,
+                    # Middle 50% of the region, same scale as the median; the
+                    # detail view prints it as the region's typical range.
+                    "group_q25":    q25,
+                    "group_q75":    q75,
                     "group_std":    sd,
                     # z is dropped from the display but kept for analysis and
                     # sorting -- it can rank features better than a percentile.
@@ -573,7 +718,8 @@ def group_relative_feature_stats(
                     continue
                 code = int(round(float(Xnp[b, fi])))
                 col  = np.rint(rows[:, fi]).astype(np.int64)
-                freq = float((col == code).sum()) / n_g
+                count = int((col == code).sum())
+                freq = float(count) / n_g
                 vals, cnts = np.unique(col, return_counts=True)
                 _mode_n = int(cnts.max())
                 _mode = int(vals[int(cnts.argmax())])
@@ -585,13 +731,15 @@ def group_relative_feature_stats(
                 #   credit-g: personal_status at 48% against a "mode" also at
                 #   48%, in a region of 23. So a value that occurs as often as
                 #   the mode does not count as differing from it.
-                _tied = int((col == code).sum()) == _mode_n
+                _tied = count == _mode_n
                 cat_out.append({
                     "feature_idx":     fi,
                     "feature_name":    cols[fi] if fi < len(cols) else f"f{fi}",
                     "kind":            "categorical",
                     "value":           code,
                     "group_freq":      freq,
+                    "group_count":     count,
+                    "group_n":         n_g,
                     "group_mode":      _mode,
                     "group_mode_freq": float(_mode_n) / n_g,
                     "rarity":          1.0 - freq,
@@ -621,7 +769,8 @@ def group_relative_feature_stats(
         #     tell a hidden feature from an absent one.
         cat_out.sort(key=lambda d: (d["differs_from_mode"], d["rarity"]),
                      reverse=True)
-        result.append({"numeric": num_out, "categorical": cat_out, "group_size": n_g})
+        result.append({"numeric": num_out, "categorical": cat_out,
+                       "region": profile_cache[p], "group_size": n_g})
     return result
 
 

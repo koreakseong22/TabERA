@@ -10,23 +10,26 @@ class TangentReproduceTests(unittest.TestCase):
     def parse(self, *extra):
         return reproduce.parser().parse_args(["--openml_id", "51", *extra])
 
-    def test_tangent_uses_own_study_and_separate_result(self):
-        args = self.parse("--correction_geometry", "tangent",
-                          "--head_input_scale", "unit")
+    def test_unit_tangent_uses_own_study_and_separate_result(self):
+        args = self.parse("--correction_geometry", "unit_tangent",
+                          "--head_input_scale", "auto")
         config = reproduce.requested_config(args, arm_config)
-        self.assertEqual(config["correction_geometry"], "tangent")
-        self.assertEqual(config["head_input_scale"], "unit")
+        self.assertEqual(config["correction_geometry"], "unit_tangent")
+        self.assertEqual(config["head_input_scale"], "auto")
         study = str(final_study_path("root", 1, 51, config))
-        self.assertIn("..geom=tangent", study)
-        self.assertNotIn("..hs=unit", study)  # unit is study_pkl_tag's legacy reference
+        self.assertIn("..geom=unit_tangent", study)
+        self.assertIn("..hs=auto", study)
         out = reproduce.structure_result_path(result_path("root", 1, 51, config=config), config)
-        self.assertIn("..geom=tangent..hs=unit", out.name)
+        self.assertIn("..geom=unit_tangent..hs=auto", out.name)
         self.assertNotEqual(out, result_path("root", 1, 51))
 
     def test_default_paths_are_unchanged(self):
         args = self.parse()
         config = reproduce.requested_config(args, arm_config)
         self.assertEqual(config, FINAL_CONFIG)
+        self.assertEqual(config["correction_geometry"], "tangent")
+        self.assertEqual(config["head_input_scale"], "unit")
+        self.assertEqual(config["early_stop_metric"], "val_loss")
         base = result_path("root", 1, 51, config=config)
         self.assertEqual(reproduce.structure_result_path(base, config), base)
 

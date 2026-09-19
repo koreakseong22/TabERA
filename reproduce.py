@@ -16,10 +16,10 @@ def parser():
     p.add_argument("--member", type=int, choices=range(5), default=0)
     p.add_argument("--correction_geometry", choices=["unit_tangent", "tangent"],
                    default=FINAL_CONFIG["correction_geometry"],
-                   help="final Unit Tangent model or the independently tuned Tangent ablation")
+                   help="final Tangent model or the independently tuned Unit Tangent variant")
     p.add_argument("--head_input_scale", choices=["auto", "unit"],
                    default=FINAL_CONFIG["head_input_scale"],
-                   help="Unit Tangent uses auto; the Tangent ablation uses unit")
+                   help="final Tangent uses unit; Unit Tangent uses auto")
     p.add_argument("--disable_dead_reinit", action="store_true",
                    help=("ablation arm: dead-prototype recovery off (dead_reinit_patience=1e9, so the reinit "
                          "block in regroup_update never fires). Reads the ..nodr study written by "
@@ -27,10 +27,10 @@ def parser():
                          "main arm's files are untouched"))
     p.add_argument("--early_stop_metric", choices=["val_loss", "accuracy", "logloss", "auroc", "bacc"],
                    default=FINAL_CONFIG["early_stop_metric"],
-                   help=("validation criterion for early stopping. Default val_loss is the MultiTab protocol: "
+                   help=("Default val_loss uses the MultiTab protocol: "
                          "batch-averaged validation loss, patience 20, and the model at the epoch training "
-                         "stopped is evaluated (no best-checkpoint restore). Every other value is an ablation "
-                         "arm that restores the best checkpoint by that metric; it reads the ..esm=NAME study "
+                         "stopped is evaluated (no best-checkpoint restore). Other values select an "
+                         "arm that restores the best checkpoint by that metric; accuracy has no study esm tag, others use ..esm=NAME "
                          "written by optimize.py --early_stop_metric and writes model=tabera..esm=NAME.. results"))
     p.add_argument("--hpo_source", choices=["own", "main"], default="own",
                    help=("where an ablation arm takes its hyperparameters from. own (default): the arm's own "
@@ -244,8 +244,8 @@ def run(args):
         pred, prob = get_preds_and_probs(logits, task)
         vp, vprob = get_preds_and_probs(val_logits, task)
         scale = dataset.y_std if task == "regression" else 1.
-        perf = calculate_metric(ye * scale, pred * scale, prob, task, "test")
-        val_perf = calculate_metric(yv * scale, vp * scale, vprob, task, "val")
+        perf = calculate_metric(ye * scale, pred * scale, logits, task, "test")
+        val_perf = calculate_metric(yv * scale, vp * scale, val_logits, task, "val")
         clean = lambda values: {k: float(v) if np.isfinite(v) else None for k, v in values.items()}
         payload = dict(Prediction=pred.detach().cpu().numpy(),
                        Probability=None if task == "regression" else logits.detach().cpu().numpy(),

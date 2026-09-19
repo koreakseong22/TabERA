@@ -27,6 +27,7 @@ def calculate_metric(
     probs:  Optional[torch.Tensor],
     tasktype: str,
     split: str,   # 'val' or 'test'
+    prob: bool = False,
 ) -> Dict[str, float]:
     """MultiTab final-reproduction 규약으로 평가한다.
 
@@ -40,10 +41,9 @@ def calculate_metric(
     과거 ``*_mt_*`` 별도 키는 사용하지 않는다. 위 네 키 자체가 MultiTab
     benchmark 정의다.
 
-    ``probs``는 TabERA의 sigmoid/softmax가 이미 한 번 적용된 최종 확률이다.
-    MultiTab reproduce.py는 raw logits를 eval.py에 넘기고 그곳에서 sigmoid/
-    softmax를 한 번 적용하므로, 여기서 다시 변환하지 않는 것이 final
-    reproduction metric과 동등하다.
+    ``probs`` defaults to raw logits, matching official MultiTab. This function
+    applies scipy expit/softmax once. Set ``prob=True`` only for inputs that
+    are already probabilities (the official explicit bypass).
 
     Multiclass AUROC는 split에 없는 class를 임의로 제거하지 않는다. MultiTab
     data.py처럼 전체 class 차원의 one-hot target을 재구성하여 macro OVR을
@@ -90,6 +90,10 @@ def calculate_metric(
     )
     if valid_probs:
         pr_np = np.asarray(pr_np)
+        if not prob:
+            from scipy.special import expit, softmax
+            pr_np = (expit(pr_np) if tasktype == "binclass"
+                     else softmax(pr_np, axis=1))
 
     # ── Binary classification ────────────────────────────────
     if tasktype == "binclass":
@@ -103,7 +107,8 @@ def calculate_metric(
             f1 = float("nan")
 
         if valid_probs:
-            prob_pos = pr_np[:, 1] if pr_np.ndim == 2 else pr_np.reshape(-1)
+            prob_pos = (pr_np[:, 1] if pr_np.ndim == 2 and pr_np.shape[1] == 2
+                        else pr_np.reshape(-1))
             try:
                 auroc = float(roc_auc_score(y_cls, prob_pos))
             except ValueError:
@@ -225,7 +230,7 @@ def compute_metric(
             out = {"acc_val": (_p == y).float().mean().item()}
         try:
             preds, probs = get_preds_and_probs(logits, tasktype)
-            for k, v in calculate_metric(y, preds, probs, tasktype, "val").items():
+            for k, v in calculate_metric(y, preds, logits, tasktype, "val").items():
                 if k != "acc_val":
                     out[k] = v
 

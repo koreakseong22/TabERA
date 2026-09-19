@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+from typing import Optional
 
 from libs.data         import TabularDataset
 from libs.search_space import params_to_model_kwargs, study_pkl_tag, HPO_TRAINING_SCHEDULE
@@ -31,7 +32,8 @@ from libs.data         import get_batch_size
 from libs.supervised   import TabERAWrapper
 from libs.tabera         import TabERA
 from libs.prototypes     import inverse_transform_numeric
-from libs.explain_format import ExplanationFormatter, build_neighbor_card
+from libs.explain_format import (ExplanationFormatter, N_DISPLAY_FEATURES,
+                                 select_explanation_features)
 from libs.benchmark_config import FINAL_CONFIG
 from libs                import diagnostics as diag
 from libs.eval         import calculate_metric, get_preds_and_probs, get_criterion
@@ -110,44 +112,75 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
                        pred_info: dict = None,
                        target_class_names: list = None,
                        tasktype: str = None,
-                       max_neighbors: int = 2,   # + the closest contrast when outside
+                       max_neighbors: int = 3,
                        max_features: int = 3,
-                       max_gaps: int = 2,        # differs budget for the contrast case
-                       max_matches: int = 2,
-                       max_differs: int = 1,
                        verbose: bool = False,
-                       max_dims: int = 5) -> None:
+                       sink: Optional[list] = None) -> None:
     """Print a compact, user-facing TabERA explanation.
 
-    The default view deliberately answers only four questions:
-      1) What was predicted, and how did the region baseline become the
-         final prediction?
-      2) Which predictive region contains this case?
-      3) What do the nearest past cases in that region look like?
-      4) Where does this case sit relative to the members of its region?
+    The default view answers three questions, one block each, and every
+    block only ever shows features drawn from one shared selection
+    (``explain_format.select_explanation_features``):
 
-    Three kinds of information are kept apart on purpose:
-      Prediction  the computation itself. logits = (W_eff·c + b) + W_eff·d is
-                  an identity in *logit* space; the two probabilities shown
-                  are each a separate sigmoid/softmax of those logits, so they
-                  are placed side by side and never subtracted. The direction
-                  line (binary only) is the sign of the correction logit.
-      ②           evidence. Retrieval is not an input to the logits.
-      ③           description. Raw-feature percentiles and the cosine distance
-                  to the region centre are not inputs to the logits either and
-                  are not attribution (see diagnostics.group_relative_feature_stats
-                  and within_region_position). Nothing in ③ explains the
-                  Prediction shift; only the correction term does.
+      Prediction      what was predicted.
+      Input summary   the case's values for the shared feature set -- a
+                      display selection, not the important features.
+      ①               which group the case was assigned to, what its
+                      training members look like, and the group's profile --
+                      chosen without looking at this case, then compared to
+                      it (so two "≠" marks are a finding, not a fault).
+      ②               where this case departs from the members of that group
+                      (this case, typical in group, position). Descriptive
+                      statistics: the rows locate the case, they do not
+                      explain the prediction, and when nothing stands out the
+                      block says the case is typical instead of filling three
+                      rows. A feature may appear in ① and ②; the two answer
+                      different questions.
+      ③               training cases retrieved from that group, laid out on
+                      the same feature columns so they can be compared with
+                      the case and with ①/②. Evidence only: retrieval is not
+                      an input to the logits, and "retrieved" rather than
+                      "similar" because the ranking is a cosine in the learned
+                      representation, not raw-feature similarity.
 
-    All values come from the same observer outputs as before; this function is
-    display-only and does not change prediction, routing, retrieval, or any
-    diagnostic computation.  ``--explain_verbose`` exposes the researcher
-    details (routing mass, the logit decomposition as numbers, entropies, and
-    the raw representation distance) that are intentionally hidden from the
-    default user view.
+    The group→final decomposition appears in the default view only when the
+    correction changed the predicted class: then ① ("96% good") and the
+    prediction ("bad") would otherwise contradict each other, and one line
+    stating the two decisions is what keeps the explanation consistent. It
+    states the fact only; the correction is latent, so nothing attributes
+    it to the rows of ②.
 
-    ``max_*`` values are display budgets only, never decision thresholds.
+    What the default view deliberately leaves out is researcher detail with
+    no user-facing question behind it: sample and region ids, the full
+    feature list, the logit decomposition when nothing changed, cosine
+    similarities, the routing mass, entropies, the middle-50% ranges and the
+    centre distance. ``--explain_verbose`` (``verbose=True``) prints all of
+    it, and uses the internal name "Region N" for the group id.
+
+    All values come from the same observer outputs as before; this function
+    is display-only and changes no prediction, routing, retrieval or
+    diagnostic computation. ``max_*`` values are display budgets, and the
+    thresholds behind ② live in ``explain_format`` as display rules -- none of
+    them is a decision threshold of the model.
     """
+    def out(text: str = "", role: str = "text", bold=None) -> None:
+        """One line of the explanation, tagged with the role a renderer styles
+        it by. With ``sink=None`` this is ``print``; ``libs/explain_png``
+        passes a list instead and receives exactly the lines the terminal
+        would have shown, so a figure cannot drift from the text -- it is the
+        same output, not a second layout.
+
+        roles: title / section / subsection / value / mono / text / muted /
+        rule / blank. ``bold`` is an optional (start, end) character span
+        inside a ``mono`` line, used only where a monospace bold face keeps
+        every column boundary exactly where the terminal put it.
+        """
+        for line in str(text).split("\n"):
+            if sink is None:
+                print(line)
+            else:
+                sink.append(("blank" if not line.strip() else role, line, bold))
+
     e = explanations[sample_idx]
     proto = e.get("prototype") or {}
     le = e.get("local_evidence")
@@ -155,294 +188,397 @@ def print_explanation(explanations: list, sample_idx: int, col_names: list,
     dv = e.get("prototype_deviation")
     gc = e.get("group_stats")
     rp = e.get("region_position")
+    is_reg = tasktype == "regression"
 
-    # ── Small display helpers ──────────────────────────────────────
     # ⚠ Value formatting lives in ExplanationFormatter so that this view and
     #   the figure in libs/explain_figure.py cannot disagree about a class
-    #   name, an inverse-transformed value, or the rank sentence. Selection,
-    #   ordering and the display budgets below stay here.
+    #   name, an inverse-transformed value, or the rank sentence. Which rows
+    #   are shown is decided once, in select_explanation_features.
     fmt = ExplanationFormatter(
         col_names=col_names, cat_category_names=cat_category_names,
         quantile_transformer=quantile_transformer, num_cols=num_cols,
         target_class_names=target_class_names, tasktype=tasktype)
-    _label_name  = fmt.label_name
-    _region_name = fmt.region_name
-    _dist_str    = fmt.dist_str
-    _pretty_num  = fmt.pretty_num
-    _real_numeric = fmt.real_numeric
-    _fmt_cat_value = fmt.fmt_cat_value
-    _rank_position = fmt.rank_position
+    _label_name = fmt.label_name
+    region = fmt.region_name(proto.get("assigned_group"))
+    numeric_columns = set(num_cols or [])
+    name_to_idx = {name: i for i, name in enumerate(col_names)}
 
-    # ── Header ────────────────────────────────────────────────────
-    print(f"\n{'━'*48}")
-    print(f"  TabERA Explanation — Sample #{sample_idx}")
-    print(f"{'━'*48}")
+    def _value(name, value):
+        if name_to_idx.get(name) in numeric_columns:
+            return fmt.fmt_num_value(name, value)
+        return fmt.fmt_cat_value(name, value)
 
-    # ── Prediction ────────────────────────────────────────────────
-    print("\n  Prediction")
-    # ⚠ Two independent blocks, not if/elif. The caller always builds
-    #   pred_info (for regression with pred_confidence=None), so an elif on
-    #   the regression decomposition was unreachable and regression never
-    #   printed its baseline/correction/final line.
-    label = (pred_info or {}).get("pred_label", "prediction")
-    if pred_info is not None:
-        conf = pred_info.get("pred_confidence")
-        if conf is None:
-            print(f"     → {label}")
-        else:
-            print(f"     → {label} — {conf:.1%}")
+    def _cell(s, width=18):
+        s = str(s)
+        return s if len(s) <= width else s[:width - 1] + "…"
 
-    if dv is not None and tasktype == "regression":
-        # Regression has no probability: the logit *is* the prediction (in
-        # standardised units), so the three terms are shown directly.
-        print(f"     Region baseline {dv['logit_proto']:+.4f} · "
-              f"correction {dv['logit_dev']:+.4f} · "
-              f"final {dv['logit_proto'] + dv['logit_dev']:+.4f}  (standardised)")
-    elif pred_info is not None:
-        # ⚠ pp and pf are each a separate sigmoid/softmax of the region
-        #   baseline logit and of the full logit, both read on the finally
-        #   predicted class. The decomposition is exact in logit space only,
-        #   so the two are shown side by side and never subtracted.
-        if dv is not None and dv.get("prob_final") is not None:
-            pp = dv.get("prob_proto")
-            pf = dv.get("prob_final")
-            changed = bool(dv.get("argmax_changed"))
-            if changed:
-                proto_code = dv.get("proto_pred")
-                proto_label = _label_name(proto_code)
-                print(f"     Region baseline: {proto_label} → Final: {label}")
-                if pp is not None:
-                    print(f"     Final-class confidence at region baseline: {pp:.1%} → {pf:.1%}")
-            elif pp is not None:
-                print(f"     Region baseline:  {label} {pp:.1%}")
-                print(f"     Final prediction: {label} {pf:.1%}")
-            # Direction of the correction, binary only. With one logit the
-            # sign of W_eff·d decides everything, and "did the predicted class
-            # gain or lose" is exactly pf > pp (sigmoid is monotone). With
-            # more classes one term shifts every class at once, so naming a
-            # single alternative would be a choice with no basis.
-            pred_code = pred_info.get("pred_code")
-            if (pp is not None and target_class_names is not None
-                    and len(target_class_names) == 2 and pred_code in (0, 1)):
-                other = str(target_class_names[1 - int(pred_code)])
-                if abs(pf - pp) < 5e-4:
-                    verb = "leaves"
-                else:
-                    verb = "strengthens" if pf > pp else "weakens"
-                print(f"     Correction:       {verb} \"{label}\" relative to \"{other}\"")
+    def _table(header, rows, indent="     ", gap="   ", bold_col=None):
+        """Left-aligned columns; a column is as wide as its widest cell.
 
-    # ── ① Predictive region ──────────────────────────────────────
-    region = _region_name(proto.get("assigned_group"))
+        ``bold_col`` marks one body column for emphasis. It travels as a
+        character span rather than a separate text run, so a renderer sets it
+        in the bold face of the *same* monospace family and leaves every
+        column boundary where the terminal put it.
+        """
+        table = [header] + rows
+        ncol = max(len(r) for r in table)
+        widths = [max(len(str(r[c])) if c < len(r) else 0 for r in table)
+                  for c in range(ncol)]
+        for ri, r in enumerate(table):
+            cells = [f"{str(r[c]) if c < len(r) else '':<{widths[c]}}"
+                     for c in range(ncol)]
+            line = indent + gap.join(cells).rstrip()
+            span = None
+            if bold_col is not None and ri and bold_col < len(r):
+                start = len(indent) + sum(widths[c] + len(gap)
+                                          for c in range(bold_col))
+                span = (start, start + len(str(r[bold_col])))
+            out(line, "mono", span)
+
+    sel = select_explanation_features(gc, n_region=max_features,
+                                      n_position=max_features)
+    # ① and ② are ranked lists; Key input and ③ show the shared set as input,
+    # so they keep dataset column order.
+    display = sorted(sel["display"], key=lambda n: name_to_idx.get(n, len(col_names)))
+    # With no selection (no statistics, or a group too small to summarise)
+    # the shared set falls back to the first dataset columns.
+    shown_cols = display or list(col_names)[:N_DISPLAY_FEATURES]
+    by_name = sel["by_name"]
+    input_features = e.get("input_features")
     group_size = None
     if le is not None:
         group_size = le.get("group_size")
     if group_size is None:
         tinfo = proto.get("target_info")
         group_size = tinfo.get("n") if tinfo is not None else None
+    if group_size is None and gc is not None:
+        group_size = gc.get("group_size")
 
-    print("\n  ① Predictive region")
+    def _count_str(counts, total):
+        """``8 good, 0 bad``: counts only, no shares -- the block is titled
+        "Retrieved past cases" and must not read as a vote."""
+        counts = {int(k): int(v) for k, v in (counts or {}).items()}
+        if is_reg or not total:
+            return None
+        if target_class_names is not None and len(target_class_names) <= 3:
+            codes = list(range(len(target_class_names)))
+            codes.sort(key=lambda c: (-counts.get(c, 0), c))
+            return ", ".join(f"{counts.get(c, 0)} {_label_name(c)}" for c in codes)
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        parts = [f"{c} {_label_name(k)}" for k, c in ranked[:3]]
+        rest = sum(c for _, c in ranked[3:])
+        if rest:
+            parts.append(f"{rest} others")
+        return ", ".join(parts)
+
+    # ── Header ────────────────────────────────────────────────────
+    W = "━" * 60
+    out(f"\n{W}", "rule")
+    # The index into the explained samples (test rows 0..n_explain-1), so a
+    # reader can point at "the one from # 7"; verbose adds the internal region.
+    out(f"  TabERA Explanation  # {sample_idx}" + (f" · {region}" if verbose else ""),
+        "title")
+    out(W, "rule")
+
+    # ── Prediction ────────────────────────────────────────────────
+    label = (pred_info or {}).get("pred_label", "prediction")
+    conf = (pred_info or {}).get("pred_confidence")
+    prediction_text = label if conf is None else f"{label} — {conf:.1%}"
+    out("\n  Prediction", "section")
+    out(f"     {prediction_text}", "value")
+
+    # ── Key input ─────────────────────────────────────────────────
+    # Input x, never the latent query or an importance ranking. The default
+    # shows the shared feature set so the same columns recur in ①, ② and ③;
+    # verbose lists every column in dataset order.
+    if input_features is not None:
+        if verbose:
+            out(f"\n  Input case — {len(col_names)} features", "section")
+            name_width = max((len(n) for n in col_names), default=0)
+            for name in col_names:
+                out(f"     {name:<{name_width}} = {_value(name, input_features[name])}",
+                    "mono")
+            if numeric_columns:
+                out("     Numeric values are reconstructed from preprocessing and rounded."
+                    if quantile_transformer is not None else
+                    "     Numeric values are shown in the model-input scale.", "muted")
+        else:
+            shown = [n for n in shown_cols if n in input_features]
+            out("\n  Input summary", "section")
+            out("     " + ", ".join(f"{n} = {_value(n, input_features[n])}" for n in shown),
+                "mono")
+            rest = len(col_names) - len(shown)
+            if rest > 0:
+                out(f"     +{rest} more", "muted")
+
+    # ── Prediction path (researcher detail) ───────────────────────
+    if verbose and dv is not None:
+        lp = dv.get("logit_proto")
+        ld = dv.get("logit_dev")
+        baseline_conf = dv.get("prob_proto_pred")
+        proto_pred = dv.get("proto_pred")
+        baseline_label = (_label_name(proto_pred)
+                          if proto_pred is not None else "region prediction")
+
+        out("\n  Prediction path", "section")
+        out("     Input", "mono")
+        out("       ↓ encoder", "mono")
+        out("     Query representation", "mono")
+        out("       ↓ cosine routing", "mono")
+        out(f"     {region}", "mono")
+        out("       ↓ region prediction", "mono")
+        if is_reg:
+            out(f"     {lp:+.4f}" if lp is not None else "     unavailable", "mono")
+        else:
+            baseline_text = baseline_label
+            if baseline_conf is not None:
+                baseline_text += f" — {baseline_conf:.1%}"
+            out(f"     {baseline_text}", "mono")
+        out("       ↓ sample-specific correction", "mono")
+        if is_reg:
+            final_value = lp + ld if lp is not None and ld is not None else None
+            out(f"     {final_value:+.4f}" if final_value is not None else "     unavailable",
+                "mono")
+        else:
+            out(f"     {prediction_text}", "mono")
+            if proto_pred is not None and (pred_info or {}).get("pred_code") is not None:
+                changed = int(proto_pred) != int(pred_info["pred_code"])
+                out(f"     Group-based prediction: {baseline_label} → Final prediction: {label}"
+                    f"{' (changed)' if changed else ' (unchanged)'}", "text")
+
+        if lp is not None and ld is not None:
+            if target_class_names is not None and len(target_class_names) == 2:
+                channel_note = f'binary logit; + favours "{target_class_names[1]}"'
+            elif tasktype == "multiclass":
+                channel_note = f'final-class channel: "{label}"'
+            else:
+                channel_note = "model-output channel"
+            out(f"\n     Logit decomposition ({channel_note}):", "text")
+            out(f"       region       {lp:+.4f}", "mono")
+            out(f"       correction   {ld:+.4f}", "mono")
+            out(f"       final        {lp + ld:+.4f}", "mono")
+
+    # ── ① Assigned group ─────────────────────────────────────────
+    out("\n  ① Your assigned group", "section")
+    parts = []
+    if verbose:
+        parts.append(region)
     if group_size is not None:
-        print(f"     {region} — {int(group_size)} training cases")
-    else:
-        print(f"     {region}")
-
-    if tasktype == "regression":
+        parts.append(f"{int(group_size)} training cases")
+    if is_reg:
         if le is not None and le.get("group_mean") is not None:
-            print(f"     Region target: mean {le['group_mean']:.4g} · std {le['group_std']:.4g}")
+            parts.append(f"target mean {le['group_mean']:.4g}, std {le['group_std']:.4g}")
         elif proto.get("target_info") is not None:
-            print(f"     Region target: {_format_target_info(proto['target_info'])}")
+            parts.append(_format_target_info(proto["target_info"]))
     else:
         gcnt = (le or {}).get("group_label_counts")
-        if gcnt:
-            print(f"     Outcomes: {_dist_str(gcnt, int(group_size), max_items=3)}")
+        if gcnt and group_size:
+            parts.append(fmt.dist_str(gcnt, int(group_size), max_items=3,
+                                      show_total=False, sep=", "))
         elif proto.get("target_info") is not None:
-            print(f"     Outcomes: {_format_target_info(proto['target_info'])}")
+            parts.append(_format_target_info(proto["target_info"]))
+    # "; " between the context (the group, its size) and the outcome
+    # breakdown, whose own items are separated by ", ".
+    out("     " + ("; ".join(parts) if parts else region), "text")
 
-    # ── ② Similar past cases ─────────────────────────────────────
-    # Display policy, visible in the headings: the closest max_neighbors
-    # cases, plus the closest contrasting case as an extra slot when it falls
-    # outside that budget. Every case carries a small card so it reads as an
-    # example rather than an id.
-    print("\n  ② Similar past cases — evidence only")
-    pred_code = (pred_info or {}).get("pred_code")
-    contrast = None
-    if nbrs and tasktype != "regression" and pred_code is not None:
-        contrast = next((nb for nb in nbrs
-                         if nb.get("label") is not None
-                         and int(round(float(nb["label"]))) != int(pred_code)), None)
-    if le is not None:
-        nnb = int(le.get("n_neighbors", len(nbrs)))
-        if tasktype == "regression":
-            print(f"     Retrieved: {nnb} nearest cases in this region · "
-                  f"mean {le.get('local_mean', float('nan')):.4g} · "
-                  f"std {le.get('local_std', float('nan')):.4g}")
-        else:
-            lcnt = le.get("label_counts") or {}
-            line = f"     Retrieved: {_dist_str(lcnt, nnb, max_items=3)}"
-            if pred_code is not None and nbrs and contrast is None:
-                line += f" · no contrast among {nnb}"
-            print(line)
-        # The retrieval implementation expands beyond the assigned group only
-        # when the group itself cannot supply k candidates. This note prevents
-        # the UI from falsely calling such a result purely within-region.
-        if (le.get("group_size") is not None and nnb
-                and int(le["group_size"]) < nnb):
-            print(f"     Note: search expanded beyond the assigned region "
-                  f"(region had {int(le['group_size'])} candidates).")
+    if sel["too_small"]:
+        out(f"     Group profile unavailable — only {int(group_size)} training "
+            f"cases in this group.", "text")
+    elif sel["region"]:
+        # Rows were ranked without this case (diagnostics._region_profile);
+        # the mark is the only place the case enters.
+        rows = []
+        for row in sel["region"]:
+            name = row["feature_name"]
+            case, agrees = fmt.region_row_comparison(row, by_name.get(name))
+            if case is None:
+                mark = (_value(name, input_features[name])
+                        if input_features and name in input_features else "")
+            elif agrees is None:
+                # Numeric: the case's value, with no ✓/≠. A value cannot equal
+                # a median, so a tick would stand for an unstated band; the
+                # band that exists (the group's middle 50%) is its own column
+                # under --explain_verbose.
+                mark = case
+            elif agrees:
+                mark = "✓ same"
+            else:
+                mark = f"≠ {case}"
+            rows.append((name, fmt.typical_value(row), mark))
+        out("\n     Group profile", "subsection")
+        _table(("", "typical in group", "this case"), rows, bold_col=2)
+        if verbose:
+            out("     Ranked by distribution shift against the whole training set,", "muted")
+            out("     not against this case: KS distance for numeric, total variation", "muted")
+            out("     for categorical (both 0–1). ✓/≠ marks an exact match with the", "muted")
+            out("     group's modal value; a numeric row shows the case's value only,", "muted")
+            out("     since nothing equals a median. Typical values observed in the", "muted")
+            out("     group, not the features that routed this case to it.", "muted")
+
+    # ── ② Position within the group ──────────────────────────────
+    # Descriptive statistics only: nothing here is an input to the logits and
+    # nothing here explains the prediction (diagnostics docstrings).
+    out("\n  ② How does this case compare within the group?", "section")
+    if gc is None:
+        out("     (no group statistics available)", "muted")
+    elif sel["too_small"]:
+        out(f"     Too few training cases in this group ({int(group_size)}) to "
+            f"place this case.", "text")
+    elif not sel["position"]:
+        out("     This case is typical of its group.", "text")
+    else:
+        header = ["", "this case", "typical in group", "position"]
+        if verbose:
+            header.append("middle 50%")
+        rows = []
+        for d in sel["position"]:
+            name = d["feature_name"]
+            if d["kind"] == "numeric":
+                typical = f"{fmt.fmt_num_value(name, d['group_median'])} (median)"
+                pos = fmt.rank_position_short(d) or ""
+                rng = fmt.typical_range(d) or ""
+            else:
+                typical = (f"{fmt.fmt_cat_value(name, d['group_mode'])} "
+                           f"({float(d.get('group_mode_freq', 0.0)):.0%})")
+                pos = fmt.cat_position_short(d)
+                rng = ""
+            r = [name, _value(name, d["value"]), typical, pos]
+            if verbose:
+                r.append(rng)
+            rows.append(r)
+        _table(header, rows, bold_col=1)
+    if verbose:
+        out("     Rows: numeric value below the 15th or above the 85th within-group", "muted")
+        out("     percentile, or a categorical value held by <10% of the group", "muted")
+        out("     (display rule, not a test).", "muted")
+        if rp is not None:
+            out(f"     Distance to group centre: {fmt.centre_distance_position(rp)}", "muted")
+            out(f"     (cosine {rp['distance']:.4f}; group min/median/max "
+                f"{rp['group_min']:.4f}/{rp['group_median']:.4f}/{rp['group_max']:.4f})",
+                "muted")
+
+    # Only when the correction flipped the class: without this line ① ("96%
+    # good") and the prediction ("bad") would contradict each other. A fact
+    # about two decisions, not an attribution to the rows above -- the
+    # correction is latent and nothing here ties it to a feature.
+    if (not is_reg and dv is not None and dv.get("proto_pred") is not None
+            and (pred_info or {}).get("pred_code") is not None
+            and int(dv["proto_pred"]) != int(pred_info["pred_code"])):
+        out(f"\n     Group-based prediction: {_label_name(dv['proto_pred'])} → "
+            f"Final prediction: {label}", "value")
+        out("     The case-specific adjustment changed the predicted class.", "text")
+
+    # ── ③ Retrieved cases ────────────────────────────────────────
+    nnb = int((le or {}).get("n_neighbors", len(nbrs)) or len(nbrs))
+    # retrieve() expands beyond the assigned group only when the group cannot
+    # supply k candidates; the title must not call such a result within-group.
+    expanded = (le is not None and le.get("group_size") is not None and nnb
+                and int(le["group_size"]) < nnb)
+    # ⚠ No "evidence only" caption here. The claim still holds -- retrieval
+    #   never enters the logits -- and --explain_verbose and the README state
+    #   it; the default view carries it in the wording instead ("Retrieved
+    #   past cases", never "the cases behind the prediction").
+    out("\n  ③ Retrieved past cases" + ("" if expanded else " from this group"),
+        "section")
+    if expanded:
+        out(f"     Note: search expanded beyond the assigned group "
+            f"(group had {int(le['group_size'])} candidates).", "muted")
 
     if not nbrs:
-        print("     No retrieved cases available.")
+        out("     No retrieved cases available.", "muted")
     else:
-        # Region frequency of the query's own categorical values, used only to
-        # order exact matches (see build_neighbor_card). Descriptive input.
-        cat_rarity = {d["feature_name"]: float(d.get("group_freq", 1.0))
-                      for d in ((gc or {}).get("categorical") or [])}
-
-        def _case(nb, is_contrast):
-            sid = nb.get("sample_id")
-            sid_s = f"#{sid}" if sid is not None and sid >= 0 else f"memory #{nb['memory_idx']}"
-            tag = " · contrast" if is_contrast else ""
-            print(f"       {sid_s:<7s} {_label_name(nb.get('label'))}  ·  "
-                  f"similarity {nb['similarity']:.3f}{tag}")
-            card = build_neighbor_card(
-                nb, fmt, max_matches=max_matches,
-                max_differs=(max_gaps if is_contrast else max_differs),
-                cat_rarity=cat_rarity)
-            if card["matches"]:
-                print(f"         matches: {' · '.join(card['matches'])}")
-            if card["closest"]:
-                print(f"         closest values: {' · '.join(card['closest'])}")
-            if card["differs"]:
-                print(f"         differs: {' · '.join(card['differs'])}")
-
-        top = list(nbrs[:max_neighbors])
-        print("     Closest cases:")
-        for i, nb in enumerate(top):
-            if i:
-                print()
-            _case(nb, contrast is not None and nb is contrast)
-        if contrast is not None and contrast not in top:
-            print()
-            print("     Closest contrasting case:")
-            _case(contrast, True)
-        print()
-        print("     Similarity is measured in the embedding; shown feature values are descriptive.")
-
-    # ── ③ Position relative to the region ─────────────────────────
-    # Descriptive only. Neither block below is an input to the logits, and
-    # neither explains the Prediction shift (diagnostics docstrings).
-    if (gc and (gc.get("numeric") or gc.get("categorical"))) or rp is not None:
-        print("\n  ③ Position relative to the region")
-
-    if gc and (gc.get("numeric") or gc.get("categorical")):
-        nums = list(gc.get("numeric") or [])
-        # In a section explicitly about departures, categorical values equal
-        # to the region mode do not earn scarce display space. This is a
-        # semantic filter (equal vs different), not a numeric threshold.
-        cats = [d for d in (gc.get("categorical") or [])
-                if d.get("differs_from_mode", True) or d.get("absent_from_group", False)]
-
-        budget = max(0, int(max_features))
-        chosen_num, chosen_cat = [], []
-        if budget > 0:
-            if nums and cats:
-                n_num = min(len(nums), (budget + 1) // 2)
-                n_cat = min(len(cats), budget - n_num)
-                # Fill any unused categorical slots with numeric ones, then
-                # vice versa. Total output never exceeds max_features.
-                n_num = min(len(nums), n_num + max(0, budget - n_num - n_cat))
-                n_cat = min(len(cats), budget - n_num)
-                if n_num + n_cat < budget:
-                    n_cat = min(len(cats), n_cat + (budget - n_num - n_cat))
-                chosen_num, chosen_cat = nums[:n_num], cats[:n_cat]
-            elif nums:
-                chosen_num = nums[:budget]
+        shown = list(nbrs) if verbose else list(nbrs[:max_neighbors])
+        have_features = all(nb.get("features") for nb in shown)
+        columns = shown_cols if have_features else []
+        header = [""] + list(columns) + ["outcome"]
+        if verbose:
+            header += ["case id", "similarity"]
+        rows = []
+        for i, nb in enumerate(shown):
+            r = [f"Case {i + 1}"]
+            for name in columns:
+                feats = nb.get("features") or {}
+                r.append(_cell(_value(name, feats[name])) if name in feats else "?")
+            r.append(_label_name(nb.get("label")))
+            if verbose:
+                sid = nb.get("sample_id")
+                r.append(f"#{sid}" if sid is not None and sid >= 0
+                         else f"memory #{nb['memory_idx']}")
+                r.append(f"{nb['similarity']:.3f}")
+            rows.append(r)
+        out()
+        _table(header, rows, bold_col=1 + len(columns))
+        out()
+        summary = f"{len(shown)} of {nnb} shown"
+        if le is not None:
+            if is_reg:
+                summary += (f"; outcomes: mean "
+                            f"{le.get('local_mean', float('nan')):.4g}, "
+                            f"std {le.get('local_std', float('nan')):.4g}")
             else:
-                chosen_cat = cats[:budget]
-
-        if chosen_num or chosen_cat:
-            print("     Values that stand out:")
-
-        for d in chosen_num:
-            vr = _real_numeric(d["feature_idx"], d["value"])
-            # ⚠ group_mean is the mean in quantile space, inverse-transformed.
-            #   T⁻¹(mean(T(x))) is not the arithmetic mean in original units,
-            #   hence "reference", not "mean".
-            mr = _real_numeric(d["feature_idx"], d["group_mean"])
-            v_s = _pretty_num(vr) if vr is not None else f"{d['value']:.3f}"
-            m_s = _pretty_num(mr) if mr is not None else f"{d['group_mean']:.3f}"
-            print(f"       • {d['feature_name']} = {v_s}")
-            print(f"         region reference: {m_s}")
-            pos = _rank_position(d)
-            if pos:
-                print(f"         {pos}")
-
-        for d in chosen_cat:
-            value = _fmt_cat_value(d["feature_name"], d["value"])
-            mode = _fmt_cat_value(d["feature_name"], d["group_mode"])
-            if d.get("absent_from_group"):
-                share = "not seen among region cases"
-            else:
-                share = f"{d.get('group_freq', 0.0):.0%} in region"
-            print(f"       • {d['feature_name']} = {value}")
-            print(f"         {share} · most common: {mode} {d.get('group_mode_freq', 0.0):.0%}")
-
-    if rp is not None:
-        # ⚠ Stated as what within_region_position() returns: a cosine
-        #   distance to the region centre and its rank among the region's
-        #   training cases. It is not a typicality score -- a region need not
-        #   be spherical -- and the explained sample is not itself a member,
-        #   so the comparison set is named explicitly.
-        where = fmt.centre_distance_position(rp)
-        print("     Distance from region centre:")
-        print(f"       {where}")
+                cs = _count_str(le.get("label_counts"), nnb)
+                if cs:
+                    summary += "; " + cs
+        out(f"     {summary}", "text")
+        if verbose:
+            out("     Ranked by cosine similarity in TabERA's learned representation;", "muted")
+            out("     the columns are the cases' stored input values and do not", "muted")
+            out("     explain that cosine.", "muted")
+            if have_features:
+                out("     Full input of each case:", "muted")
+                name_width = max((len(n) for n in col_names), default=0)
+                for i, nb in enumerate(shown):
+                    out(f"       Case {i + 1}", "mono")
+                    for name in col_names:
+                        if name in nb["features"]:
+                            out(f"         {name:<{name_width}} = "
+                                f"{_value(name, nb['features'][name])}", "mono")
 
     # ── Researcher-only detail ─────────────────────────────────────
     if verbose:
-        print("\n  Advanced diagnostics")
+        out("\n  Advanced diagnostics", "section")
+        out("     Retrieved-case similarity is measured in the embedding;", "muted")
+        out("     shown feature values and region comparisons are descriptive,", "muted")
+        out("     not feature attributions or inputs to the prediction head.", "muted")
         if dv is not None:
-            if dv.get("logit_proto") is not None and dv.get("logit_dev") is not None:
-                lp, ld = dv["logit_proto"], dv["logit_dev"]
-                # Binary tasks have one raw logit whose sign picks the class
-                # (positive = class index 1), so it is not oriented to the
-                # predicted class; say which class "+" favours. Multi-class
-                # values are the predicted class's channel.
-                if target_class_names is not None and len(target_class_names) == 2:
-                    chan = f"binary logit, + favours \"{target_class_names[1]}\""
-                else:
-                    chan = "predicted-class channel"
-                print(f"     Logit decomposition (exact in logit space; {chan}): "
-                      f"region baseline {lp:+.4f} · correction {ld:+.4f} "
-                      f"· final {lp + ld:+.4f}")
+            correction_parts = [
+                f"geometry={dv.get('correction_geometry', 'unknown')}",
+                f"head scale={dv.get('head_input_scale', 'unknown')}",
+            ]
+            if dv.get("beta") is not None:
+                correction_parts.append(f"β={dv['beta']:.4f}")
+            if dv.get("gamma") is not None:
+                correction_parts.append(f"γ={dv['gamma']:.4f}")
+            if dv.get("dev_norm") is not None:
+                correction_parts.append(f"‖d‖={dv['dev_norm']:.4f}")
+            out(f"     Correction configuration: {' · '.join(correction_parts)}", "muted")
         if proto.get("routing_confidence") is not None:
-            print(f"     Routing mass: assigned {proto['routing_confidence']:.1%}", end="")
+            _routing = f"     Routing mass: assigned {proto['routing_confidence']:.1%}"
             if proto.get("others_mass") is not None:
-                print(f" · others {proto['others_mass']:.1%}")
-            else:
-                print()
+                _routing += f" · others {proto['others_mass']:.1%}"
+            out(_routing, "muted")
             for r in proto.get("runners_up") or []:
                 if r.get("target_info") is None:
                     continue
-                print(f"       runner-up {r['label']}: {r['routing_confidence']:.1%} "
-                      f"({_format_target_info(r['target_info'])})")
-        if le is not None and tasktype != "regression":
+                out(f"       runner-up {r['label']}: {r['routing_confidence']:.1%} "
+                    f"({_format_target_info(r['target_info'])})", "muted")
+        if le is not None and not is_reg:
             if le.get("label_entropy") is not None:
-                print(f"     Label entropy: neighbours {le['label_entropy']:.3f} "
-                      f"· region {le['group_label_entropy']:.3f}")
+                out(f"     Label entropy: neighbours {le['label_entropy']:.3f} "
+                    f"· region {le['group_label_entropy']:.3f}", "muted")
             ar = le.get("ambiguity_ratio")
             if ar is not None and ar == ar:
-                print(f"     Local/region entropy ratio: {ar:.3f}")
+                out(f"     Local/region entropy ratio: {ar:.3f}", "muted")
         labels = proto.get("group_feature_labels") or []
         if labels:
+            # label_all_groups ranks by cross-group distinctiveness, a
+            # different rule from block ① (region vs whole dataset); named
+            # here so the two lists are not read as one.
             shown = [f"{fl.feature_name}={fl.label}" for fl in labels[:max_features]]
-            print(f"     Region-characteristic features: {', '.join(shown)}")
-        if rp is not None:
-            print(f"     Cosine distance to region centre: {rp['distance']:.4f} "
-                  f"(region min/median/max {rp['group_min']:.4f}/"
-                  f"{rp['group_median']:.4f}/{rp['group_max']:.4f})")
+            out(f"     Cross-group distinctive features (label_all_groups): "
+                f"{', '.join(shown)}", "muted")
 
-    print(f"{'━'*48}")
-
+    out(W, "rule")
 
 
 
@@ -1779,6 +1915,7 @@ def run_single_seed(
             # numbers are for auditing, never for picking between the two.
             _raw_preds_test = wrapper.predict(X_test)
             _raw_probs_test = wrapper.predict_proba(X_test)
+            _raw_logits_test = wrapper.predict_proba(X_test, logit=True)
             _refine_info = wrapper.refine_readout(
                 X_train, y_train, X_val, y_val,
                 lr=args.refine_lr, weight_decay=args.refine_wd,
@@ -1786,7 +1923,7 @@ def run_single_seed(
                 include_null=not args.refine_no_null,
             )
             _refine_info["raw_test_metrics"] = calculate_metric(
-                y_test, _raw_preds_test, _raw_probs_test, tasktype, "test")
+                y_test, _raw_preds_test, _raw_logits_test, tasktype, "test")
             _refine_time = time.time() - _rst
     # Include readout-refinement time in the reported fit time when enabled.
     _base_fit_time = _fit_time
@@ -1805,8 +1942,10 @@ def run_single_seed(
         val_metrics  = calculate_metric(y_val  * y_std, preds_val  * y_std, None, tasktype, "val")
         test_metrics = calculate_metric(y_test * y_std, preds_test * y_std, None, tasktype, "test")
     else:
-        val_metrics  = calculate_metric(y_val,  preds_val,  probs_val,  tasktype, "val")
-        test_metrics = calculate_metric(y_test, preds_test, probs_test, tasktype, "test")
+        val_metrics = calculate_metric(
+            y_val, preds_val, wrapper.predict_proba(X_val, logit=True), tasktype, "val")
+        test_metrics = calculate_metric(
+            y_test, preds_test, wrapper.predict_proba(X_test, logit=True), tasktype, "test")
 
     print(f"\n  {env_info}  {openml_id}  {dataset_info['name']}  tabera  {log_dir}")
     print(f"  val  : {val_metrics}")
@@ -2274,44 +2413,77 @@ def run_single_seed(
         _nbrs = diag.retrieved_neighbors(model, out)
         _le   = diag.local_label_evidence(model, out)
         _pdv  = diag.prototype_deviation(model, out)
-        _gst  = diag.group_relative_feature_stats(model, out, X_show)
+        from libs.explanation_schema import explanation_categories
+        explanation_types = explanation_categories(openml_id)
+        explanation_category_names = dict(dataset.cat_category_names)
+        explanation_category_names.update({
+            name: {code: str(code) for code in codes}
+            for name, codes in explanation_types.items()
+        })
+        _gst = diag.group_relative_feature_stats(
+            model, out, X_show,
+            categorical_overrides=explanation_types,
+            quantile_transformer=dataset.quantile_transformer,
+        )
         _wrp  = (diag.within_region_position(model, out)
                  if getattr(args, "refresh_on_best", False) else None)
 
-        cat_names = {dataset.col_names[i] for i in dataset.X_cat}
+        # Raw-feature gaps are used only by the separate publication figure's
+        # legacy contrast panel. The console explanation, including verbose
+        # mode, reads the retrieved cases' stored features directly.
+        cat_names = ({dataset.col_names[i] for i in dataset.X_cat}
+                     if args.explain_figure else None)
         X_show_cpu = X_show.detach().cpu().numpy()
         for b, exp in enumerate(explanations):
             query_dict = {name: float(X_show_cpu[b, i])
                           for i, name in enumerate(dataset.col_names)}
+            exp["input_features"] = query_dict
             exp["neighbors"]           = (_nbrs[b] if _nbrs else [])
             exp["local_evidence"]      = (_le[b]   if _le   else None)
             exp["prototype_deviation"] = (_pdv[b]  if _pdv  else None)
             exp["group_stats"]         = (_gst[b]  if _gst  else None)
             exp["region_position"]     = (_wrp[b]  if _wrp  else None)
-            for nb in exp["neighbors"]:
-                if nb.get("features"):
-                    # Attach every gap; sorting and truncation belong to the
-                    # display layer.
-                    nb["gaps"] = diag.feature_gaps(
-                        query_dict, nb["features"], cat_names)
+            if cat_names is not None:
+                for nb in exp["neighbors"]:
+                    if nb.get("features"):
+                        # Attach every gap for the figure; its layout owns
+                        # sorting and truncation.
+                        nb["gaps"] = diag.feature_gaps(
+                            query_dict, nb["features"], cat_names)
         if not explanations:
             print("  (no explanations — memory bank has not been filled yet)")
             print("  → try increasing epochs or n_trials.")
         else:
             for i in range(n_show):
+                _explain_kwargs = dict(
+                    cat_category_names=explanation_category_names,
+                    quantile_transformer=dataset.quantile_transformer,
+                    num_cols=list(dataset.X_num),
+                    pred_info=pred_infos[i],
+                    target_class_names=getattr(
+                        dataset, "target_class_names", None),
+                    tasktype=tasktype,
+                    verbose=getattr(args, "explain_verbose", False))
                 print_explanation(explanations, i, dataset.col_names,
-                                   cat_category_names=dataset.cat_category_names,
-                                   quantile_transformer=dataset.quantile_transformer,
-                                   num_cols=list(dataset.X_num),
-                                   pred_info=pred_infos[i],
-                                   target_class_names=getattr(
-                                       dataset, "target_class_names", None),
-                                   tasktype=tasktype,
-                                   verbose=getattr(args, "explain_verbose", False))
+                                  **_explain_kwargs)
+
+                # The image is a typesetting pass over the very lines just
+                # printed: the same call with a sink collects them instead of
+                # printing, so the figure cannot say anything the text did
+                # not. --explain_verbose applies to both.
+                if args.explain_png:
+                    from libs.explain_png import render_explanation_png
+                    _rows = []
+                    print_explanation(explanations, i, dataset.col_names,
+                                      sink=_rows, **_explain_kwargs)
+                    _stem = Path(args.explain_png)
+                    for _p in render_explanation_png(
+                            _rows, _stem.with_name(f"{_stem.name}_sample{i}")):
+                        print(f"  saved explanation image: {_p}")
 
             # The figure is drawn from these same `explanations` dicts and
-            # through the same ExplanationFormatter. ⚠ Its panel (2) has not
-            # yet been moved onto build_neighbor_card(), so only Prediction,
+            # through the same ExplanationFormatter. Its panel (2) has a
+            # separate, publication-oriented layout, so only Prediction,
             # (1) and (3) are guaranteed to match the text above.
             if args.explain_figure:
                 from libs.explain_figure import render_explanation_figure
@@ -2321,7 +2493,7 @@ def run_single_seed(
                         explanations, i,
                         _stem.with_name(f"{_stem.name}_sample{i}"),
                         col_names=dataset.col_names,
-                        cat_category_names=dataset.cat_category_names,
+                        cat_category_names=explanation_category_names,
                         quantile_transformer=dataset.quantile_transformer,
                         num_cols=list(dataset.X_num),
                         pred_info=pred_infos[i],
@@ -2416,21 +2588,30 @@ def main():
                         help="record and print per-epoch timing diagnostics")
     parser.add_argument("--verbose", action="store_true",
                         help="print additional run/provenance diagnostics")
+    parser.add_argument("--explain_png", type=str, default=None,
+                        help=(
+                            "with --explain, also typeset each explanation exactly as "
+                            "printed into <PREFIX>_sample<i>.png (300 dpi) and a vector "
+                            ".pdf, on a white page in DejaVu Sans/Mono -- for using the "
+                            "user-facing view itself as a figure. It renders the same "
+                            "lines the terminal shows, so --explain_verbose changes the "
+                            "image too. Unlike --explain_figure this draws no charts."))
     parser.add_argument("--explain_figure", type=str, default=None,
                         help=(
                             "with --explain, also render each explained sample as a "
                             "publication figure: PNG at 300 dpi plus a vector PDF, "
                             "written as <PREFIX>_sample<i>.{png,pdf}. Prediction, (1) "
                             "and (3) are drawn from the same observer outputs and the "
-                            "same formatter as the printed text. ⚠ Panel (2) of the "
-                            "figure still shows the older contrast-only comparison, "
-                            "not the per-case cards the text prints; do not cite it as "
-                            "identical to the text until it is updated."))
+                            "same formatter as the printed text. Panel (2) uses a separate "
+                            "publication-oriented layout and should not be cited as identical "
+                            "to the console's retrieval list."))
     parser.add_argument("--explain_verbose", action="store_true",
-                        help=("append researcher diagnostics to the compact explanation: "
-                              "routing mass, predicted-channel logit decomposition, label "
-                              "entropy, region-characteristic features, and raw representation "
-                              "distance. The default --explain view is user-facing and concise."))
+                        help=("researcher view of the explanation: sample/region ids, the full "
+                              "input, the region→final logit decomposition, the ranking rules "
+                              "behind ① and ②, middle-50% ranges and centre distance, every "
+                              "retrieved case with ids, similarities and full inputs, routing "
+                              "mass and label entropies. The default --explain view is "
+                              "user-facing and concise."))
     parser.add_argument("--explain",   action="store_true",
                         help="print the feature explanation after training")
     parser.add_argument("--final_readout_refine", action="store_true",
@@ -2457,9 +2638,8 @@ def main():
                         default=FINAL_CONFIG["head_input_scale"],
                         choices=["unit", "auto", "matched"],
                         help=("head-input scale gamma. Default is the final architecture "
-                              "(auto, shared with optimize.py via FINAL_CONFIG). auto is "
-                              "defined only for unit_tangent, so the legacy arm needs "
-                              "BOTH --correction_geometry additive --head_input_scale unit. "
+                              "(unit, gamma=1, shared via FINAL_CONFIG). auto is "
+                              "defined only for unit_tangent. "
                               "Ignored with --from_saved_state, where the checkpoint's "
                               "value applies."))
     parser.add_argument("--tie_rule", type=str, default="first",
@@ -2568,9 +2748,8 @@ def main():
                         choices=["additive", "chord", "tangent", "unit_tangent"],
                         help=(
                             "Phase A arm: the geometry of d = h - c. Default is the final "
-                            "architecture (unit_tangent, shared with optimize.py via "
-                            "FINAL_CONFIG). The legacy arm needs BOTH --correction_geometry "
-                            "additive --head_input_scale unit. Must match the "
+                            "architecture (tangent, shared with optimize.py via "
+                            "FINAL_CONFIG, paired with head_input_scale=unit). Must match the "
                             "value optimize.py ran with -- it selects the study file "
                             "(..geom=NAME) and, if the study records a different arm, "
                             "this run stops rather than train a different model than "
@@ -2585,8 +2764,7 @@ def main():
                             "it selects the study file (..esm=NAME) and this run stops "
                             "if the study recorded a different one. Default val_loss is the "
                             "MultiTab protocol (batch-averaged validation loss, patience 20, "
-                            "terminal checkpoint, no restore); 'accuracy' is the earlier "
-                            "TabERA rule, now an ablation arm. No effect with "
+                            "terminal checkpoint, no restore). No effect with "
                             "--from_saved_state, which skips training."))
     parser.add_argument("--plr_n_frequencies", type=int, default=16,
                         help="number of periodic frequencies per column when num_embedding=plr_lite (default 16).")
@@ -2680,18 +2858,13 @@ def main():
                         help="repeat KernelSHAP diagnostics to estimate Monte Carlo variability")
     args = parser.parse_args()
 
-    # ⚠ The two structural flags come as a pair. head_input_scale="auto" is
-    #   defined only for unit_tangent (TabERA.__init__ raises), so now that
-    #   the defaults are the final arm, `--correction_geometry additive` on its
-    #   own would pair the legacy geometry with the final scale and die deep
-    #   inside model construction. Say so up front, with the fix.
-    if (not args.from_saved_state and args.correction_geometry == "additive"
+    # Validate explicit geometry/scale combinations before loading data.
+    # Saved-state analysis uses the checkpoint's own configuration.
+    if (not args.from_saved_state and args.correction_geometry != "unit_tangent"
             and args.head_input_scale == "auto"):
         raise SystemExit(
-            "--correction_geometry additive requires --head_input_scale unit: "
-            "head_input_scale=auto is defined only for unit_tangent. The legacy "
-            "arm is selected with both flags: "
-            "--correction_geometry additive --head_input_scale unit")
+            "head_input_scale=auto is defined only for correction_geometry=unit_tangent. "
+            "For tangent use --head_input_scale unit.")
 
     # Deterministic mode is strict by default; unsupported CUDA operations raise.
     if args.deterministic:

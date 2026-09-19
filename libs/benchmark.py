@@ -76,16 +76,15 @@ def arm_config(disable_dead_reinit=False, early_stop_metric=None):
     treated like a different geometry: its own HPO study (``..nodr`` /
     ``..esm=NAME`` in the study filename), its own contract (``config``
     differs), and its own result files (``arm_tag``). Nothing about the main
-    arm's names changes, so every existing study and result keeps resolving
-    under its original path.
+    arm's names changes within a fixed configuration. Historical results must
+    retain their explicit configuration when defaults change.
 
     Arms:
       disable_dead_reinit   dead-prototype recovery off
       early_stop_metric     which validation criterion drives patience.
-                            val_loss is the main, MultiTab-matched protocol
-                            (FINAL_CONFIG) and returns the terminal model;
-                            accuracy is the earlier TabERA rule (best-val-acc
-                            checkpoint restore), kept as an ablation arm
+                            val_loss uses the MultiTab terminal-model protocol
+                            by default; accuracy restores the best-validation-
+                            accuracy checkpoint as an optional variant.
     """
     cfg = dict(FINAL_CONFIG, disable_dead_reinit=bool(disable_dead_reinit))
     if early_stop_metric is not None:
